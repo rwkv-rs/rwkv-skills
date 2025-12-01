@@ -64,7 +64,7 @@ print(result)
 `rwkv-skills-scheduler` 暴露了一组命令（队列预览、调度、状态、停止、日志轮播）：
 ```bash
 rwkv-skills-scheduler queue
-rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/results
+rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
 ```
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
 `src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`。

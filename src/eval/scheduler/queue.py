@@ -28,6 +28,7 @@ def build_queue(
     model_globs: Sequence[str],
     job_order: Sequence[str],
     completed: Collection[CompletedKey],
+    failed: Collection[CompletedKey] | None = None,
     running: Collection[str],
     skip_dataset_slugs: Collection[str],
     model_select: str,
@@ -41,6 +42,7 @@ def build_queue(
 
     pending: list[QueueItem] = []
     completed_set = set(completed)
+    failed_set = set(failed or ())
     skip_datasets = {canonical_slug(slug) for slug in skip_dataset_slugs}
     running_set = set(running)
 
@@ -60,7 +62,7 @@ def build_queue(
                     dataset_slug=canonical_dataset,
                     is_cot=spec.is_cot,
                 )
-                if key in completed_set:
+                if key in completed_set or key in failed_set:
                     continue
                 job_id = f"{spec.id_prefix}{build_run_slug(model_path, canonical_dataset, is_cot=spec.is_cot)}"
                 if job_id in running_set:

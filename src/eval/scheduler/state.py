@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .config import (
+    DEFAULT_COMPLETION_DIR,
+    DEFAULT_EVAL_RESULT_DIR,
+    DEFAULT_RUN_LOG_DIR,
+    REPO_ROOT,
+    RESULTS_ROOT,
+)
 from .dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
 from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset
 
@@ -26,9 +33,12 @@ class CompletedKey:
 class CompletedRecord:
     job_id: str
     key: CompletedKey
-    log_path: Path
+    score_path: Path
+    completion_path: Path
+    eval_result_path: Path | None
     dataset_path: str
     model_name: str
+    missing_artifacts: tuple[str, ...] = ()
 
 
 @dataclass
@@ -36,6 +46,9 @@ class RunningEntry:
     pid: int
     gpu: str | None
     log_path: Path | None = None
+
+
+_MISSING_ARTIFACT_ALERTS: set[tuple[Path, str]] = set()
 
 
 def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, CompletedRecord]]:
@@ -54,8 +67,26 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
 
         model_name = raw.get("model") or raw.get("raw_model")
         dataset_path = raw.get("dataset")
-        if not isinstance(model_name, str) or not isinstance(dataset_path, str):
+        log_path_str = raw.get("log_path")
+        if not isinstance(model_name, str) or not isinstance(dataset_path, str) or not isinstance(log_path_str, str):
             continue
+
+        completion_path = _resolve_run_path(log_path_str)
+        missing: list[str] = []
+        if not completion_path.exists():
+            _warn_missing_artifact(json_path, "completion", completion_path)
+            missing.append("completion")
+
+        eval_details_path: Path | None = None
+        task_details = raw.get("task_details")
+        if isinstance(task_details, Mapping):
+            details_path = task_details.get("eval_details_path")
+            if isinstance(details_path, str):
+                candidate = _resolve_run_path(details_path)
+                if not candidate.exists():
+                    _warn_missing_artifact(json_path, "eval_details", candidate)
+                else:
+                    eval_details_path = candidate
 
         dataset_slug = infer_dataset_slug_from_path(dataset_path)
         is_cot = _detect_is_cot(json_path, raw)
@@ -68,29 +99,105 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
             dataset_slug=dataset_slug,
             is_cot=is_cot,
         )
-        completed.add(key)
+        if not missing:
+            completed.add(key)
         records[json_path.stem] = CompletedRecord(
             job_id=json_path.stem,
             key=key,
-            log_path=json_path,
+            score_path=json_path,
+            completion_path=completion_path,
+            eval_result_path=eval_details_path,
             dataset_path=dataset_path,
             model_name=model_name,
+            missing_artifacts=tuple(missing),
         )
     return completed, records
 
 
+def _warn_missing_artifact(json_path: Path, category: str, path: Path) -> None:
+    key = (json_path, category)
+    if key in _MISSING_ARTIFACT_ALERTS:
+        return
+    _MISSING_ARTIFACT_ALERTS.add(key)
+    print(f"⚠️  结果 {json_path} 缺少 {category} 文件：{path}")
+
+
+def _resolve_run_path(path_str: str) -> Path:
+    raw = Path(path_str).expanduser()
+    candidates: list[Path] = []
+
+    def _push(path: Path | None) -> None:
+        if path is None:
+            return
+        normalized = path.expanduser()
+        if normalized not in candidates:
+            candidates.append(normalized)
+
+    if raw.is_absolute():
+        _push(raw)
+        _push(_rebase_to_repo(raw))
+    else:
+        _push((REPO_ROOT / raw).expanduser())
+
+    _push(_match_known_results_root(raw))
+
+    name = raw.name
+    if name:
+        for base in (
+            DEFAULT_COMPLETION_DIR,
+            DEFAULT_EVAL_RESULT_DIR,
+            DEFAULT_RUN_LOG_DIR,
+            RESULTS_ROOT,
+        ):
+            _push(base / name)
+
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0] if candidates else raw
+
+
+def _rebase_to_repo(path: Path) -> Path | None:
+    parts = path.parts
+    repo_name = REPO_ROOT.name
+    for idx, part in enumerate(parts):
+        if part == repo_name:
+            relative = Path(*parts[idx + 1 :])
+            return (REPO_ROOT / relative) if relative.parts else REPO_ROOT
+    for idx, part in enumerate(parts):
+        if part == "results":
+            relative = Path(*parts[idx:])
+            return (REPO_ROOT / relative) if relative.parts else (REPO_ROOT / "results")
+    return None
+
+
+def _match_known_results_root(path: Path) -> Path | None:
+    if not path.is_absolute():
+        return None
+    marker = RESULTS_ROOT.name
+    for idx, part in enumerate(path.parts):
+        if part == marker:
+            relative = Path(*path.parts[idx + 1 :])
+            return (RESULTS_ROOT / relative) if relative.parts else RESULTS_ROOT
+    return None
+
+
 def _detect_is_cot(log_path: Path, payload: Mapping[str, object]) -> bool:
-    if any(
-        key in payload
-        for key in (
-            "cot_generation_template",
-            "final_answer_generation_template",
-            "cot_generation_input_example",
-            "answer_generation_input_example",
-        )
-    ):
+    cot_flag = payload.get("cot")
+    if isinstance(cot_flag, bool):
+        return cot_flag
+    cot_markers = (
+        "cot_generation_template",
+        "final_answer_generation_template",
+        "cot_generation_input_example",
+        "answer_generation_input_example",
+    )
+    if any(key in payload for key in cot_markers):
         return True
-    return "cot" in log_path.name.lower()
+    name = log_path.name.lower()
+    if "nocot" in name:
+        return False
+    return "cot" in name
 
 
 def load_running(pid_dir: Path) -> dict[str, RunningEntry]:

@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -81,12 +82,14 @@ class LogsOptions:
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
-    completed, _ = scan_completed_jobs(opts.log_dir)
+    completed, score_records = scan_completed_jobs(opts.log_dir)
+    failed = {record.key for record in score_records.values() if record.missing_artifacts}
     running_entries = load_running(opts.pid_dir)
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
         completed=completed,
+        failed=failed,
         running=running_entries.keys(),
         skip_dataset_slugs=opts.skip_dataset_slugs,
         model_select=opts.model_select,
@@ -111,6 +114,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
     job_metadata: dict[str, dict[str, object]] = {}
     completed_log_ids: set[str] | None = None
     pending_notice_printed = False
+    failed_announced: set[str] = set()
 
     while True:
         failure = FAILURE_MONITOR.wait_failure(timeout=0)
@@ -120,11 +124,27 @@ def action_dispatch(opts: DispatchOptions) -> None:
             return
 
         completed, completed_records = scan_completed_jobs(opts.log_dir)
+        failed_keys = {record.key for record in completed_records.values() if record.missing_artifacts}
+        for job_id, record in completed_records.items():
+            if not record.missing_artifacts or job_id in failed_announced:
+                continue
+            missing_desc = "、".join(record.missing_artifacts)
+            print(f"❌ {job_id} 先前运行缺少 {missing_desc}，已标记失败（score: {record.score_path})")
+            log_job_event(
+                "job_fail",
+                job_id,
+                reason="missing_artifacts",
+                missing=record.missing_artifacts,
+                score_path=str(record.score_path),
+                log_path=str(record.completion_path),
+            )
+            failed_announced.add(job_id)
         running_entries = load_running(opts.pid_dir)
         queue = build_queue(
             model_globs=opts.model_globs,
             job_order=opts.job_order,
             completed=completed,
+            failed=failed_keys,
             running=running_entries.keys(),
             skip_dataset_slugs=opts.skip_dataset_slugs,
             model_select=opts.model_select,
@@ -133,7 +153,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
         )
         now = time.time()
 
-        completed_ids = set(completed_records.keys())
+        completed_ids = {job_id for job_id, record in completed_records.items() if not record.missing_artifacts}
         new_completed = set() if completed_log_ids is None else completed_ids - completed_log_ids
         if new_completed:
             for job_id in sorted(new_completed):
@@ -148,10 +168,12 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "model_slug": info.key.model_slug,
                     "dataset_path": info.dataset_path,
                     "model_name": info.model_name,
-                    "log_path": str(info.log_path),
+                    "log_path": str(info.completion_path),
                     "runtime_s": runtime,
                     "is_cot": info.key.is_cot,
                 }
+                if info.eval_result_path:
+                    payload["eval_details_path"] = str(info.eval_result_path)
                 payload.update(meta)
                 log_job_event("job_done", job_id, **payload)
         completed_log_ids = completed_ids
@@ -239,7 +261,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
 
             log_stem = build_run_log_name(item.model_path, dataset_slug, is_cot=job.is_cot)
             completion_path = opts.completion_dir / f"{log_stem}.jsonl"
-            console_log_path = opts.run_log_dir / f"{log_stem}.log"
+            console_log_path = _allocate_console_log_path(opts.run_log_dir, log_stem)
             pid_path = opts.pid_dir / f"{item.job_id}.pid"
             item.dataset_path = dataset_path
 
@@ -289,7 +311,14 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 env=env,
             )
 
-            command = build_command(job, item.model_path, dataset_path, f"cuda:{gpu}", batch_size=batch_size)
+            command = build_command(
+                job,
+                item.model_path,
+                dataset_path,
+                f"cuda:{gpu}",
+                batch_size=batch_size,
+                output_path=completion_path,
+            )
             print(f"🚀 Launch {item.job_id} -> cuda:{gpu}")
             print(f"    Dataset: {dataset_path}")
             print(f"    Completion: {completion_path}")
@@ -340,6 +369,7 @@ def build_command(
     device: str,
     *,
     batch_size: int | None = None,
+    output_path: Path | None = None,
 ) -> list[str]:
     base = [DEFAULT_PYTHON, "-m", job.module]
     args = [
@@ -352,6 +382,8 @@ def build_command(
     ]
     if batch_size is not None and job.batch_flag:
         args.extend([job.batch_flag, str(batch_size)])
+    if output_path is not None:
+        args.extend(["--output", str(output_path)])
     if job.extra_args:
         args.extend(job.extra_args)
     return base + args
@@ -448,6 +480,23 @@ def _clean_param_swap_records(log_dir: Path) -> None:
 
     shutil.rmtree(target, ignore_errors=True)
     print(f"🧹 已清理参数搜索记录: {target}")
+
+
+def _allocate_console_log_path(base_dir: Path, stem: str) -> Path:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    candidate = base_dir / f"{stem}.log"
+    if not candidate.exists():
+        return candidate
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    candidate = base_dir / f"{stem}--{timestamp}.log"
+    if not candidate.exists():
+        return candidate
+    attempt = 1
+    while True:
+        numbered = base_dir / f"{stem}--{timestamp}-{attempt}.log"
+        if not numbered.exists():
+            return numbered
+        attempt += 1
 
 
 def _print_queue_summary(pending: Sequence[QueueItem], running: Mapping[str, RunningEntry]) -> None:
