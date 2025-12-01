@@ -61,9 +61,7 @@ def _normalize_model_identifier(raw: str) -> str:
         return f"{whole}.{frac}b"
 
     sanitized = re.sub(r"(?P<whole>\d+)-(?P<frac>\d+)b", _decimal_replacer, sanitized)
-    match = re.match(r"^rwkv7[a-z0-9]*-(.+)$", sanitized)
-    tail = match.group(1) if match else sanitized
-    parts = tail.split("-")
+    parts = sanitized.split("-")
     head_parts: list[str] = []
     for part in parts:
         if re.fullmatch(r"\d{8}", part):
@@ -71,7 +69,7 @@ def _normalize_model_identifier(raw: str) -> str:
         if part.lower().startswith("ctx"):
             break
         head_parts.append(part)
-    return "-".join(head_parts) if head_parts else tail
+    return "-".join(head_parts) if head_parts else sanitized
 
 
 def _parse_model_tags(identifier: str) -> tuple[str | None, str | None, str | None]:
