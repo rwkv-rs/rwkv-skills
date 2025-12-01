@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
@@ -18,11 +18,11 @@ from .common import JsonlStageWriter, SampleRecord, StageRecord
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
 
-EN_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
+EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
-Assistant:"""
+Assistant: The answer is"""
 
 EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
@@ -33,7 +33,12 @@ Assistant: <think"""
 EN_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 Therefore, the answer is"""
 
-ZH_PROMPT_TEMPLATE = """User: <Q>
+ZH_DIRECT_PROMPT_TEMPLATE = """User: <Q>
+<CHOICES>
+
+Assistant: 正确答案是"""
+
+ZH_COT_PROMPT_TEMPLATE = """User: <Q>
 <CHOICES>
 
 Assistant:"""
@@ -53,12 +58,27 @@ COT_SAMPLING = SamplingConfig(
 )
 
 
-def _select_templates(dataset_name: str | None) -> tuple[str, str]:
+@dataclass(frozen=True)
+class PromptTemplates:
+    direct: str
+    cot: str
+    final: str
+
+
+def _select_prompt_templates(dataset_name: str | None) -> PromptTemplates:
     if dataset_name:
         stem = dataset_name.lower()
         if any(token in stem for token in ("ceval", "zh", "cn")):
-            return ZH_PROMPT_TEMPLATE, ZH_FINAL_ANSWER_TEMPLATE
-    return EN_PROMPT_TEMPLATE, EN_FINAL_ANSWER_TEMPLATE
+            return PromptTemplates(
+                ZH_DIRECT_PROMPT_TEMPLATE,
+                ZH_COT_PROMPT_TEMPLATE,
+                ZH_FINAL_ANSWER_TEMPLATE,
+            )
+    return PromptTemplates(
+        EN_DIRECT_PROMPT_TEMPLATE,
+        EN_COT_PROMPT_TEMPLATE,
+        EN_FINAL_ANSWER_TEMPLATE,
+    )
 
 
 @dataclass(slots=True)
@@ -88,8 +108,9 @@ class MultipleChoicePipeline:
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
+        templates = _select_prompt_templates(dataset_name)
         if prompt_template is None:
-            prompt_template, _ = _select_templates(dataset_name)
+            prompt_template = templates.direct
 
         writer = JsonlStageWriter(output_path)
         for idx, record in enumerate(records):
@@ -135,14 +156,11 @@ class MultipleChoicePipeline:
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
-        if cot_prompt_template is None or final_answer_template is None:
-            prompt_tpl, final_tpl = _select_templates(dataset_name)
-            if cot_prompt_template is None:
-                cot_prompt_template = (
-                    EN_COT_PROMPT_TEMPLATE if prompt_tpl == EN_PROMPT_TEMPLATE else prompt_tpl
-                )
-            if final_answer_template is None:
-                final_answer_template = final_tpl
+        templates = _select_prompt_templates(dataset_name)
+        if cot_prompt_template is None:
+            cot_prompt_template = templates.cot
+        if final_answer_template is None:
+            final_answer_template = templates.final
 
         cot_prompts = [self._format_prompt(record, cot_prompt_template) for record in records]
         if not cot_prompts:
@@ -208,7 +226,7 @@ class MultipleChoicePipeline:
         records = list(dataset)
         if sample_limit is not None and sample_limit > 0:
             records = records[: min(sample_limit, len(records))]
-        dataset_name = Path(dataset_path).stem
+        dataset_name = infer_dataset_slug_from_path(dataset_path)
         return records, dataset_name
 
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:

@@ -52,7 +52,7 @@ class RecordBase:
     metadata: MetadataDict = field(default_factory=dict)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class SubjectRecordBase(RecordBase):
     """Record type that optionally carries subject/category info."""
 

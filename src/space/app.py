@@ -278,11 +278,11 @@ def _build_dashboard() -> gr.Blocks:
                 warnings=warnings,
             )
             return (
-                gr.Dropdown.update(choices=model_choices, value=dropdown_value),
-                gr.Dropdown.update(choices=domain_choices, value=domain_value),
-                gr.Markdown.update(value=summary_value),
-                gr.HTML.update(value=_render_cards(visible_entries)),
-                gr.Dataframe.update(value=_build_table(visible_entries)),
+                gr.update(choices=model_choices, value=dropdown_value),
+                gr.update(choices=domain_choices, value=domain_value),
+                gr.update(value=summary_value),
+                gr.update(value=_render_cards(visible_entries)),
+                gr.update(value=_build_table(visible_entries)),
             )
 
         model_dropdown.change(
