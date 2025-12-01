@@ -60,6 +60,53 @@ class _ActiveTask:
     finish_reason: str | None
 
 
+def _torch_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """Lightweight torch fallback for top-k/top-p sampling on CUDA."""
+
+    use_top_k = top_k is not None and top_k > 0 and top_k < logits.size(-1)
+    if use_top_k:
+        logits, topk_idx = torch.topk(logits, top_k, dim=-1)
+    else:
+        topk_idx = None
+
+    probs = torch.softmax(logits, dim=-1)
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if 0.0 < top_p < 1.0:
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        cum = sorted_probs.cumsum(dim=-1)
+        # keep at least one token even if top_p is extremely small
+        mask = cum > top_p
+        mask[..., 0] = False
+        filtered = sorted_probs.masked_fill(mask, 0.0)
+        filtered_sum = filtered.sum(dim=-1, keepdim=True)
+        needs_fallback = ~torch.isfinite(filtered_sum) | (filtered_sum <= 0)
+        if torch.any(needs_fallback):
+            # fallback to the top candidate so we always have a valid distribution
+            fallback = torch.zeros_like(filtered)
+            fallback[..., 0] = 1.0
+            filtered = torch.where(needs_fallback, fallback, filtered)
+            filtered_sum = filtered.sum(dim=-1, keepdim=True)
+        filtered = filtered / filtered_sum.clamp_min(torch.finfo(filtered.dtype).eps)
+        local_choice = torch.multinomial(filtered, 1).squeeze(-1)
+        local_idx = torch.gather(sorted_idx, -1, local_choice.unsqueeze(-1)).squeeze(-1)
+    else:
+        prob_sum = probs.sum(dim=-1, keepdim=True)
+        needs_fallback = ~torch.isfinite(prob_sum) | (prob_sum <= 0)
+        if torch.any(needs_fallback):
+            # prefer the highest logit in the current view when the distribution is degenerate
+            fallback = torch.zeros_like(probs)
+            fallback.scatter_(-1, torch.argmax(logits, dim=-1, keepdim=True), 1.0)
+            probs = torch.where(needs_fallback, fallback, probs)
+            prob_sum = probs.sum(dim=-1, keepdim=True)
+        probs = probs / prob_sum.clamp_min(torch.finfo(probs.dtype).eps)
+        local_idx = torch.multinomial(probs, 1).squeeze(-1)
+
+    if topk_idx is not None:
+        local_idx = torch.gather(topk_idx, -1, local_idx.unsqueeze(-1)).squeeze(-1)
+    return local_idx
+
+
 def _continuous_batching(
     model: RWKVModelProtocol,
     tokenizer: TokenizerProtocol,
@@ -103,6 +150,7 @@ def _continuous_batching(
     )
 
     outputs: list[GenerationOutput] = []
+    flashinfer_ok = True
 
     while active_tasks:
         accomplished: list[int] = []
@@ -180,7 +228,18 @@ def _continuous_batching(
             temp = sampling.temperature or 1.0
             out /= temp
 
-        new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(out, sampling.top_k, sampling.top_p)
+        logits = out.float().contiguous()
+        if flashinfer_ok:
+            try:
+                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                    logits, sampling.top_k, sampling.top_p
+                )
+            except RuntimeError as exc:
+                print(f"⚠️ flashinfer sampling failed: {exc}; falling back to torch sampling.")
+                flashinfer_ok = False
+                new_tokens = _torch_top_k_top_p(logits, sampling.top_k, sampling.top_p)
+        else:
+            new_tokens = _torch_top_k_top_p(logits, sampling.top_k, sampling.top_p)
         new_tokens = new_tokens.tolist()
         for task in active_tasks:
             task.new_token = new_tokens[task.state_pos]
