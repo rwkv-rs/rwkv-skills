@@ -17,8 +17,9 @@ def _iter_mbpp_records(problems: Mapping[str, dict]) -> Iterable[dict]:
         payload = dict(problem)
         prompt = payload.get("prompt") or payload.get("question") or ""
         if isinstance(prompt, str):
-            payload["prompt"] = prompt
-            payload["question"] = prompt.replace(*_QUESTION_REPLACE)
+            prompt_tab = prompt.replace(*_QUESTION_REPLACE)
+            payload["prompt"] = prompt_tab
+            payload["question"] = prompt_tab
         else:
             payload["prompt"] = ""
             payload["question"] = ""

@@ -5,8 +5,8 @@
 ## 目录速览
 - `src/infer`：RWKV 模型加载、采样策略与连续批量生成引擎。
 - `src/eval/datasets`：数据结构定义、JSONL 加载器以及各类数据集的准备脚本。
-- `src/eval/evaluators`：多选 / 自由问答 / 指令遵循评测管线（代码生成管线尚未实现）。
-- `src/eval/scheduler`：评测任务排队、GPU 侦测与调度的 CLI（现已附带 multi-choice / free-response / instruction-following 入口脚本）。
+- `src/eval/evaluators`：多选 / 自由问答 / 指令遵循 / 代码生成（HumanEval、MBPP）评测管线。
+- `src/eval/scheduler`：评测任务排队、GPU 侦测与调度的 CLI（现已附带 multi-choice / free-response / instruction-following / human-eval / mbpp 入口脚本）。
 - `albatross`：上游 RWKV 参考实现子模块。
 - `weights`、`data`、`results`（可选）：模型权重、数据集与评测产物的默认存放位置。
 
@@ -47,7 +47,7 @@ PY
 支持的数据集别名可通过 `available_*_datasets()` 系列函数查看。
 
 ## 评测与推理示例
-目前推荐直接调用管线类（调度器缺少实际执行脚本，见下文）：
+目前推荐直接调用管线类：
 ```python
 from src.eval.evaluators.multi_choice import MultipleChoicePipeline
 from src.infer.model import ModelLoadConfig
@@ -68,10 +68,35 @@ rwkv-skills-scheduler queue
 rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
-`src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`。
+`src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`。
+
+## HumanEval 代码生成评测
+- 数据集准备：`prepare_dataset("human_eval", Path("data"))` 会下载官方 `HumanEval.jsonl.gz` 并写出 `data/human_eval/test.jsonl`。
+- 直接运行 CLI：
+  ```bash
+  python -m src.bin.eval_code_human_eval \
+    --model-path weights/rwkv7-*.pth \
+    --dataset data/human_eval/test.jsonl \
+    --samples-per-task 10 \
+    --batch-size 128 \
+    --eval-timeout 3
+  ```
+  生成的样本写入 results/logs 结构，并会自动执行官方测试用例输出 pass@k 结果（如仅生成 1 次只输出 pass@1）。
+
+## MBPP 代码生成评测
+- 数据集准备：`prepare_dataset("mbpp", Path("data"))` 会使用 EvalPlus 版本的 MBPP+，并将 prompt 中的 4 空格转换为制表符。
+- 运行 CLI：
+  ```bash
+  python -m src.bin.eval_code_mbpp \
+    --model-path weights/rwkv7-*.pth \
+    --dataset data/mbpp/test.jsonl \
+    --samples-per-task 10 \
+    --batch-size 128 \
+    --eval-timeout 3
+  ```
+  会生成多样本并用 EvalPlus 测试用例执行，输出 pass@k。
 
 ## 已知缺口 / TODO
-- `src/eval/evaluators/coding.py` 为空文件，代码生成评测管线尚未实现（对应 job 已暂时移除）。
-- 代码生成相关依赖（EvalPlus 等）已声明，但缺少配套的运行逻辑。
+- 尚未支持其他代码基准（LiveCodeBench/BigCodeBench 等）；当前代码生成仅覆盖 HumanEval 与 MBPP。
 
 欢迎根据上述缺口补全实现并更新文档。

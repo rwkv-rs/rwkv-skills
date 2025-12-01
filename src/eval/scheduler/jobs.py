@@ -40,6 +40,7 @@ SPECIAL_DEFAULT_SPLITS: dict[str, str] = {
 }
 CODE_DEFAULT_SPLITS: dict[str, str] = {
     "mbpp": "test",
+    "human_eval": "test",
 }
 
 
@@ -169,6 +170,24 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_dataset_required=True,
+    ),
+    "code_human_eval": JobSpec(
+        name="code_human_eval",
+        module="src.bin.eval_code_human_eval",
+        dataset_slugs=(canonical_slug("human_eval_test"),),
+        is_cot=False,
+        batch_flag="--batch-size",
+        probe_flag="--max-samples",
+        probe_max_generate_flag="--max-tokens",
+    ),
+    "code_mbpp": JobSpec(
+        name="code_mbpp",
+        module="src.bin.eval_code_mbpp",
+        dataset_slugs=(canonical_slug("mbpp_test"),),
+        is_cot=False,
+        batch_flag="--batch-size",
+        probe_flag="--max-samples",
+        probe_max_generate_flag="--max-tokens",
     ),
     "instruction_following": JobSpec(
         name="instruction_following",
