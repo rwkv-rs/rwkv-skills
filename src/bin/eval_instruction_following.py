@@ -14,6 +14,7 @@ from src.eval.metrics.instruction_following.metrics import (
     load_samples_from_jsonl,
 )
 from src.eval.results.layout import jsonl_path, write_scores_json
+from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline, DEFAULT_SAMPLING
 from src.infer.model import ModelLoadConfig
@@ -45,8 +46,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    slug = infer_dataset_slug_from_path(args.dataset)
-    out_path = _resolve_output_path(args.dataset, args.model_path, args.output)
+    try:
+        dataset_path = resolve_or_prepare_dataset(args.dataset)
+    except Exception as exc:
+        print(f"❌ 数据集准备失败: {exc}")
+        return 1
+    slug = infer_dataset_slug_from_path(str(dataset_path))
+    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = InstructionFollowingPipeline(config)
 
@@ -56,7 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     ban_tokens = tuple(args.ban_token) if args.ban_token else None
 
     result = pipeline.run(
-        dataset_path=args.dataset,
+        dataset_path=str(dataset_path),
         output_path=str(out_path),
         sampling=sampling,
         batch_size=max(1, args.batch_size),

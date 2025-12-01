@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.results.layout import jsonl_path
+from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.free_response import (
     FreeResponsePipeline,
@@ -42,7 +43,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    out_path = _resolve_output_path(args.dataset, args.model_path, args.output)
+    try:
+        dataset_path = resolve_or_prepare_dataset(args.dataset)
+    except Exception as exc:
+        print(f"❌ 数据集准备失败: {exc}")
+        return 1
+    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
 
@@ -50,7 +56,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     final_sampling = DEFAULT_FINAL_SAMPLING.clamp(args.final_max_tokens)
 
     result = pipeline.run(
-        dataset_path=args.dataset,
+        dataset_path=str(dataset_path),
         output_path=str(out_path),
         cot_sampling=cot_sampling,
         final_sampling=final_sampling,

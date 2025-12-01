@@ -9,6 +9,7 @@ from typing import Sequence
 from dataclasses import replace
 
 from src.eval.results.layout import jsonl_path, write_scores_json
+from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.coding import CodingPipeline, DEFAULT_CODE_SAMPLING
 from src.infer.model import ModelLoadConfig
@@ -44,8 +45,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    slug = infer_dataset_slug_from_path(args.dataset)
-    out_path = _resolve_output_path(args.dataset, args.model_path, args.output)
+    try:
+        dataset_path = resolve_or_prepare_dataset(args.dataset)
+    except Exception as exc:
+        print(f"❌ 数据集准备失败: {exc}")
+        return 1
+    slug = infer_dataset_slug_from_path(str(dataset_path))
+    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
 
     sampling = DEFAULT_CODE_SAMPLING
     if args.max_tokens:
@@ -60,7 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = CodingPipeline(config)
     result = pipeline.run_mbpp(
-        dataset_path=args.dataset,
+        dataset_path=str(dataset_path),
         output_path=str(out_path),
         sampling=sampling,
         batch_size=max(1, args.batch_size),
