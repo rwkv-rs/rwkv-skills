@@ -119,6 +119,17 @@ def _continuous_batching(
         return []
     batch_size = max(1, min(batch_size, len(prompts)))
 
+    def _torch_sample(logits_tensor: torch.Tensor, *, force_cpu: bool = False) -> torch.Tensor:
+        if force_cpu and logits_tensor.is_cuda:
+            logits_tensor = logits_tensor.cpu()
+        try:
+            return _torch_top_k_top_p(logits_tensor, sampling.top_k, sampling.top_p)
+        except RuntimeError as exc:
+            if logits_tensor.is_cuda:
+                print(f"⚠️ torch sampling on CUDA failed: {exc}; retrying on CPU.")
+                return _torch_top_k_top_p(logits_tensor.cpu(), sampling.top_k, sampling.top_p)
+            raise
+
     encoded = deque()
     for idx, prompt in enumerate(prompts):
         tokens = tokenizer.encode(prompt)
@@ -237,9 +248,11 @@ def _continuous_batching(
             except RuntimeError as exc:
                 print(f"⚠️ flashinfer sampling failed: {exc}; falling back to torch sampling.")
                 flashinfer_ok = False
-                new_tokens = _torch_top_k_top_p(logits, sampling.top_k, sampling.top_p)
+                error_text = str(exc).lower()
+                force_cpu = logits.is_cuda and ("illegal memory access" in error_text or "cuda error" in error_text)
+                new_tokens = _torch_sample(logits, force_cpu=force_cpu)
         else:
-            new_tokens = _torch_top_k_top_p(logits, sampling.top_k, sampling.top_p)
+            new_tokens = _torch_sample(logits)
         new_tokens = new_tokens.tolist()
         for task in active_tasks:
             task.new_token = new_tokens[task.state_pos]

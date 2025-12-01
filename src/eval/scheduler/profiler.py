@@ -16,7 +16,8 @@ from .jobs import JobSpec
 
 _BATCH_CANDIDATES_ENV = os.environ.get("RUN_BATCH_CANDIDATES") or os.environ.get(
     "RUN_COT_BATCH_CANDIDATES",
-    "4096,2048,1024,512,256,128,64,32,16,8,4,2,1",
+    # limit default probing to 2048 to avoid host fallback overhead when VRAM is flaky
+    "2048,1024,512,256,128,64,32,16,8,4,2,1",
 )
 DEFAULT_COT_BATCH_CANDIDATES = tuple(
     int(value.strip()) for value in _BATCH_CANDIDATES_ENV.split(",") if value.strip()
@@ -120,10 +121,20 @@ class BatchProfiler:
         if not candidates:
             return None
 
+        max_allowed_batch = max(candidates)
+
         job_cache = self._cache.setdefault(job.name, {})
         model_cache = job_cache.setdefault(model_slug, {})
         record = model_cache.get(gpu)
         cached_value = _extract_cached_batch(record)
+        if cached_value is not None and cached_value > max_allowed_batch:
+            cached_value = max_allowed_batch
+            model_cache[gpu] = {
+                "batch": cached_value,
+                "last_probe": time.time(),
+            }
+            record = model_cache[gpu]
+            save_batch_cache(self.cache_path, self._cache)
         record_is_dict = isinstance(record, Mapping)
         last_probe = record.get("last_probe") if record_is_dict else None
         last_error = record.get("last_error") if record_is_dict else None
