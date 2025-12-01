@@ -90,8 +90,8 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model-select",
         choices=MODEL_SELECT_CHOICES,
-        default="all",
-        help="模型筛选策略",
+        default="latest-data",
+        help="模型筛选策略（默认 latest-data：每档参数取 data_version 最新，忽略 0.1b/0.4b）",
     )
     parser.add_argument("--min-param-b", type=float, help="仅保留参数量 >= 阈值 (B)")
     parser.add_argument("--max-param-b", type=float, help="仅保留参数量 <= 阈值 (B)")

@@ -11,11 +11,28 @@ from typing import Final, Sequence
 from .config import REPO_ROOT
 
 
-MODEL_SELECT_CHOICES: Final[tuple[str, ...]] = ("all", "param-extrema")
+MODEL_SELECT_CHOICES: Final[tuple[str, ...]] = ("all", "param-extrema", "latest-data")
 MODEL_PREFIX_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?P<family>[a-z]+[0-9]+)(?P<tag>[a-z]+)?(?P<number>[0-9]+)?$",
     re.IGNORECASE,
 )
+
+ARCH_ORDER: Final[tuple[str, ...]] = ("rwkv7", "rwkv7a", "rwkv7b")
+DATA_VERSION_ORDER: Final[tuple[str, ...]] = (
+    "g0",
+    "g0a",
+    "g0a2",
+    "g0a3",
+    "g0a4",
+    "g1",
+    "g1a",
+    "g1a2",
+    "g1a3",
+    "g1a4",
+    "g1b",
+)
+NUM_PARAM_ORDER: Final[tuple[str, ...]] = ("0.1b", "0.4b", "1.5b", "2.9b", "7.2b", "13.3b")
+NUM_PARAM_SKIP: Final[set[str]] = {"0.1b", "0.4b"}
 
 
 def expand_model_paths(patterns: Sequence[str]) -> list[Path]:
@@ -55,6 +72,36 @@ def _normalize_model_identifier(raw: str) -> str:
             break
         head_parts.append(part)
     return "-".join(head_parts) if head_parts else tail
+
+
+def _parse_model_tags(identifier: str) -> tuple[str | None, str | None, str | None]:
+    """Extract (arch_version, data_version, num_params token) from normalized identifier.
+
+    Example: rwkv7-g1a4-2.9b -> ("rwkv7", "g1a4", "2.9b")
+    """
+
+    if not identifier:
+        return None, None, None
+    parts = identifier.split("-")
+    arch = parts[0].lower() if parts else None
+    data_version = None
+    num_params = None
+    for token in parts[1:]:
+        low = token.lower()
+        if low in DATA_VERSION_ORDER:
+            data_version = low
+        if re.fullmatch(r"\d+(?:\.\d+)?b", low):
+            num_params = low
+    return arch, data_version, num_params
+
+
+def _rank(seq: Sequence[str], value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return list(seq).index(value)
+    except ValueError:
+        return None
 
 
 def _extract_param_count(model_short: str) -> float | None:
@@ -102,23 +149,23 @@ def filter_model_paths(
     min_param_b: float | None,
     max_param_b: float | None,
 ) -> list[Path]:
-    entries: list[tuple[float | None, str, Path]] = []
+    entries: list[tuple[float | None, str, Path, str | None, str | None]] = []
     for path in model_paths:
         normalized = _normalize_model_identifier(path.stem)
+        arch, data_version, num_token = _parse_model_tags(normalized)
         params_val = _extract_param_count(normalized)
         if min_param_b is not None and params_val is not None and params_val < min_param_b:
             continue
-        if max_param_b is not None:
-            if params_val is None or params_val > max_param_b:
-                continue
-        entries.append((params_val, normalized, path))
+        if max_param_b is not None and (params_val is None or params_val > max_param_b):
+            continue
+        entries.append((params_val, normalized, path, data_version, num_token))
 
     if strategy == "all":
-        return [path for _, _, path in entries]
+        return [path for _, _, path, *_ in entries]
 
     if strategy == "param-extrema":
         grouped: dict[float | None, list[tuple[str, Path]]] = {}
-        for params_val, normalized, path in entries:
+        for params_val, normalized, path, *_ in entries:
             grouped.setdefault(params_val, []).append((normalized, path))
 
         selected: set[Path] = set()
@@ -133,7 +180,39 @@ def filter_model_paths(
             keep = {ordered_models[0], ordered_models[-1]}
             for model_name in keep:
                 selected.add(model_map[model_name])
-        return [path for _, _, path in entries if path in selected]
+        return [path for _, _, path, *_ in entries if path in selected]
+
+    if strategy == "latest-data":
+        selected: set[Path] = set()
+        fallback: list[Path] = []
+        groups: dict[tuple[str, str], list[tuple[str | None, str, Path]]] = {}
+        for _, normalized, path, data_version, num_token in entries:
+            if num_token in NUM_PARAM_SKIP:
+                continue
+            arch, _, _ = _parse_model_tags(normalized)
+            if arch is None or data_version is None or num_token is None:
+                fallback.append(path)
+                continue
+            groups.setdefault((arch, num_token), []).append((data_version, normalized, path))
+
+        for (arch, num_token), items in groups.items():
+            # pick the highest data_version according to DATA_VERSION_ORDER
+            items_sorted = sorted(
+                items,
+                key=lambda x: (
+                    _rank(ARCH_ORDER, arch) or 0,
+                    _rank(NUM_PARAM_ORDER, num_token) or 0,
+                    _rank(DATA_VERSION_ORDER, x[0]) or -1,
+                    _model_version_sort_key(x[1]),
+                ),
+            )
+            best = items_sorted[-1]
+            selected.add(best[2])
+
+        # include anything we couldn't classify
+        selected.update(fallback)
+        return [path for _, _, path, *_ in entries if path in selected]
+
     raise ValueError(f"未知的模型选择策略: {strategy!r}")
 
 
