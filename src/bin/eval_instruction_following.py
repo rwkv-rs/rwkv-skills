@@ -12,13 +12,17 @@ from dataclasses import replace
 from src.eval.metrics.instruction_following.metrics import (
     evaluate_samples,
     load_samples_from_jsonl,
+    compute_avg_at_k,
     write_sample_results,
 )
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline, DEFAULT_SAMPLING
 from src.infer.model import ModelLoadConfig
+
+DEFAULT_AVG_K: tuple[int, ...] = ()
+IFEVAL_AVG_K = (4,)
 
 
 def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
@@ -29,6 +33,43 @@ def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -
         return Path(env_path).expanduser()
     slug = infer_dataset_slug_from_path(dataset)
     return jsonl_path(slug, is_cot=False, model_name=Path(model_path).stem)
+
+
+def _max_k(values) -> int:
+    return max(values) if values else 0
+
+
+def _resolve_avg_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
+    if args.avg_k:
+        return tuple(args.avg_k)
+    lower_slug = canonical_slug(str(slug))
+    if lower_slug.startswith("ifeval"):
+        return IFEVAL_AVG_K
+    return DEFAULT_AVG_K
+
+
+def _report_avg_k(slug: str, final_avg_k: tuple[int, ...]) -> tuple[int, ...]:
+    lower_slug = canonical_slug(str(slug))
+    if lower_slug.startswith("ifeval"):
+        return IFEVAL_AVG_K
+    return final_avg_k
+
+
+def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
+    if not metric_map or not ks:
+        return {}
+    allowed = {int(k) for k in ks if int(k) > 0}
+    filtered: dict[str, float] = {}
+    for key, value in metric_map.items():
+        if not key.startswith(prefix):
+            continue
+        try:
+            suffix = int(key.split("@", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if suffix in allowed:
+            filtered[key] = value
+    return filtered
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -47,6 +88,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Compatibility flag (no-op).",
     )
+    parser.add_argument(
+        "--avg-k",
+        type=int,
+        action="append",
+        help="avg@k values to compute from generated samples (IFEval 默认 4)",
+    )
     return parser.parse_args(argv)
 
 
@@ -61,6 +108,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = InstructionFollowingPipeline(config)
+    avg_k_final = _resolve_avg_k(slug, args)
+    report_avg_k = _report_avg_k(slug, avg_k_final)
+    samples_per_prompt = max(_max_k(avg_k_final), 1)
 
     sampling = DEFAULT_SAMPLING
     if args.stop_token:
@@ -76,11 +126,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         enable_think=bool(args.enable_think),
         stop_tokens=sampling.stop_tokens,
         ban_tokens=ban_tokens,
+        samples_per_prompt=samples_per_prompt,
     )
     samples = load_samples_from_jsonl(out_path)
     metrics = evaluate_samples(samples, strict=True)
+    avg_metrics_all = compute_avg_at_k(metrics.samples, avg_k_final)
+    if avg_metrics_all:
+        metrics.avg_at_k = avg_metrics_all
     eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
     write_sample_results(metrics.samples, eval_path)
+    avg_payload = _filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
     score_path = write_scores_json(
         slug,
         is_cot=False,
@@ -88,6 +143,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         metrics={
             "prompt_accuracy": metrics.prompt_accuracy,
             "instruction_accuracy": metrics.instruction_accuracy,
+            **avg_payload,
         },
         samples=len(samples),
         log_path=out_path,
@@ -96,6 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "tier0_accuracy": metrics.tier0_accuracy,
             "tier1_accuracy": metrics.tier1_accuracy,
             "eval_details_path": str(eval_path),
+            **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
         },
     )
     print(f"✅ instruction-following done: {result.sample_count} samples -> {result.output_path}")

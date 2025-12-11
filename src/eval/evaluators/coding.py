@@ -26,7 +26,8 @@ DEFAULT_CODE_SAMPLING = SamplingConfig(
     pad_zero=True,
 )
 
-DEFAULT_PASS_K = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+# Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
+DEFAULT_PASS_K = (1,)
 
 
 def _compress_newlines(text: str) -> str:
@@ -66,12 +67,15 @@ class CodingPipeline:
         *,
         sampling: SamplingConfig = DEFAULT_CODE_SAMPLING,
         batch_size: int = 64,
-        samples_per_task: int = 1,
         sample_limit: int | None = None,
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        probe_only: bool = False,
+        write_output: bool = True,
     ) -> CodingPipelineResult:
+        samples_per_task = max(1, max(pass_k) if pass_k else 1)
+        write_output = write_output and (not probe_only)
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         if not records:
             return CodingPipelineResult(dataset_name, 0, Path(output_path), 0)
@@ -90,6 +94,8 @@ class CodingPipeline:
             remaining = max(len(entries) - start_index, 0)
             print(f"⏩ HumanEval 恢复运行：已完成 {start_index}/{len(entries)}，剩余 {remaining}")
         pending_entries = entries[start_index:]
+        if probe_only and pending_entries:
+            pending_entries = pending_entries[: min(batch_size, len(pending_entries))]
         if pending_entries:
             prompts = [entry[0] for entry in pending_entries]
             outputs = self.engine.generate(
@@ -99,6 +105,10 @@ class CodingPipeline:
                 progress_desc="Generating code",
             )
             output_by_idx = {item.prompt_index: item for item in outputs}
+
+            if not write_output:
+                return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
+
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
                 seq = output_by_idx.get(local_idx)
@@ -159,12 +169,15 @@ class CodingPipeline:
         *,
         sampling: SamplingConfig = DEFAULT_CODE_SAMPLING,
         batch_size: int = 64,
-        samples_per_task: int = 1,
         sample_limit: int | None = None,
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        probe_only: bool = False,
+        write_output: bool = True,
     ) -> CodingPipelineResult:
+        samples_per_task = max(1, max(pass_k) if pass_k else 1)
+        write_output = write_output and (not probe_only)
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         if not records:
             return CodingPipelineResult(dataset_name, 0, Path(output_path), 0)
@@ -183,6 +196,8 @@ class CodingPipeline:
             remaining = max(len(entries) - start_index, 0)
             print(f"⏩ MBPP 恢复运行：已完成 {start_index}/{len(entries)}，剩余 {remaining}")
         pending_entries = entries[start_index:]
+        if probe_only and pending_entries:
+            pending_entries = pending_entries[: min(batch_size, len(pending_entries))]
         if pending_entries:
             prompts = [entry[0] for entry in pending_entries]
             outputs = self.engine.generate(
@@ -192,6 +207,10 @@ class CodingPipeline:
                 progress_desc="Generating code",
             )
             output_by_idx = {item.prompt_index: item for item in outputs}
+
+            if not write_output:
+                return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
+
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
                 seq = output_by_idx.get(local_idx)

@@ -19,6 +19,7 @@ class InstructionFollowingSample:
     response: str
     instruction_ids: list[str]
     kwargs_list: list[dict]
+    sample_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -38,6 +39,7 @@ class InstructionFollowingMetrics:
     tier0_accuracy: dict[str, float]
     tier1_accuracy: dict[str, float]
     samples: list[InstructionFollowingSampleResult]
+    avg_at_k: dict[str, float] | None = None
 
 
 def load_samples_from_jsonl(path: str | Path) -> list[InstructionFollowingSample]:
@@ -63,6 +65,7 @@ def load_samples_from_jsonl(path: str | Path) -> list[InstructionFollowingSample
                     response=response,
                     instruction_ids=list(instruction_ids),
                     kwargs_list=list(kwargs_list),
+                    sample_id=payload.get("sample_id"),
                 )
             )
     return records
@@ -142,6 +145,37 @@ def evaluate_samples(
     )
 
 
+def compute_avg_at_k(
+    samples: Iterable[InstructionFollowingSampleResult],
+    ks: Iterable[int],
+) -> dict[str, float]:
+    """Average prompt-level accuracy across the first k samples per problem."""
+
+    grouped: dict[int, list[tuple[int, bool]]] = {}
+    for result in samples:
+        sample = result.sample
+        sample_id = sample.sample_id if sample.sample_id is not None else 0
+        grouped.setdefault(sample.key, []).append((int(sample_id), result.follow_all))
+
+    metrics: dict[str, float] = {}
+    for k in ks:
+        k = int(k)
+        if k <= 0:
+            continue
+        correct = 0
+        total = 0
+        for entries in grouped.values():
+            ordered = sorted(entries, key=lambda pair: pair[0])
+            if len(ordered) < k:
+                continue
+            selected = ordered[:k]
+            correct += sum(1 for _, flag in selected if flag)
+            total += k
+        if total > 0:
+            metrics[f"avg@{k}"] = correct / total
+    return metrics
+
+
 def _build_loose_variants(response: str) -> list[str]:
     lines = response.split("\n")
     variants = [response]
@@ -172,6 +206,7 @@ def write_sample_results(
                 "kwargs_list": result.sample.kwargs_list,
                 "follow_instruction_list": result.follow_instruction_list,
                 "follow_all": result.follow_all,
+                "sample_id": result.sample.sample_id,
             }
             fh.write(orjson.dumps(payload, option=orjson.OPT_APPEND_NEWLINE))
     return target
@@ -184,4 +219,5 @@ __all__ = [
     "load_samples_from_jsonl",
     "evaluate_samples",
     "write_sample_results",
+    "compute_avg_at_k",
 ]

@@ -80,11 +80,11 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
   python -m src.bin.eval_code_human_eval \
     --model-path weights/rwkv7-*.pth \
     --dataset data/human_eval/test.jsonl \
-    --samples-per-task 10 \
     --batch-size 128 \
+    --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
     --eval-timeout 3
   ```
-  生成的样本写入 results/completions 结构，并会自动执行官方测试用例输出 pass@k 结果（如仅生成 1 次只输出 pass@1）。
+  生成的样本写入 results/completions 结构，并会自动执行官方测试用例输出 pass@k 结果（生成次数等于最大的 k）。
 
 ## MBPP 代码生成评测
 - 数据集准备：`prepare_dataset("mbpp", Path("data"))` 会使用 EvalPlus 版本的 MBPP+，并将 prompt 中的 4 空格转换为制表符。
@@ -93,11 +93,11 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
   python -m src.bin.eval_code_mbpp \
     --model-path weights/rwkv7-*.pth \
     --dataset data/mbpp/test.jsonl \
-    --samples-per-task 10 \
     --batch-size 128 \
+    --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
     --eval-timeout 3
   ```
-  会生成多样本并用 EvalPlus 测试用例执行，输出 pass@k。
+  会生成多样本并用 EvalPlus 测试用例执行，输出 pass@k（生成次数等于最大的 k）。
 
 ## 已知缺口 / TODO
 - 尚未支持其他代码基准（LiveCodeBench/BigCodeBench 等）；当前代码生成仅覆盖 HumanEval 与 MBPP。

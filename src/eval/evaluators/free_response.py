@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
@@ -109,11 +109,12 @@ class FreeResponsePipeline:
         dataset_name: str | None = None,
         sample_limit: int | None = None,
         pad_to_batch: bool = False,
-        samples_per_task: int = 1,
+        pass_k: Iterable[int] | None = None,
+        write_output: bool = True,
+        samples_per_task: int | None = None,
     ) -> FreeResponsePipelineResult:
-        raw_records, resolved_name = self._load_records(dataset_path, None)
-        if sample_limit is not None and sample_limit > 0:
-            raw_records = raw_records[: min(sample_limit, len(raw_records))]
+        samples_per_task = samples_per_task or max(1, max(pass_k) if pass_k else 1)
+        raw_records, resolved_name = self._load_records(dataset_path, sample_limit)
         problem_count = len(raw_records)
         dataset_name = dataset_name or resolved_name
         target_path = Path(output_path)
@@ -129,18 +130,22 @@ class FreeResponsePipeline:
         if not expanded:
             return FreeResponsePipelineResult(dataset_name, 0, target_path, problem_count)
 
-        resume = detect_resume_state(target_path)
-        if resume.has_progress:
-            ensure_resume_samples_compatible(target_path, samples_per_task)
-        start_index = min(resume.next_index, len(expanded))
-        if start_index and len(expanded):
-            remaining = max(len(expanded) - start_index, 0)
-            print(f"⏩ 自由问答恢复运行：已完成 {start_index}/{len(expanded)}，剩余 {remaining}")
+        if write_output:
+            resume = detect_resume_state(target_path)
+            if resume.has_progress:
+                ensure_resume_samples_compatible(target_path, samples_per_task)
+            start_index = min(resume.next_index, len(expanded))
+            if start_index and len(expanded):
+                remaining = max(len(expanded) - start_index, 0)
+                print(f"⏩ 自由问答恢复运行：已完成 {start_index}/{len(expanded)}，剩余 {remaining}")
+        else:
+            start_index = 0
+            resume = None
         remaining_entries = expanded[start_index:]
         if not remaining_entries:
             return FreeResponsePipelineResult(dataset_name, len(expanded), target_path, problem_count)
 
-        writer = JsonlStageWriter(target_path, resume=resume.has_progress)
+        writer = JsonlStageWriter(target_path, resume=resume.has_progress) if write_output else None
         cot_prompts = [cot_prompt_template.replace("<Q>", record.question) for _, record, _ in remaining_entries]
         cot_outputs = self.engine.generate(
             cot_prompts,
@@ -163,6 +168,10 @@ class FreeResponsePipeline:
             batch_size=batch_size,
             progress_desc="Generating answers",
         )
+
+        if not write_output:
+            return FreeResponsePipelineResult(dataset_name, len(expanded), target_path, problem_count)
+
         final_by_idx = {item.prompt_index: item for item in final_outputs}
 
         for local_idx, (problem_idx, record, sample_id) in enumerate(remaining_entries):
@@ -209,10 +218,12 @@ class FreeResponsePipeline:
         self, dataset_path: str, sample_limit: int | None
     ) -> tuple[list[FreeAnswerRecord], str]:
         loader = JsonlFreeAnswerLoader(dataset_path)
-        dataset = loader.load()
-        records = list(dataset)
-        if sample_limit is not None and sample_limit > 0:
-            records = records[: min(sample_limit, len(records))]
+        records: list[FreeAnswerRecord] = []
+        limited = sample_limit is not None and sample_limit > 0
+        for record in loader:
+            records.append(record)
+            if limited and len(records) >= sample_limit:
+                break
         return records, Path(dataset_path).stem
 
 

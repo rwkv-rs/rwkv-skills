@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import gradio as gr
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
 from src.eval.results.layout import ensure_results_structure
 from .data import (
@@ -22,7 +25,6 @@ from .data import (
     ScoreEntry,
     parse_model_signature,
     latest_entries_for_model,
-    list_domains,
     list_models,
     load_scores,
     pick_latest_model,
@@ -31,7 +33,139 @@ from .data import (
 
 AUTO_MODEL_LABEL = "每档最新（调度策略）"
 AUTO_EXCLUDED_PARAMS = {"0_1B", "0_4B"}
-DEFAULT_DOMAIN = "全部"
+PRIMARY_KEYS = (
+    "judge_accuracy",
+    "exact_accuracy",
+    "accuracy",
+    "prompt_accuracy",
+    "instruction_accuracy",
+    "pass@1",
+    "pass@2",
+    "pass@5",
+    "pass@10",
+)
+DOMAIN_GROUPS = (
+    {
+        "key": "knowledge",
+        "label": "Knowledge",
+        "domains": {"mmlu系列", "multi-choice系列", "其他"},
+        "title": "知识类（MMLU / Multi-choice）",
+    },
+    {
+        "key": "math",
+        "label": "Math",
+        "domains": {"math reasoning系列"},
+        "title": "数学推理（AIME / Math-500 等）",
+    },
+    {
+        "key": "coding",
+        "label": "Coding",
+        "domains": {"coding系列"},
+        "title": "代码",
+    },
+    {
+        "key": "instruction_following",
+        "label": "Instruction Following",
+        "domains": {"instruction following系列"},
+        "title": "指令遵循（IFEval 等）",
+    },
+    {
+        "key": "function_call",
+        "label": "Function Call",
+        "domains": {"function_call系列", "function_call"},
+        "title": "函数调用",
+    },
+)
+AIME_BASES = {"aime24", "aime25"}
+MATH500_BASES = {"math_500"}
+IFEVAL_BASES = {"ifeval"}
+CODING_FALLBACK_SAMPLE = """
+**模型**：示例
+**数据集**：HUMANEVAL · 样例：HumanEval/0 · 结果：passed
+
+**Prompt**:
+```python
+from typing import List
+
+
+def has_close_elements(numbers: List[float], threshold: float) -> bool:
+    \"\"\" Check if in given list of numbers, are any two numbers closer to each other than
+    given threshold.
+    >>> has_close_elements([1.0, 2.0, 3.0], 0.5)
+    False
+    >>> has_close_elements([1.0, 2.8, 3.0, 4.0, 5.0, 2.0], 0.3)
+    True
+    \"\"\"
+```
+
+**Completion**:
+```python
+    numbers.sort()
+    for i in range(len(numbers) - 1):
+        if numbers[i + 1] - numbers[i] < threshold:
+            return True
+    return False
+```
+""".strip()
+SUBDOMAIN_ORDER = [
+    "business",
+    "economics",
+    "law",
+    "politics",
+    "history",
+    "philosophy",
+    "psychology",
+    "sociology",
+    "education",
+    "language",
+    "literature",
+    "religion",
+    "biology",
+    "medicine",
+    "chemistry",
+    "physics",
+    "math",
+    "computer_science",
+    "engineering",
+    "security",
+    "other",
+]
+SUBDOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "business": ("business", "management", "marketing", "finance", "accounting", "commerce", "administration"),
+    "economics": ("economics", "econometrics", "macroeconomics", "microeconomics"),
+    "law": ("law", "legal", "jurisprudence"),
+    "politics": ("politics", "policy", "government", "marxism", "mao", "us_foreign_policy"),
+    "history": ("history", "prehistory"),
+    "philosophy": ("philosophy", "logic", "ethics", "moral", "world_religions", "religions"),
+    "psychology": ("psychology",),
+    "sociology": ("sociology", "anthropology"),
+    "education": ("education", "teacher"),
+    "language": ("language", "linguistics", "chinese_language", "chinese", "literature"),
+    "literature": ("literature", "reading"),
+    "religion": ("religion", "theology"),
+    "biology": ("biology", "anatomy", "genetics", "virology", "neuroscience", "molecular", "organismal"),
+    "medicine": ("medicine", "clinical", "pharmacy", "medical"),
+    "chemistry": ("chemistry", "organic_chemistry"),
+    "physics": ("physics", "astronomy"),
+    "math": ("math", "mathematics", "algebra", "statistics", "probability", "geometry"),
+    "computer_science": ("computer", "programming", "machine_learning", "operating_system", "network", "architecture"),
+    "engineering": ("engineering", "electrical", "civil", "mechanical", "metrology"),
+    "security": ("security", "cybersecurity", "computer_security"),
+}
+INSTRUCTION_DOMAIN_ORDER = [
+    "change_case",
+    "combination",
+    "detectable_content",
+    "detectable_format",
+    "keywords",
+    "language",
+    "length_constraints",
+    "punctuation",
+    "startend",
+    "other",
+]
+
+
 @dataclass(slots=True)
 class SelectionState:
     entries: list[ScoreEntry]
@@ -164,6 +298,22 @@ def _dataset_base(name: str) -> str:
     return name
 
 
+def _normalize_token(text: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() or ch == "_" else "_" for ch in text)
+
+
+def _normalize_subject_label(text: str) -> str:
+    return text.replace("_", " ").strip().lower()
+
+
+def _series_sort_key(model: str) -> tuple[int, int, int, str]:
+    sig = parse_model_signature(model)
+    param_rank = sig.param_rank if sig.param_rank is not None else len(NUM_PARAMS)
+    arch_rank = sig.arch_rank if sig.arch_rank is not None else len(ARCH_VERSIONS)
+    data_rank = sig.data_rank if sig.data_rank is not None else len(DATA_VERSIONS)
+    return (param_rank, arch_rank, data_rank, model)
+
+
 def _method_tag(is_cot: bool) -> str:
     return "cot" if is_cot else "nocot"
 
@@ -246,25 +396,14 @@ def _format_metric_value(value: Any) -> str:
 
 def _primary_metric(metrics: dict[str, Any]) -> tuple[str, str] | None:
     # Prefer common accuracy keys in a stable order so judge results surface first.
-    preferred = (
-        "judge_accuracy",
-        "exact_accuracy",
-        "accuracy",
-        "prompt_accuracy",
-        "instruction_accuracy",
-        "pass@1",
-        "pass@2",
-        "pass@5",
-        "pass@10",
-    )
-    for key in preferred:
+    for key in PRIMARY_KEYS:
         value = metrics.get(key)
         if isinstance(value, (int, float)):
             return key, _format_metric_value(value)
     for key, value in metrics.items():
         if isinstance(value, (int, float)):
             return key, _format_metric_value(value)
-    for key in preferred:
+    for key in PRIMARY_KEYS:
         value = metrics.get(key)
         if value is not None:
             return key, _format_metric_value(value)
@@ -284,7 +423,6 @@ def _render_summary(
     all_entries: list[ScoreEntry],
     visible: list[ScoreEntry],
     selection: SelectionState,
-    domain_choice: str,
     warnings: Iterable[str] | None = None,
 ) -> str:
     if not all_entries:
@@ -301,7 +439,7 @@ def _render_summary(
     lines = [
         f"- 分数根目录：`{SPACE_SCORES_ROOT}`",
         f"- 当前策略：`{selection.selected_label}`" + ("（按排序规则自动选择）" if selection.auto_selected else ""),
-        f"- 已选大领域：{domain_choice}",
+        "- 领域分块：knowledge / math / coding / instruction_following / function_call",
         f"- 模型列数：{len(selection.model_sequence)}",
         f"- 基准行数：{benchmark_count}",
         f"- 可见数据集：{len(visible)} / 总分数文件：{len(all_entries)}",
@@ -316,15 +454,7 @@ def _render_summary(
     return "\n".join(lines)
 
 
-def _filter_by_domain(entries: Iterable[ScoreEntry], domain: str) -> list[ScoreEntry]:
-    if domain == DEFAULT_DOMAIN:
-        filtered = list(entries)
-    else:
-        filtered = [entry for entry in entries if entry.domain == domain]
-    return _sort_entries(filtered)
-
-
-def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None, domain: str) -> SelectionState:
+def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None) -> SelectionState:
     if not entries:
         return SelectionState(
             entries=[],
@@ -353,9 +483,8 @@ def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None, d
         else:
             allowed_models = ordered_models
         filtered_entries = [entry for entry in combined_entries if entry.model in allowed_models]
-        visible_entries = _filter_by_domain(filtered_entries, domain)
         return SelectionState(
-            entries=visible_entries,
+            entries=_sort_entries(filtered_entries),
             dropdown_value=AUTO_MODEL_LABEL,
             selected_label=AUTO_MODEL_LABEL,
             auto_selected=False,
@@ -379,9 +508,8 @@ def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None, d
         )
 
     latest = latest_entries_for_model(entries, target_model)
-    visible_entries = _filter_by_domain(latest, domain)
     return SelectionState(
-        entries=visible_entries,
+        entries=_sort_entries(latest),
         dropdown_value=target_model,
         selected_label=target_model,
         auto_selected=auto_selected,
@@ -391,24 +519,119 @@ def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None, d
     )
 
 
-def _cell_metric_value(entry: ScoreEntry | None) -> str:
+def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
     if entry is None:
         return "—"
+
+    base = dataset_base.lower()
+    metrics = entry.metrics
+
+    def _format_specific(key: str) -> str | None:
+        value = metrics.get(key)
+        if isinstance(value, (int, float, bool)):
+            return _format_metric_value(value)
+        return None
+
+    if base.startswith("aime"):
+        parts: list[str] = []
+        for key in ("avg@16", "pass@8"):
+            formatted = _format_specific(key)
+            if formatted is not None:
+                parts.append(f"{key} {formatted}")
+        if parts:
+            return " / ".join(parts)
+
+    if base in MATH500_BASES:
+        formatted = _format_specific("avg@4")
+        if formatted is not None:
+            return formatted
+
+    if base.startswith("ifeval"):
+        formatted = _format_specific("avg@4")
+        if formatted is not None:
+            return formatted
+
     primary = _primary_metric(entry.metrics)
     if not primary:
         return "—"
     return primary[1]
 
 
-def _build_pivot_table(selection: SelectionState) -> tuple[list[str], list[list[Any]]]:
+def _preferred_numeric(metrics: dict[str, Any], keys: Sequence[str]) -> tuple[str | None, float | None]:
+    for key in keys:
+        value = metrics.get(key)
+        number = _numeric_value(value)
+        if number is not None:
+            return key, number
+    return None, None
+
+
+def _primary_numeric_metric(metrics: dict[str, Any]) -> tuple[str | None, float | None]:
+    key, value = _preferred_numeric(metrics, PRIMARY_KEYS)
+    if key:
+        return key, value
+    for key, value in metrics.items():
+        num = _numeric_value(value)
+        if num is not None:
+            return key, num
+    for key, value in metrics.items():
+        if value is not None:
+            num = _numeric_value(value)
+            if num is not None:
+                return key, num
+    return None, None
+
+
+def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) -> tuple[str | None, float | None]:
+    base = (dataset_base or _dataset_base(entry.dataset)).lower()
+    metrics = entry.metrics
+
+    if base.startswith("aime"):
+        key, value = _preferred_numeric(metrics, ("pass@8", "avg@16"))
+        if key:
+            return key, value
+
+    if base in MATH500_BASES:
+        key, value = _preferred_numeric(metrics, ("avg@4",))
+        if key:
+            return key, value
+
+    if base.startswith("ifeval"):
+        key, value = _preferred_numeric(metrics, ("avg@4", "instruction_accuracy", "prompt_accuracy"))
+        if key:
+            return key, value
+
+    if entry.domain == "coding系列":
+        # Prefer pass@1, then the lowest available k, else any numeric.
+        for k in (1, 2, 4, 8, 16):
+            key, value = _preferred_numeric(metrics, (f"pass@{k}",))
+            if key:
+                return key, value
+        # If no pass@k found, fall back to highest numeric metric.
+        best_key: str | None = None
+        best_val: float | None = None
+        for key, value in metrics.items():
+            num = _numeric_value(value)
+            if num is None:
+                continue
+            if best_val is None or num > best_val:
+                best_key, best_val = key, num
+        if best_key:
+            return best_key, best_val
+
+    return _primary_numeric_metric(metrics)
+
+
+def _build_pivot_table(selection: SelectionState, entries: Iterable[ScoreEntry] | None = None) -> tuple[list[str], list[list[Any]]]:
     headers = ["Benchmark"] + [_model_display_name(model) for model in selection.model_sequence]
-    if not selection.entries:
+    target_entries = list(entries) if entries is not None else selection.entries
+    if not target_entries:
         return headers, []
 
     row_meta: dict[tuple[str, str], dict[str, Any]] = {}
     grouped: dict[tuple[str, str, str], ScoreEntry] = {}
 
-    for entry in selection.entries:
+    for entry in target_entries:
         base = _dataset_base(entry.dataset)
         method = _method_tag(entry.cot)
         row_key = (base, method)
@@ -455,9 +678,424 @@ def _build_pivot_table(selection: SelectionState) -> tuple[list[str], list[list[
         row: list[Any] = [row_label]
         for model in selection.model_sequence:
             entry = grouped.get((model, meta["base"], meta["method"]))
-            row.append(_cell_metric_value(entry))
+            row.append(_cell_metric_value(entry, dataset_base=meta["base"]))
         rows.append(row)
     return headers, rows
+
+
+def _parse_pass_suffix(key: str) -> int | None:
+    token = str(key).strip().lower()
+    if not token.startswith("pass"):
+        return None
+    token = token[len("pass") :]
+    if token.startswith("@"):
+        token = token[1:]
+    if token.startswith("at"):
+        token = token[2:]
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _numeric_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_pass_curve(entry: ScoreEntry) -> dict[int, float]:
+    curve: dict[int, float] = {}
+
+    def _ingest(source: Any) -> None:
+        if not isinstance(source, dict):
+            return
+        for key, value in source.items():
+            suffix = _parse_pass_suffix(key)
+            score = _numeric_value(value)
+            if suffix is not None and score is not None:
+                curve.setdefault(suffix, score)
+
+    if entry.task_details:
+        _ingest(entry.task_details.get("pass_curve"))
+    _ingest(entry.metrics)
+    return dict(sorted(curve.items()))
+
+
+def _map_subject_to_subdomain(subject: str) -> str:
+    token = _normalize_token(subject)
+    for domain, keywords in SUBDOMAIN_KEYWORDS.items():
+        for kw in keywords:
+            if kw in token:
+                return domain
+    parts = token.split("_")
+    if parts and parts[0]:
+        head = parts[0]
+        for domain, keywords in SUBDOMAIN_KEYWORDS.items():
+            if head in keywords:
+                return domain
+    return "other"
+
+
+def _collect_subject_metrics(entry: ScoreEntry) -> dict[str, float]:
+    details = entry.task_details or {}
+    accuracy_by_subject = details.get("accuracy_by_subject")
+    if isinstance(accuracy_by_subject, dict):
+        results: dict[str, float] = {}
+        for subject, value in accuracy_by_subject.items():
+            num = _numeric_value(value)
+            if num is not None:
+                results[str(subject)] = num
+        return results
+    return {}
+
+
+def _build_knowledge_radar(selection: SelectionState) -> go.Figure | None:
+    entries = [entry for entry in selection.entries if entry.domain in {"mmlu系列", "multi-choice系列", "其他"}]
+    if not entries:
+        return None
+
+    scores: dict[str, dict[str, list[float]]] = {}
+    for entry in entries:
+        subject_scores = _collect_subject_metrics(entry)
+        if not subject_scores:
+            continue
+        model_label = _model_display_name(entry.model)
+        scores.setdefault(model_label, {})
+        for subject, value in subject_scores.items():
+            subdomain = _map_subject_to_subdomain(subject)
+            scores[model_label].setdefault(subdomain, []).append(value)
+
+    if not scores:
+        return None
+
+    domain_order = [d for d in SUBDOMAIN_ORDER if any(scores[model].get(d) for model in scores)]
+    if not domain_order:
+        return None
+
+    label_to_model: dict[str, str] = {}
+    for entry in entries:
+        label_to_model[_model_display_name(entry.model)] = entry.model
+
+    series: list[go.Scatterpolar] = []
+    def _series_order_key(model_label: str) -> tuple[int, int, int, str]:
+        model = label_to_model.get(model_label, model_label)
+        return _series_sort_key(model)
+
+    for model in sorted(scores, key=_series_order_key):
+        values: list[float | None] = []
+        for domain in domain_order:
+            vals = scores[model].get(domain)
+            if vals:
+                values.append(sum(vals) / len(vals))
+            else:
+                values.append(None)
+        if not any(v is not None for v in values):
+            continue
+        closed_values = values + [values[0]]
+        closed_labels = [dom.replace("_", " ").title() for dom in domain_order] + [
+            domain_order[0].replace("_", " ").title()
+        ]
+        series.append(
+            go.Scatterpolar(
+                r=closed_values,
+                theta=closed_labels,
+                name=model,
+                fill="toself",
+            )
+        )
+
+    if not series:
+        return None
+
+    fig = go.Figure(data=series)
+    fig.update_layout(
+        title="Knowledge 子领域雷达图",
+        polar=dict(radialaxis=dict(visible=True, tickformat=".0%")),
+        template="plotly_dark",
+        height=480,
+        margin=dict(t=50, l=40, r=20, b=30),
+        legend_title_text="模型",
+    )
+    return fig
+
+
+def _build_aime_plot(selection: SelectionState) -> go.Figure | None:
+    rows: list[dict[str, Any]] = []
+    series_order: dict[str, tuple[Any, ...]] = {}
+    for entry in selection.entries:
+        base = _dataset_base(entry.dataset).lower()
+        if base not in AIME_BASES:
+            continue
+        curve = _extract_pass_curve(entry)
+        if not curve:
+            continue
+        model_label = _model_display_name(entry.model)
+        bench_label = base.upper()
+        series = f"{bench_label} · {model_label}"
+        series_order.setdefault(series, (bench_label, *_series_sort_key(entry.model)))
+        for k, acc in curve.items():
+            rows.append(
+                {
+                    "series": series,
+                    "pass_k": int(k),
+                    "acc": float(acc),
+                }
+            )
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df.sort_values(["series", "pass_k"], inplace=True)
+    series_ordered = sorted(series_order.keys(), key=lambda key: series_order[key])
+    fig = px.line(
+        df,
+        x="pass_k",
+        y="acc",
+        color="series",
+        markers=True,
+        category_orders={"series": series_ordered},
+    )
+    fig.update_layout(
+        title="AIME pass@k 曲线",
+        legend_title_text="数据集 · 模型",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=40, l=30, r=20, b=30),
+    )
+    fig.update_yaxes(title_text="Accuracy", tickformat=".0%", rangemode="tozero")
+    unique_ks = sorted(df["pass_k"].unique().tolist())
+    fig.update_xaxes(title_text="pass@k", tickmode="array", tickvals=unique_ks)
+    return fig
+
+
+def _build_domain_tables(selection: SelectionState) -> dict[str, str]:
+    tables: dict[str, str] = {}
+    for group in DOMAIN_GROUPS:
+        filtered = [entry for entry in selection.entries if entry.domain in group["domains"]]
+        headers, rows = _build_pivot_table(selection, entries=filtered)
+        tables[group["key"]] = _render_pivot_html(headers, rows, title=group["title"])
+    return tables
+
+
+def _build_knowledge_radar(selection: SelectionState) -> go.Figure | None:
+    entries = [entry for entry in selection.entries if entry.domain in {"mmlu系列", "multi-choice系列", "其他"}]
+    if not entries:
+        return None
+
+    subjects: set[str] = set()
+    subject_scores: dict[str, dict[str, float]] = {}
+
+    for entry in entries:
+        details = entry.task_details or {}
+        acc_map = details.get("accuracy_by_subject")
+        if not isinstance(acc_map, dict):
+            continue
+        model_key = entry.model
+        for raw_name, raw_val in acc_map.items():
+            canonical = _normalize_subject_label(str(raw_name))
+            score = _numeric_value(raw_val)
+            if canonical and score is not None:
+                subjects.add(canonical)
+                subject_scores.setdefault(model_key, {})
+                current = subject_scores[model_key].get(canonical)
+                if current is None or score > current:
+                    subject_scores[model_key][canonical] = score
+
+    if not subjects:
+        return None
+
+    axis_labels = [label.title() for label in sorted(subjects)]
+    series: list[go.Scatterpolar] = []
+    for model in selection.model_sequence:
+        scores = subject_scores.get(model)
+        if not scores:
+            continue
+        values: list[float] = []
+        for canonical in sorted(subjects):
+            values.append(scores.get(canonical, 0.0))
+        closed_values = values + [values[0]]
+        closed_labels = axis_labels + [axis_labels[0]]
+        series.append(
+            go.Scatterpolar(
+                r=closed_values,
+                theta=closed_labels,
+                name=_model_display_name(model),
+                fill="toself",
+            )
+        )
+
+    if not series:
+        return None
+
+    fig = go.Figure(data=series)
+    fig.update_layout(
+        title="Knowledge 子领域雷达图（accuracy_by_subject）",
+        polar=dict(radialaxis=dict(visible=True, tickformat=".0%", range=[0, 1])),
+        template="plotly_dark",
+        margin=dict(t=50, l=40, r=20, b=30),
+        legend_title_text="模型",
+    )
+    return fig
+
+
+def _build_instruction_bar(selection: SelectionState) -> go.Figure | None:
+    entries = [entry for entry in selection.entries if entry.domain == "instruction following系列"]
+    if not entries:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    label_to_model = {_model_display_name(e.model): e.model for e in entries}
+    for entry in entries:
+        details = entry.task_details or {}
+        buckets: dict[str, list[float]] = {}
+        for tier_key in ("tier0_accuracy", "tier1_accuracy"):
+            acc_map = details.get(tier_key)
+            if not isinstance(acc_map, dict):
+                continue
+            for name, value in acc_map.items():
+                num = _numeric_value(value)
+                if num is None:
+                    continue
+                prefix = str(name).split(":", 1)[0]
+                buckets.setdefault(prefix, []).append(num)
+        for domain, scores in buckets.items():
+            rows.append(
+                {
+                    "domain": domain.replace("_", " "),
+                    "model": _model_display_name(entry.model),
+                    "score": sum(scores) / len(scores),
+                }
+            )
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    domain_order = [d.replace("_", " ") for d in INSTRUCTION_DOMAIN_ORDER if d.replace("_", " ") in df["domain"].unique()]
+    series_order = sorted(df["model"].unique(), key=lambda label: _series_sort_key(label_to_model.get(label, label)))
+    df.sort_values(["domain", "model"], inplace=True)
+    fig = px.bar(
+        df,
+        x="domain",
+        y="score",
+        color="model",
+        barmode="group",
+        category_orders={"domain": domain_order, "model": series_order},
+        hover_data=None,
+    )
+    fig.update_layout(
+        title="Instruction Following 子领域",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=50, l=40, r=20, b=30),
+        legend_title_text="模型",
+    )
+    fig.update_yaxes(title_text="Accuracy", tickformat=".0%", rangemode="tozero")
+    fig.update_xaxes(title_text="子领域")
+    return fig
+
+
+def _build_coding_bar(selection: SelectionState) -> go.Figure | None:
+    entries = [entry for entry in selection.entries if entry.domain == "coding系列"]
+    if not entries:
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for entry in entries:
+        base = _dataset_base(entry.dataset)
+        metric_key, metric_value = _best_numeric_metric(entry, dataset_base=base)
+        if metric_value is None:
+            continue
+        rows.append(
+            {
+                "dataset": base.upper(),
+                "model": _model_display_name(entry.model),
+                "score": metric_value,
+                "metric": metric_key or "score",
+            }
+        )
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df.sort_values(["dataset", "model"], inplace=True)
+    label_to_model = {_model_display_name(e.model): e.model for e in entries}
+    series_order = sorted(df["model"].unique(), key=lambda label: _series_sort_key(label_to_model.get(label, label)))
+    fig = px.bar(
+        df,
+        x="dataset",
+        y="score",
+        color="model",
+        barmode="group",
+        hover_data=["metric"],
+        text_auto=".1%",
+        category_orders={"model": series_order},
+    )
+    fig.update_layout(
+        title="Coding 关键指标（优先 pass@1，其次 pass@k）",
+        template="plotly_dark",
+        height=420,
+        margin=dict(t=50, l=40, r=20, b=30),
+        legend_title_text="模型",
+    )
+    fig.update_traces(textposition="outside", cliponaxis=False)
+    fig.update_yaxes(title_text="Accuracy", tickformat=".0%", rangemode="tozero")
+    fig.update_xaxes(title_text="基准")
+    return fig
+
+
+def _truncate(text: str, limit: int = 900) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _load_coding_example(selection: SelectionState) -> str | None:
+    entries = [entry for entry in selection.entries if entry.domain == "coding系列"]
+    if not entries:
+        return CODING_FALLBACK_SAMPLE
+
+    # Pick the smallest parameter model first to keep prompts concise.
+    entries = sorted(entries, key=lambda e: _series_sort_key(e.model))
+    for entry in entries:
+        path = Path(entry.log_path) if entry.log_path else None
+        if not path or not path.exists():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                line = fh.readline()
+        except OSError:
+            continue
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+
+        prompt = payload.get("prompt1") or payload.get("prompt_raw") or payload.get("prompt") or ""
+        completion = payload.get("completion") or payload.get("output1") or payload.get("response") or ""
+        result = payload.get("result") or payload.get("passed")
+        task_id = payload.get("task_id") or payload.get("entry_point") or ""
+
+        parts = [
+            f"**模型**：{_model_display_name(entry.model)}",
+            f"**数据集**：{_dataset_base(entry.dataset).upper()}  ·  **样例**：{task_id or 'N/A'}  ·  **结果**：{result}",
+            "**Prompt**:",
+            f"```python\n{_truncate(str(prompt).strip())}\n```",
+            "**Completion**:",
+            f"```python\n{_truncate(str(completion).strip())}\n```",
+        ]
+        return "\n\n".join(parts)
+
+    return CODING_FALLBACK_SAMPLE
 
 
 def _pivot_to_csv(headers: list[str], rows: list[list[Any]]) -> str:
@@ -468,7 +1106,7 @@ def _pivot_to_csv(headers: list[str], rows: list[list[Any]]) -> str:
     return buffer.getvalue()
 
 
-def _render_pivot_html(headers: list[str], rows: list[list[Any]]) -> str:
+def _render_pivot_html(headers: list[str], rows: list[list[Any]], *, title: str = "明细") -> str:
     """Render pivot table into a HTML table with predictable column widths.
 
     要求：
@@ -508,7 +1146,7 @@ def _render_pivot_html(headers: list[str], rows: list[list[Any]]) -> str:
     )
 
     return f"""
-<div class="space-table-title">明细</div>
+<div class="space-table-title">{_html(title)}</div>
 <div class="space-table-grid" style="--model-col-width: {benchmark_width}ch; --metric-col-width: {model_col_width}ch;">
   <table>
     <colgroup>{colgroup}</colgroup>
@@ -523,34 +1161,35 @@ def _render_pivot_html(headers: list[str], rows: list[list[Any]]) -> str:
 """.strip()
 
 
-def _compute_choices(entries: list[ScoreEntry]) -> tuple[list[str], list[str]]:
-    models = [AUTO_MODEL_LABEL] + list_models(entries)
-    domains = [DEFAULT_DOMAIN] + list_domains(entries)
-    return models, domains
+def _compute_choices(entries: list[ScoreEntry]) -> list[str]:
+    return [AUTO_MODEL_LABEL] + list_models(entries)
 
 
-def _initial_payload() -> tuple[list[ScoreEntry], SelectionState, str, list[str]]:
+def _initial_payload() -> tuple[list[ScoreEntry], SelectionState, list[str]]:
     errors: list[str] = []
     entries = load_scores(errors=errors)
-    selection = _prepare_selection(entries, AUTO_MODEL_LABEL, DEFAULT_DOMAIN)
-    return entries, selection, DEFAULT_DOMAIN, errors
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+    return entries, selection, errors
 
 
 def _build_dashboard() -> gr.Blocks:
     css, style_warning = _load_css()
-    entries, selection, domain, load_errors = _initial_payload()
-    model_choices, domain_choices = _compute_choices(entries)
+    entries, selection, load_errors = _initial_payload()
+    model_choices = _compute_choices(entries)
     warnings = load_errors + ([style_warning] if style_warning else [])
 
     summary = _render_summary(
         all_entries=entries,
         visible=selection.entries,
         selection=selection,
-        domain_choice=domain,
         warnings=warnings,
     )
-    pivot_headers, pivot_rows = _build_pivot_table(selection)
-    pivot_html = _render_pivot_html(pivot_headers, pivot_rows)
+    domain_tables = _build_domain_tables(selection)
+    aime_plot_value = _build_aime_plot(selection)
+    knowledge_radar_value = _build_knowledge_radar(selection)
+    instruction_bar_value = _build_instruction_bar(selection)
+    coding_bar_value = _build_coding_bar(selection)
+    coding_example_value = _load_coding_example(selection)
 
     # Gradio 5.50 不再可靠支持 Blocks(elem_id=...) 作为 CSS 锚点，
     # 所以这里用一个带有自定义 class 的 Column 作为样式作用域根节点。
@@ -575,63 +1214,133 @@ def _build_dashboard() -> gr.Blocks:
                     value=AUTO_MODEL_LABEL,
                     scale=3,
                 )
-                domain_dropdown = gr.Dropdown(
-                    label="大领域",
-                    choices=domain_choices,
-                    value=domain,
-                    scale=2,
-                )
                 refresh_btn = gr.Button("刷新分数", variant="primary", elem_classes="space-refresh-btn", scale=1)
+                download_btn = gr.DownloadButton("导出为 CSV", elem_classes="space-export-btn", scale=1)
 
             summary_md = gr.Markdown(summary, elem_classes="space-card space-summary-card")
-            table = gr.HTML(pivot_html, elem_classes="space-card space-table-card")
-            download_btn = gr.DownloadButton("导出为 CSV", elem_classes="space-export-btn")
+            tables: dict[str, gr.HTML] = {}
+            aime_plot: gr.Plot | None = None
+            knowledge_radar: gr.Plot | None = None
+            instruction_bar: gr.Plot | None = None
+            coding_bar: gr.Plot | None = None
+            coding_example: gr.Markdown | None = None
 
-            def update_dashboard(selected_model: str, selected_domain: str):
+            with gr.Tabs(elem_classes="space-card space-table-card"):
+                for group in DOMAIN_GROUPS:
+                    with gr.Tab(group["label"]):
+                        if group["key"] == "knowledge":
+                            knowledge_radar = gr.Plot(
+                                value=knowledge_radar_value,
+                                show_label=False,
+                                elem_classes="space-table-card",
+                            )
+                        if group["key"] == "math":
+                            aime_plot = gr.Plot(
+                                value=aime_plot_value,
+                                show_label=False,
+                                elem_classes="space-table-card",
+                            )
+                        if group["key"] == "coding":
+                            coding_bar = gr.Plot(
+                                value=coding_bar_value,
+                                show_label=False,
+                                elem_classes="space-table-card",
+                            )
+                            coding_example = gr.Markdown(
+                                value=coding_example_value or "暂未找到 Coding 示例。",
+                                elem_classes="space-card space-summary-card",
+                            )
+                        if group["key"] == "instruction_following":
+                            instruction_bar = gr.Plot(
+                                value=instruction_bar_value,
+                                show_label=False,
+                                elem_classes="space-table-card",
+                            )
+                        tables[group["key"]] = gr.HTML(
+                            domain_tables.get(group["key"], _render_pivot_html([], [])),
+                            elem_classes="space-table-card",
+                        )
+
+            def update_dashboard(selected_model: str):
                 load_errors: list[str] = []
                 entries = load_scores(errors=load_errors)
-                model_choices, domain_choices = _compute_choices(entries)
-                domain_value = selected_domain if selected_domain in domain_choices else DEFAULT_DOMAIN
+                model_choices = _compute_choices(entries)
                 dropdown_value = selected_model if selected_model in model_choices else AUTO_MODEL_LABEL
 
-                selection_state = _prepare_selection(entries, dropdown_value, domain_value)
+                selection_state = _prepare_selection(entries, dropdown_value)
                 warnings = load_errors + ([style_warning] if style_warning else [])
 
                 summary_value = _render_summary(
                     all_entries=entries,
                     visible=selection_state.entries,
                     selection=selection_state,
-                    domain_choice=domain_value,
                     warnings=warnings,
                 )
-                pivot_headers, pivot_rows = _build_pivot_table(selection_state)
-                pivot_html = _render_pivot_html(pivot_headers, pivot_rows)
-                return (
+                domain_table_values = _build_domain_tables(selection_state)
+                aime_plot_fig = _build_aime_plot(selection_state)
+                knowledge_radar_fig = _build_knowledge_radar(selection_state)
+                instruction_bar_fig = _build_instruction_bar(selection_state)
+                coding_bar_fig = _build_coding_bar(selection_state)
+                coding_example_md = _load_coding_example(selection_state) or "暂未找到 Coding 示例。"
+
+                outputs: list[Any] = [
                     gr.update(choices=model_choices, value=selection_state.dropdown_value),
-                    gr.update(choices=domain_choices, value=domain_value),
                     gr.update(value=summary_value),
-                    gr.update(value=pivot_html),
-                )
+                ]
+                for group in DOMAIN_GROUPS:
+                    outputs.append(gr.update(value=domain_table_values.get(group["key"])))
+                    if group["key"] == "knowledge" and knowledge_radar is not None:
+                        outputs.append(gr.update(value=knowledge_radar_fig))
+                    if group["key"] == "math" and aime_plot is not None:
+                        outputs.append(gr.update(value=aime_plot_fig))
+                    if group["key"] == "coding" and coding_bar is not None:
+                        outputs.append(gr.update(value=coding_bar_fig))
+                        if coding_example is not None:
+                            outputs.append(gr.update(value=coding_example_md))
+                    if group["key"] == "instruction_following" and instruction_bar is not None:
+                        outputs.append(gr.update(value=instruction_bar_fig))
+                return outputs
 
             model_dropdown.change(
                 update_dashboard,
-                inputs=[model_dropdown, domain_dropdown],
-                outputs=[model_dropdown, domain_dropdown, summary_md, table],
-            )
-            domain_dropdown.change(
-                update_dashboard,
-                inputs=[model_dropdown, domain_dropdown],
-                outputs=[model_dropdown, domain_dropdown, summary_md, table],
+                inputs=[model_dropdown],
+                outputs=[
+                    model_dropdown,
+                    summary_md,
+                    tables["knowledge"],
+                    knowledge_radar,
+                    tables["math"],
+                    aime_plot,
+                    tables["coding"],
+                    coding_bar,
+                    coding_example,
+                    tables["instruction_following"],
+                    instruction_bar,
+                    tables["function_call"],
+                ],
             )
             refresh_btn.click(
                 update_dashboard,
-                inputs=[model_dropdown, domain_dropdown],
-                outputs=[model_dropdown, domain_dropdown, summary_md, table],
+                inputs=[model_dropdown],
+                outputs=[
+                    model_dropdown,
+                    summary_md,
+                    tables["knowledge"],
+                    knowledge_radar,
+                    tables["math"],
+                    aime_plot,
+                    tables["coding"],
+                    coding_bar,
+                    coding_example,
+                    tables["instruction_following"],
+                    instruction_bar,
+                    tables["function_call"],
+                ],
             )
 
-            def export_csv(selected_model: str, selected_domain: str):
+            def export_csv(selected_model: str):
                 entries = load_scores()
-                selection_state = _prepare_selection(entries, selected_model, selected_domain)
+                selection_state = _prepare_selection(entries, selected_model)
                 headers, rows = _build_pivot_table(selection_state)
                 csv_text = _pivot_to_csv(headers, rows)
                 temp_dir = Path(tempfile.mkdtemp(prefix="rwkv_space_"))
@@ -641,7 +1350,7 @@ def _build_dashboard() -> gr.Blocks:
 
             download_btn.click(
                 export_csv,
-                inputs=[model_dropdown, domain_dropdown],
+                inputs=[model_dropdown],
                 outputs=download_btn,
             )
 

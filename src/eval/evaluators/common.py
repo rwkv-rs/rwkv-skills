@@ -283,8 +283,8 @@ def ensure_resume_samples_compatible(path: Path, samples_per_task: int) -> None:
     if samples_per_task >= required:
         return
     raise ValueError(
-        f"已有日志 {path} 含 sample_id={max_id}，需要 --samples-per-task 至少 {required} 才能继续；"
-        "请删除旧日志或使用不小于该值的采样次数重试。"
+        f"已有日志 {path} 含 sample_id={max_id}，需要每题至少 {required} 个样本才能继续（由 pass-k 最大值决定）；"
+        "请删除旧日志或使用不小于该值的生成次数重试。"
     )
 
 

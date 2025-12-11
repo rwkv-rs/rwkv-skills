@@ -32,7 +32,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="MBPP JSONL path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
-    parser.add_argument("--samples-per-task", type=int, default=1, help="Number of completions per task")
     parser.add_argument("--max-samples", type=int, help="Limit number of problems for quick runs")
     parser.add_argument("--max-tokens", type=int, help="Clamp generation length")
     parser.add_argument("--temperature", type=float, help="Override sampling temperature")
@@ -42,10 +41,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
     parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
     parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="只跑一批生成用于 batch 探测，不评测、不写盘",
+    )
+    parser.add_argument(
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to report (default: 1,2,4,8,16,32,64,128,256)",
+        help="pass@k values to report (default: 1)",
     )
     return parser.parse_args(argv)
 
@@ -98,18 +102,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = CodingPipeline(config)
-    default_pass_k = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+    default_pass_k = (1,)
     pass_k = tuple(args.pass_k) if args.pass_k else default_pass_k
     result = pipeline.run_mbpp(
         dataset_path=str(dataset_path),
         output_path=str(out_path),
         sampling=sampling,
         batch_size=max(1, args.batch_size),
-        samples_per_task=max(1, args.samples_per_task),
         sample_limit=args.max_samples,
         eval_timeout=args.eval_timeout,
         eval_workers=args.eval_workers,
         pass_k=pass_k,
+        probe_only=args.probe_only,
+        write_output=not args.probe_only,
     )
 
     print(f"✅ MBPP 生成完成：{result.sample_count} completions -> {result.output_path}")

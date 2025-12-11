@@ -11,7 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .auto_samples import derive_auto_samples_per_task
 from .config import (
     DEFAULT_COMPLETION_DIR,
     DEFAULT_DISPATCH_POLL_SECONDS,
@@ -370,12 +369,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 model_slug=item.model_slug,
                 env=env,
                 dataset_questions=questions,
-                samples_per_task_flag=job.samples_per_task_flag,
             )
-
-            samples_override = None
-            if job.samples_per_task_flag:
-                samples_override = derive_auto_samples_per_task(batch_size, questions)
 
             command = build_command(
                 job,
@@ -384,17 +378,12 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 f"cuda:{gpu}",
                 batch_size=batch_size,
                 output_path=completion_path,
-                samples_per_task=samples_override,
             )
             print(f"🚀 Launch {item.job_id} -> cuda:{gpu}")
             print(f"    Dataset: {dataset_path}")
             print(f"    Completion: {completion_path}")
             print(f"    Console: {console_log_path}")
             print(f"    Cmd: {' '.join(command)}")
-            if samples_override:
-                print(
-                    f"    ↪ auto samples-per-task={samples_override} (questions={questions or '?'})"
-                )
             meta = job_metadata.setdefault(item.job_id, {})
             meta.update(
                 job=item.job_name,
@@ -405,7 +394,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 log_path=str(completion_path),
                 console_log_path=str(console_log_path),
                 gpu=gpu,
-                samples_per_task=samples_override,
             )
 
             process = launch_job(
@@ -434,7 +422,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 gpu=f"cuda:{gpu}",
                 pid=process.pid,
                 wait_s=wait_s,
-                samples_per_task=samples_override,
             )
 
         time.sleep(1)
@@ -448,7 +435,6 @@ def build_command(
     *,
     batch_size: int | None = None,
     output_path: Path | None = None,
-    samples_per_task: int | None = None,
 ) -> list[str]:
     base = [DEFAULT_PYTHON, "-m", job.module]
     args = [
@@ -463,8 +449,6 @@ def build_command(
         args.extend([job.batch_flag, str(batch_size)])
     if output_path is not None:
         args.extend(["--output", str(output_path)])
-    if samples_per_task is not None and job.samples_per_task_flag:
-        args.extend([job.samples_per_task_flag, str(samples_per_task)])
     if job.extra_args:
         args.extend(job.extra_args)
     return base + args

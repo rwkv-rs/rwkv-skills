@@ -63,7 +63,8 @@ class JobSpec:
     probe_max_generate_flag: str | None = None
     probe_dataset_required: bool = False
     probe_extra_args: tuple[str, ...] = ()
-    samples_per_task_flag: str | None = None
+    # 用于探测 batch size 时估算实际样本量（例如 pass@k>1 时每题会展开多条样本）
+    probe_samples_per_task: int = 1
 
     @property
     def id_prefix(self) -> str:
@@ -171,7 +172,8 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_dataset_required=True,
-        samples_per_task_flag="--samples-per-task",
+        # 高难数学默认 pass@k 较大，按 256 倍展开估算样本量，避免 batch 探测过小
+        probe_samples_per_task=256,
     ),
     "free_response_judge": JobSpec(
         name="free_response_judge",
@@ -183,7 +185,6 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_dataset_required=True,
-        samples_per_task_flag="--samples-per-task",
     ),
     "code_human_eval": JobSpec(
         name="code_human_eval",
@@ -192,9 +193,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         is_cot=False,
         domain="code",
         batch_flag="--batch-size",
-        probe_flag="--max-samples",
+        probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
-        samples_per_task_flag="--samples-per-task",
+        probe_samples_per_task=1,  # coding 默认只做 pass@1
     ),
     "code_mbpp": JobSpec(
         name="code_mbpp",
@@ -203,9 +204,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         is_cot=False,
         domain="code",
         batch_flag="--batch-size",
-        probe_flag="--max-samples",
+        probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
-        samples_per_task_flag="--samples-per-task",
+        probe_samples_per_task=1,  # coding 默认只做 pass@1
     ),
     "instruction_following": JobSpec(
         name="instruction_following",

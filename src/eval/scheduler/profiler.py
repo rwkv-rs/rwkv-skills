@@ -13,7 +13,6 @@ from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 from filelock import FileLock
 
-from .auto_samples import derive_auto_samples_per_task
 from .config import DEFAULT_PYTHON, REPO_ROOT
 from .jobs import JobSpec
 
@@ -188,7 +187,6 @@ class BatchProfiler:
         model_slug: str,
         env: dict[str, str],
         dataset_questions: int | None = None,
-        samples_per_task_flag: str | None = None,
     ) -> int | None:
         self._refresh_cache_if_stale()
         batch_flag = job.batch_flag
@@ -202,10 +200,12 @@ class BatchProfiler:
 
         max_allowed_batch = max(base_candidates)
         question_count = dataset_questions if dataset_questions and dataset_questions > 0 else None
+        if question_count and job.probe_samples_per_task > 1:
+            # 估算实际生成样本量（题目数 * 每题样本数），避免对少样本数据集从过小的 batch 起 probe
+            question_count *= max(1, job.probe_samples_per_task)
         candidates = self._select_probe_candidates(
             base_candidates,
             question_count=question_count,
-            sweep_enabled=bool(samples_per_task_flag),
         )
         if not candidates:
             return None
@@ -220,35 +220,15 @@ class BatchProfiler:
                 "batch": cached_value,
                 "last_probe": time.time(),
             }
-            expected_samples = self._expected_samples_per_task(
-                cached_value,
-                dataset_questions=question_count,
-                samples_per_task_flag=samples_per_task_flag,
-            )
-            if expected_samples is not None:
-                entry["samples_per_task"] = expected_samples
             model_cache[gpu] = entry
             record = model_cache[gpu]
             self._persist_cache()
         record_is_dict = isinstance(record, Mapping)
         last_probe = record.get("last_probe") if record_is_dict else None
         last_error = record.get("last_error") if record_is_dict else None
-        cached_samples_per_task = None
-        if record_is_dict:
-            sample_field = record.get("samples_per_task")
-            if isinstance(sample_field, (int, float)):
-                cached_samples_per_task = int(sample_field)
         cache_is_trustworthy = (
             cached_value is not None and cached_value > 0 and isinstance(last_probe, (int, float)) and (not last_error)
         )
-        if cache_is_trustworthy and samples_per_task_flag:
-            expected_samples = self._expected_samples_per_task(
-                cached_value,
-                dataset_questions=question_count,
-                samples_per_task_flag=samples_per_task_flag,
-            )
-            if expected_samples is None or cached_samples_per_task != expected_samples:
-                cache_is_trustworthy = False
         if cache_is_trustworthy:
             print(f"🔁 Using cached batch size {cached_value} for {job_id} on cuda:{gpu}.")
             return cached_value
@@ -263,13 +243,6 @@ class BatchProfiler:
                 "last_error": "dataset path unavailable",
                 "last_probe": time.time(),
             }
-            expected_samples = self._expected_samples_per_task(
-                fallback,
-                dataset_questions=question_count,
-                samples_per_task_flag=samples_per_task_flag,
-            )
-            if expected_samples is not None:
-                entry["samples_per_task"] = expected_samples
             model_cache[gpu] = entry
             self._persist_cache()
             return fallback
@@ -293,14 +266,13 @@ class BatchProfiler:
                     str(candidate),
                 ]
             )
-            derived_samples = None
-            expected_samples_value = None
-            if samples_per_task_flag:
-                derived_samples = derive_auto_samples_per_task(candidate, question_count)
-                expected_samples_value = derived_samples if derived_samples is not None else 1
-                if derived_samples is not None:
-                    command.extend([samples_per_task_flag, str(expected_samples_value)])
 
+            # 限制探测开销：只跑最小样本 / probe-only
+            if job.probe_flag:
+                if job.probe_flag == "--probe-only":
+                    command.append(job.probe_flag)
+                else:
+                    command.extend([job.probe_flag, "1"])
             if dataset_path is not None:
                 command.extend(["--dataset", str(dataset_path)])
             if job.probe_max_generate_flag:
@@ -329,10 +301,6 @@ class BatchProfiler:
                     "batch": candidate,
                     "last_probe": time.time(),
                 }
-                if samples_per_task_flag:
-                    if expected_samples_value is None:
-                        expected_samples_value = 1
-                    entry["samples_per_task"] = expected_samples_value
                 model_cache[gpu] = entry
                 self._persist_cache()
                 print(f"✅ Batch size {candidate} works for {job_id} on cuda:{gpu} (probe {elapsed:.1f}s).")
@@ -385,13 +353,10 @@ class BatchProfiler:
         candidates: Sequence[int],
         *,
         question_count: int | None,
-        sweep_enabled: bool,
     ) -> tuple[int, ...]:
         ordered = [value for value in candidates if isinstance(value, int) and value > 0]
         if not ordered:
             return tuple()
-        if sweep_enabled:
-            return tuple(ordered)
         if question_count is None or question_count <= 0:
             return tuple(ordered)
         max_candidate = max(ordered)
@@ -426,18 +391,5 @@ class BatchProfiler:
         if bits < 0:
             return None
         return 1 << bits
-
-    def _expected_samples_per_task(
-        self,
-        batch_size: int | None,
-        *,
-        dataset_questions: int | None,
-        samples_per_task_flag: str | None,
-    ) -> int | None:
-        if batch_size is None or not samples_per_task_flag:
-            return None
-        derived = derive_auto_samples_per_task(batch_size, dataset_questions)
-        return derived if derived is not None else 1
-
 
 __all__ = ["BatchProfiler", "load_batch_cache", "save_batch_cache", "update_batch_cache_locked"]

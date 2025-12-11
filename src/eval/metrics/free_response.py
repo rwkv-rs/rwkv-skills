@@ -41,6 +41,7 @@ class FreeResponseMetrics:
     judge_accuracy: float | None
     samples: list[FreeResponseSampleResult]
     pass_at_k: dict[str, float] | None = None
+    avg_at_k: dict[str, float] | None = None
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -154,6 +155,49 @@ def compute_pass_at_k(
     return metrics
 
 
+def compute_avg_at_k(
+    samples: Iterable[FreeResponseSampleResult],
+    ks: Sequence[int],
+    *,
+    use_judge: bool = False,
+) -> dict[str, float]:
+    """Compute average accuracy across the first k samples for each problem."""
+
+    grouped: dict[str, list[tuple[int, bool]]] = {}
+    for result in samples:
+        sample = result.sample
+        flag = result.correct_exact
+        if use_judge and result.judge_correct is not None:
+            flag = result.judge_correct
+        if flag is None:
+            continue
+        sample_key = f"{sample.dataset}:idx:{sample.sample_index}"
+        if sample.problem_index is not None:
+            sample_key = f"{sample.dataset}:{sample.problem_index}"
+        elif sample.question:
+            sample_key = f"{sample.dataset}:q:{sample.question.strip()}"
+        sample_id = sample.sample_id if sample.sample_id is not None else sample.sample_index
+        grouped.setdefault(sample_key, []).append((int(sample_id), bool(flag)))
+
+    metrics: dict[str, float] = {}
+    for k in ks:
+        k = int(k)
+        if k <= 0:
+            continue
+        correct = 0
+        total = 0
+        for entries in grouped.values():
+            ordered = sorted(entries, key=lambda pair: pair[0])
+            if len(ordered) < k:
+                continue
+            selected = ordered[:k]
+            correct += sum(1 for _, flag in selected if flag)
+            total += k
+        if total > 0:
+            metrics[f"avg@{k}"] = correct / total
+    return metrics
+
+
 @dataclass(slots=True)
 class LLMJudgeConfig:
     api_key: str
@@ -259,4 +303,5 @@ __all__ = [
     "evaluate_with_judge",
     "write_sample_results",
     "compute_pass_at_k",
+    "compute_avg_at_k",
 ]

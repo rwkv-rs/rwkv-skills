@@ -54,20 +54,26 @@ class InstructionFollowingPipeline:
         enable_think: bool = False,
         stop_tokens: tuple[int, ...] = DEFAULT_STOP_TOKENS,
         ban_tokens: tuple[int, ...] | None = None,
+        samples_per_prompt: int | None = None,
     ) -> InstructionFollowingPipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
-        if not records:
+        repeats = max(1, samples_per_prompt or 1)
+        expanded: list[tuple[int, InstructionFollowingRecord, int]] = []
+        for idx, record in enumerate(records):
+            for sample_id in range(repeats):
+                expanded.append((idx, record, sample_id))
+        if not expanded:
             return InstructionFollowingPipelineResult(dataset_name, 0, Path(output_path))
 
         resume = detect_resume_state(output_path)
-        start_index = min(resume.next_index, len(records))
-        if start_index and len(records):
-            remaining = max(len(records) - start_index, 0)
-            print(f"⏩ Instruction-following 恢复运行：已完成 {start_index}/{len(records)}，剩余 {remaining}")
-        remaining_records = records[start_index:]
+        start_index = min(resume.next_index, len(expanded))
+        if start_index and len(expanded):
+            remaining = max(len(expanded) - start_index, 0)
+            print(f"⏩ Instruction-following 恢复运行：已完成 {start_index}/{len(expanded)}，剩余 {remaining}")
+        remaining_records = expanded[start_index:]
         if not remaining_records:
-            return InstructionFollowingPipelineResult(dataset_name, len(records), Path(output_path))
+            return InstructionFollowingPipelineResult(dataset_name, len(expanded), Path(output_path))
 
         effective_ban = ban_tokens
         if effective_ban is None:
@@ -76,7 +82,7 @@ class InstructionFollowingPipeline:
         sampling_cfg = replace(sampling, stop_tokens=stop_tokens, ban_tokens=effective_ban)
 
         writer = JsonlStageWriter(output_path, resume=resume.has_progress)
-        prompts = [self._make_prompt(record.prompt, enable_think) for record in remaining_records]
+        prompts = [self._make_prompt(record.prompt, enable_think) for _, record, _ in remaining_records]
         outputs = self.engine.generate(
             prompts,
             sampling=sampling_cfg,
@@ -84,7 +90,7 @@ class InstructionFollowingPipeline:
             progress_desc="Generating instruction-following responses",
         )
         output_by_idx = {item.prompt_index: item for item in outputs}
-        for local_idx, record in enumerate(remaining_records):
+        for local_idx, (problem_idx, record, sample_id) in enumerate(remaining_records):
             global_idx = start_index + local_idx
             seq = output_by_idx.get(local_idx)
             if seq is None:
@@ -96,6 +102,8 @@ class InstructionFollowingPipeline:
                 "kwargs": record.kwargs_list,
                 "prompt": record.prompt,
                 "response_clean": cleaned,
+                "sample_id": sample_id,
+                "problem_index": problem_idx,
             }
             stage = StageRecord(
                 prompt=prompts[local_idx],
@@ -111,7 +119,7 @@ class InstructionFollowingPipeline:
                 )
             )
         writer.close()
-        return InstructionFollowingPipelineResult(dataset_name, len(records), Path(output_path))
+        return InstructionFollowingPipelineResult(dataset_name, len(expanded), Path(output_path))
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:
         suffix = " <think" if enable_think else ""
