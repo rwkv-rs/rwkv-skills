@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import math
 import time
 from typing import Sequence
-
-import flashinfer
+try:
+    import flashinfer # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    flashinfer = None 
 import torch
 from tqdm import tqdm
 
