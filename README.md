@@ -79,7 +79,10 @@ Math QA sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `an
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}` (full grid: `normal` then `simple`; no truncation).
-- The selector job aggregates `results/param_search/scores/...` across `gsm8k_test` + `hendrycks_math_test` (alias: `math`), picks the best shared grid point by summed objective, then promotes the chosen trial artifacts into `results/{completions,eval,scores}`.
+- The selector job aggregates `results/param_search/scores/...` across `gsm8k_test` + `hendrycks_math_test` (alias: `math`) and promotes two independent selections:
+  - best `normal` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_normal`
+  - best `simple` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_simple`
+  - (backward compatible) the best overall grid point is also promoted to the unsuffixed `{benchmark}` paths.
 
 When evaluating the latest 2.9B model, the scheduler automatically runs param-search on `gsm8k_test` + `hendrycks_math_test`.
 

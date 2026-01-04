@@ -5,8 +5,19 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
+import os
+from pathlib import Path
 import time
 from typing import Sequence
+
+if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
+    # flashinfer JIT cache defaults to ~/.cache; some sandboxed environments may have an unwritable HOME.
+    try:
+        home = Path.home()
+        if not (home.exists() and os.access(home, os.W_OK)):
+            os.environ["FLASHINFER_WORKSPACE_BASE"] = "/tmp"
+    except Exception:  # noqa: BLE001
+        os.environ["FLASHINFER_WORKSPACE_BASE"] = "/tmp"
 
 import flashinfer
 import torch
@@ -152,13 +163,25 @@ def _continuous_batching(
     device = _infer_device(model)
     states = _prepare_state_container(model.generate_zero_state(batch_size))
 
-    occurrence = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
-    alpha_presence_vector = torch.zeros_like(occurrence)
-    alpha_presence_value = 0.0 if is_simple else sampling.alpha_presence
-    alpha_presence = torch.tensor(alpha_presence_value, dtype=torch.float32, device=device)
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())
     no_penalty = set(sampling.no_penalty_token_ids)
+
+    # Frequency/presence penalty tracking can be very expensive for large (batch, vocab).
+    # Avoid allocating these tensors when they are not needed (simple mode / zero penalties).
+    alpha_presence_value = 0.0 if is_simple else float(sampling.alpha_presence)
+    alpha_frequency_value = 0.0 if is_simple else float(sampling.alpha_frequency)
+    alpha_decay_value = 1.0 if is_simple else float(sampling.alpha_decay)
+    use_penalties = (not is_simple) and (alpha_presence_value != 0.0 or alpha_frequency_value != 0.0)
+
+    occurrence: torch.Tensor | None = None
+    alpha_presence_vector: torch.Tensor | None = None
+    alpha_presence: torch.Tensor | None = None
+    if use_penalties:
+        # Keep float32 so the post-penalty logits stay float32 (flashinfer expects float32 inputs).
+        occurrence = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
+        alpha_presence_vector = torch.zeros_like(occurrence)
+        alpha_presence = torch.tensor(alpha_presence_value, dtype=torch.float32, device=device)
 
     active_tasks: list[_ActiveTask] = []
     for _ in range(batch_size):
@@ -182,8 +205,10 @@ def _continuous_batching(
     throughput_ema: float | None = None
 
     def _reset_slot(slot_idx: int) -> None:
-        occurrence[slot_idx, :] = 0
-        alpha_presence_vector[slot_idx, :] = 0
+        if occurrence is not None:
+            occurrence[slot_idx, :] = 0
+        if alpha_presence_vector is not None:
+            alpha_presence_vector[slot_idx, :] = 0
         states[0][:, :, slot_idx, :] = 0
         states[1][:, slot_idx, :, :, :] = 0
 
@@ -192,8 +217,10 @@ def _continuous_batching(
         if remove_idx != last_idx:
             states[0][:, :, remove_idx, :] = states[0][:, :, last_idx, :]
             states[1][:, remove_idx, :, :, :] = states[1][:, last_idx, :, :, :]
-            occurrence[remove_idx, :] = occurrence[last_idx, :]
-            alpha_presence_vector[remove_idx, :] = alpha_presence_vector[last_idx, :]
+            if occurrence is not None:
+                occurrence[remove_idx, :] = occurrence[last_idx, :]
+            if alpha_presence_vector is not None:
+                alpha_presence_vector[remove_idx, :] = alpha_presence_vector[last_idx, :]
             active_tasks[remove_idx] = active_tasks[last_idx]
         active_tasks.pop()
 
@@ -232,8 +259,10 @@ def _continuous_batching(
                     accomplished.append(idx)
             else:
                 if not is_simple and new_token not in no_penalty:
-                    occurrence[idx, new_token] += 1.0
-                    alpha_presence_vector[idx, new_token] = alpha_presence
+                    if occurrence is not None:
+                        occurrence[idx, new_token] += 1.0
+                    if alpha_presence_vector is not None and alpha_presence is not None:
+                        alpha_presence_vector[idx, new_token] = alpha_presence
 
         if accomplished:
             for remove_idx in sorted(accomplished, reverse=True):
@@ -266,12 +295,14 @@ def _continuous_batching(
             states[1][:, :active_count, :, :, :],
         ]
         out = model.forward_batch(next_tokens, state_view)
-        alpha_decay_value = 1.0 if is_simple else sampling.alpha_decay
-        alpha_frequency_value = 0.0 if is_simple else sampling.alpha_frequency
-        occurrence *= alpha_decay_value
-        active_occurrence = occurrence[:active_count]
-        active_alpha_presence = alpha_presence_vector[:active_count]
-        out = out - active_alpha_presence - active_occurrence * alpha_frequency_value
+
+        if use_penalties and occurrence is not None:
+            if alpha_decay_value != 1.0:
+                occurrence[:active_count].mul_(alpha_decay_value)
+            if alpha_frequency_value != 0.0:
+                out = out - occurrence[:active_count] * alpha_frequency_value
+            if alpha_presence_value != 0.0 and alpha_presence_vector is not None:
+                out = out - alpha_presence_vector[:active_count]
 
         if ban_tokens:
             out[:, list(ban_tokens)] = -math.inf
@@ -280,12 +311,13 @@ def _continuous_batching(
             temp = sampling.temperature or 1.0
             out /= temp
 
-        logits = out.float().contiguous()
         if is_simple:
+            logits = out
             if noise:
-                logits.add_(torch.empty_like(logits).uniform_(0.0, noise))
+                logits = logits + torch.empty_like(logits).uniform_(0.0, noise)
             new_tokens = torch.argmax(logits, dim=-1)
         elif flashinfer_ok:
+            logits = out.float().contiguous()
             try:
                 new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                     logits, sampling.top_k, sampling.top_p
@@ -297,6 +329,7 @@ def _continuous_batching(
                 force_cpu = logits.is_cuda and ("illegal memory access" in error_text or "cuda error" in error_text)
                 new_tokens = _torch_sample(logits, force_cpu=force_cpu)
         else:
+            logits = out.float().contiguous()
             new_tokens = _torch_sample(logits)
         new_tokens = new_tokens.tolist()
         for idx, task in enumerate(active_tasks):

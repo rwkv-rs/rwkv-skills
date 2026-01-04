@@ -75,7 +75,10 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
 其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的数学问答会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
 采样参数的网格搜索通过 param-search 流程完成：
 - runner job 会把完整网格（先 `normal` 后 `simple`，不截断）每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
-- selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），按总分选出最佳格点，并把对应的 completions/eval/scores 复制/写入到 `results/{completions,eval,scores}` 目录。
+- selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并保留两套互相独立的选参结果：
+  - `normal` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_normal`
+  - `simple` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_simple`
+  -（兼容旧逻辑）两种模式里总分最高的格点仍会写入不带后缀的 `{benchmark}` 产物路径。
 
 调度器在评测最新 2.9B 模型时，会自动对 `gsm8k_test` + `hendrycks_math_test` 启用 param-search。
 

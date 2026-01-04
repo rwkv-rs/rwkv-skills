@@ -137,6 +137,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
     parser.add_argument("--judge-base-url", help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)")
+    parser.add_argument(
+        "--scan-mode",
+        choices=("both", "normal", "simple"),
+        default="both",
+        help="Which sampling grid(s) to scan (default: both)",
+    )
     return parser.parse_args(argv)
 
 
@@ -194,16 +200,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     _cleanup_previous_trials(model_name, slug)
     sizes = grid_size_by_mode()
-    print(
-        f"🔍 Param-search grid: normal={sizes['normal']} + simple={sizes['simple']} (total={sizes['normal'] + sizes['simple']})"
-    )
+    if args.scan_mode == "both":
+        total = sizes["normal"] + sizes["simple"]
+        print(f"🔍 Param-search grid: normal={sizes['normal']} + simple={sizes['simple']} (total={total})")
+    else:
+        print(f"🔍 Param-search grid: {args.scan_mode}={sizes[args.scan_mode]}")
     print(f"    Dataset: {slug} | Model: {model_name} | Judge: {bool(judge)}")
 
     best_key: str | None = None
     best_score: float | None = None
     best_trial: int | None = None
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling):
+    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, scan_mode=args.scan_mode):
         completion_path = param_search_completion_trial_path(slug, model_name=model_name, trial_index=trial_idx)
         eval_path = param_search_eval_trial_path(slug, model_name=model_name, trial_index=trial_idx)
         score_path = param_search_scores_trial_path(slug, model_name=model_name, trial_index=trial_idx)

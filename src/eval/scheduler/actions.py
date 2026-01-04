@@ -53,6 +53,7 @@ class QueueOptions:
     model_globs: tuple[str, ...] = DEFAULT_MODEL_GLOBS
     only_dataset_slugs: tuple[str, ...] = ()
     model_name_patterns: tuple[re.Pattern[str], ...] = ()
+    param_search_scan_mode: str = "both"
 
 
 @dataclass(slots=True)
@@ -123,6 +124,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
         model_select=opts.model_select,
         min_param_b=opts.min_param_b,
         max_param_b=opts.max_param_b,
+        param_search_scan_mode=opts.param_search_scan_mode,
         model_name_patterns=opts.model_name_patterns,
     )
     question_counts = derive_question_counts(score_records)
@@ -190,6 +192,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             model_select=opts.model_select,
             min_param_b=opts.min_param_b,
             max_param_b=opts.max_param_b,
+            param_search_scan_mode=opts.param_search_scan_mode,
             model_name_patterns=opts.model_name_patterns,
         )
         question_counts = derive_question_counts(completed_records)

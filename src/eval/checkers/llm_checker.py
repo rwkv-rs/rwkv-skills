@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import threading
+import heapq
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -190,9 +195,10 @@ class LLMCheckerConfig:
     model: str
     base_url: str | None = None
     temperature: float = 0.0
-    max_workers: int = 8
+    max_workers: int = 16
     max_prompt_chars: int = 20000
-    max_retries: int = 2
+    # Set to -1 to retry forever (handled by the scheduler loop with backoff).
+    max_retries: int = -1
 
     @classmethod
     def from_env(cls) -> LLMCheckerConfig | None:
@@ -215,9 +221,30 @@ class LLMCheckerConfig:
             or os.environ.get("LLM_JUDGE_BASE_URL")
             or os.environ.get("API_BASE")
         )
+        max_workers_raw = os.environ.get("CHECKER_MAX_WORKERS") or os.environ.get("LLM_CHECKER_MAX_WORKERS")
+        max_prompt_chars_raw = os.environ.get("CHECKER_MAX_PROMPT_CHARS") or os.environ.get(
+            "LLM_CHECKER_MAX_PROMPT_CHARS"
+        )
+        max_retries_raw = os.environ.get("CHECKER_MAX_RETRIES") or os.environ.get("LLM_CHECKER_MAX_RETRIES")
         if not api_key or not model:
             return None
-        return cls(api_key=api_key, model=model, base_url=base_url)
+        kwargs: dict[str, Any] = {}
+        if max_workers_raw:
+            try:
+                kwargs["max_workers"] = max(1, int(max_workers_raw))
+            except ValueError:
+                pass
+        if max_prompt_chars_raw:
+            try:
+                kwargs["max_prompt_chars"] = max(1000, int(max_prompt_chars_raw))
+            except ValueError:
+                pass
+        if max_retries_raw:
+            try:
+                kwargs["max_retries"] = int(max_retries_raw)
+            except ValueError:
+                pass
+        return cls(api_key=api_key, model=model, base_url=base_url, **kwargs)
 
 
 def _build_prompt(context: str, answer: str, ref_answer: str) -> str:
@@ -258,45 +285,24 @@ def _call_llm_checker(client: OpenAI, *, config: LLMCheckerConfig, prompt: str) 
     }
 
     last_exc: Exception | None = None
-    for attempt in range(max(1, int(config.max_retries) + 1)):
-        try:
-            response = client.chat.completions.create(
-                model=config.model,
-                stream=False,
-                temperature=float(config.temperature),
-                response_format=response_format,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            content = (response.choices[0].message.content or "").strip()
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                raise _LLMCheckerOutputError("LLM checker output is not a JSON object")
-            data = _coerce_checker_payload(data)
-            _validate_checker_payload(data)
-            return data
-        except (
-            OpenAIError,
-            JSONDecodeError,
-            jsonschema.exceptions.ValidationError,
-            _LLMCheckerOutputError,
-            KeyError,
-            IndexError,
-            TypeError,
-        ) as exc:
-            last_exc = exc
-            # If the provider doesn't support json_schema response_format, fall back to plain JSON.
+    max_retries = int(config.max_retries)
+    if max_retries < 0:
+        # "Retry forever" is implemented by the caller (scheduler loop), so we
+        # always keep a single _call_llm_checker invocation bounded.
+        max_retries = 0
+    attempt = 0
+    use_schema = True
+
+    while True:
+        attempt += 1
+        if use_schema:
             try:
                 response = client.chat.completions.create(
                     model=config.model,
                     stream=False,
                     temperature=float(config.temperature),
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": prompt
-                            + "\n\n仅输出 JSON（不要输出任何额外文本），并确保字段类型正确：布尔值必须是 true/false。",
-                        }
-                    ],
+                    response_format=response_format,
+                    messages=[{"role": "user", "content": prompt}],
                 )
                 content = (response.choices[0].message.content or "").strip()
                 data = json.loads(content)
@@ -313,13 +319,61 @@ def _call_llm_checker(client: OpenAI, *, config: LLMCheckerConfig, prompt: str) 
                 KeyError,
                 IndexError,
                 TypeError,
-            ) as exc2:
-                last_exc = exc2
-                if attempt >= int(config.max_retries):
-                    break
-                continue
+            ) as exc:
+                last_exc = exc
+
+        # Fall back to plain JSON (for providers that don't support json_schema response_format).
+        try:
+            response = client.chat.completions.create(
+                model=config.model,
+                stream=False,
+                temperature=float(config.temperature),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                        + "\n\n仅输出 JSON（不要输出任何额外文本），并确保字段类型正确：布尔值必须是 true/false。",
+                    }
+                ],
+            )
+            content = (response.choices[0].message.content or "").strip()
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise _LLMCheckerOutputError("LLM checker output is not a JSON object")
+            data = _coerce_checker_payload(data)
+            _validate_checker_payload(data)
+            return data
+        except (
+            OpenAIError,
+            JSONDecodeError,
+            jsonschema.exceptions.ValidationError,
+            _LLMCheckerOutputError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ) as exc2:
+            last_exc = exc2
+            use_schema = False
+
+        if max_retries >= 0 and attempt >= max_retries + 1:
+            break
+
+        # Exponential backoff to avoid hammering the provider.
+        delay = min(30.0, 0.5 * (2 ** min(6, attempt - 1)))
+        time.sleep(delay)
 
     raise LLMCheckerFailure(f"LLM checker failed after retries: {last_exc}") from last_exc
+
+
+_thread_local = threading.local()
+
+
+def _get_thread_client(cfg: LLMCheckerConfig) -> OpenAI:
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+        setattr(_thread_local, "client", client)
+    return client
 
 
 def run_llm_checker(
@@ -378,53 +432,136 @@ def run_llm_checker(
         print(f"✅ LLM checker: all failed samples already checked -> {out_path}")
         return out_path
 
-    client = OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("ab") as out_f:
-        for row in to_check:
-            context = _truncate_text(str(row.get("context", "") or ""), max_chars=int(cfg.max_prompt_chars))
-            answer = _truncate_text(
-                str(row.get("answer", "") or ""),
-                max_chars=max(1, int(cfg.max_prompt_chars // 4)),
-            )
-            ref_answer = _truncate_text(
-                str(row.get("ref_answer", "") or ""),
-                max_chars=max(1, int(cfg.max_prompt_chars // 4)),
-            )
-            prompt = _build_prompt(context, answer, ref_answer)
 
-            try:
-                checked = _call_llm_checker(client, config=cfg, prompt=prompt)
-            except LLMCheckerFailure as exc:
-                print(f"⚠️  LLM checker failed; stop early: {exc}")
-                return out_path if out_path.exists() else None
-            output_row = {
-                "benchmark_name": str(row.get("benchmark_name", "") or ""),
-                "dataset_split": str(row.get("dataset_split", "") or ""),
-                "sample_index": int(row.get("sample_index", 0)),
-                "repeat_index": int(row.get("repeat_index", 0)),
-                CHECKER_FIELD_COT: str(checked.get(CHECKER_FIELD_COT, "") or ""),
-                CHECKER_FIELD_ANSWER_CORRECT: bool(checked.get(CHECKER_FIELD_ANSWER_CORRECT, False)),
-                CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR: bool(
-                    checked.get(CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR, False)
-                ),
-                CHECKER_FIELD_WORLD_KNOWLEDGE_ERROR: bool(
-                    checked.get(CHECKER_FIELD_WORLD_KNOWLEDGE_ERROR, False)
-                ),
-                CHECKER_FIELD_MATH_ERROR: bool(checked.get(CHECKER_FIELD_MATH_ERROR, False)),
-                CHECKER_FIELD_REASONING_LOGIC_ERROR: bool(
-                    checked.get(CHECKER_FIELD_REASONING_LOGIC_ERROR, False)
-                ),
-                CHECKER_FIELD_THOUGHT_CONTAINS_CORRECT_ANSWER: bool(
-                    checked.get(CHECKER_FIELD_THOUGHT_CONTAINS_CORRECT_ANSWER, False)
-                ),
-                CHECKER_FIELD_REASON: str(checked.get(CHECKER_FIELD_REASON, "") or ""),
-            }
-            out_f.write(orjson.dumps(output_row, option=orjson.OPT_APPEND_NEWLINE))
+    max_workers = max(1, int(cfg.max_workers))
+    max_workers = min(max_workers, len(to_check))
 
-    print(f"🧩 LLM checker saved: {out_path} (+{len(to_check)} rows)")
-    return out_path
+    def _check_one(row: dict[str, Any]) -> dict[str, Any]:
+        context = _truncate_text(str(row.get("context", "") or ""), max_chars=int(cfg.max_prompt_chars))
+        answer = _truncate_text(
+            str(row.get("answer", "") or ""),
+            max_chars=max(1, int(cfg.max_prompt_chars // 4)),
+        )
+        ref_answer = _truncate_text(
+            str(row.get("ref_answer", "") or ""),
+            max_chars=max(1, int(cfg.max_prompt_chars // 4)),
+        )
+        prompt = _build_prompt(context, answer, ref_answer)
+        client = _get_thread_client(cfg)
+        checked = _call_llm_checker(client, config=cfg, prompt=prompt)
+        return {
+            "benchmark_name": str(row.get("benchmark_name", "") or ""),
+            "dataset_split": str(row.get("dataset_split", "") or ""),
+            "sample_index": int(row.get("sample_index", 0)),
+            "repeat_index": int(row.get("repeat_index", 0)),
+            CHECKER_FIELD_COT: str(checked.get(CHECKER_FIELD_COT, "") or ""),
+            CHECKER_FIELD_ANSWER_CORRECT: bool(checked.get(CHECKER_FIELD_ANSWER_CORRECT, False)),
+            CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR: bool(
+                checked.get(CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR, False)
+            ),
+            CHECKER_FIELD_WORLD_KNOWLEDGE_ERROR: bool(checked.get(CHECKER_FIELD_WORLD_KNOWLEDGE_ERROR, False)),
+            CHECKER_FIELD_MATH_ERROR: bool(checked.get(CHECKER_FIELD_MATH_ERROR, False)),
+            CHECKER_FIELD_REASONING_LOGIC_ERROR: bool(checked.get(CHECKER_FIELD_REASONING_LOGIC_ERROR, False)),
+            CHECKER_FIELD_THOUGHT_CONTAINS_CORRECT_ANSWER: bool(
+                checked.get(CHECKER_FIELD_THOUGHT_CONTAINS_CORRECT_ANSWER, False)
+            ),
+            CHECKER_FIELD_REASON: str(checked.get(CHECKER_FIELD_REASON, "") or ""),
+        }
+
+    retry_forever = int(cfg.max_retries) < 0
+
+    def _row_key(row: dict[str, Any]) -> tuple[str, int, int]:
+        return (
+            str(row.get("dataset_split", "") or ""),
+            int(row.get("sample_index", 0)),
+            int(row.get("repeat_index", 0)),
+        )
+
+    def _describe_row(row: dict[str, Any]) -> str:
+        return (
+            f"benchmark={row.get('benchmark_name','')} "
+            f"split={row.get('dataset_split','')} "
+            f"sample_index={row.get('sample_index',0)} "
+            f"repeat_index={row.get('repeat_index',0)}"
+        )
+
+    def _backoff_seconds(attempt: int) -> float:
+        return min(30.0, 0.5 * (2 ** min(6, max(0, int(attempt) - 1))))
+
+    wrote = 0
+    failed = 0
+    stop_scheduling = False
+    todo = deque(to_check)
+    retry_heap: list[tuple[float, tuple[str, int, int], dict[str, Any]]] = []
+    attempts_by_key: dict[tuple[str, int, int], int] = {}
+    pending: dict[object, dict[str, Any]] = {}
+
+    with out_path.open("ab") as out_f, ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while pending or todo or retry_heap:
+            now = time.monotonic()
+            while retry_heap and retry_heap[0][0] <= now:
+                _, _, row = heapq.heappop(retry_heap)
+                todo.append(row)
+
+            while not stop_scheduling and len(pending) < max_workers and todo:
+                row = todo.popleft()
+                future = executor.submit(_check_one, row)
+                pending[future] = row
+
+            if not pending:
+                if retry_heap:
+                    sleep_for = max(0.0, retry_heap[0][0] - time.monotonic())
+                    time.sleep(min(1.0, sleep_for))
+                    continue
+                break
+
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                row = pending.pop(future)
+                if future.cancelled():
+                    continue
+
+                try:
+                    output_row = future.result()
+                except LLMCheckerFailure as exc:
+                    failed += 1
+
+                    if retry_forever:
+                        key = _row_key(row)
+                        attempt = attempts_by_key.get(key, 0) + 1
+                        attempts_by_key[key] = attempt
+                        delay = _backoff_seconds(attempt)
+                        heapq.heappush(retry_heap, (time.monotonic() + delay, key, row))
+                        print(
+                            "⚠️  LLM checker failed; will retry: "
+                            f"{_describe_row(row)} attempt={attempt} backoff={delay:.1f}s -> {exc}"
+                        )
+                        continue
+
+                    if not stop_scheduling:
+                        stop_scheduling = True
+                        print(f"⚠️  LLM checker failed; stop scheduling new requests: {_describe_row(row)} -> {exc}")
+                        for pending_future in pending:
+                            pending_future.cancel()
+                    continue
+
+                out_f.write(orjson.dumps(output_row, option=orjson.OPT_APPEND_NEWLINE))
+                wrote += 1
+
+    if wrote:
+        suffix = f" (+{wrote} rows)"
+        if failed:
+            suffix += f", failed={failed}"
+        if retry_forever:
+            suffix += ", retry_forever=true"
+        print(f"🧩 LLM checker saved: {out_path}{suffix}")
+        return out_path
+    if failed:
+        print(f"⚠️  LLM checker: no new rows written (failed={failed}) -> {out_path}")
+        return out_path if out_path.exists() else None
+    print(f"✅ LLM checker: no new rows written -> {out_path}")
+    return out_path if out_path.exists() else None
 
 
 __all__ = [

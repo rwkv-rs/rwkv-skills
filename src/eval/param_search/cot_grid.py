@@ -38,11 +38,31 @@ def total_grid_size() -> int:
     return int(sizes["normal"]) + int(sizes["simple"])
 
 
-def iter_cot_sampling_grid(base: SamplingConfig) -> Iterable[tuple[int, SamplingConfig, dict[str, object]]]:
+def grid_size(scan_mode: str = "both") -> int:
+    mode = (scan_mode or "both").strip().lower()
+    sizes = grid_size_by_mode()
+    if mode == "both":
+        return int(sizes["normal"]) + int(sizes["simple"])
+    if mode in sizes:
+        return int(sizes[mode])
+    raise ValueError(f"未知的 scan_mode: {scan_mode!r} (expected: both/normal/simple)")
+
+
+def iter_cot_sampling_grid(
+    base: SamplingConfig,
+    *,
+    scan_mode: str = "both",
+) -> Iterable[tuple[int, SamplingConfig, dict[str, object]]]:
     """Yield (trial_index, cot_sampling_cfg, params_dict) in a stable order.
 
     Order: all normal grid points first, then all simple grid points.
     """
+
+    mode = (scan_mode or "both").strip().lower()
+    if mode not in {"both", "normal", "simple"}:
+        raise ValueError(f"未知的 scan_mode: {scan_mode!r} (expected: both/normal/simple)")
+    include_normal = mode in {"both", "normal"}
+    include_simple = mode in {"both", "simple"}
 
     trial_idx = 0
     normal_grid = product(
@@ -71,7 +91,8 @@ def iter_cot_sampling_grid(base: SamplingConfig) -> Iterable[tuple[int, Sampling
             "alpha_frequency": float(alpha_frequency),
             "alpha_decay": float(alpha_decay),
         }
-        yield trial_idx, cfg, params
+        if include_normal:
+            yield trial_idx, cfg, params
         trial_idx += 1
 
     simple_grid = product(
@@ -90,5 +111,16 @@ def iter_cot_sampling_grid(base: SamplingConfig) -> Iterable[tuple[int, Sampling
             "temperature": float(temperature),
             "noise": float(noise),
         }
-        yield trial_idx, cfg, params
+        if include_simple:
+            yield trial_idx, cfg, params
         trial_idx += 1
+
+
+__all__ = [
+    "NORMAL_COT_GRID",
+    "SIMPLE_COT_GRID",
+    "grid_size_by_mode",
+    "grid_size",
+    "total_grid_size",
+    "iter_cot_sampling_grid",
+]

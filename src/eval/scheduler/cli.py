@@ -156,6 +156,12 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         help="跳过指定 benchmark（名称即可，无需 *_test 后缀）",
     )
+    parser.add_argument(
+        "--param-search-scan-mode",
+        choices=("both", "normal", "simple"),
+        default="both",
+        help="param-search 扫描模式：both/normal/simple（默认 both）",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -194,6 +200,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_globs=model_globs,
             only_dataset_slugs=only_dataset_slugs,
             model_name_patterns=model_name_patterns,
+            param_search_scan_mode=str(args.param_search_scan_mode),
         )
         action_queue(opts)
     elif command == "dispatch":
@@ -213,6 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_globs=model_globs,
             only_dataset_slugs=only_dataset_slugs,
             model_name_patterns=model_name_patterns,
+            param_search_scan_mode=str(args.param_search_scan_mode),
             dispatch_poll_seconds=int(args.dispatch_poll_seconds),
             gpu_idle_max_mem=int(args.gpu_idle_max_mem),
             skip_missing_dataset=bool(args.skip_missing_dataset),

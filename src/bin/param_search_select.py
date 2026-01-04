@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-"""Select the best param-search grid point across multiple benchmarks and promote artifacts.
+"""Select the best param-search grid points and promote artifacts.
 
 This script reads per-trial score JSONs under:
   results/param_search/scores/{model}/{benchmark}/trial_{trial}.json
 
-Then it selects the best shared grid point (by summed objective), and promotes the
-corresponding trial artifacts into the canonical results layout:
-  results/completions, results/eval, results/scores
+It selects the best shared grid point *per sampling mode* (normal/simple) by summed objective,
+then promotes the corresponding trial artifacts into the canonical results layout using suffixes:
+- {benchmark} (best overall across modes; backward compatible)
+- {benchmark}__ps_normal
+- {benchmark}__ps_simple
 """
 
 import argparse
@@ -17,6 +19,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Sequence
 
+from src.eval.checkers.llm_checker import run_llm_checker
 from src.eval.results.layout import (
     eval_details_path,
     jsonl_path,
@@ -28,6 +31,7 @@ from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
 
 
 DEFAULT_BENCHMARKS = ("gsm8k_test", "hendrycks_math_test")
+_MODE_SUFFIXES: dict[str, str] = {"normal": "__ps_normal", "simple": "__ps_simple"}
 
 
 def _resolve_path(path_value: str | Path) -> Path:
@@ -45,6 +49,20 @@ def _objective_from_metrics(metrics: dict[str, Any]) -> float:
     if isinstance(exact, (int, float)):
         return float(exact)
     return 0.0
+
+
+def _sample_mode_from_key(key: str) -> str | None:
+    try:
+        params = json.loads(key)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(params, dict):
+        return None
+    mode = params.get("sample_mode")
+    if not isinstance(mode, str):
+        return None
+    mode = mode.strip().lower()
+    return mode if mode in _MODE_SUFFIXES else None
 
 
 def _param_key_from_payload(payload: dict[str, Any]) -> str | None:
@@ -94,7 +112,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 def _promote_trial(
     *,
     trial_score_path: Path,
-    benchmark: str,
+    dest_dataset: str,
     model_name: str,
     overwrite: bool,
 ) -> None:
@@ -106,9 +124,9 @@ def _promote_trial(
         raise ValueError(f"score JSON missing task_details.eval_details_path: {trial_score_path}")
     source_eval = _resolve_path(eval_details_value)
 
-    dest_completion = jsonl_path(benchmark, is_cot=True, model_name=model_name)
-    dest_eval = eval_details_path(benchmark, is_cot=True, model_name=model_name)
-    dest_score = scores_path(benchmark, is_cot=True, model_name=model_name)
+    dest_completion = jsonl_path(dest_dataset, is_cot=True, model_name=model_name)
+    dest_eval = eval_details_path(dest_dataset, is_cot=True, model_name=model_name)
+    dest_score = scores_path(dest_dataset, is_cot=True, model_name=model_name)
 
     for src, dst in ((source_completion, dest_completion), (source_eval, dest_eval)):
         if not src.exists():
@@ -122,6 +140,7 @@ def _promote_trial(
     if dest_score.exists() and not overwrite:
         return
 
+    payload["dataset"] = dest_dataset
     payload["log_path"] = str(dest_completion)
     if isinstance(payload.get("task_details"), dict):
         payload["task_details"]["eval_details_path"] = str(dest_eval)
@@ -164,44 +183,85 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("❌ 各 benchmark 的 grid 点没有交集（params key 不一致）")
         return 1
 
-    best_key: str | None = None
-    best_sum: float | None = None
-    best_detail: dict[str, float] = {}
-    best_paths: dict[str, Path] = {}
+    selections: dict[str, tuple[str, float, dict[str, float], dict[str, Path]]] = {}
+    for mode in sorted(_MODE_SUFFIXES.keys()):
+        mode_keys = {key for key in common_keys if _sample_mode_from_key(key) == mode}
+        if not mode_keys:
+            continue
 
-    for key in sorted(common_keys):
-        total = 0.0
-        detail: dict[str, float] = {}
-        paths: dict[str, Path] = {}
-        for bench, mapping in by_benchmark.items():
-            score, path = mapping[key]
-            total += float(score)
-            detail[bench] = float(score)
-            paths[bench] = path
-        if best_sum is None or total > best_sum:
-            best_sum = total
-            best_key = key
-            best_detail = detail
-            best_paths = paths
+        best_key: str | None = None
+        best_sum: float | None = None
+        best_detail: dict[str, float] = {}
+        best_paths: dict[str, Path] = {}
+        for key in sorted(mode_keys):
+            total = 0.0
+            detail: dict[str, float] = {}
+            paths: dict[str, Path] = {}
+            for bench, mapping in by_benchmark.items():
+                score, path = mapping[key]
+                total += float(score)
+                detail[bench] = float(score)
+                paths[bench] = path
+            if best_sum is None or total > best_sum:
+                best_sum = total
+                best_key = key
+                best_detail = detail
+                best_paths = paths
 
-    if best_key is None or best_sum is None:
-        print("❌ 未找到可用的最佳 grid 点")
+        if best_key is not None and best_sum is not None:
+            selections[mode] = (best_key, best_sum, best_detail, best_paths)
+
+    if not selections:
+        print("❌ 未找到可用的最佳 grid 点（normal/simple 均无可用交集）")
         return 1
 
-    print("✅ best param-search selection:")
-    print(f"    model: {model_name}")
-    print(f"    total: {best_sum:.6f}")
-    for bench in benchmarks:
-        print(f"    {bench}: {best_detail.get(bench, 0.0):.6f}")
-    print(f"    params: {best_key}")
+    # Backward compatible: still promote the best overall selection into {benchmark}.
+    best_overall_mode, best_overall = max(selections.items(), key=lambda item: item[1][1])
+    best_key, best_sum, best_detail, best_paths = best_overall
 
+    print("✅ best param-search selections:")
+    print(f"    model: {model_name}")
+    for mode in ("normal", "simple"):
+        if mode not in selections:
+            continue
+        _, total, detail, _ = selections[mode]
+        print(f"    {mode}: total={total:.6f} ({', '.join(f'{b}={detail.get(b, 0.0):.6f}' for b in benchmarks)})")
+    print(f"    promote default: {best_overall_mode} -> {{benchmark}}")
+    for mode in ("normal", "simple"):
+        if mode in selections:
+            print(f"    promote: {mode} -> {{benchmark}}{_MODE_SUFFIXES[mode]}")
+
+    # 1) Promote best overall into {benchmark}.
     for bench, score_path in best_paths.items():
         _promote_trial(
             trial_score_path=score_path,
-            benchmark=bench,
+            dest_dataset=bench,
             model_name=model_name,
             overwrite=bool(args.overwrite),
         )
+
+    # 2) Promote per-mode best into {benchmark}__ps_{mode}.
+    for mode, (mode_key, _, _, mode_paths) in selections.items():
+        suffix = _MODE_SUFFIXES[mode]
+        for bench, score_path in mode_paths.items():
+            _promote_trial(
+                trial_score_path=score_path,
+                dest_dataset=f"{bench}{suffix}",
+                model_name=model_name,
+                overwrite=bool(args.overwrite),
+            )
+
+    # 3) Run llm_checker over the final promoted selections (__ps_normal/__ps_simple).
+    for mode in ("normal", "simple"):
+        suffix = _MODE_SUFFIXES.get(mode)
+        if not suffix or mode not in selections:
+            continue
+        for bench in benchmarks:
+            promoted_eval = eval_details_path(f"{bench}{suffix}", is_cot=True, model_name=model_name)
+            if not promoted_eval.exists():
+                print(f"⚠️  LLM checker skipped: missing promoted eval {promoted_eval}")
+                continue
+            run_llm_checker(promoted_eval, model_name=model_name)
 
     # Optional marker output for scheduler/debugging.
     if args.output and not os.environ.get("RWKV_SKILLS_JOB_ID"):
@@ -210,9 +270,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         record = {
             "model": model_name,
             "benchmarks": list(benchmarks),
-            "objective_sum": float(best_sum),
-            "objective_by_benchmark": best_detail,
-            "params": json.loads(best_key),
+            "best_overall_mode": best_overall_mode,
+            "selections": {
+                mode: {
+                    "objective_sum": float(total),
+                    "objective_by_benchmark": detail,
+                    "params": json.loads(key),
+                }
+                for mode, (key, total, detail, _) in selections.items()
+            },
         }
         with out_path.open("w", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
