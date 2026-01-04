@@ -10,7 +10,7 @@ from src.eval.param_search.cot_grid import grid_size_by_mode
 
 from .config import RESULTS_ROOT
 from .dataset_utils import canonical_slug, safe_slug
-from .jobs import JOB_CATALOGUE, JobSpec
+from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset
 from .models import expand_model_paths, filter_model_paths
 from .naming import build_run_slug
 from .state import CompletedKey, RunningEntry
@@ -42,7 +42,7 @@ _EARLY_DATASET_SLUGS = frozenset(
     )
 )
 
-_PARAM_SEARCH_BENCHMARKS = tuple(canonical_slug(slug) for slug in ("gsm8k_test", "hendrycks_math_test"))
+_PARAM_SEARCH_BENCHMARKS = tuple(canonical_slug(slug) for slug in ("gsm8k_test", "math_500_test"))
 
 
 def _normalize_param_search_scan_mode(mode: str | None) -> str:
@@ -129,8 +129,10 @@ def build_queue(
             if model_path not in latest_2_9b_models:
                 continue
             model_slug = safe_slug(model_path.stem)
-            gsm_key = CompletedKey(job="free_response_judge", model_slug=model_slug, dataset_slug=gsm_slug, is_cot=True)
-            math_key = CompletedKey(job="free_response", model_slug=model_slug, dataset_slug=math_slug, is_cot=True)
+            gsm_job = detect_job_from_dataset(gsm_slug, True) or "free_response_judge"
+            math_job = detect_job_from_dataset(math_slug, True) or "free_response"
+            gsm_key = CompletedKey(job=gsm_job, model_slug=model_slug, dataset_slug=gsm_slug, is_cot=True)
+            math_key = CompletedKey(job=math_job, model_slug=model_slug, dataset_slug=math_slug, is_cot=True)
             param_search_enabled[model_path] = (
                 gsm_key not in completed_set
                 and gsm_key not in failed_set

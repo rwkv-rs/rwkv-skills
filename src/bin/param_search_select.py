@@ -30,7 +30,7 @@ from src.eval.scheduler.config import REPO_ROOT, RESULTS_ROOT
 from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
 
 
-DEFAULT_BENCHMARKS = ("gsm8k_test", "hendrycks_math_test")
+DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
 _MODE_SUFFIXES: dict[str, str] = {"normal": "__ps_normal", "simple": "__ps_simple"}
 
 
@@ -95,7 +95,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--benchmarks",
         nargs="+",
         default=list(DEFAULT_BENCHMARKS),
-        help="Benchmarks to aggregate (default: gsm8k_test hendrycks_math_test)",
+        help="Benchmarks to aggregate (default: gsm8k_test math_500_test)",
     )
     parser.add_argument(
         "--overwrite",

@@ -198,7 +198,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
     "param_search_free_response": JobSpec(
         name="param_search_free_response",
         module="src.bin.param_search_free_response",
-        dataset_slugs=(canonical_slug("hendrycks_math_test"),),
+        dataset_slugs=(canonical_slug("math_500_test"),),
         is_cot=True,
         domain="param_search",
         batch_flag="--batch-size",
