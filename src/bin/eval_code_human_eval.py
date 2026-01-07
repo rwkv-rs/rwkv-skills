@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 from pathlib import Path
 from typing import Sequence
 
@@ -15,6 +14,7 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.coding import CodingPipeline, DEFAULT_CODE_SAMPLING
 from src.eval.metrics.code_generation.evaluate import evaluate_human_eval
+from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
 
@@ -59,9 +59,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset)
-    except Exception as exc:
-        print(f"❌ 数据集准备失败: {exc}")
+        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
+    except FileNotFoundError as exc:
+        print(f"❌ {exc}")
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
@@ -128,6 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
     print(f"📊 scores saved: {score_path}")
+    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
     return 0
 
 

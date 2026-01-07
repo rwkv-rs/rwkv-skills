@@ -4,9 +4,11 @@ from __future__ import annotations
 
 This project enforces a strict separation:
 - `results/completions`: model generation traces (prompts/completions/stop reasons only)
-- `results/eval`: evaluator judgments (context + pass/fail + fail reason only)
+- `results/eval`: evaluator judgments (context + pass/fail + fail reason + extracted answer + reference answer)
 
-Both formats are intentionally minimal to keep artifacts stable and reusable.
+Both formats aim to stay stable and reusable. Eval artifacts are derived from
+completions but may store additional evaluator-facing fields to enable
+downstream analysis (e.g. wrong-answer checking).
 """
 
 from dataclasses import asdict
@@ -61,6 +63,8 @@ def make_eval_payload(
     *,
     is_passed: bool,
     fail_reason: str | None = None,
+    answer: str | None = None,
+    ref_answer: str | None = None,
 ) -> dict[str, Any]:
     """Build a canonical `results/eval` line from a `results/completions` line."""
     passed = bool(is_passed)
@@ -71,6 +75,8 @@ def make_eval_payload(
         "sample_index": int(completions_payload.get("sample_index", 0)),
         "repeat_index": int(completions_payload.get("repeat_index", 0)),
         "context": build_context_from_completions(completions_payload),
+        "answer": "" if answer is None else str(answer),
+        "ref_answer": "" if ref_answer is None else str(ref_answer),
         "is_passed": passed,
         "fail_reason": reason,
     }

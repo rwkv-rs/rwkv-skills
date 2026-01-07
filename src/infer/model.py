@@ -22,12 +22,14 @@ class DataVersion(str, Enum):
     G0A3 = "g0a3"
     G0A4 = "g0a4"
     G0B = "g0b"
+    G0C = "g0c"
     G1 = "g1"
     G1A = "g1a"
     G1A2 = "g1a2"
     G1A3 = "g1a3"
     G1A4 = "g1a4"
     G1B = "g1b"
+    G1C = "g1c"
 
 
 class ParamSize(str, Enum):

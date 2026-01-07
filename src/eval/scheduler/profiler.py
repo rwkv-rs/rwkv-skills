@@ -375,12 +375,15 @@ class BatchProfiler:
             sequence.append(value)
             seen.add(value)
 
-        _add(start)
         threshold = start
         fallback = self._previous_power_of_two(start)
-        if fallback is not None:
+        is_power_of_two = (start & (start - 1)) == 0
+        # Prefer probing the nearest lower power-of-two first when `start` is not already a power-of-two:
+        # it is usually more stable for throughput and avoids "odd" batch sizes (e.g. 1319) that can be slower.
+        if fallback is not None and not is_power_of_two:
             _add(fallback)
             threshold = fallback
+        _add(start)
         for candidate in ordered:
             if candidate < threshold:
                 _add(candidate)

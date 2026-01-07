@@ -7,8 +7,8 @@ from typing import Collection, Sequence
 
 
 DATASET_SLUG_ALIASES: dict[str, str] = {
-    "math500_test": "math_500_test",
     "math500": "math_500_test",
+    "math": "hendrycks_math_test",
     "input_data": "ifeval_test",
     "ceval_exam_test": "ceval_test",
     "mbpp": "mbpp_test",
@@ -33,6 +33,15 @@ _KNOWN_SPLIT_NAMES = {
     "verified",
     "all",
     "text",
+    # HLE category splits (data/hle/{math,cs,...}.jsonl) should keep the parent prefix.
+    "other",
+    "human",
+    "math",
+    "phy",
+    "cs",
+    "bio",
+    "chem",
+    "eng",
 }
 
 
@@ -47,7 +56,7 @@ def safe_slug(text: str) -> str:
 
 
 def canonical_slug(text: str) -> str:
-    slug = safe_slug(text)
+    slug = safe_slug(text).lower()
     return DATASET_SLUG_ALIASES.get(slug, slug)
 
 
@@ -86,7 +95,9 @@ def infer_dataset_slug_from_path(dataset_path: str) -> str:
     stem = path.stem
     parent = path.parent.name
     lower_stem = stem.lower()
-    if lower_stem in _KNOWN_SPLIT_NAMES and parent:
+    # Prefer `parent_stem` when the file name looks like a split (e.g. data/<bench>/<split>.jsonl).
+    # Avoid prefixing the top-level data dir so files like data/math.jsonl can still be aliased.
+    if lower_stem in _KNOWN_SPLIT_NAMES and parent and parent.lower() != "data":
         candidate = f"{parent}_{stem}"
     else:
         candidate = stem

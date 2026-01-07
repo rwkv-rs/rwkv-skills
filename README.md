@@ -77,7 +77,14 @@ The default model glob is configured in `src/eval/scheduler/config.py` (it only 
 
 Math QA sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
 
-Sampling-parameter scan can be enabled in `eval_free_response.py` via `--param-search` (optionally cap runs with `--param-search-trials`, max 30 per `sample_mode`). The scan sweeps CoT sampling in two modes: `normal` (temperature/top_p/alpha_*) first, then `simple` (albatross-style temperature+noise); answer-stage sampling stays fixed. The best trial's params are written to `task_details.param_search` in the score JSON.
+Sampling-parameter grid search is handled via the param-search workflow:
+- Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}` (full grid: `normal` then `simple`; no truncation).
+- The selector job aggregates `results/param_search/scores/...` across `gsm8k_test` + `hendrycks_math_test` (alias: `math`) and promotes two independent selections:
+  - best `normal` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_normal`
+  - best `simple` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_simple`
+  - (backward compatible) the best overall grid point is also promoted to the unsuffixed `{benchmark}` paths.
+
+When evaluating the latest 2.9B model, the scheduler automatically runs param-search on `gsm8k_test` + `hendrycks_math_test`.
 
 ## HumanEval code generation evaluation
 - Dataset prep: `prepare_dataset("human_eval", Path("data"))` downloads the official `HumanEval.jsonl.gz` and writes `data/human_eval/test.jsonl`.

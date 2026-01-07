@@ -16,7 +16,7 @@ from src.eval.scheduler.jobs import detect_job_from_dataset
 
 
 ARCH_VERSIONS = ("rwkv7", "rwkv7a", "rwkv7b")
-DATA_VERSIONS = ("g0", "g0a", "g0a2", "g0a3", "g0a4", "g0b", "g1", "g1a", "g1a2", "g1a3", "g1a4", "g1b")
+DATA_VERSIONS = ("g0", "g0a", "g0a2", "g0a3", "g0a4", "g0b", "g0c", "g1", "g1a", "g1a2", "g1a3", "g1a4", "g1b", "g1c")
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 

@@ -86,20 +86,22 @@ def evaluate_instruction_following(
             if sample_index < 0 or sample_index >= len(dataset):
                 response = _response_from_completion(payload)
                 follow_list: list[bool] = []
+                ref_answer = ""
             else:
                 record = dataset[sample_index]
                 response = _response_from_completion(payload)
                 follow_list = []
+                ref_parts: list[str] = []
 
                 variants = None if strict else _build_loose_variants(response)
                 for idx, instruction_id in enumerate(record.instruction_ids):
                     instruction_cls = registry[instruction_id]
                     instruction = instruction_cls(instruction_id)
                     kwargs = record.kwargs_list[idx]
-                    instruction.build_description(**kwargs)
+                    description = instruction.build_description(**kwargs)
                     args = instruction.get_instruction_args()
                     if args and "prompt" in args:
-                        instruction.build_description(prompt=record.prompt)
+                        description = instruction.build_description(prompt=record.prompt)
 
                     if strict:
                         is_following = bool(response.strip() and instruction.check_following(response))
@@ -110,6 +112,10 @@ def evaluate_instruction_following(
                                 is_following = True
                                 break
                     follow_list.append(is_following)
+                    if description:
+                        ref_parts.append(f"{instruction_id}: {description}")
+                    else:
+                        ref_parts.append(str(instruction_id))
 
                     tier0_key = instruction_id.split(":")[0]
                     tier0_total[tier0_key] = tier0_total.get(tier0_key, 0) + 1
@@ -117,6 +123,7 @@ def evaluate_instruction_following(
                     if is_following:
                         tier0_correct[tier0_key] = tier0_correct.get(tier0_key, 0) + 1
                         tier1_correct[instruction_id] = tier1_correct.get(instruction_id, 0) + 1
+                ref_answer = "\n".join(ref_parts)
 
             follow_all = bool(follow_list) and all(follow_list)
             prompt_total += 1
@@ -126,7 +133,17 @@ def evaluate_instruction_following(
             instruction_correct += sum(1 for flag in follow_list if flag)
 
             rows_for_avg.append((sample_index, repeat_index, follow_all))
-            out_f.write(orjson.dumps(make_eval_payload(payload, is_passed=follow_all), option=orjson.OPT_APPEND_NEWLINE))
+            out_f.write(
+                orjson.dumps(
+                    make_eval_payload(
+                        payload,
+                        is_passed=follow_all,
+                        answer=response,
+                        ref_answer=ref_answer,
+                    ),
+                    option=orjson.OPT_APPEND_NEWLINE,
+                )
+            )
 
     prompt_accuracy = prompt_correct / prompt_total if prompt_total else 0.0
     instruction_accuracy = instruction_correct / instruction_total if instruction_total else 0.0

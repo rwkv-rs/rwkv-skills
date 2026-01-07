@@ -22,11 +22,11 @@ from .config import (
     REPO_ROOT,
 )
 from .datasets import DATASET_ROOTS, DATA_OUTPUT_ROOT
-from .jobs import JOB_CATALOGUE, JobSpec, locate_dataset
+from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset, locate_dataset
 from .naming import build_run_log_name
 from .process import FAILURE_MONITOR, JobFailure, handle_job_failure, launch_job, list_idle_gpus, log_job_event
 from .profiler import BatchProfiler
-from .queue import QueueItem, build_queue, sort_queue_items
+from .queue import _PARAM_SEARCH_BENCHMARKS, QueueItem, build_queue, sort_queue_items
 from .question_counts import derive_question_counts
 from .state import (
     CompletedKey,
@@ -53,6 +53,7 @@ class QueueOptions:
     model_globs: tuple[str, ...] = DEFAULT_MODEL_GLOBS
     only_dataset_slugs: tuple[str, ...] = ()
     model_name_patterns: tuple[re.Pattern[str], ...] = ()
+    param_search_scan_mode: str = "both"
 
 
 @dataclass(slots=True)
@@ -123,6 +124,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
         model_select=opts.model_select,
         min_param_b=opts.min_param_b,
         max_param_b=opts.max_param_b,
+        param_search_scan_mode=opts.param_search_scan_mode,
         model_name_patterns=opts.model_name_patterns,
     )
     question_counts = derive_question_counts(score_records)
@@ -190,6 +192,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             model_select=opts.model_select,
             min_param_b=opts.min_param_b,
             max_param_b=opts.max_param_b,
+            param_search_scan_mode=opts.param_search_scan_mode,
             model_name_patterns=opts.model_name_patterns,
         )
         question_counts = derive_question_counts(completed_records)
@@ -341,6 +344,21 @@ def action_dispatch(opts: DispatchOptions) -> None:
             )
             if opts.overwrite:
                 overwritten_keys.add(completed_key)
+                if item.job_name == "param_search_select":
+                    # param_search_select promotes trial artifacts into the canonical eval layout, so the
+                    # "completed" keys that appear under log_dir are the downstream eval jobs (e.g.
+                    # free_response_judge), not param_search_select itself. Register them so overwrite mode
+                    # can converge instead of re-queuing selection indefinitely.
+                    for benchmark_slug in _PARAM_SEARCH_BENCHMARKS:
+                        promoted_job = detect_job_from_dataset(benchmark_slug, True) or "free_response_judge"
+                        overwritten_keys.add(
+                            CompletedKey(
+                                job=promoted_job,
+                                model_slug=item.model_slug,
+                                dataset_slug=benchmark_slug,
+                                is_cot=True,
+                            )
+                        )
 
             env = os.environ.copy()
             env.update(
@@ -371,6 +389,10 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 dataset_questions=questions,
             )
 
+            extra_args = item.extra_args
+            if opts.overwrite and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
+                extra_args = extra_args + ("--overwrite",)
+
             command = build_command(
                 job,
                 item.model_path,
@@ -378,6 +400,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 f"cuda:{gpu}",
                 batch_size=batch_size,
                 output_path=completion_path,
+                extra_args=extra_args,
             )
             print(f"🚀 Launch {item.job_id} -> cuda:{gpu}")
             print(f"    Dataset: {dataset_path}")
@@ -435,6 +458,7 @@ def build_command(
     *,
     batch_size: int | None = None,
     output_path: Path | None = None,
+    extra_args: Sequence[str] = (),
 ) -> list[str]:
     base = [DEFAULT_PYTHON, "-m", job.module]
     args = [
@@ -451,6 +475,8 @@ def build_command(
         args.extend(["--output", str(output_path)])
     if job.extra_args:
         args.extend(job.extra_args)
+    if extra_args:
+        args.extend(extra_args)
     return base + args
 
 

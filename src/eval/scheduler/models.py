@@ -25,12 +25,14 @@ DATA_VERSION_ORDER: Final[tuple[str, ...]] = (
     "g0a3",
     "g0a4",
     "g0b",
+    "g0c",
     "g1",
     "g1a",
     "g1a2",
     "g1a3",
     "g1a4",
     "g1b",
+    "g1c",
 )
 NUM_PARAM_ORDER: Final[tuple[str, ...]] = ("0.1b", "0.4b", "1.5b", "2.9b", "7.2b", "13.3b")
 NUM_PARAM_SKIP: Final[set[str]] = {"0.1b", "0.4b"}

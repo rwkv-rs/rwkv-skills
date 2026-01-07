@@ -14,7 +14,12 @@ from src.eval.metrics.free_response import (
     compute_avg_at_k,
     evaluate_free_response,
 )
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.checkers.llm_checker import run_llm_checker
+from src.eval.results.layout import (
+    eval_details_path,
+    jsonl_path,
+    write_scores_json,
+)
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.free_response import (
@@ -49,8 +54,6 @@ HARD_MATH_AVG_K_OVERRIDES = {
     "aime24_test": AIME_AVG_K,
     "aime25_test": AIME_AVG_K,
 }
-
-
 def _load_env_file(path: Path) -> None:
     """Lightweight .env loader (key=value, optional quotes, ignores comments)."""
     if not path.exists():
@@ -92,11 +95,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Scheduler compatibility flag: run a single-sample probe",
     )
     parser.add_argument(
-        "--no-param-search",
-        action="store_true",
-        help="Compatibility flag (no-op).",
-    )
-    parser.add_argument(
         "--pass-k",
         type=int,
         action="append",
@@ -118,13 +116,13 @@ def _max_k(values) -> int:
     return max(values) if values else 0
 
 
-def _resolve_pass_k(slug: str, args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[int, ...]]:
+def _resolve_pass_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
     if args.pass_k:
         resolved = tuple(args.pass_k)
-        return resolved, resolved
+        return resolved
     lower_slug = canonical_slug(str(slug))
     final_pass_k = AIME_PASS_K if lower_slug in HARD_MATH_PASS_K_SLUGS else DEFAULT_PASS_K
-    return final_pass_k, final_pass_k
+    return final_pass_k
 
 
 def _resolve_avg_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
@@ -160,10 +158,10 @@ def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[s
     for key, value in metric_map.items():
         if not key.startswith(prefix):
             continue
-        try:
-            suffix = int(key.split("@", 1)[1])
-        except (ValueError, IndexError):
+        suffix_text = key[len(prefix) :]
+        if not suffix_text.isdigit():
             continue
+        suffix = int(suffix_text)
         if suffix in allowed:
             filtered[key] = value
     return filtered
@@ -173,15 +171,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     _load_env_file(Path(".env"))
     args = parse_args(argv)
     try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset)
-    except Exception as exc:
-        print(f"❌ 数据集准备失败: {exc}")
+        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
+    except FileNotFoundError as exc:
+        print(f"❌ {exc}")
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
-    pass_k_final, _ = _resolve_pass_k(slug, args)
+    pass_k_final = _resolve_pass_k(slug, args)
     avg_k_final = _resolve_avg_k(slug, args)
     report_pass_k = _report_pass_k(slug, pass_k_final)
     report_avg_k = _report_avg_k(slug, avg_k_final)
@@ -209,18 +207,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
-
-    result = pipeline.run(
-        dataset_path=str(dataset_path),
-        output_path=str(output_path),
-        cot_sampling=cot_sampling,
-        final_sampling=final_sampling,
-        batch_size=max(1, args.batch_size),
-        sample_limit=sample_limit,
-        pass_k=generate_pass_k,
-        samples_per_task=samples_per_task if not args.probe_only else 1,
-        write_output=not args.probe_only,
-    )
 
     # Evaluate from canonical completions (no reference/metrics fields inside).
     judge_model = (
@@ -250,6 +236,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_url=judge_base_url,
             )
         )
+
+    result = pipeline.run(
+        dataset_path=str(dataset_path),
+        output_path=str(output_path),
+        cot_sampling=cot_sampling,
+        final_sampling=final_sampling,
+        batch_size=max(1, args.batch_size),
+        sample_limit=sample_limit,
+        pass_k=generate_pass_k,
+        samples_per_task=samples_per_task,
+        write_output=True,
+    )
     eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
     evaluation = evaluate_free_response(
         output_path,
@@ -283,13 +281,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         metrics=metrics_payload,
         samples=evaluation.samples,
         problems=result.problem_count,
-        log_path=out_path,
+        log_path=output_path,
         task="free_response_judge",
         task_details=task_details,
     )
     print(f"✅ judge CoT done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")
+    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
     return 0
 
 

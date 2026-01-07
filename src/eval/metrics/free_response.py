@@ -158,6 +158,8 @@ def evaluate_free_response(
 
     payloads: list[dict] = []
     exact_flags: list[bool] = []
+    answers: list[str] = []
+    ref_answers: list[str] = []
     judge_inputs: list[tuple[str, str, str]] = []
 
     # First pass: compute exact + gather judge inputs
@@ -178,6 +180,8 @@ def evaluate_free_response(
 
         payloads.append(payload)
         exact_flags.append(bool(exact))
+        answers.append(prediction)
+        ref_answers.append(reference)
         if judge is not None:
             judge_inputs.append((question, reference, prediction))
 
@@ -200,7 +204,17 @@ def evaluate_free_response(
                 else:
                     passed = bool(exact_flags[idx])
                 rows_for_at_k.append((sample_index, repeat_index, passed))
-                out_f.write(orjson.dumps(make_eval_payload(payload, is_passed=passed), option=orjson.OPT_APPEND_NEWLINE))
+                out_f.write(
+                    orjson.dumps(
+                        make_eval_payload(
+                            payload,
+                            is_passed=passed,
+                            answer=answers[idx],
+                            ref_answer=ref_answers[idx],
+                        ),
+                        option=orjson.OPT_APPEND_NEWLINE,
+                    )
+                )
     else:
         for idx, payload in enumerate(payloads):
             sample_index = int(payload.get("sample_index", 0))

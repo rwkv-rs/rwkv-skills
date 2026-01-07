@@ -11,6 +11,7 @@ from src.eval.scheduler.config import (
     DEFAULT_LOG_DIR,
     DEFAULT_COMPLETION_DIR,
     DEFAULT_EVAL_RESULT_DIR,
+    DEFAULT_CHECK_RESULT_DIR,
     DEFAULT_RUN_LOG_DIR,
 )
 from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
@@ -18,9 +19,13 @@ from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
 
 COMPLETIONS_ROOT = DEFAULT_COMPLETION_DIR
 EVAL_RESULTS_ROOT = DEFAULT_EVAL_RESULT_DIR
+CHECK_RESULTS_ROOT = DEFAULT_CHECK_RESULT_DIR
 SCORES_ROOT = DEFAULT_LOG_DIR
 CONSOLE_LOG_ROOT = DEFAULT_RUN_LOG_DIR
 PARAM_SEARCH_ROOT = RESULTS_ROOT / "param_search"
+PARAM_SEARCH_COMPLETIONS_ROOT = PARAM_SEARCH_ROOT / "completions"
+PARAM_SEARCH_EVAL_RESULTS_ROOT = PARAM_SEARCH_ROOT / "eval"
+PARAM_SEARCH_SCORES_ROOT = PARAM_SEARCH_ROOT / "scores"
 
 
 def ensure_results_structure() -> None:
@@ -28,9 +33,13 @@ def ensure_results_structure() -> None:
         RESULTS_ROOT,
         COMPLETIONS_ROOT,
         EVAL_RESULTS_ROOT,
+        CHECK_RESULTS_ROOT,
         SCORES_ROOT,
         CONSOLE_LOG_ROOT,
         PARAM_SEARCH_ROOT,
+        PARAM_SEARCH_COMPLETIONS_ROOT,
+        PARAM_SEARCH_EVAL_RESULTS_ROOT,
+        PARAM_SEARCH_SCORES_ROOT,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -69,49 +78,96 @@ def eval_details_path(dataset_slug: str, *, is_cot: bool, model_name: str) -> Pa
     rel = _model_dataset_relpath(dataset_slug, is_cot=is_cot, model_name=model_name)
     return _materialize(rel, suffix="_results.jsonl", root=EVAL_RESULTS_ROOT)
 
-
-def param_search_dir(dataset_slug: str, *, is_cot: bool, model_name: str) -> Path:
+def check_details_path(benchmark_name: str, *, model_name: str) -> Path:
+    """Per-benchmark checker output (results/check/{model}/{benchmark}.jsonl)."""
     ensure_results_structure()
-    rel = _model_dataset_relpath(dataset_slug, is_cot=is_cot, model_name=model_name)
-    directory = PARAM_SEARCH_ROOT / rel
+    model_dir = safe_slug(model_name)
+    bench = safe_slug(benchmark_name)
+    target = CHECK_RESULTS_ROOT / model_dir / f"{bench}.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+def param_search_dir(dataset_slug: str, *, model_name: str, root: Path) -> Path:
+    ensure_results_structure()
+    model_dir = safe_slug(model_name)
+    benchmark_dir = canonical_slug(dataset_slug)
+    directory = root / model_dir / benchmark_dir
     directory.mkdir(parents=True, exist_ok=True)
     return directory
 
 
-def param_search_trial_path(
+def param_search_completion_trial_path(
     dataset_slug: str,
     *,
-    is_cot: bool,
     model_name: str,
     trial_index: int,
 ) -> Path:
-    directory = param_search_dir(dataset_slug, is_cot=is_cot, model_name=model_name)
-    return directory / f"trial_{trial_index:02d}.jsonl"
+    directory = param_search_dir(dataset_slug, model_name=model_name, root=PARAM_SEARCH_COMPLETIONS_ROOT)
+    return directory / f"trial_{int(trial_index)}.jsonl"
+
+def param_search_eval_trial_path(
+    dataset_slug: str,
+    *,
+    model_name: str,
+    trial_index: int,
+) -> Path:
+    directory = param_search_dir(dataset_slug, model_name=model_name, root=PARAM_SEARCH_EVAL_RESULTS_ROOT)
+    return directory / f"trial_{int(trial_index)}.jsonl"
 
 
-def param_search_records_path(dataset_slug: str, *, is_cot: bool, model_name: str) -> Path:
-    directory = param_search_dir(dataset_slug, is_cot=is_cot, model_name=model_name)
-    return directory / "records.jsonl"
+def param_search_scores_trial_path(
+    dataset_slug: str,
+    *,
+    model_name: str,
+    trial_index: int,
+) -> Path:
+    directory = param_search_dir(dataset_slug, model_name=model_name, root=PARAM_SEARCH_SCORES_ROOT)
+    return directory / f"trial_{int(trial_index)}.json"
 
 
 __all__ = [
     "COMPLETIONS_ROOT",
     "EVAL_RESULTS_ROOT",
+    "CHECK_RESULTS_ROOT",
     "CONSOLE_LOG_ROOT",
     "SCORES_ROOT",
     "PARAM_SEARCH_ROOT",
+    "PARAM_SEARCH_COMPLETIONS_ROOT",
+    "PARAM_SEARCH_EVAL_RESULTS_ROOT",
+    "PARAM_SEARCH_SCORES_ROOT",
     "ensure_results_structure",
     "jsonl_path",
     "scores_path",
     "eval_details_path",
+    "check_details_path",
     "param_search_dir",
-    "param_search_trial_path",
-    "param_search_records_path",
+    "param_search_completion_trial_path",
+    "param_search_eval_trial_path",
+    "param_search_scores_trial_path",
     "write_scores_json",
+    "make_scores_payload",
+    "write_scores_json_to_path",
 ]
 
 
-def write_scores_json(
+def _normalize_jsonable(value):  # noqa: ANN001
+    import numpy as np  # local import: avoids import cost in CLI startup
+
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _normalize_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_jsonable(v) for v in value]
+    return value
+
+
+def make_scores_payload(
     dataset_slug: str,
     *,
     is_cot: bool,
@@ -123,39 +179,8 @@ def write_scores_json(
     task: str | None = None,
     task_details: dict | None = None,
     extra: dict | None = None,
-) -> Path:
-    """Persist aggregated metrics as JSON in the canonical scores directory.
-
-    The payload shape intentionally mirrors the documented example:
-    {
-        "dataset": ..., "model": ..., "cot": bool,
-        "metrics": {...}, "samples": int,
-        "problems": optional int,
-        "created_at": iso8601, "log_path": "results/completions/...jsonl",
-        "task": "optional task name",
-        "task_details": {"task specific breakdowns"},
-        ...extra
-    }
-    """
-
-    def _normalize_jsonable(value):  # noqa: ANN001
-        import numpy as np  # local import: avoids import cost in CLI startup
-
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, np.generic):
-            return value.item()
-
-        if isinstance(value, Path):
-            return str(value)
-        if isinstance(value, dict):
-            return {k: _normalize_jsonable(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple, set)):
-            return [_normalize_jsonable(v) for v in value]
-        return value
-
+) -> dict:
     ensure_results_structure()
-    path = scores_path(dataset_slug, is_cot=is_cot, model_name=model_name)
     payload = {
         "dataset": dataset_slug,
         "model": model_name,
@@ -173,7 +198,43 @@ def write_scores_json(
         payload["task_details"] = task_details
     if extra:
         payload.update(extra)
+    return payload
 
+
+def write_scores_json_to_path(path: Path, payload: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
     return path
+
+
+def write_scores_json(
+    dataset_slug: str,
+    *,
+    is_cot: bool,
+    model_name: str,
+    metrics: dict,
+    samples: int,
+    problems: int | None = None,
+    log_path: Path | str,
+    task: str | None = None,
+    task_details: dict | None = None,
+    extra: dict | None = None,
+) -> Path:
+    """Persist aggregated metrics as JSON in the canonical scores directory."""
+
+    ensure_results_structure()
+    path = scores_path(dataset_slug, is_cot=is_cot, model_name=model_name)
+    payload = make_scores_payload(
+        dataset_slug,
+        is_cot=is_cot,
+        model_name=model_name,
+        metrics=metrics,
+        samples=samples,
+        problems=problems,
+        log_path=log_path,
+        task=task,
+        task_details=task_details,
+        extra=extra,
+    )
+    return write_scores_json_to_path(path, payload)

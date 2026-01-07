@@ -65,6 +65,9 @@ def evaluate_multiple_choice(
     with eval_output_path.open("wb") as out_f:
         for payload in _iter_jsonl(completions_path):
             sample_index = int(payload.get("sample_index", 0))
+            last_stage = _max_stage_index(payload)
+            token_text = str(payload.get(f"completion{last_stage}", ""))
+            predicted = _extract_choice_letter(token_text)
             if sample_index < 0 or sample_index >= len(dataset):
                 # Unknown sample index -> mark incorrect, but still emit an eval row.
                 passed = False
@@ -74,10 +77,6 @@ def evaluate_multiple_choice(
                 record = dataset[sample_index]
                 subject = record.subject
                 answer_letter = ALPHABET[record.answer_index]
-
-                last_stage = _max_stage_index(payload)
-                token_text = str(payload.get(f"completion{last_stage}", ""))
-                predicted = _extract_choice_letter(token_text)
                 passed = bool(predicted) and predicted == answer_letter
 
             total += 1
@@ -90,7 +89,17 @@ def evaluate_multiple_choice(
                 sub_hits += 1
             subject_totals[subject] = (sub_total, sub_hits)
 
-            out_f.write(orjson.dumps(make_eval_payload(payload, is_passed=passed), option=orjson.OPT_APPEND_NEWLINE))
+            out_f.write(
+                orjson.dumps(
+                    make_eval_payload(
+                        payload,
+                        is_passed=passed,
+                        answer=predicted or "",
+                        ref_answer=answer_letter or "",
+                    ),
+                    option=orjson.OPT_APPEND_NEWLINE,
+                )
+            )
 
     accuracy_by_subject = {
         subj: (hits / count if count else 0.0) for subj, (count, hits) in subject_totals.items()
@@ -100,4 +109,3 @@ def evaluate_multiple_choice(
 
 
 __all__ = ["MultipleChoiceMetrics", "evaluate_multiple_choice"]
-

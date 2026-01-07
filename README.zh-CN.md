@@ -73,7 +73,14 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
 `src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`。
 其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的数学问答会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
-`eval_free_response.py` 支持用 `--param-search` 开启采样参数扫描（可用 `--param-search-trials` 限制扫描次数，每种 `sample_mode` 最多 30）。扫描会按顺序先跑 `normal`（temperature/top_p/alpha_*），再跑 `simple`（albatross 风格 temperature+noise），answer 阶段的 sampling 参数保持固定不扫描；最佳 trial 的参数会写入 score JSON 的 `task_details.param_search`。
+采样参数的网格搜索通过 param-search 流程完成：
+- runner job 会把完整网格（先 `normal` 后 `simple`，不截断）每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
+- selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并保留两套互相独立的选参结果：
+  - `normal` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_normal`
+  - `simple` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_simple`
+  -（兼容旧逻辑）两种模式里总分最高的格点仍会写入不带后缀的 `{benchmark}` 产物路径。
+
+调度器在评测最新 2.9B 模型时，会自动对 `gsm8k_test` + `hendrycks_math_test` 启用 param-search。
 
 ## HumanEval 代码生成评测
 - 数据集准备：`prepare_dataset("human_eval", Path("data"))` 会下载官方 `HumanEval.jsonl.gz` 并写出 `data/human_eval/test.jsonl`。
