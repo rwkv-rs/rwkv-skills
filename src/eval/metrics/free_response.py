@@ -2,16 +2,17 @@ from __future__ import annotations
 
 """Free-form QA evaluation over canonical `results/completions` JSONL."""
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 import json
 import re
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
-import unicodedata
 
 import orjson
-
+import tqdm
 from openai import OpenAI
 
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
@@ -99,7 +100,11 @@ class LLMJudgeConfig:
     api_key: str
     model: str
     base_url: str | None = None
-    max_workers: int = 32
+    max_workers: int = 4
+
+    max_retries: int = 3
+    backoff_base: float = 0.5
+
     prompt_template: str = (
         "You are a rigorous AI judge. Your task is to evaluate whether a student's "
         "answer is semantically completely equivalent to the reference answer, based on "
@@ -122,21 +127,41 @@ class LLMJudge:
             prompt = prompt.replace("<Q>", question)
             prompt = prompt.replace("<REF>", reference)
             prompt = prompt.replace("<A>", prediction)
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                stream=False,
-                temperature=0.0,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            content = (response.choices[0].message.content or "").strip()
-            if content not in {"True", "False"}:
-                raise ValueError(f"LLM judge 输出非法值: {content}")
-            return content == "True"
+
+            # Retry loop with exponential backoff
+            for attempt in range(self.config.max_retries + 1):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.config.model,
+                        stream=False,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    content = (response.choices[0].message.content or "").strip()
+
+                    if content not in {"True", "False"}:
+                        raise ValueError(f"LLM judge 输出非法值: {content!r}")
+
+                    return content == "True"
+
+                except Exception:
+                    # Final attempt failed: don't crash overall eval, just return False
+                    if attempt == self.config.max_retries:
+                        return False
+
+                    backoff = self.config.backoff_base * (2**attempt)
+                    time.sleep(backoff)
+
+            return False
 
         results: list[bool] = [False for _ in range(len(items))]
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
-            futures = {executor.submit(worker, entry): idx for idx, entry in enumerate(items)}
-            for future in as_completed(futures):
+            futures = {
+                executor.submit(worker, entry): idx for idx, entry in enumerate(items)
+            }
+            for future in tqdm.tqdm(
+                as_completed(futures), total=len(futures), desc="LLM judging"
+            ):
                 idx = futures[future]
                 results[idx] = future.result()
         return results
@@ -227,7 +252,9 @@ def evaluate_free_response(
 
     samples = len(payloads)
     exact_accuracy = total_exact / samples if samples else 0.0
-    judge_accuracy = (total_judge / samples) if (judge_flags is not None and samples) else None
+    judge_accuracy = (
+        (total_judge / samples) if (judge_flags is not None and samples) else None
+    )
     return FreeResponseEvaluation(
         exact_accuracy=exact_accuracy,
         judge_accuracy=judge_accuracy,

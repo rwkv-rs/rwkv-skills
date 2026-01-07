@@ -109,6 +109,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
     parser.add_argument("--judge-base-url", help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)")
+    parser.add_argument("--judge-max-workers", type=int, default=32, help="Max concurrent workers for LLM judge")
     return parser.parse_args(argv)
 
 
@@ -234,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 api_key=judge_api_key,
                 model=judge_model,
                 base_url=judge_base_url,
+                max_workers=args.judge_max_workers,
             )
         )
 
