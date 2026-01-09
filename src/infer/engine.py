@@ -294,6 +294,7 @@ def _continuous_batching(
         state_view = [
             states[0][:, :, :active_count, :],
             states[1][:, :active_count, :, :, :],
+            states[2],
         ]
         out = model.forward_batch(next_tokens, state_view)
 
