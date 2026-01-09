@@ -74,7 +74,7 @@ To ignore existing results under `results/scores` and force a rerun, pass `--ove
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
 
 The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler entry scripts are provided:
-`src/bin/eval_multi_choice.py`, `eval_multi_choice_cot.py`, `eval_free_response.py`, `eval_free_response_judge.py`, `eval_instruction_following.py`, `eval_code_human_eval.py`, `eval_code_mbpp.py`.
+`src/bin/eval_multi_choice.py`, `eval_multi_choice_cot.py`, `eval_free_response.py`, `eval_free_response_judge.py`, `eval_instruction_following.py`, `eval_code_human_eval.py`, `eval_code_mbpp.py`, `eval_code_livecodebench.py`.
 
 Math QA sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
 
@@ -113,8 +113,23 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
   ```
   Multiple samples are generated and executed against EvalPlus test cases to output pass@k (number of generations equals the maximum k).
 
+## LiveCodeBench code generation evaluation
+- Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_latest (lite) split and writes `data/livecodebench/test.jsonl`.
+- Versioned datasets: `livecodebench_v1` ... `livecodebench_v6` (lite).
+- Run via CLI:
+  ```bash
+  python -m src.bin.eval_code_livecodebench \
+    --model-path weights/rwkv7-*.pth \
+    --dataset data/livecodebench/test.jsonl \
+    --batch-size 64 \
+    --pass-k 1 --pass-k 5 \
+    --eval-timeout 6 \
+    --eval-workers 12
+  ```
+  LiveCodeBench uses the extracted code blocks for execution and reports pass@k (number of generations equals the maximum k).
+
 ## Known gaps / TODO
-- Other code benchmarks (LiveCodeBench/BigCodeBench, etc.) are not supported yet; code generation currently covers only HumanEval and MBPP.
+- Other code benchmarks (BigCodeBench, etc.) are not supported yet.
 
 Contributions are welcome—please implement missing pieces and update the docs accordingly.
 

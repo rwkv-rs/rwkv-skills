@@ -172,8 +172,10 @@ def _normalize_metrics(payload: dict[str, Any], *, dataset: str, is_cot: bool, t
     job_name = detect_job_from_dataset(dataset, is_cot=is_cot)
     slug = canonical_slug(dataset)
     normalized_slug = "".join(ch for ch in slug if ch.isalnum()).lower()
-    code_like = job_name in {"code_human_eval", "code_mbpp"} or (task and task.startswith("code")) or (
-        "humaneval" in normalized_slug or "mbpp" in normalized_slug
+    code_like = job_name in {"code_human_eval", "code_mbpp", "code_livecodebench"} or (
+        task and task.startswith("code")
+    ) or (
+        "humaneval" in normalized_slug or "mbpp" in normalized_slug or "livecodebench" in normalized_slug
     )
     if not code_like:
         return metrics
@@ -269,7 +271,7 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
     if slug.startswith("mmlu"):
         return "mmlu系列"
     job = detect_job_from_dataset(slug, is_cot=is_cot)
-    if job in {"code_human_eval", "code_mbpp"}:
+    if job in {"code_human_eval", "code_mbpp", "code_livecodebench"}:
         return "coding系列"
     if job == "instruction_following":
         return "instruction following系列"

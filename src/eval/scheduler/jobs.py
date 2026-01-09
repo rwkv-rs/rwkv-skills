@@ -44,6 +44,13 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_plus": "test",
     "human_eval_fix": "test",
     "human_eval_cn": "test",
+    "livecodebench": "test",
+    "livecodebench_v1": "test",
+    "livecodebench_v2": "test",
+    "livecodebench_v3": "test",
+    "livecodebench_v4": "test",
+    "livecodebench_v5": "test",
+    "livecodebench_v6": "test",
 }
 
 
@@ -152,6 +159,9 @@ HUMAN_EVAL_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
 MBPP_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
     sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("mbpp"))
 )
+LCB_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
+    sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("livecodebench"))
+)
 
 
 JOB_CATALOGUE: dict[str, JobSpec] = {
@@ -237,6 +247,17 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         name="code_mbpp",
         module="src.bin.eval_code_mbpp",
         dataset_slugs=MBPP_CODE_SLUGS or (canonical_slug("mbpp_test"),),
+        is_cot=False,
+        domain="code",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_max_generate_flag="--max-tokens",
+        probe_samples_per_task=1,  # coding 默认只做 pass@1
+    ),
+    "code_livecodebench": JobSpec(
+        name="code_livecodebench",
+        module="src.bin.eval_code_livecodebench",
+        dataset_slugs=LCB_CODE_SLUGS or (canonical_slug("livecodebench_test"),),
         is_cot=False,
         domain="code",
         batch_flag="--batch-size",

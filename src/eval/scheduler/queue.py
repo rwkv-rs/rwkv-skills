@@ -37,6 +37,7 @@ _EARLY_DATASET_SLUGS = frozenset(
         "math_500_test",
         "human_eval_test",
         "mbpp_test",
+        "livecodebench_test",
         "ifeval_test",
         "ceval_test",
     )

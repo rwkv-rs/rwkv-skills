@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-"""Run MBPP code generation + evaluation for RWKV models."""
+"""Run LiveCodeBench code generation + evaluation for RWKV models."""
 
 import argparse
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
-from dataclasses import replace
 
+from src.eval.checkers.llm_checker import run_llm_checker
+from src.eval.evaluators.coding import CodingPipeline, LCB_CODE_SAMPLING
+from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.eval.evaluators.coding import CodingPipeline, MBPP_EVAL_CODE_SAMPLING
-from src.eval.metrics.code_generation.evaluate import evaluate_mbpp_dataset
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
 
@@ -28,9 +28,9 @@ def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RWKV MBPP evaluator")
+    parser = argparse.ArgumentParser(description="RWKV LiveCodeBench evaluator")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
-    parser.add_argument("--dataset", required=True, help="MBPP JSONL path")
+    parser.add_argument("--dataset", required=True, help="LiveCodeBench JSONL path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of problems for quick runs")
@@ -65,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     slug = infer_dataset_slug_from_path(str(dataset_path))
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
 
-    sampling = MBPP_EVAL_CODE_SAMPLING
+    sampling = LCB_CODE_SAMPLING
     if args.max_tokens:
         sampling = sampling.clamp(args.max_tokens)
     if args.temperature is not None:
@@ -81,7 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     default_pass_k = (1,)
     pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
     sample_limit = batch_size if args.probe_only else args.max_samples
-    result = pipeline.run_mbpp(
+    result = pipeline.run_livecodebench(
         dataset_path=str(dataset_path),
         output_path=str(out_path),
         sampling=sampling,
@@ -101,10 +101,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    print(f"✅ MBPP 生成完成：{result.sample_count} completions -> {result.output_path}")
+    print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions -> {result.output_path}")
 
     eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
-    eval_metrics = evaluate_mbpp_dataset(
+    eval_metrics = evaluate_livecodebench_dataset(
         out_path,
         dataset_path=str(dataset_path),
         eval_output_path=eval_path,
@@ -112,7 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_workers=args.eval_workers,
         timeout=args.eval_timeout,
     )
-    print(f"MBPP 评测: {eval_metrics} (详情: {eval_path})")
+    print(f"LiveCodeBench 评测: {eval_metrics} (详情: {eval_path})")
     score_path = write_scores_json(
         slug,
         is_cot=False,
@@ -121,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         samples=result.sample_count,
         problems=result.problem_count,
         log_path=out_path,
-        task="code_mbpp",
+        task="code_livecodebench",
         task_details={
             "eval_details_path": str(eval_path),
         },
