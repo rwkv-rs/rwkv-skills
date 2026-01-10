@@ -8,7 +8,7 @@ from typing import Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
-from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
+from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
@@ -39,7 +39,7 @@ MBPP_EVAL_CODE_SAMPLING = SamplingConfig(
     pad_zero=True,
 )
 
-LCB_CODE_SAMPLING = SamplingConfig(
+LCB_COT_SAMPLING = SamplingConfig(
     max_generate_tokens=8192,
     temperature=0.6,
     top_k=50,
@@ -47,7 +47,19 @@ LCB_CODE_SAMPLING = SamplingConfig(
     alpha_presence=0.25,
     alpha_frequency=0.25,
     alpha_decay=0.996,
-    stop_tokens=[0, 261, 24281],
+    stop_tokens=(0,),
+    pad_zero=True,
+)
+
+LCB_FINAL_SAMPLING = SamplingConfig(
+    max_generate_tokens=8192,
+    temperature=0.6,
+    top_k=50,
+    top_p=0.6,
+    alpha_presence=0.25,
+    alpha_frequency=0.25,
+    alpha_decay=0.996,
+    stop_tokens=(6884, 21214),
     pad_zero=True,
 )
 
@@ -93,7 +105,7 @@ _LCB_FORMAT_WITHOUT_STARTER = (
 )
 
 
-def _format_lcb_prompt(question: str, starter_code: str | None) -> str:
+def _format_lcb_body(question: str, starter_code: str | None) -> str:
     clean = (question or "").strip()
     body = f"### Question:\n{clean}\n\n"
     if starter_code and starter_code.strip():
@@ -103,7 +115,19 @@ def _format_lcb_prompt(question: str, starter_code: str | None) -> str:
         body += f"### Format: {_LCB_FORMAT_WITHOUT_STARTER}\n"
         body += "```python\n# YOUR CODE HERE\n```\n\n"
     body += "### Answer: (use the provided format with backticks)\n\n"
-    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}\nAssistant:"
+    return body
+
+
+_LCB_FINAL_ANSWER_PREFIX = "\nTherefore, the correct code is ```python\n"
+
+
+def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
+    body = _format_lcb_body(question, starter_code)
+    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think"
+
+
+def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
+    return f"{cot_prompt}{cot_completion}{_LCB_FINAL_ANSWER_PREFIX}"
 
 
 @dataclass(slots=True)
@@ -328,7 +352,8 @@ class CodingPipeline:
         dataset_path: str,
         output_path: str,
         *,
-        sampling: SamplingConfig = LCB_CODE_SAMPLING,
+        cot_sampling: SamplingConfig = LCB_COT_SAMPLING,
+        final_sampling: SamplingConfig = LCB_FINAL_SAMPLING,
         batch_size: int = 64,
         sample_limit: int | None = None,
         eval_timeout: float = 3.0,
@@ -351,21 +376,35 @@ class CodingPipeline:
             prompts = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
-                prompt_text = _format_lcb_prompt(record.prompt, record.starter_code)
+                prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
                 prompts.append(prompt_text)
-            _ = self.engine.generate(
+            cot_outputs = self.engine.generate(
                 prompts,
-                sampling=sampling,
+                sampling=cot_sampling,
                 batch_size=batch_size,
-                progress_desc="Probing code",
+                progress_desc="Probing CoT",
                 probe_only=True,
             )
+            final_prompts: list[str] = []
+            cot_by_idx = {item.prompt_index: item for item in cot_outputs}
+            for local_idx, prompt_text in enumerate(prompts):
+                cot_seq = cot_by_idx.get(local_idx)
+                cot_text = cot_seq.text if cot_seq is not None else ""
+                final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_text))
+            if final_prompts:
+                _ = self.engine.generate(
+                    final_prompts,
+                    sampling=final_sampling,
+                    batch_size=batch_size,
+                    progress_desc="Probing final code",
+                    probe_only=True,
+                )
             return CodingPipelineResult(dataset_name, len(prompts), Path(output_path), len(records))
 
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
             for sample_idx in range(samples_per_task):
-                prompt_text = _format_lcb_prompt(record.prompt, record.starter_code)
+                prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         target_path = Path(output_path)
@@ -379,28 +418,59 @@ class CodingPipeline:
         pending_entries = entries[start_index:]
         if pending_entries:
             prompts = [entry[0] for entry in pending_entries]
-            outputs = self.engine.generate(
+            cot_outputs = self.engine.generate(
                 prompts,
-                sampling=sampling,
+                sampling=cot_sampling,
                 batch_size=max(1, min(batch_size, len(prompts))),
-                progress_desc="Generating code",
+                progress_desc="Generating CoT",
             )
-            output_by_idx = {item.prompt_index: item for item in outputs}
+            cot_by_idx = {item.prompt_index: item for item in cot_outputs}
+
+            final_prompts: list[str] = []
+            final_prompt_indices: list[int] = []
+            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
+                cot_seq = cot_by_idx.get(local_idx)
+                if cot_seq is None:
+                    continue
+                final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_seq.text))
+                final_prompt_indices.append(local_idx)
+
+            final_outputs = []
+            if final_prompts:
+                final_outputs = self.engine.generate(
+                    final_prompts,
+                    sampling=final_sampling,
+                    batch_size=max(1, min(batch_size, len(final_prompts))),
+                    progress_desc="Generating final code",
+                )
+            final_by_idx = {
+                final_prompt_indices[item.prompt_index]: item for item in final_outputs
+            }
 
             if not write_output:
-                return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
+                return CodingPipelineResult(dataset_name, len(cot_outputs), target_path, len(records))
 
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
-            sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
+            sampling_config = normalize_sampling_config_by_stage(
+                [(1, cot_sampling), (2, final_sampling)]
+            )
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
-                seq = output_by_idx.get(local_idx)
-                if seq is None:
+                cot_seq = cot_by_idx.get(local_idx)
+                final_seq = final_by_idx.get(local_idx)
+                if cot_seq is None or final_seq is None:
                     continue
-                raw_output = seq.text or ""
-                stage = StageRecord(
+                prior_context = f"{prompt_text}{cot_seq.text}"
+                final_prompt = _format_lcb_final_prompt(prompt_text, cot_seq.text)
+                delta_prompt = prompt_delta(final_prompt, prior_context)
+                cot_stage = StageRecord(
                     prompt=prompt_text,
-                    completion=raw_output,
-                    stop_reason=seq.finish_reason,
+                    completion=cot_seq.text,
+                    stop_reason=cot_seq.finish_reason,
+                )
+                final_stage = StageRecord(
+                    prompt=delta_prompt,
+                    completion=final_seq.text,
+                    stop_reason=final_seq.finish_reason,
                 )
                 writer.write(
                     SampleRecord(
@@ -409,7 +479,7 @@ class CodingPipeline:
                         sample_index=rec_idx,
                         repeat_index=sample_idx,
                         sampling_config=sampling_config,
-                        stages=[stage],
+                        stages=[cot_stage, final_stage],
                     )
                 )
             writer.close()
@@ -437,5 +507,6 @@ __all__ = [
     "CodingPipelineResult",
     "HUMAN_EVAL_CODE_SAMPLING",
     "MBPP_EVAL_CODE_SAMPLING",
-    "LCB_CODE_SAMPLING",
+    "LCB_COT_SAMPLING",
+    "LCB_FINAL_SAMPLING",
 ]

@@ -105,6 +105,15 @@ def _build_lcb_sample(record: CodeGenerationRecord) -> tuple[dict, str]:
     return sample, sample["input_output"]
 
 
+def _normalize_difficulty(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"easy", "medium", "hard"}:
+        return lowered
+    return None
+
+
 def estimate_pass_at_k(
     num_samples: Union[int, List[int], np.ndarray],
     num_correct: Union[List[int], np.ndarray],
@@ -135,13 +144,18 @@ def evaluate_livecodebench_dataset(
     n_workers: int = 4,
     timeout: float = 6.0,
 ) -> dict[str, float]:
+    pass_k_values = tuple(int(val) for val in pass_k)
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
     sample_map: dict[int, dict] = {}
     ref_map: dict[int, str] = {}
+    difficulty_map: dict[int, str] = {}
     for idx, record in enumerate(dataset_records):
         sample, ref_answer = _build_lcb_sample(record)
         sample_map[idx] = sample
         ref_map[idx] = ref_answer
+        difficulty = _normalize_difficulty(record.metadata.get("difficulty"))
+        if difficulty:
+            difficulty_map[idx] = difficulty
 
     results_by_key: dict[tuple[int, int], dict] = {}
     grouped: dict[int, list[bool]] = defaultdict(list)
@@ -183,11 +197,32 @@ def evaluate_livecodebench_dataset(
     correct_arr = np.array(correct)
 
     pass_at_k: dict[str, float] = {}
-    for val in pass_k:
+    for val in pass_k_values:
         mask = total_arr >= val
         if not mask.any():
             continue
         pass_at_k[f"pass@{val}"] = estimate_pass_at_k(total_arr[mask], correct_arr[mask], int(val)).mean()
+
+    difficulty_totals: dict[str, list[int]] = defaultdict(list)
+    difficulty_corrects: dict[str, list[int]] = defaultdict(list)
+    for sample_index, flags in grouped.items():
+        difficulty = difficulty_map.get(sample_index)
+        if not difficulty:
+            continue
+        difficulty_totals[difficulty].append(len(flags))
+        difficulty_corrects[difficulty].append(sum(1 for flag in flags if flag))
+
+    for difficulty in ("easy", "medium", "hard"):
+        totals = np.array(difficulty_totals.get(difficulty, []))
+        corrects = np.array(difficulty_corrects.get(difficulty, []))
+        if totals.size == 0:
+            continue
+        for val in pass_k_values:
+            mask = totals >= val
+            if not mask.any():
+                continue
+            key = f"pass@{val}_{difficulty}"
+            pass_at_k[key] = estimate_pass_at_k(totals[mask], corrects[mask], int(val)).mean()
 
     eval_output_path = Path(eval_output_path)
     eval_output_path.parent.mkdir(parents=True, exist_ok=True)

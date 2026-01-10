@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.checkers.llm_checker import run_llm_checker
-from src.eval.evaluators.coding import CodingPipeline, LCB_CODE_SAMPLING
+from src.eval.evaluators.coding import CodingPipeline, LCB_COT_SAMPLING, LCB_FINAL_SAMPLING
 from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
@@ -24,7 +24,7 @@ def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -
     if env_path:
         return Path(env_path).expanduser()
     slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=False, model_name=Path(model_path).stem)
+    return jsonl_path(slug, is_cot=True, model_name=Path(model_path).stem)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -65,15 +65,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     slug = infer_dataset_slug_from_path(str(dataset_path))
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
 
-    sampling = LCB_CODE_SAMPLING
+    cot_sampling = LCB_COT_SAMPLING
+    final_sampling = LCB_FINAL_SAMPLING
     if args.max_tokens:
-        sampling = sampling.clamp(args.max_tokens)
+        cot_sampling = cot_sampling.clamp(args.max_tokens)
+        final_sampling = final_sampling.clamp(args.max_tokens)
     if args.temperature is not None:
-        sampling = replace(sampling, temperature=args.temperature)
+        cot_sampling = replace(cot_sampling, temperature=args.temperature)
+        final_sampling = replace(final_sampling, temperature=args.temperature)
     if args.top_k is not None:
-        sampling = replace(sampling, top_k=args.top_k)
+        cot_sampling = replace(cot_sampling, top_k=args.top_k)
+        final_sampling = replace(final_sampling, top_k=args.top_k)
     if args.top_p is not None:
-        sampling = replace(sampling, top_p=args.top_p)
+        cot_sampling = replace(cot_sampling, top_p=args.top_p)
+        final_sampling = replace(final_sampling, top_p=args.top_p)
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = CodingPipeline(config)
@@ -84,7 +89,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = pipeline.run_livecodebench(
         dataset_path=str(dataset_path),
         output_path=str(out_path),
-        sampling=sampling,
+        cot_sampling=cot_sampling,
+        final_sampling=final_sampling,
         batch_size=batch_size,
         sample_limit=sample_limit,
         eval_timeout=args.eval_timeout,
@@ -103,7 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions -> {result.output_path}")
 
-    eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
+    eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
     eval_metrics = evaluate_livecodebench_dataset(
         out_path,
         dataset_path=str(dataset_path),
@@ -115,7 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"LiveCodeBench 评测: {eval_metrics} (详情: {eval_path})")
     score_path = write_scores_json(
         slug,
-        is_cot=False,
+        is_cot=True,
         model_name=Path(args.model_path).stem,
         metrics=eval_metrics or {},
         samples=result.sample_count,
