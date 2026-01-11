@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Prepare LiveCodeBench (code generation) datasets as JSONL."""
 
+import os
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -11,15 +12,10 @@ from ..data_utils import configure_hf_home, write_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import CODE_GENERATION_REGISTRY
 
 _LITE_DATASET_ID = "livecodebench/code_generation_lite"
-_RELEASE_TAGS: dict[str, str] = {
-    "livecodebench": "release_latest",
-    "livecodebench_v1": "release_v1",
-    "livecodebench_v2": "release_v2",
-    "livecodebench_v3": "release_v3",
-    "livecodebench_v4": "release_v4",
-    "livecodebench_v5": "release_v5",
-    "livecodebench_v6": "release_v6",
-}
+_DATASET_CONFIG = "release_latest"
+# Pin to the latest known version tag to keep the scheduler reproducible and
+# compatible with offline HuggingFace caches.
+_DEFAULT_VERSION_TAG = "release_v6"
 
 
 def _iter_livecodebench_records(
@@ -45,7 +41,7 @@ def _prepare_livecodebench(
     *,
     split: str,
     dataset_name: str,
-    release_version: str,
+    version_tag: str,
 ) -> list[Path]:
     if split != "test":
         raise ValueError(f"{dataset_name} 仅提供 test split")
@@ -55,10 +51,12 @@ def _prepare_livecodebench(
     target = dataset_dir / f"{split}.jsonl"
 
     dataset_id = _LITE_DATASET_ID
+    version_tag = (os.environ.get("RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG") or version_tag).strip()
     dataset = load_dataset(
         dataset_id,
+        _DATASET_CONFIG,
         split=split,
-        version_tag=release_version,
+        version_tag=version_tag,
         trust_remote_code=True,
     )
 
@@ -67,7 +65,7 @@ def _prepare_livecodebench(
         target,
         _iter_livecodebench_records(
             rows,
-            release_version=release_version,
+            release_version=version_tag,
             source_dataset=dataset_id,
         ),
     )
@@ -80,76 +78,7 @@ def prepare_livecodebench(output_root: Path, split: str = "test") -> list[Path]:
         output_root,
         split=split,
         dataset_name="livecodebench",
-        release_version=_RELEASE_TAGS["livecodebench"],
+        version_tag=_DEFAULT_VERSION_TAG,
     )
 
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v1")
-def prepare_livecodebench_v1(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v1",
-        release_version=_RELEASE_TAGS["livecodebench_v1"],
-    )
-
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v2")
-def prepare_livecodebench_v2(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v2",
-        release_version=_RELEASE_TAGS["livecodebench_v2"],
-    )
-
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v3")
-def prepare_livecodebench_v3(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v3",
-        release_version=_RELEASE_TAGS["livecodebench_v3"],
-    )
-
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v4")
-def prepare_livecodebench_v4(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v4",
-        release_version=_RELEASE_TAGS["livecodebench_v4"],
-    )
-
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v5")
-def prepare_livecodebench_v5(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v5",
-        release_version=_RELEASE_TAGS["livecodebench_v5"],
-    )
-
-
-@CODE_GENERATION_REGISTRY.register("livecodebench_v6")
-def prepare_livecodebench_v6(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_livecodebench(
-        output_root,
-        split=split,
-        dataset_name="livecodebench_v6",
-        release_version=_RELEASE_TAGS["livecodebench_v6"],
-    )
-
-
-__all__ = [
-    "prepare_livecodebench",
-    "prepare_livecodebench_v1",
-    "prepare_livecodebench_v2",
-    "prepare_livecodebench_v3",
-    "prepare_livecodebench_v4",
-    "prepare_livecodebench_v5",
-    "prepare_livecodebench_v6",
-]
+__all__ = ["prepare_livecodebench"]

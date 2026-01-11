@@ -45,12 +45,6 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_fix": "test",
     "human_eval_cn": "test",
     "livecodebench": "test",
-    "livecodebench_v1": "test",
-    "livecodebench_v2": "test",
-    "livecodebench_v3": "test",
-    "livecodebench_v4": "test",
-    "livecodebench_v5": "test",
-    "livecodebench_v6": "test",
 }
 
 
