@@ -93,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for path in eval_files:
         model_name = _infer_model_name(path, eval_root=eval_root, forced=args.model_name)
-        run_llm_checker(path, model_name=model_name)
+        run_llm_checker(path, model_name=model_name, enabled=True)
 
     return 0
 

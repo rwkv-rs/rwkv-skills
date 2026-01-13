@@ -67,7 +67,7 @@ class DispatchOptions(QueueOptions):
     clean_param_swap: bool = False
     batch_cache_path: Path | None = None
     overwrite: bool = False
-    disable_checker: bool = False
+    enable_checker: bool = False
 
 
 @dataclass(slots=True)
@@ -376,8 +376,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
                 }
             )
-            if opts.disable_checker:
-                env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
             questions = question_counts.get(dataset_slug)
 
@@ -395,6 +393,8 @@ def action_dispatch(opts: DispatchOptions) -> None:
             extra_args = item.extra_args
             if opts.overwrite and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
                 extra_args = extra_args + ("--overwrite",)
+            if opts.enable_checker and "--enable-checker" not in extra_args:
+                extra_args = extra_args + ("--enable-checker",)
 
             command = build_command(
                 job,
