@@ -80,6 +80,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
     parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--enable-checker", action="store_true", help="Enable LLM wrong-answer checker")
     parser.add_argument(
         "--no-param-search",
         action="store_true",
@@ -162,7 +163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"✅ instruction-following done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    run_llm_checker(eval_path, model_name=Path(args.model_path).stem, enabled=args.enable_checker)
     return 0
 
 

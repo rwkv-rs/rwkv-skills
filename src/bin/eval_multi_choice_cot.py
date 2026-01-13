@@ -84,6 +84,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
     parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--enable-checker", action="store_true", help="Enable LLM wrong-answer checker")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -201,7 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"✅ CoT multiple-choice done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    run_llm_checker(eval_path, model_name=Path(args.model_path).stem, enabled=args.enable_checker)
     return 0
 
 

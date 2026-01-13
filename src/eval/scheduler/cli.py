@@ -81,9 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="忽略 log_dir 中已存在的结果，重新评测并覆盖",
     )
     dispatch_parser.add_argument(
-        "--disable-checker",
+        "--enable-checker",
         action="store_true",
-        help="关闭 LLM wrong-answer checker（不运行 run_llm_checker）",
+        help="显式开启 LLM wrong-answer checker（默认不运行）",
     )
 
     status_parser = sub.add_parser("status", help="查看正在运行的任务")
@@ -232,7 +232,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             clean_param_swap=bool(args.clean_param_swap),
             batch_cache_path=batch_cache,
             overwrite=bool(args.overwrite),
-            disable_checker=bool(args.disable_checker),
+            enable_checker=bool(args.enable_checker),
         )
         action_dispatch(opts)
     elif command == "status":

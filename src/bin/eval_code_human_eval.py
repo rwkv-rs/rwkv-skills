@@ -43,6 +43,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
     parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--enable-checker", action="store_true", help="Enable LLM wrong-answer checker")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -134,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
     )
     print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    run_llm_checker(eval_path, model_name=Path(args.model_path).stem, enabled=args.enable_checker)
     return 0
 
 

@@ -91,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", help="Ignored (scheduler compatibility)")
     parser.add_argument("--device", help="Ignored (scheduler compatibility)")
     parser.add_argument("--output", help="Optional JSONL marker output path (scheduler compatibility)")
+    parser.add_argument("--enable-checker", action="store_true", help="Enable LLM wrong-answer checker")
     parser.add_argument(
         "--benchmarks",
         nargs="+",
@@ -261,7 +262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not promoted_eval.exists():
                 print(f"⚠️  LLM checker skipped: missing promoted eval {promoted_eval}")
                 continue
-            run_llm_checker(promoted_eval, model_name=model_name)
+            run_llm_checker(promoted_eval, model_name=model_name, enabled=args.enable_checker)
 
     # Optional marker output for scheduler/debugging.
     if args.output and not os.environ.get("RWKV_SKILLS_JOB_ID"):

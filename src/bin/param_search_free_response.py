@@ -83,6 +83,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
     parser.add_argument("--output", help="Ignored (scheduler compatibility)")
+    parser.add_argument("--enable-checker", action="store_true", help="Enable LLM wrong-answer checker")
     parser.add_argument("--para-grid-normal", default=None, type=str, 
                         help="""Grid search parameter space as a dictionary: \n
                          e.g. \'{\"temperature\":[0.3,0.4],\"top_k\":[50],\"top_p\":[0.3,0.4],\"alpha_presence\":[0.0,0.1],\"alpha_frequency\":[0.1],\"alpha_decay\":[0.99]}\'

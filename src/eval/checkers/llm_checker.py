@@ -13,6 +13,7 @@ from typing import Any, Iterable
 
 import orjson
 import jsonschema
+import tqdm
 from json import JSONDecodeError
 from openai import OpenAI, OpenAIError
 
@@ -388,6 +389,7 @@ def run_llm_checker(
     *,
     model_name: str,
     config: LLMCheckerConfig | None = None,
+    enabled: bool = False,
 ) -> Path | None:
     """Run wrong-answer checker over a single eval JSONL file.
 
@@ -395,8 +397,9 @@ def run_llm_checker(
     """
 
     _load_env_file((REPO_ROOT / ".env").resolve())
-    if _env_flag("RWKV_SKILLS_DISABLE_CHECKER"):
-        print("ℹ️  LLM checker disabled (RWKV_SKILLS_DISABLE_CHECKER=1)")
+    enabled = enabled or _env_flag("RWKV_SKILLS_ENABLE_CHECKER")
+    if not enabled:
+        print("ℹ️  LLM checker skipped: not enabled (pass --enable-checker or set RWKV_SKILLS_ENABLE_CHECKER=1)")
         return None
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
@@ -507,7 +510,16 @@ def run_llm_checker(
     attempts_by_key: dict[tuple[str, int, int], int] = {}
     pending: dict[object, dict[str, Any]] = {}
 
-    with out_path.open("ab") as out_f, ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with (
+        out_path.open("ab") as out_f,
+        ThreadPoolExecutor(max_workers=max_workers) as executor,
+        tqdm.tqdm(
+            total=len(to_check),
+            desc="Running LLM checker",
+            unit="sample",
+            ascii=True,
+        ) as progress,
+    ):
         while pending or todo or retry_heap:
             now = time.monotonic()
             while retry_heap and retry_heap[0][0] <= now:
@@ -549,6 +561,7 @@ def run_llm_checker(
                         )
                         continue
 
+                    progress.update(1)
                     if not stop_scheduling:
                         stop_scheduling = True
                         print(f"⚠️  LLM checker failed; stop scheduling new requests: {_describe_row(row)} -> {exc}")
@@ -558,6 +571,7 @@ def run_llm_checker(
 
                 out_f.write(orjson.dumps(output_row, option=orjson.OPT_APPEND_NEWLINE))
                 wrote += 1
+                progress.update(1)
 
     if wrote:
         suffix = f" (+{wrote} rows)"
