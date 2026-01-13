@@ -97,7 +97,8 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
     --dataset data/human_eval/test.jsonl \
     --batch-size 128 \
     --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
-    --eval-timeout 3
+    --eval-timeout 3 \
+    --device cuda:0
   ```
   Samples are written under `results/completions`, and the official unit tests are executed automatically to produce pass@k (number of generations equals the maximum k).
 
@@ -110,7 +111,8 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
     --dataset data/mbpp/test.jsonl \
     --batch-size 128 \
     --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
-    --eval-timeout 3
+    --eval-timeout 3 \
+    --device cuda:0
   ```
   Multiple samples are generated and executed against EvalPlus test cases to output pass@k (number of generations equals the maximum k).
 
@@ -122,9 +124,10 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
     --batch-size 64 \
-    --pass-k 1 --pass-k 5 \
+    --pass-k 1 \
     --eval-timeout 6 \
-    --eval-workers 12
+    --eval-workers 12 \
+    --device cuda:0
   ```
   LiveCodeBench uses the extracted code blocks for execution and reports pass@k (number of generations equals the maximum k).
 

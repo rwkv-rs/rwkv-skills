@@ -32,7 +32,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV MBPP evaluator")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", required=True, help="MBPP JSONL path")
-    parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
+    parser.add_argument("--device", default="cuda:0", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of problems for quick runs")
     parser.add_argument("--max-tokens", type=int, help="Clamp generation length")

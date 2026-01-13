@@ -93,7 +93,8 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
     --dataset data/human_eval/test.jsonl \
     --batch-size 128 \
     --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
-    --eval-timeout 3
+    --eval-timeout 3 \
+    --device cuda:0
   ```
   生成的样本写入 results/completions 结构，并会自动执行官方测试用例输出 pass@k 结果（生成次数等于最大的 k）。
 
@@ -106,7 +107,8 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
     --dataset data/mbpp/test.jsonl \
     --batch-size 128 \
     --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
-    --eval-timeout 3
+    --eval-timeout 3 \
+    --device cuda:0
   ```
   会生成多样本并用 EvalPlus 测试用例执行，输出 pass@k（生成次数等于最大的 k）。
 
@@ -118,9 +120,10 @@ rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-di
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
     --batch-size 64 \
-    --pass-k 1 --pass-k 5 \
+    --pass-k 1 \
     --eval-timeout 6 \
-    --eval-workers 12
+    --eval-workers 12 \
+    --device cuda:0
   ```
   会抽取代码块并执行 LiveCodeBench 测试，输出 pass@k（生成次数等于最大的 k）。
 
