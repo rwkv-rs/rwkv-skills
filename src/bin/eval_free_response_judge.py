@@ -22,6 +22,10 @@ from src.eval.results.layout import (
 )
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
+from src.eval.results.schema import dataset_slug_parts
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.eval.evaluators.free_response import (
     FreeResponsePipeline,
     DEFAULT_COT_SAMPLING,
@@ -287,6 +291,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         task="free_response_judge",
         task_details=task_details,
     )
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        service = EvalDbService(db)
+        benchmark_name, dataset_split = dataset_slug_parts(slug)
+        run_ctx = service.prepare_run(
+            dataset_slug=benchmark_name,
+            split_name=dataset_split,
+            model_path=args.model_path,
+            is_cot=True,
+            run_tag=Path(output_path).stem,
+            sampling_config=None,
+            runtime_config=None,
+            code_version=None,
+        )
+        service.ingest_eval_results(eval_path=eval_path, run_id=run_ctx.run_id, metric_name="passed")
+        service.record_score_summary(
+            run_id=run_ctx.run_id,
+            event_type="score_summary",
+            metrics=metrics_payload,
+            samples=evaluation.samples,
+            problems=result.problem_count,
+            log_path=output_path,
+            eval_path=eval_path,
+            score_path=score_path,
+            task="free_response_judge",
+            task_details=task_details,
+        )
     print(f"✅ judge CoT done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")

@@ -36,8 +36,12 @@ from src.eval.results.layout import (
     param_search_scores_trial_path,
     write_scores_json_to_path,
 )
+from src.eval.results.schema import dataset_slug_parts
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -156,6 +160,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
+    db_service: EvalDbService | None = None
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        db_service = EvalDbService(db)
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
@@ -276,6 +285,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_details=task_details,
         )
         write_scores_json_to_path(score_path, payload)
+        if db_service:
+            benchmark_name, dataset_split = dataset_slug_parts(slug)
+            run_ctx = db_service.prepare_run(
+                dataset_slug=benchmark_name,
+                split_name=dataset_split,
+                model_path=args.model_path,
+                is_cot=True,
+                run_tag=completion_path.stem,
+                sampling_config=None,
+                runtime_config=None,
+                code_version=None,
+            )
+            db_service.ingest_eval_results(
+                eval_path=eval_path,
+                run_id=run_ctx.run_id,
+                metric_name="passed",
+            )
+            db_service.record_score_summary(
+                run_id=run_ctx.run_id,
+                event_type="score_summary",
+                metrics=metrics_payload,
+                samples=evaluation.samples,
+                problems=result.problem_count,
+                log_path=completion_path,
+                eval_path=eval_path,
+                score_path=score_path,
+                task="param_search_free_response_judge",
+                task_details=task_details,
+            )
 
         objective = (
             float(metrics_payload["judge_accuracy"])

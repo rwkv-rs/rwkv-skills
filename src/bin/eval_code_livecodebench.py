@@ -12,6 +12,10 @@ from src.eval.checkers.llm_checker import run_llm_checker
 from src.eval.evaluators.coding import CodingPipeline, LCB_CODE_SAMPLING
 from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.schema import dataset_slug_parts
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.model import ModelLoadConfig
@@ -126,6 +130,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             "eval_details_path": str(eval_path),
         },
     )
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        service = EvalDbService(db)
+        benchmark_name, dataset_split = dataset_slug_parts(slug)
+        run_ctx = service.prepare_run(
+            dataset_slug=benchmark_name,
+            split_name=dataset_split,
+            model_path=args.model_path,
+            is_cot=False,
+            run_tag=Path(out_path).stem,
+            sampling_config=None,
+            runtime_config=None,
+            code_version=None,
+        )
+        service.ingest_eval_results(eval_path=eval_path, run_id=run_ctx.run_id, metric_name="passed")
+        service.record_score_summary(
+            run_id=run_ctx.run_id,
+            event_type="score_summary",
+            metrics=eval_metrics or {},
+            samples=result.sample_count,
+            problems=result.problem_count,
+            log_path=out_path,
+            eval_path=eval_path,
+            score_path=score_path,
+            task="code_livecodebench",
+            task_details={"eval_details_path": str(eval_path)},
+        )
     print(f"📊 scores saved: {score_path}")
     run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
     return 0

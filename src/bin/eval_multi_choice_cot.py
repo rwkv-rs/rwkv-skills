@@ -13,6 +13,10 @@ import torch
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.schema import dataset_slug_parts
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
 from src.eval.scheduler.profiler import update_batch_cache_locked
@@ -192,6 +196,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             "eval_details_path": str(eval_path),
         },
     )
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        service = EvalDbService(db)
+        benchmark_name, dataset_split = dataset_slug_parts(slug)
+        run_ctx = service.prepare_run(
+            dataset_slug=benchmark_name,
+            split_name=dataset_split,
+            model_path=args.model_path,
+            is_cot=True,
+            run_tag=Path(output_path).stem,
+            sampling_config=None,
+            runtime_config=None,
+            code_version=None,
+        )
+        service.ingest_eval_results(eval_path=eval_path, run_id=run_ctx.run_id, metric_name="passed")
+        service.record_score_summary(
+            run_id=run_ctx.run_id,
+            event_type="score_summary",
+            metrics={"accuracy": metrics.accuracy},
+            samples=metrics.samples,
+            problems=None,
+            log_path=output_path,
+            eval_path=eval_path,
+            score_path=score_path,
+            task="multiple_choice_cot",
+            task_details={
+                "accuracy_by_subject": metrics.accuracy_by_subject,
+                "eval_details_path": str(eval_path),
+            },
+        )
     print(f"✅ CoT multiple-choice done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")

@@ -16,6 +16,9 @@ from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from .common import JsonlStageWriter, SampleRecord, StageRecord, detect_resume_state
 
 DEFAULT_STOP_TOKENS = (0, 261, 24281)
@@ -43,6 +46,7 @@ class InstructionFollowingPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
+        self.model_path = model_config.weights_path
 
     def run(
         self,
@@ -85,6 +89,27 @@ class InstructionFollowingPipeline:
         sampling_cfg = replace(sampling, stop_tokens=stop_tokens, ban_tokens=effective_ban)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling_cfg)])
 
+        db_service: EvalDbService | None = None
+        run_ctx = None
+        if DEFAULT_DB_CONFIG.enabled:
+            db = DatabaseManager.instance()
+            db.initialize(DEFAULT_DB_CONFIG)
+            db_service = EvalDbService(db)
+            run_ctx = db_service.prepare_run(
+                dataset_slug=benchmark_name,
+                split_name=dataset_split,
+                model_path=str(self.model_path),
+                is_cot=False,
+                run_tag=Path(output_path).stem,
+                sampling_config=sampling_config,
+                runtime_config={
+                    "batch_size": batch_size,
+                    "samples_per_prompt": samples_per_prompt,
+                    "enable_think": enable_think,
+                },
+                code_version=None,
+            )
+
         writer = JsonlStageWriter(output_path, resume=resume.has_progress)
         prompts = [self._make_prompt(record.prompt, enable_think) for _, record, _ in remaining_records]
         outputs = self.engine.generate(
@@ -103,6 +128,61 @@ class InstructionFollowingPipeline:
                 completion=seq.text,
                 stop_reason=seq.finish_reason,
             )
+            if db_service and run_ctx:
+                meta = {
+                    "instruction_ids": record.instruction_ids,
+                    "kwargs_list": record.kwargs_list,
+                    "key": record.key,
+                    **(record.metadata or {}),
+                }
+                sample_db_id = db_service.upsert_sample(
+                    dataset_id=run_ctx.dataset_id,
+                    split_id=run_ctx.split_id,
+                    sample_index=problem_idx,
+                    question=record.prompt,
+                    reference_answer=None,
+                    meta=meta,
+                )
+                run_sample_id = db_service.upsert_run_sample(
+                    run_id=run_ctx.run_id,
+                    sample_id=sample_db_id,
+                    repeat_index=sample_id,
+                    status="pending",
+                    current_stage=None,
+                )
+                if db_service.fetch_latest_stage(run_sample_id=run_sample_id, stage="final"):
+                    db_service.mark_run_sample_status(
+                        run_sample_id=run_sample_id,
+                        status="succeeded",
+                        current_stage="final",
+                        finished=True,
+                    )
+                else:
+                    attempt_id, attempt_index = db_service.start_attempt(
+                        run_sample_id=run_sample_id,
+                        current_stage="final",
+                    )
+                    db_service.write_stage_output(
+                        attempt_id=attempt_id,
+                        stage="final",
+                        seq=0,
+                        prompt=prompts[local_idx],
+                        completion=seq.text,
+                        finish_reason=seq.finish_reason,
+                        is_final=True,
+                    )
+                    db_service.mark_attempt_status(
+                        attempt_id=attempt_id,
+                        status="succeeded",
+                        finished=True,
+                    )
+                    db_service.mark_run_sample_status(
+                        run_sample_id=run_sample_id,
+                        status="succeeded",
+                        current_stage="final",
+                        latest_attempt_index=attempt_index,
+                        finished=True,
+                    )
             writer.write(
                 SampleRecord(
                     benchmark_name=benchmark_name,
@@ -114,6 +194,8 @@ class InstructionFollowingPipeline:
                 )
             )
         writer.close()
+        if db_service and run_ctx:
+            db_service.mark_run_status(run_id=run_ctx.run_id, status="succeeded")
         return InstructionFollowingPipelineResult(dataset_name, len(expanded), Path(output_path))
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:
