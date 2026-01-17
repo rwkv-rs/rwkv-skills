@@ -14,9 +14,8 @@ from .eval_db_repo import EvalDbRepository, StageOutputRow
 
 @dataclass(slots=True)
 class RunContext:
-    dataset_id: str
+    subject_id: str
     split_id: str
-    model_id: str
     task_uuid: str
     run_id: str
     dataset_slug: str
@@ -55,27 +54,23 @@ class EvalDbService:
         domain = JOB_CATALOGUE[job_name].domain if job_name and job_name in JOB_CATALOGUE else None
 
         with self._db.get_connection() as conn:
-            dataset_id = self._repo.upsert_dataset(
+            subject_id = self._repo.upsert_subject(
                 conn,
                 dataset_slug=dataset_slug,
                 domain=domain,
                 dataset_version=None,
-                meta=None,
-            )
-            split_id = self._repo.upsert_split(conn, dataset_id=dataset_id, split_name=split_name)
-            model_id = self._repo.upsert_model(
-                conn,
+                dataset_meta=None,
                 model_slug=model_slug,
                 model_name=model_slug,
                 model_revision=None,
                 provider="local",
-                meta={"path": model_path},
+                model_meta={"path": model_path},
             )
+            split_id = self._repo.upsert_split(conn, subject_id=subject_id, split_name=split_name)
             task_uuid = self._repo.upsert_task(
                 conn,
                 task_id=task_id,
-                dataset_id=dataset_id,
-                model_id=model_id,
+                subject_id=subject_id,
                 task_tag=task_tag,
                 meta={"job": job_name},
             )
@@ -93,9 +88,8 @@ class EvalDbService:
                     status="running",
                 )
             return RunContext(
-                dataset_id=dataset_id,
+                subject_id=subject_id,
                 split_id=split_id,
-                model_id=model_id,
                 task_uuid=task_uuid,
                 run_id=run_id,
                 dataset_slug=dataset_slug,
@@ -112,7 +106,7 @@ class EvalDbService:
     def upsert_sample(
         self,
         *,
-        dataset_id: str,
+        subject_id: str,
         split_id: str,
         sample_index: int,
         question: str | None,
@@ -122,7 +116,7 @@ class EvalDbService:
         with self._db.get_connection() as conn:
             return self._repo.upsert_sample(
                 conn,
-                dataset_id=dataset_id,
+                subject_id=subject_id,
                 split_id=split_id,
                 sample_index=sample_index,
                 question=question,

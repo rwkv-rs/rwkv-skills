@@ -19,28 +19,49 @@ class EvalDbRepository:
     def _json(value: dict[str, Any] | None) -> Json | None:
         return Json(value) if value is not None else None
 
-    def upsert_dataset(
+    def upsert_subject(
         self,
         conn: psycopg.Connection,
         *,
         dataset_slug: str,
         domain: str | None,
         dataset_version: str | None,
-        meta: dict[str, Any] | None,
+        dataset_meta: dict[str, Any] | None,
+        model_slug: str,
+        model_name: str | None,
+        model_revision: str | None,
+        provider: str | None,
+        model_meta: dict[str, Any] | None,
     ) -> str:
         row = conn.execute(
             """
-            INSERT INTO eval_dataset (dataset_slug, domain, dataset_version, meta)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (dataset_slug)
+            INSERT INTO eval_subject (
+                dataset_slug, domain, dataset_version, dataset_meta,
+                model_slug, model_name, model_revision, provider, model_meta
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (dataset_slug, model_slug, COALESCE(model_revision, ''))
             DO UPDATE SET
                 domain = EXCLUDED.domain,
                 dataset_version = EXCLUDED.dataset_version,
-                meta = EXCLUDED.meta,
+                dataset_meta = EXCLUDED.dataset_meta,
+                model_name = EXCLUDED.model_name,
+                provider = EXCLUDED.provider,
+                model_meta = EXCLUDED.model_meta,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """,
-            (dataset_slug, domain, dataset_version, self._json(meta)),
+            (
+                dataset_slug,
+                domain,
+                dataset_version,
+                self._json(dataset_meta),
+                model_slug,
+                model_name,
+                model_revision,
+                provider,
+                self._json(model_meta),
+            ),
         ).fetchone()
         return str(row["id"])
 
@@ -48,18 +69,18 @@ class EvalDbRepository:
         self,
         conn: psycopg.Connection,
         *,
-        dataset_id: str,
+        subject_id: str,
         split_name: str,
     ) -> str:
         row = conn.execute(
             """
-            INSERT INTO eval_split (dataset_id, split_name)
+            INSERT INTO eval_split (subject_id, split_name)
             VALUES (%s, %s)
-            ON CONFLICT (dataset_id, split_name)
+            ON CONFLICT (subject_id, split_name)
             DO UPDATE SET updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """,
-            (dataset_id, split_name),
+            (subject_id, split_name),
         ).fetchone()
         return str(row["id"])
 
@@ -67,7 +88,7 @@ class EvalDbRepository:
         self,
         conn: psycopg.Connection,
         *,
-        dataset_id: str,
+        subject_id: str,
         split_id: str,
         sample_index: int,
         question: str | None,
@@ -77,10 +98,10 @@ class EvalDbRepository:
         row = conn.execute(
             """
             INSERT INTO eval_sample (
-                dataset_id, split_id, sample_index, question, reference_answer, meta
+                subject_id, split_id, sample_index, question, reference_answer, meta
             )
             VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (dataset_id, split_id, sample_index)
+            ON CONFLICT (subject_id, split_id, sample_index)
             DO UPDATE SET
                 question = EXCLUDED.question,
                 reference_answer = EXCLUDED.reference_answer,
@@ -88,49 +109,7 @@ class EvalDbRepository:
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """,
-            (dataset_id, split_id, sample_index, question, reference_answer, self._json(meta)),
-        ).fetchone()
-        return str(row["id"])
-
-    def upsert_model(
-        self,
-        conn: psycopg.Connection,
-        *,
-        model_slug: str,
-        model_name: str | None,
-        model_revision: str | None,
-        provider: str | None,
-        meta: dict[str, Any] | None,
-    ) -> str:
-        row = conn.execute(
-            """
-            SELECT id
-            FROM eval_model
-            WHERE model_slug = %s AND COALESCE(model_revision, '') = COALESCE(%s, '')
-            """,
-            (model_slug, model_revision),
-        ).fetchone()
-        if row:
-            conn.execute(
-                """
-                UPDATE eval_model
-                SET model_name = %s,
-                    model_revision = %s,
-                    provider = %s,
-                    meta = %s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                """,
-                (model_name, model_revision, provider, self._json(meta), row["id"]),
-            )
-            return str(row["id"])
-        row = conn.execute(
-            """
-            INSERT INTO eval_model (model_slug, model_name, model_revision, provider, meta)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (model_slug, model_name, model_revision, provider, self._json(meta)),
+            (subject_id, split_id, sample_index, question, reference_answer, self._json(meta)),
         ).fetchone()
         return str(row["id"])
 
@@ -139,25 +118,23 @@ class EvalDbRepository:
         conn: psycopg.Connection,
         *,
         task_id: str,
-        dataset_id: str,
-        model_id: str,
+        subject_id: str,
         task_tag: str | None,
         meta: dict[str, Any] | None,
     ) -> str:
         row = conn.execute(
             """
-            INSERT INTO eval_task (task_id, dataset_id, model_id, task_tag, meta)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO eval_task (task_id, subject_id, task_tag, meta)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (task_id)
             DO UPDATE SET
-                dataset_id = EXCLUDED.dataset_id,
-                model_id = EXCLUDED.model_id,
+                subject_id = EXCLUDED.subject_id,
                 task_tag = EXCLUDED.task_tag,
                 meta = EXCLUDED.meta,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """,
-            (task_id, dataset_id, model_id, task_tag, self._json(meta)),
+            (task_id, subject_id, task_tag, self._json(meta)),
         ).fetchone()
         return str(row["id"])
 

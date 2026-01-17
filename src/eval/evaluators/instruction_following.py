@@ -136,7 +136,7 @@ class InstructionFollowingPipeline:
                     **(record.metadata or {}),
                 }
                 sample_db_id = db_service.upsert_sample(
-                    dataset_id=run_ctx.dataset_id,
+                    subject_id=run_ctx.subject_id,
                     split_id=run_ctx.split_id,
                     sample_index=problem_idx,
                     question=record.prompt,

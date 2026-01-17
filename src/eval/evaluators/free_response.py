@@ -314,7 +314,7 @@ class FreeResponsePipeline:
                     ref_answer = _resolve_reference_answer(rec)
                     meta = {"subject": rec.subject, **(rec.metadata or {})}
                     sample_id = service.upsert_sample(
-                        dataset_id=run_ctx.dataset_id,
+                        subject_id=run_ctx.subject_id,
                         split_id=run_ctx.split_id,
                         sample_index=p_idx,
                         question=rec.question,

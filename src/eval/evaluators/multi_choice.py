@@ -164,7 +164,7 @@ class MultipleChoicePipeline:
                     **(record.metadata or {}),
                 }
                 sample_id = db_service.upsert_sample(
-                    dataset_id=run_ctx.dataset_id,
+                    subject_id=run_ctx.subject_id,
                     split_id=run_ctx.split_id,
                     sample_index=idx,
                     question=record.question,
@@ -339,7 +339,7 @@ class MultipleChoicePipeline:
                     **(record.metadata or {}),
                 }
                 sample_id = db_service.upsert_sample(
-                    dataset_id=run_ctx.dataset_id,
+                    subject_id=run_ctx.subject_id,
                     split_id=run_ctx.split_id,
                     sample_index=global_idx,
                     question=record.question,
