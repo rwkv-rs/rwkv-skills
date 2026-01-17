@@ -142,3 +142,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_ckpt_latest
     ON eval_cot_checkpoint(attempt_id, stage) WHERE latest;
 CREATE INDEX IF NOT EXISTS idx_eval_ckpt_lookup
     ON eval_cot_checkpoint(attempt_id, stage, created_at DESC);
+
+-- View: front-end friendly join for run + sample + result.
+CREATE OR REPLACE VIEW view_eval_run_sample AS
+SELECT
+    r.id AS run_id,
+    r.benchmark_name,
+    r.dataset,
+    r.dataset_split,
+    r.model_name,
+    r.model_path,
+    r.cot,
+    r.metrics,
+    r.status AS run_status,
+    r.created_at AS run_created_at,
+    s.id AS sample_id,
+    s.sample_index,
+    s.question,
+    s.ref_answer,
+    rs.repeat_index,
+    rs.answer,
+    rs.is_passed,
+    rs.fail_reason,
+    rs.status AS sample_status,
+    rs.started_at AS sample_started_at,
+    rs.finished_at AS sample_finished_at
+FROM eval_run_sample rs
+JOIN eval_run r ON r.id = rs.run_id
+JOIN eval_sample s ON s.id = rs.sample_id;
