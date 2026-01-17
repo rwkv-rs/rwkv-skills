@@ -19,139 +19,29 @@ class EvalDbRepository:
     def _json(value: dict[str, Any] | None) -> Json | None:
         return Json(value) if value is not None else None
 
-    def upsert_subject(
-        self,
-        conn: psycopg.Connection,
-        *,
-        dataset_slug: str,
-        domain: str | None,
-        dataset_version: str | None,
-        dataset_meta: dict[str, Any] | None,
-        model_slug: str,
-        model_name: str | None,
-        model_revision: str | None,
-        provider: str | None,
-        model_meta: dict[str, Any] | None,
-    ) -> str:
-        row = conn.execute(
-            """
-            INSERT INTO eval_subject (
-                dataset_slug, domain, dataset_version, dataset_meta,
-                model_slug, model_name, model_revision, provider, model_meta
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (dataset_slug, model_slug, COALESCE(model_revision, ''))
-            DO UPDATE SET
-                domain = EXCLUDED.domain,
-                dataset_version = EXCLUDED.dataset_version,
-                dataset_meta = EXCLUDED.dataset_meta,
-                model_name = EXCLUDED.model_name,
-                provider = EXCLUDED.provider,
-                model_meta = EXCLUDED.model_meta,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-            """,
-            (
-                dataset_slug,
-                domain,
-                dataset_version,
-                self._json(dataset_meta),
-                model_slug,
-                model_name,
-                model_revision,
-                provider,
-                self._json(model_meta),
-            ),
-        ).fetchone()
-        return str(row["id"])
-
-    def upsert_split(
-        self,
-        conn: psycopg.Connection,
-        *,
-        subject_id: str,
-        split_name: str,
-    ) -> str:
-        row = conn.execute(
-            """
-            INSERT INTO eval_split (subject_id, split_name)
-            VALUES (%s, %s)
-            ON CONFLICT (subject_id, split_name)
-            DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-            """,
-            (subject_id, split_name),
-        ).fetchone()
-        return str(row["id"])
-
-    def upsert_sample(
-        self,
-        conn: psycopg.Connection,
-        *,
-        subject_id: str,
-        split_id: str,
-        sample_index: int,
-        question: str | None,
-        reference_answer: str | None,
-        meta: dict[str, Any] | None,
-    ) -> str:
-        row = conn.execute(
-            """
-            INSERT INTO eval_sample (
-                subject_id, split_id, sample_index, question, reference_answer, meta
-            )
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (subject_id, split_id, sample_index)
-            DO UPDATE SET
-                question = EXCLUDED.question,
-                reference_answer = EXCLUDED.reference_answer,
-                meta = EXCLUDED.meta,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-            """,
-            (subject_id, split_id, sample_index, question, reference_answer, self._json(meta)),
-        ).fetchone()
-        return str(row["id"])
-
-    def upsert_task(
-        self,
-        conn: psycopg.Connection,
-        *,
-        task_id: str,
-        subject_id: str,
-        task_tag: str | None,
-        meta: dict[str, Any] | None,
-    ) -> str:
-        row = conn.execute(
-            """
-            INSERT INTO eval_task (task_id, subject_id, task_tag, meta)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (task_id)
-            DO UPDATE SET
-                subject_id = EXCLUDED.subject_id,
-                task_tag = EXCLUDED.task_tag,
-                meta = EXCLUDED.meta,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-            """,
-            (task_id, subject_id, task_tag, self._json(meta)),
-        ).fetchone()
-        return str(row["id"])
-
     def get_run_by_tag(
         self,
         conn: psycopg.Connection,
         *,
-        task_id: str,
+        benchmark_name: str,
+        dataset: str,
+        dataset_split: str,
+        model_name: str,
+        cot: bool,
         run_tag: str | None,
     ) -> str | None:
         row = conn.execute(
             """
             SELECT id
             FROM eval_run
-            WHERE task_id = %s AND run_tag IS NOT DISTINCT FROM %s
+            WHERE benchmark_name = %s
+              AND dataset = %s
+              AND dataset_split = %s
+              AND model_name = %s
+              AND cot = %s
+              AND run_tag IS NOT DISTINCT FROM %s
             """,
-            (task_id, run_tag),
+            (benchmark_name, dataset, dataset_split, model_name, cot, run_tag),
         ).fetchone()
         return str(row["id"]) if row else None
 
@@ -159,42 +49,71 @@ class EvalDbRepository:
         self,
         conn: psycopg.Connection,
         *,
-        task_id: str,
+        benchmark_name: str,
+        dataset: str,
+        dataset_split: str,
+        model_name: str,
+        cot: bool,
         run_tag: str | None,
     ) -> None:
         conn.execute(
             """
             DELETE FROM eval_run
-            WHERE task_id = %s AND run_tag IS NOT DISTINCT FROM %s
+            WHERE benchmark_name = %s
+              AND dataset = %s
+              AND dataset_split = %s
+              AND model_name = %s
+              AND cot = %s
+              AND run_tag IS NOT DISTINCT FROM %s
             """,
-            (task_id, run_tag),
+            (benchmark_name, dataset, dataset_split, model_name, cot, run_tag),
         )
 
     def insert_run(
         self,
         conn: psycopg.Connection,
         *,
-        task_id: str,
+        benchmark_name: str,
+        dataset: str,
+        dataset_split: str,
+        model_name: str,
+        model_slug: str | None,
+        model_revision: str | None,
+        model_path: str | None,
+        cot: bool,
         run_tag: str | None,
         sampling_config: dict[str, Any] | None,
         runtime_config: dict[str, Any] | None,
         code_version: str | None,
+        task: str | None,
+        task_details: dict[str, Any] | None,
         status: str,
     ) -> str:
         row = conn.execute(
             """
             INSERT INTO eval_run (
-                task_id, run_tag, sampling_config, runtime_config, code_version, status, started_at
+                benchmark_name, dataset, dataset_split, model_name, model_slug,
+                model_revision, model_path, cot, run_tag, sampling_config, runtime_config,
+                code_version, task, task_details, status, started_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             RETURNING id
             """,
             (
-                task_id,
+                benchmark_name,
+                dataset,
+                dataset_split,
+                model_name,
+                model_slug,
+                model_revision,
+                model_path,
+                cot,
                 run_tag,
                 self._json(sampling_config),
                 self._json(runtime_config),
                 code_version,
+                task,
+                self._json(task_details),
                 status,
             ),
         ).fetchone()
@@ -208,18 +127,84 @@ class EvalDbRepository:
         status: str,
         error_msg: str | None = None,
         finished: bool = False,
+        start_now: bool = False,
     ) -> None:
         conn.execute(
             """
             UPDATE eval_run
             SET status = %s,
                 error_msg = %s,
-                updated_at = CURRENT_TIMESTAMP,
+                started_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE started_at END,
                 finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END
             WHERE id = %s
             """,
-            (status, error_msg, finished, run_id),
+            (status, error_msg, start_now, finished, run_id),
         )
+
+    def update_run_summary(
+        self,
+        conn: psycopg.Connection,
+        *,
+        run_id: str,
+        metrics: dict[str, Any],
+        samples: int,
+        problems: int | None,
+        log_path: str | None,
+        eval_details_path: str | None,
+        task: str | None,
+        task_details: dict[str, Any] | None,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE eval_run
+            SET metrics = %s,
+                samples = %s,
+                problems = %s,
+                log_path = %s,
+                eval_details_path = %s,
+                task = %s,
+                task_details = %s
+            WHERE id = %s
+            """,
+            (
+                self._json(metrics),
+                samples,
+                problems,
+                log_path,
+                eval_details_path,
+                task,
+                self._json(task_details),
+                run_id,
+            ),
+        )
+
+    def upsert_sample(
+        self,
+        conn: psycopg.Connection,
+        *,
+        benchmark_name: str,
+        dataset_split: str,
+        sample_index: int,
+        question: str | None,
+        reference_answer: str | None,
+        meta: dict[str, Any] | None,
+    ) -> str:
+        row = conn.execute(
+            """
+            INSERT INTO eval_sample (
+                benchmark_name, dataset_split, sample_index, question, ref_answer, meta
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (benchmark_name, dataset_split, sample_index)
+            DO UPDATE SET
+                question = COALESCE(EXCLUDED.question, eval_sample.question),
+                ref_answer = COALESCE(EXCLUDED.ref_answer, eval_sample.ref_answer),
+                meta = COALESCE(EXCLUDED.meta, eval_sample.meta)
+            RETURNING id
+            """,
+            (benchmark_name, dataset_split, sample_index, question, reference_answer, self._json(meta)),
+        ).fetchone()
+        return str(row["id"])
 
     def upsert_run_sample(
         self,
@@ -236,15 +221,14 @@ class EvalDbRepository:
             INSERT INTO eval_run_sample (
                 run_id, sample_id, repeat_index, status, current_stage, started_at
             )
-            VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, CASE WHEN %s <> 'pending' THEN CURRENT_TIMESTAMP ELSE NULL END)
             ON CONFLICT (run_id, sample_id, repeat_index)
             DO UPDATE SET
                 status = EXCLUDED.status,
-                current_stage = EXCLUDED.current_stage,
-                updated_at = CURRENT_TIMESTAMP
+                current_stage = EXCLUDED.current_stage
             RETURNING id
             """,
-            (run_id, sample_id, repeat_index, status, current_stage),
+            (run_id, sample_id, repeat_index, status, current_stage, status),
         ).fetchone()
         return str(row["id"])
 
@@ -258,6 +242,7 @@ class EvalDbRepository:
         latest_attempt_index: int | None = None,
         error_msg: str | None = None,
         finished: bool = False,
+        start_now: bool = False,
     ) -> None:
         conn.execute(
             """
@@ -266,12 +251,54 @@ class EvalDbRepository:
                 current_stage = %s,
                 latest_attempt_index = COALESCE(%s, latest_attempt_index),
                 error_msg = %s,
-                updated_at = CURRENT_TIMESTAMP,
+                started_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE started_at END,
                 finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END
             WHERE id = %s
             """,
-            (status, current_stage, latest_attempt_index, error_msg, finished, run_sample_id),
+            (status, current_stage, latest_attempt_index, error_msg, start_now, finished, run_sample_id),
         )
+
+    def update_run_sample_result(
+        self,
+        conn: psycopg.Connection,
+        *,
+        run_id: str,
+        sample_index: int,
+        repeat_index: int,
+        answer: str | None,
+        ref_answer: str | None,
+        is_passed: bool,
+        fail_reason: str | None,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE eval_run_sample rs
+            SET answer = %s,
+                is_passed = %s,
+                fail_reason = %s,
+                status = 'succeeded',
+                finished_at = CURRENT_TIMESTAMP
+            FROM eval_sample s
+            WHERE rs.sample_id = s.id
+              AND rs.run_id = %s
+              AND s.sample_index = %s
+              AND rs.repeat_index = %s
+            """,
+            (answer, is_passed, fail_reason, run_id, sample_index, repeat_index),
+        )
+        if ref_answer is not None:
+            conn.execute(
+                """
+                UPDATE eval_sample s
+                SET ref_answer = %s
+                FROM eval_run_sample rs
+                WHERE rs.sample_id = s.id
+                  AND rs.run_id = %s
+                  AND s.sample_index = %s
+                  AND rs.repeat_index = %s
+                """,
+                (ref_answer, run_id, sample_index, repeat_index),
+            )
 
     def get_latest_attempt_index(
         self,
@@ -321,17 +348,18 @@ class EvalDbRepository:
         status: str,
         error_msg: str | None = None,
         finished: bool = False,
+        start_now: bool = False,
     ) -> None:
         conn.execute(
             """
             UPDATE eval_attempt
             SET status = %s,
                 error_msg = %s,
-                updated_at = CURRENT_TIMESTAMP,
+                started_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE started_at END,
                 finished_at = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE finished_at END
             WHERE id = %s
             """,
-            (status, error_msg, finished, attempt_id),
+            (status, error_msg, start_now, finished, attempt_id),
         )
 
     def fetch_latest_final_stage(
@@ -425,39 +453,40 @@ class EvalDbRepository:
             ),
         )
 
-    def insert_metric(
+    def insert_cot_checkpoint(
         self,
         conn: psycopg.Connection,
         *,
-        run_sample_id: str,
-        name: str,
-        value_num: float | None,
-        value_text: str | None,
-        meta: dict[str, Any] | None,
+        attempt_id: str,
+        stage: str,
+        token_offset: int | None,
+        partial_completion: str | None,
+        kv_cache_ref: str | None,
+        rng_state: dict[str, Any] | None,
+        status: str | None,
     ) -> None:
         conn.execute(
             """
-            INSERT INTO eval_metric (run_sample_id, name, value_num, value_text, meta)
-            VALUES (%s, %s, %s, %s, %s)
+            UPDATE eval_cot_checkpoint
+            SET latest = FALSE
+            WHERE attempt_id = %s AND stage = %s AND latest = TRUE
             """,
-            (run_sample_id, name, value_num, value_text, self._json(meta)),
+            (attempt_id, stage),
         )
-
-    def insert_run_event(
-        self,
-        conn: psycopg.Connection,
-        *,
-        run_id: str | None,
-        run_sample_id: str | None,
-        event_type: str,
-        message: str | None,
-        meta: dict[str, Any] | None,
-    ) -> None:
         conn.execute(
             """
-            INSERT INTO eval_run_event (run_id, run_sample_id, event_type, message, meta)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO eval_cot_checkpoint (
+                attempt_id, stage, token_offset, partial_completion, kv_cache_ref, rng_state, status, latest
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
             """,
-            (run_id, run_sample_id, event_type, message, self._json(meta)),
+            (
+                attempt_id,
+                stage,
+                token_offset,
+                partial_completion,
+                kv_cache_ref,
+                self._json(rng_state),
+                status,
+            ),
         )
-

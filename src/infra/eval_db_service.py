@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
+from src.eval.results.schema import dataset_slug_parts
+from src.eval.scheduler.dataset_utils import canonical_slug, make_dataset_slug, safe_slug
 from src.eval.scheduler.jobs import JOB_CATALOGUE, detect_job_from_dataset
 from src.infra.database import DatabaseManager
 
@@ -14,15 +15,14 @@ from .eval_db_repo import EvalDbRepository, StageOutputRow
 
 @dataclass(slots=True)
 class RunContext:
-    subject_id: str
-    split_id: str
-    task_uuid: str
     run_id: str
-    dataset_slug: str
-    split_name: str
+    benchmark_name: str
+    dataset: str
+    dataset_split: str
+    model_name: str
     model_slug: str
-    task_id: str
-    run_tag: str
+    run_tag: str | None
+    cot: bool
 
 
 class EvalDbService:
@@ -34,7 +34,7 @@ class EvalDbService:
         self,
         *,
         dataset_slug: str,
-        split_name: str,
+        split_name: str | None,
         model_path: str,
         is_cot: bool,
         run_tag: str | None,
@@ -45,69 +45,96 @@ class EvalDbService:
         overwrite_run: bool = False,
     ) -> RunContext:
         dataset_slug = canonical_slug(dataset_slug)
-        split_name = split_name or "test"
-        model_slug = safe_slug(Path(model_path).stem)
-        task_id = f"{dataset_slug}__{model_slug}"
-        run_tag = run_tag or safe_slug(f"{dataset_slug}__{model_slug}")
+        if split_name:
+            benchmark_name = dataset_slug
+            dataset_split = split_name
+        else:
+            benchmark_name, dataset_split = dataset_slug_parts(dataset_slug)
+        dataset = make_dataset_slug(benchmark_name, dataset_split) if dataset_split else dataset_slug
 
-        job_name = detect_job_from_dataset(dataset_slug, is_cot=is_cot)
+        model_name = Path(model_path).stem
+        model_slug = safe_slug(model_name)
+        run_tag = run_tag or safe_slug(f"{dataset}__{model_slug}")
+
+        job_name = detect_job_from_dataset(dataset, is_cot=is_cot)
         domain = JOB_CATALOGUE[job_name].domain if job_name and job_name in JOB_CATALOGUE else None
+        task_details = {"job": job_name, "domain": domain} if job_name else None
+        task = task_tag or job_name
 
         with self._db.get_connection() as conn:
-            subject_id = self._repo.upsert_subject(
-                conn,
-                dataset_slug=dataset_slug,
-                domain=domain,
-                dataset_version=None,
-                dataset_meta=None,
-                model_slug=model_slug,
-                model_name=model_slug,
-                model_revision=None,
-                provider="local",
-                model_meta={"path": model_path},
-            )
-            split_id = self._repo.upsert_split(conn, subject_id=subject_id, split_name=split_name)
-            task_uuid = self._repo.upsert_task(
-                conn,
-                task_id=task_id,
-                subject_id=subject_id,
-                task_tag=task_tag,
-                meta={"job": job_name},
-            )
             if overwrite_run:
-                self._repo.delete_run_by_tag(conn, task_id=task_uuid, run_tag=run_tag)
-            run_id = self._repo.get_run_by_tag(conn, task_id=task_uuid, run_tag=run_tag)
+                self._repo.delete_run_by_tag(
+                    conn,
+                    benchmark_name=benchmark_name,
+                    dataset=dataset,
+                    dataset_split=dataset_split,
+                    model_name=model_name,
+                    cot=is_cot,
+                    run_tag=run_tag,
+                )
+            run_id = self._repo.get_run_by_tag(
+                conn,
+                benchmark_name=benchmark_name,
+                dataset=dataset,
+                dataset_split=dataset_split,
+                model_name=model_name,
+                cot=is_cot,
+                run_tag=run_tag,
+            )
             if not run_id:
                 run_id = self._repo.insert_run(
                     conn,
-                    task_id=task_uuid,
+                    benchmark_name=benchmark_name,
+                    dataset=dataset,
+                    dataset_split=dataset_split,
+                    model_name=model_name,
+                    model_slug=model_slug,
+                    model_revision=None,
+                    model_path=model_path,
+                    cot=is_cot,
                     run_tag=run_tag,
                     sampling_config=sampling_config,
                     runtime_config=runtime_config,
                     code_version=code_version,
+                    task=task,
+                    task_details=task_details,
                     status="running",
                 )
+            else:
+                self._repo.update_run_status(
+                    conn,
+                    run_id=run_id,
+                    status="running",
+                    start_now=True,
+                    finished=False,
+                )
             return RunContext(
-                subject_id=subject_id,
-                split_id=split_id,
-                task_uuid=task_uuid,
                 run_id=run_id,
-                dataset_slug=dataset_slug,
-                split_name=split_name,
+                benchmark_name=benchmark_name,
+                dataset=dataset,
+                dataset_split=dataset_split,
+                model_name=model_name,
                 model_slug=model_slug,
-                task_id=task_id,
                 run_tag=run_tag,
+                cot=is_cot,
             )
 
     def mark_run_status(self, *, run_id: str, status: str, error_msg: str | None = None) -> None:
         with self._db.get_connection() as conn:
-            self._repo.update_run_status(conn, run_id=run_id, status=status, error_msg=error_msg, finished=True)
+            self._repo.update_run_status(
+                conn,
+                run_id=run_id,
+                status=status,
+                error_msg=error_msg,
+                finished=True,
+                start_now=status == "running",
+            )
 
     def upsert_sample(
         self,
         *,
-        subject_id: str,
-        split_id: str,
+        benchmark_name: str,
+        dataset_split: str,
         sample_index: int,
         question: str | None,
         reference_answer: str | None,
@@ -116,8 +143,8 @@ class EvalDbService:
         with self._db.get_connection() as conn:
             return self._repo.upsert_sample(
                 conn,
-                subject_id=subject_id,
-                split_id=split_id,
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
                 sample_index=sample_index,
                 question=question,
                 reference_answer=reference_answer,
@@ -181,6 +208,7 @@ class EvalDbService:
                 status="running",
                 current_stage=current_stage,
                 latest_attempt_index=next_idx,
+                start_now=True,
             )
             return attempt_id, next_idx
 
@@ -199,6 +227,7 @@ class EvalDbService:
                 status=status,
                 error_msg=error_msg,
                 finished=finished,
+                start_now=status == "running",
             )
 
     def mark_run_sample_status(
@@ -220,6 +249,7 @@ class EvalDbService:
                 latest_attempt_index=latest_attempt_index,
                 error_msg=error_msg,
                 finished=finished,
+                start_now=status == "running",
             )
 
     def write_stage_output(
@@ -258,6 +288,17 @@ class EvalDbService:
                 is_partial=is_partial,
                 is_final=is_final,
             )
+            if stage == "cot" and is_partial:
+                self._repo.insert_cot_checkpoint(
+                    conn,
+                    attempt_id=attempt_id,
+                    stage=stage,
+                    token_offset=None,
+                    partial_completion=completion,
+                    kv_cache_ref=None,
+                    rng_state=None,
+                    status="partial",
+                )
 
     def ingest_eval_results(
         self,
@@ -276,30 +317,42 @@ class EvalDbService:
                 if not text:
                     continue
                 payload = json.loads(text)
+                benchmark_name = str(payload.get("benchmark_name", ""))
+                dataset_split = str(payload.get("dataset_split", ""))
                 sample_index = int(payload.get("sample_index", 0))
                 repeat_index = int(payload.get("repeat_index", 0))
-                run_sample_id = self._repo.get_run_sample_id(
+                answer = payload.get("answer")
+                ref_answer = payload.get("ref_answer")
+                is_passed = bool(payload.get("is_passed", False))
+                fail_reason = payload.get("fail_reason")
+                context = payload.get("context")
+                meta = {"context": context} if context else None
+                sample_id = self._repo.upsert_sample(
+                    conn,
+                    benchmark_name=benchmark_name or "unknown",
+                    dataset_split=dataset_split or "unknown",
+                    sample_index=sample_index,
+                    question=None if not context else str(context),
+                    reference_answer=None if ref_answer is None else str(ref_answer),
+                    meta=meta,
+                )
+                self._repo.upsert_run_sample(
+                    conn,
+                    run_id=run_id,
+                    sample_id=sample_id,
+                    repeat_index=repeat_index,
+                    status="succeeded",
+                    current_stage="final",
+                )
+                self._repo.update_run_sample_result(
                     conn,
                     run_id=run_id,
                     sample_index=sample_index,
                     repeat_index=repeat_index,
-                )
-                if not run_sample_id:
-                    continue
-                is_passed = bool(payload.get("is_passed", False))
-                value_num = 1.0 if is_passed else 0.0
-                meta = {
-                    "answer": payload.get("answer"),
-                    "ref_answer": payload.get("ref_answer"),
-                    "fail_reason": payload.get("fail_reason"),
-                }
-                self._repo.insert_metric(
-                    conn,
-                    run_sample_id=run_sample_id,
-                    name=metric_name,
-                    value_num=value_num,
-                    value_text=str(is_passed),
-                    meta=meta,
+                    answer=None if answer is None else str(answer),
+                    ref_answer=None if ref_answer is None else str(ref_answer),
+                    is_passed=is_passed,
+                    fail_reason=None if fail_reason is None else str(fail_reason),
                 )
                 inserted += 1
         return inserted
@@ -318,23 +371,25 @@ class EvalDbService:
         task: str | None,
         task_details: dict[str, Any] | None,
     ) -> None:
-        meta = {
-            "metrics": metrics,
-            "samples": samples,
-            "problems": problems,
-            "log_path": str(log_path),
-            "eval_path": str(eval_path),
-            "score_path": str(score_path),
-            "task": task,
-            "task_details": task_details or {},
-        }
+        details = task_details.copy() if task_details else {}
+        details.setdefault("score_path", str(score_path))
+        details.setdefault("eval_details_path", str(eval_path))
         with self._db.get_connection() as conn:
-            self._repo.insert_run_event(
+            self._repo.update_run_summary(
                 conn,
                 run_id=run_id,
-                run_sample_id=None,
-                event_type=event_type,
-                message="score_summary",
-                meta=meta,
+                metrics=metrics,
+                samples=samples,
+                problems=problems,
+                log_path=str(log_path),
+                eval_details_path=str(eval_path),
+                task=task,
+                task_details=details,
             )
-
+            self._repo.update_run_status(
+                conn,
+                run_id=run_id,
+                status="succeeded",
+                finished=True,
+                start_now=False,
+            )

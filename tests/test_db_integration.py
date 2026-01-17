@@ -38,7 +38,7 @@ class TestDatabaseManager(unittest.TestCase):
         mock_conn.execute.assert_called()
         executed_sql = [call_args[0][0] for call_args in mock_conn.execute.call_args_list]
         self.assertTrue(
-            any("CREATE TABLE IF NOT EXISTS eval_subject" in sql for sql in executed_sql)
+            any("CREATE TABLE IF NOT EXISTS eval_run" in sql for sql in executed_sql)
         )
 
     @patch("psycopg.ConnectionPool")
