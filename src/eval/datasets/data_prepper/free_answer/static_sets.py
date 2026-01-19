@@ -11,7 +11,6 @@ from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
 STATIC_DATASETS = {
     "aime24": "aime24_test.jsonl",
     "aime25": "aime25_test.jsonl",
-    "answer-judge": "answer_judge_test.jsonl",
     "comp-math-24-25": "comp-math-24-25_test.jsonl",
 }
 

@@ -1,3 +1,9 @@
+[default]
+pass_k = [1]
+avg_k = [4]
+report_pass_k = [1]
+report_avg_k = [4]
+
 [cot]
 template = "free_response_cot_default"
 

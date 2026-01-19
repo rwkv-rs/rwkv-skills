@@ -114,10 +114,12 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
     failed = {record.key for record in score_records.values() if record.missing_artifacts}
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
+    overwrite = bool(getattr(opts, "overwrite", False))
+    completed_for_queue = set() if overwrite else completed
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
-        completed=completed,
+        completed=completed_for_queue,
         failed=failed,
         running=running_entries.keys(),
         skip_dataset_slugs=opts.skip_dataset_slugs,

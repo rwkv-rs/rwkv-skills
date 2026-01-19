@@ -22,7 +22,7 @@ DATASET_SLUG_ALIASES: dict[str, str] = {
     "cmmlu": "cmmlu_test",
 }
 
-_KNOWN_SPLIT_NAMES = {
+_CANONICALIZE_SPLIT_NAMES = {
     "train",
     "test",
     "validation",
@@ -34,16 +34,11 @@ _KNOWN_SPLIT_NAMES = {
     "verified",
     "all",
     "text",
-    # HLE category splits (data/hle/{math,cs,...}.jsonl) should keep the parent prefix.
-    "other",
-    "human",
-    "math",
-    "phy",
-    "cs",
-    "bio",
-    "chem",
-    "eng",
 }
+
+# HLE category splits (data/hle/{math,cs,...}.jsonl) should keep the parent prefix.
+_KNOWN_SPLIT_NAMES = set(_CANONICALIZE_SPLIT_NAMES)
+_KNOWN_SPLIT_NAMES.update({"other", "human", "math", "phy", "cs", "bio", "chem", "eng"})
 
 
 def safe_slug(text: str) -> str:
@@ -62,7 +57,7 @@ def canonical_slug(text: str) -> str:
 
 
 def _strip_known_split_suffix(slug: str) -> str:
-    for split in sorted(_KNOWN_SPLIT_NAMES, key=len, reverse=True):
+    for split in sorted(_CANONICALIZE_SPLIT_NAMES, key=len, reverse=True):
         suffix = f"_{split}"
         if slug.endswith(suffix):
             return slug[: -len(suffix)]
@@ -72,9 +67,9 @@ def _strip_known_split_suffix(slug: str) -> str:
 def split_benchmark_and_split(dataset_slug: str) -> tuple[str, str]:
     """Split a canonical dataset slug into (benchmark_name, dataset_split).
 
-    The split suffix is detected using the same `_KNOWN_SPLIT_NAMES` logic that
-    powers benchmark canonicalisation. If no known suffix is found, the split
-    is returned as an empty string.
+    The split suffix is detected using `_KNOWN_SPLIT_NAMES` (which includes HLE
+    category suffixes like `_math` for path inference). If no known suffix is
+    found, the split is returned as an empty string.
     """
     slug = canonical_slug(dataset_slug)
     # Artifact-only stems (e.g. results/.../xxx__cot.jsonl) may surface here; strip them.

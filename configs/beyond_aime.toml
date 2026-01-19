@@ -1,3 +1,9 @@
+[default]
+pass_k = [8]
+avg_k = [16]
+report_pass_k = [8]
+report_avg_k = [16]
+
 [cot]
 template = "math_cot_default"
 

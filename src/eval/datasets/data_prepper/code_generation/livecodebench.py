@@ -57,7 +57,6 @@ def _prepare_livecodebench(
         _DATASET_CONFIG,
         split=split,
         version_tag=version_tag,
-        trust_remote_code=True,
     )
 
     rows = sorted(dataset, key=lambda item: str(item.get("question_id", "")))

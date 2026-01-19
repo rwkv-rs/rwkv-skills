@@ -69,12 +69,13 @@ print(result)
 rwkv-skills-scheduler queue
 rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
 ```
+其中 `queue` 是 `dispatch` 的 dry-run，会接受与 `dispatch` 一致的参数（包含 `--overwrite`）并输出将被调度的任务列表。
 若需无视 `results/scores` 中已存在的结果并强制重跑，可在 dispatch 时附上 `--overwrite`，调度器会在启动前删除旧的 completion / score / eval 产物再重新评测。
 评测脚本在配置好 API_KEY/JUDGE_MODEL 时默认会运行 LLM wrong-answer checker；如需关闭，可在 dispatch 时附上 `--disable-checker`。
 可以用 `--only-datasets aime24 aime25` 这类参数仅重测指定 benchmark（名称即可，不需要 `_test` 后缀），也可以用 `--skip-datasets mmlu` 排除特定集合。若想只跑部分模型，无需填写完整路径，可使用 `--model-regex '^rwkv7-.*7\\.2b$'` 等正则过滤模型文件名，配合默认的权重 glob 即可。
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
 `src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`、`eval_code_livecodebench.py`。
-其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的数学问答会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
+其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的 free-response benchmark 会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
 采样参数的网格搜索通过 param-search 流程完成：
 - runner job 会把完整网格（先 `normal` 后 `simple`，不截断）每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
 - selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并保留两套互相独立的选参结果：

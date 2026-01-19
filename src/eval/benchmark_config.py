@@ -37,6 +37,11 @@ _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
 @dataclass(slots=True)
 class BenchmarkModelConfig:
     sampling_overrides: dict[str, object]
+    # Optional evaluation-level overrides (e.g. free-response pass@k / avg@k).
+    pass_k: tuple[int, ...] | None = None
+    avg_k: tuple[int, ...] | None = None
+    report_pass_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[int, ...] | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -196,6 +201,10 @@ def _normalize_model_key(value: str) -> str:
 
 def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     sampling_overrides: dict[str, object] = {}
+    pass_k: tuple[int, ...] | None = None
+    avg_k: tuple[int, ...] | None = None
+    report_pass_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[int, ...] | None = None
 
     for key, raw in table.items():
         if key in _INT_FIELDS:
@@ -208,6 +217,18 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             value = raw if isinstance(raw, bool) else None
         elif key in _STR_FIELDS:
             value = str(raw) if isinstance(raw, str) else None
+        elif key == "pass_k":
+            pass_k = _coerce_k_tuple(raw)
+            continue
+        elif key == "avg_k":
+            avg_k = _coerce_k_tuple(raw)
+            continue
+        elif key == "report_pass_k":
+            report_pass_k = _coerce_k_tuple(raw)
+            continue
+        elif key == "report_avg_k":
+            report_avg_k = _coerce_k_tuple(raw)
+            continue
         else:
             continue
         if value is not None:
@@ -215,6 +236,10 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
 
     return BenchmarkModelConfig(
         sampling_overrides=sampling_overrides,
+        pass_k=pass_k,
+        avg_k=avg_k,
+        report_pass_k=report_pass_k,
+        report_avg_k=report_avg_k,
     )
 
 
@@ -258,6 +283,20 @@ def _coerce_int_tuple(value: Any) -> tuple[int, ...] | None:
                 return None
         return tuple(items)
     return None
+
+
+def _coerce_k_tuple(value: Any) -> tuple[int, ...] | None:
+    """Coerce pass@k / avg@k style configs.
+
+    Accepts int or list/tuple of ints; filters out non-positive values and sorts/uniques.
+    Returns an empty tuple when explicitly configured as an empty list.
+    """
+
+    raw = _coerce_int_tuple(value)
+    if raw is None:
+        return None
+    filtered = sorted({int(item) for item in raw if int(item) > 0})
+    return tuple(filtered)
 
 
 def resolve_sampling_config(
