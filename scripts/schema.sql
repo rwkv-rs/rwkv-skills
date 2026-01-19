@@ -1,172 +1,211 @@
 -- Extensions needed for UUID generation.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- Table: evaluation runs (front-end main list).
-CREATE TABLE IF NOT EXISTS eval_run (
+-- Table: version (task run metadata)
+CREATE TABLE IF NOT EXISTS version (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    benchmark_name VARCHAR(128) NOT NULL,
-    dataset VARCHAR(255) NOT NULL,
-    dataset_split VARCHAR(128) NOT NULL,
-    model_name VARCHAR(255) NOT NULL,
-    model_slug VARCHAR(255),
-    model_revision VARCHAR(255),
-    model_path TEXT,
-    cot BOOLEAN NOT NULL DEFAULT FALSE,
-    run_tag VARCHAR(255),
-    sampling_config JSONB,
-    runtime_config JSONB,
-    code_version VARCHAR(255),
-    task VARCHAR(128),
-    task_details JSONB,
-    metrics JSONB,
-    samples INT,
-    problems INT,
-    log_path TEXT,
-    eval_details_path TEXT,
-    status VARCHAR(32) NOT NULL DEFAULT 'pending',
-    error_msg TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ
+    job_name TEXT,
+    job_id TEXT,
+    dataset TEXT,
+    model TEXT,
+    git_sha TEXT,
+    is_param_search BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_eval_run_dataset ON eval_run(dataset);
-CREATE INDEX IF NOT EXISTS idx_eval_run_model ON eval_run(model_name);
-CREATE INDEX IF NOT EXISTS idx_eval_run_status ON eval_run(status);
-CREATE INDEX IF NOT EXISTS idx_eval_run_cot ON eval_run(cot);
-CREATE INDEX IF NOT EXISTS idx_eval_run_created ON eval_run(created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_eval_run_lookup
-    ON eval_run(benchmark_name, dataset, dataset_split, model_name, cot);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_run_tag
-    ON eval_run(benchmark_name, dataset, dataset_split, model_name, cot, run_tag);
+CREATE INDEX IF NOT EXISTS idx_version_created_at
+    ON version(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_version_job
+    ON version(job_name, job_id);
+CREATE INDEX IF NOT EXISTS idx_version_model_dataset
+    ON version(model, dataset);
+CREATE INDEX IF NOT EXISTS idx_version_param_search
+    ON version(is_param_search);
 
--- Table: benchmark samples (deduplicated by benchmark+split+index).
-CREATE TABLE IF NOT EXISTS eval_sample (
+-- Table: completions (results/completions/*.jsonl)
+CREATE TABLE IF NOT EXISTS completions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    benchmark_name VARCHAR(128) NOT NULL,
-    dataset_split VARCHAR(128) NOT NULL,
+    version_id UUID NOT NULL REFERENCES version(id) ON DELETE CASCADE,
+    is_param_search BOOLEAN NOT NULL DEFAULT FALSE,
+    benchmark_name TEXT NOT NULL,
+    dataset_split TEXT NOT NULL,
     sample_index INT NOT NULL,
-    question TEXT,
-    ref_answer TEXT,
-    meta JSONB,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_sample_key
-    ON eval_sample(benchmark_name, dataset_split, sample_index);
-CREATE INDEX IF NOT EXISTS idx_eval_sample_lookup
-    ON eval_sample(benchmark_name, dataset_split);
-
--- Table: run-sample status and summary result.
-CREATE TABLE IF NOT EXISTS eval_run_sample (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_id UUID NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
-    sample_id UUID NOT NULL REFERENCES eval_sample(id) ON DELETE CASCADE,
     repeat_index INT NOT NULL,
-    current_stage VARCHAR(32),
-    latest_attempt_index INT DEFAULT 0,
+    sampling_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    context JSONB
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_completions_sample
+    ON completions(version_id, benchmark_name, dataset_split, sample_index, repeat_index);
+CREATE INDEX IF NOT EXISTS idx_completions_lookup
+    ON completions(benchmark_name, dataset_split, sample_index);
+CREATE INDEX IF NOT EXISTS idx_completions_version
+    ON completions(version_id, is_param_search);
+
+-- Table: eval (results/eval/*_results.jsonl)
+CREATE TABLE IF NOT EXISTS eval (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    version_id UUID NOT NULL REFERENCES version(id) ON DELETE CASCADE,
+    is_param_search BOOLEAN NOT NULL DEFAULT FALSE,
+    benchmark_name TEXT NOT NULL,
+    dataset_split TEXT NOT NULL,
+    sample_index INT NOT NULL,
+    repeat_index INT NOT NULL,
+    context TEXT,
     answer TEXT,
-    is_passed BOOLEAN,
-    fail_reason TEXT,
-    status VARCHAR(32) NOT NULL DEFAULT 'pending',
-    error_msg TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ
+    ref_answer TEXT,
+    is_passed BOOLEAN NOT NULL DEFAULT FALSE,
+    fail_reason TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_run_sample_key
-    ON eval_run_sample(run_id, sample_id, repeat_index);
-CREATE INDEX IF NOT EXISTS idx_eval_run_sample_run
-    ON eval_run_sample(run_id, status);
-CREATE INDEX IF NOT EXISTS idx_eval_run_sample_sample
-    ON eval_run_sample(sample_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_sample
+    ON eval(version_id, benchmark_name, dataset_split, sample_index, repeat_index);
+CREATE INDEX IF NOT EXISTS idx_eval_lookup
+    ON eval(benchmark_name, dataset_split, sample_index);
+CREATE INDEX IF NOT EXISTS idx_eval_version
+    ON eval(version_id, is_param_search);
 
--- Table: attempts for retry/worker execution.
-CREATE TABLE IF NOT EXISTS eval_attempt (
+-- Table: score (results/scores/*.json)
+CREATE TABLE IF NOT EXISTS score (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    run_sample_id UUID NOT NULL REFERENCES eval_run_sample(id) ON DELETE CASCADE,
-    attempt_index INT NOT NULL,
-    worker_id VARCHAR(255),
-    shard_id INT,
-    shard_count INT,
-    seed BIGINT,
-    status VARCHAR(32) NOT NULL DEFAULT 'running',
-    error_msg TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ
+    version_id UUID NOT NULL REFERENCES version(id) ON DELETE CASCADE,
+    is_param_search BOOLEAN NOT NULL DEFAULT FALSE,
+    dataset TEXT NOT NULL,
+    model TEXT NOT NULL,
+    cot BOOLEAN NOT NULL DEFAULT FALSE,
+    metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+    samples INT NOT NULL,
+    problems INT,
+    created_at TIMESTAMPTZ NOT NULL,
+    log_path TEXT,
+    task TEXT,
+    task_details JSONB
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_attempt_key
-    ON eval_attempt(run_sample_id, attempt_index);
-CREATE INDEX IF NOT EXISTS idx_eval_attempt_status
-    ON eval_attempt(run_sample_id, status);
+CREATE INDEX IF NOT EXISTS idx_score_dataset_model
+    ON score(dataset, model, cot);
+CREATE INDEX IF NOT EXISTS idx_score_created_at
+    ON score(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_score_version
+    ON score(version_id, is_param_search);
 
--- Table: stage output (prompt/completion).
-CREATE TABLE IF NOT EXISTS eval_stage_output (
+-- Table: logs (results/logs/*.log)
+CREATE TABLE IF NOT EXISTS logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    attempt_id UUID NOT NULL REFERENCES eval_attempt(id) ON DELETE CASCADE,
-    stage VARCHAR(32) NOT NULL,
-    seq INT NOT NULL DEFAULT 0,
-    prompt TEXT,
-    completion TEXT,
-    finish_reason VARCHAR(32),
-    provider_request_id VARCHAR(255),
-    raw_response JSONB,
-    token_count_prompt INT,
-    token_count_response INT,
-    latency_ms INT,
-    cost_usd NUMERIC,
-    is_partial BOOLEAN NOT NULL DEFAULT FALSE,
-    is_final BOOLEAN NOT NULL DEFAULT FALSE,
+    version_id UUID REFERENCES version(id) ON DELETE SET NULL,
+    event TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX IF NOT EXISTS idx_eval_stage_latest
-    ON eval_stage_output(attempt_id, stage, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_eval_stage_finish
-    ON eval_stage_output(stage, finish_reason);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_stage_final
-    ON eval_stage_output(attempt_id, stage) WHERE is_final;
+CREATE INDEX IF NOT EXISTS idx_logs_job_id
+    ON logs(job_id);
+CREATE INDEX IF NOT EXISTS idx_logs_created_at
+    ON logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_logs_version
+    ON logs(version_id);
 
--- Table: CoT checkpoints for resume.
-CREATE TABLE IF NOT EXISTS eval_cot_checkpoint (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    attempt_id UUID NOT NULL REFERENCES eval_attempt(id) ON DELETE CASCADE,
-    stage VARCHAR(32) NOT NULL,
-    token_offset INT,
-    partial_completion TEXT,
-    kv_cache_ref TEXT,
-    rng_state JSONB,
-    status VARCHAR(32),
-    latest BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_ckpt_latest
-    ON eval_cot_checkpoint(attempt_id, stage) WHERE latest;
-CREATE INDEX IF NOT EXISTS idx_eval_ckpt_lookup
-    ON eval_cot_checkpoint(attempt_id, stage, created_at DESC);
-
--- View: front-end friendly join for run + sample + result.
-CREATE OR REPLACE VIEW view_eval_run_sample AS
+-- View: latest score per model/dataset with corresponding eval/completions.
+CREATE OR REPLACE VIEW view_latest_model_run AS
+WITH latest_score AS (
+    SELECT
+        version_id,
+        dataset,
+        model,
+        cot,
+        metrics,
+        samples,
+        problems,
+        created_at,
+        log_path,
+        task,
+        task_details,
+        ROW_NUMBER() OVER (
+            PARTITION BY dataset, model, cot
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM score
+    WHERE is_param_search = FALSE
+)
 SELECT
-    r.id AS run_id,
-    r.benchmark_name,
-    r.dataset,
-    r.dataset_split,
-    r.model_name,
-    r.model_path,
-    r.cot,
-    r.metrics,
-    r.status AS run_status,
-    r.created_at AS run_created_at,
-    s.id AS sample_id,
-    s.sample_index,
-    s.question,
-    s.ref_answer,
-    rs.repeat_index,
-    rs.answer,
-    rs.is_passed,
-    rs.fail_reason,
-    rs.status AS sample_status,
-    rs.started_at AS sample_started_at,
-    rs.finished_at AS sample_finished_at
-FROM eval_run_sample rs
-JOIN eval_run r ON r.id = rs.run_id
-JOIN eval_sample s ON s.id = rs.sample_id;
+    s.version_id,
+    s.dataset,
+    s.model,
+    s.cot,
+    s.metrics,
+    s.samples,
+    s.problems,
+    s.created_at AS score_created_at,
+    s.log_path,
+    s.task,
+    s.task_details,
+    e.benchmark_name,
+    e.dataset_split,
+    e.sample_index,
+    e.repeat_index,
+    e.context,
+    e.answer,
+    e.ref_answer,
+    e.is_passed,
+    e.fail_reason,
+    c.sampling_config,
+    c.context AS completion_context
+FROM latest_score s
+JOIN eval e
+  ON e.version_id = s.version_id
+ AND e.is_param_search = FALSE
+JOIN completions c
+  ON c.version_id = s.version_id
+ AND c.is_param_search = FALSE
+ AND c.benchmark_name = e.benchmark_name
+ AND c.dataset_split = e.dataset_split
+ AND c.sample_index = e.sample_index
+ AND c.repeat_index = e.repeat_index
+WHERE s.rn = 1;
+
+-- View: latest score per dataset/model/cot for quick listing.
+CREATE OR REPLACE VIEW view_score_latest AS
+SELECT
+    version_id,
+    dataset,
+    model,
+    cot,
+    metrics,
+    samples,
+    problems,
+    created_at,
+    log_path,
+    task,
+    task_details
+FROM (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY dataset, model, cot
+            ORDER BY created_at DESC
+        ) AS rn
+    FROM score
+    WHERE is_param_search = FALSE
+) latest
+WHERE latest.rn = 1;
+
+-- View: join eval with completions for sample-level inspection.
+CREATE OR REPLACE VIEW view_eval_completion AS
+SELECT
+    e.version_id,
+    e.benchmark_name,
+    e.dataset_split,
+    e.sample_index,
+    e.repeat_index,
+    e.context,
+    e.answer,
+    e.ref_answer,
+    e.is_passed,
+    e.fail_reason,
+    c.sampling_config,
+    c.context AS completion_context
+FROM eval e
+JOIN completions c
+  ON c.version_id = e.version_id
+ AND c.benchmark_name = e.benchmark_name
+ AND c.dataset_split = e.dataset_split
+ AND c.sample_index = e.sample_index
+ AND c.repeat_index = e.repeat_index
+WHERE e.is_param_search = FALSE
+  AND c.is_param_search = FALSE;

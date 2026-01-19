@@ -9,7 +9,6 @@ from typing import Sequence
 from dataclasses import replace
 
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
-from src.eval.results.schema import dataset_slug_parts
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.infra.database import DatabaseManager
 from src.infra.eval_db_service import EvalDbService
@@ -134,29 +133,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         db = DatabaseManager.instance()
         db.initialize(DEFAULT_DB_CONFIG)
         service = EvalDbService(db)
-        benchmark_name, dataset_split = dataset_slug_parts(slug)
-        run_ctx = service.prepare_run(
-            dataset_slug=benchmark_name,
-            split_name=dataset_split,
-            model_path=args.model_path,
-            is_cot=False,
-            run_tag=Path(out_path).stem,
-            sampling_config=None,
-            runtime_config=None,
-            code_version=None,
+        version_id = service.get_or_create_version(
+            job_name="eval_code_mbpp",
+            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+            dataset=str(slug),
+            model=Path(args.model_path).stem,
+            is_param_search=False,
+            allow_resume=True,
         )
-        service.ingest_eval_results(eval_path=eval_path, run_id=run_ctx.run_id, metric_name="passed")
-        service.record_score_summary(
-            run_id=run_ctx.run_id,
-            event_type="score_summary",
-            metrics=eval_metrics or {},
-            samples=result.sample_count,
-            problems=result.problem_count,
-            log_path=out_path,
+        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+        service.ingest_completions(
+            completions_path=out_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.ingest_eval(
             eval_path=eval_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.record_score(
             score_path=score_path,
-            task="code_mbpp",
-            task_details={"eval_details_path": str(eval_path)},
+            version_id=version_id,
+            is_param_search=False,
         )
     print(f"📊 scores saved: {score_path}")
     run_llm_checker(eval_path, model_name=Path(args.model_path).stem)

@@ -10,9 +10,6 @@ from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoa
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
@@ -175,22 +172,6 @@ class CodingPipeline:
         target_path = Path(output_path)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
 
-        db_service: EvalDbService | None = None
-        run_ctx = None
-        if DEFAULT_DB_CONFIG.enabled:
-            db = DatabaseManager.instance()
-            db.initialize(DEFAULT_DB_CONFIG)
-            db_service = EvalDbService(db)
-            run_ctx = db_service.prepare_run(
-                dataset_slug=benchmark_name,
-                split_name=dataset_split,
-                model_path=str(self.model_path),
-                is_cot=False,
-                run_tag=target_path.stem,
-                sampling_config=sampling_config,
-                runtime_config={"batch_size": batch_size, "samples_per_task": samples_per_task},
-                code_version=None,
-            )
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -223,63 +204,6 @@ class CodingPipeline:
                     completion=raw_output,
                     stop_reason=seq.finish_reason,
                 )
-                if db_service and run_ctx:
-                    meta = {
-                        "task_id": record.task_id,
-                        "starter_code": record.starter_code,
-                        "entry_point": record.entry_point,
-                        "canonical_solution": record.canonical_solution,
-                        "test_cases": record.test_cases,
-                        **(record.metadata or {}),
-                    }
-                    sample_db_id = db_service.upsert_sample(
-                        benchmark_name=run_ctx.benchmark_name,
-                        dataset_split=run_ctx.dataset_split,
-                        sample_index=rec_idx,
-                        question=record.prompt,
-                        reference_answer=(record.canonical_solution or ""),
-                        meta=meta,
-                    )
-                    run_sample_id = db_service.upsert_run_sample(
-                        run_id=run_ctx.run_id,
-                        sample_id=sample_db_id,
-                        repeat_index=sample_idx,
-                        status="pending",
-                        current_stage=None,
-                    )
-                    if db_service.fetch_latest_stage(run_sample_id=run_sample_id, stage="final"):
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            finished=True,
-                        )
-                    else:
-                        attempt_id, attempt_index = db_service.start_attempt(
-                            run_sample_id=run_sample_id,
-                            current_stage="final",
-                        )
-                        db_service.write_stage_output(
-                            attempt_id=attempt_id,
-                            stage="final",
-                            seq=0,
-                            prompt=prompt_text,
-                            completion=raw_output,
-                            finish_reason=seq.finish_reason,
-                            is_final=True,
-                        )
-                        db_service.mark_attempt_status(
-                            attempt_id=attempt_id,
-                            status="succeeded",
-                            finished=True,
-                        )
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            latest_attempt_index=attempt_index,
-                            finished=True,
-                        )
                 writer.write(
                     SampleRecord(
                         benchmark_name=benchmark_name,
@@ -291,8 +215,6 @@ class CodingPipeline:
                     )
                 )
             writer.close()
-            if db_service and run_ctx:
-                db_service.mark_run_status(run_id=run_ctx.run_id, status="succeeded")
 
         return CodingPipelineResult(
             dataset=dataset_name,
@@ -352,22 +274,6 @@ class CodingPipeline:
 
         target_path = Path(output_path)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
-        db_service: EvalDbService | None = None
-        run_ctx = None
-        if DEFAULT_DB_CONFIG.enabled:
-            db = DatabaseManager.instance()
-            db.initialize(DEFAULT_DB_CONFIG)
-            db_service = EvalDbService(db)
-            run_ctx = db_service.prepare_run(
-                dataset_slug=benchmark_name,
-                split_name=dataset_split,
-                model_path=str(self.model_path),
-                is_cot=False,
-                run_tag=target_path.stem,
-                sampling_config=sampling_config,
-                runtime_config={"batch_size": batch_size, "samples_per_task": samples_per_task},
-                code_version=None,
-            )
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -400,63 +306,6 @@ class CodingPipeline:
                     completion=raw_output,
                     stop_reason=seq.finish_reason,
                 )
-                if db_service and run_ctx:
-                    meta = {
-                        "task_id": record.task_id,
-                        "starter_code": record.starter_code,
-                        "entry_point": record.entry_point,
-                        "canonical_solution": record.canonical_solution,
-                        "test_cases": record.test_cases,
-                        **(record.metadata or {}),
-                    }
-                    sample_db_id = db_service.upsert_sample(
-                        benchmark_name=run_ctx.benchmark_name,
-                        dataset_split=run_ctx.dataset_split,
-                        sample_index=rec_idx,
-                        question=record.prompt,
-                        reference_answer=(record.canonical_solution or ""),
-                        meta=meta,
-                    )
-                    run_sample_id = db_service.upsert_run_sample(
-                        run_id=run_ctx.run_id,
-                        sample_id=sample_db_id,
-                        repeat_index=sample_idx,
-                        status="pending",
-                        current_stage=None,
-                    )
-                    if db_service.fetch_latest_stage(run_sample_id=run_sample_id, stage="final"):
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            finished=True,
-                        )
-                    else:
-                        attempt_id, attempt_index = db_service.start_attempt(
-                            run_sample_id=run_sample_id,
-                            current_stage="final",
-                        )
-                        db_service.write_stage_output(
-                            attempt_id=attempt_id,
-                            stage="final",
-                            seq=0,
-                            prompt=prompt_text,
-                            completion=raw_output,
-                            finish_reason=seq.finish_reason,
-                            is_final=True,
-                        )
-                        db_service.mark_attempt_status(
-                            attempt_id=attempt_id,
-                            status="succeeded",
-                            finished=True,
-                        )
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            latest_attempt_index=attempt_index,
-                            finished=True,
-                        )
                 writer.write(
                     SampleRecord(
                         benchmark_name=benchmark_name,
@@ -468,8 +317,6 @@ class CodingPipeline:
                     )
                 )
             writer.close()
-            if db_service and run_ctx:
-                db_service.mark_run_status(run_id=run_ctx.run_id, status="succeeded")
 
         return CodingPipelineResult(
             dataset=dataset_name,
@@ -525,22 +372,6 @@ class CodingPipeline:
 
         target_path = Path(output_path)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
-        db_service: EvalDbService | None = None
-        run_ctx = None
-        if DEFAULT_DB_CONFIG.enabled:
-            db = DatabaseManager.instance()
-            db.initialize(DEFAULT_DB_CONFIG)
-            db_service = EvalDbService(db)
-            run_ctx = db_service.prepare_run(
-                dataset_slug=benchmark_name,
-                split_name=dataset_split,
-                model_path=str(self.model_path),
-                is_cot=False,
-                run_tag=target_path.stem,
-                sampling_config=sampling_config,
-                runtime_config={"batch_size": batch_size, "samples_per_task": samples_per_task},
-                code_version=None,
-            )
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -573,63 +404,6 @@ class CodingPipeline:
                     completion=raw_output,
                     stop_reason=seq.finish_reason,
                 )
-                if db_service and run_ctx:
-                    meta = {
-                        "task_id": record.task_id,
-                        "starter_code": record.starter_code,
-                        "entry_point": record.entry_point,
-                        "canonical_solution": record.canonical_solution,
-                        "test_cases": record.test_cases,
-                        **(record.metadata or {}),
-                    }
-                    sample_db_id = db_service.upsert_sample(
-                        benchmark_name=run_ctx.benchmark_name,
-                        dataset_split=run_ctx.dataset_split,
-                        sample_index=rec_idx,
-                        question=record.prompt,
-                        reference_answer=(record.canonical_solution or ""),
-                        meta=meta,
-                    )
-                    run_sample_id = db_service.upsert_run_sample(
-                        run_id=run_ctx.run_id,
-                        sample_id=sample_db_id,
-                        repeat_index=sample_idx,
-                        status="pending",
-                        current_stage=None,
-                    )
-                    if db_service.fetch_latest_stage(run_sample_id=run_sample_id, stage="final"):
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            finished=True,
-                        )
-                    else:
-                        attempt_id, attempt_index = db_service.start_attempt(
-                            run_sample_id=run_sample_id,
-                            current_stage="final",
-                        )
-                        db_service.write_stage_output(
-                            attempt_id=attempt_id,
-                            stage="final",
-                            seq=0,
-                            prompt=prompt_text,
-                            completion=raw_output,
-                            finish_reason=seq.finish_reason,
-                            is_final=True,
-                        )
-                        db_service.mark_attempt_status(
-                            attempt_id=attempt_id,
-                            status="succeeded",
-                            finished=True,
-                        )
-                        db_service.mark_run_sample_status(
-                            run_sample_id=run_sample_id,
-                            status="succeeded",
-                            current_stage="final",
-                            latest_attempt_index=attempt_index,
-                            finished=True,
-                        )
                 writer.write(
                     SampleRecord(
                         benchmark_name=benchmark_name,
@@ -641,8 +415,6 @@ class CodingPipeline:
                     )
                 )
             writer.close()
-            if db_service and run_ctx:
-                db_service.mark_run_status(run_id=run_ctx.run_id, status="succeeded")
 
         return CodingPipelineResult(
             dataset=dataset_name,

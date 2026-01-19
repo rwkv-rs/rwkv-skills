@@ -10,7 +10,6 @@ from typing import Sequence
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
-from src.eval.results.schema import dataset_slug_parts
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.infra.database import DatabaseManager
 from src.infra.eval_db_service import EvalDbService
@@ -86,32 +85,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         db = DatabaseManager.instance()
         db.initialize(DEFAULT_DB_CONFIG)
         service = EvalDbService(db)
-        benchmark_name, dataset_split = dataset_slug_parts(slug)
-        run_ctx = service.prepare_run(
-            dataset_slug=benchmark_name,
-            split_name=dataset_split,
-            model_path=args.model_path,
-            is_cot=False,
-            run_tag=Path(out_path).stem,
-            sampling_config=None,
-            runtime_config=None,
-            code_version=None,
+        version_id = service.get_or_create_version(
+            job_name="eval_multi_choice",
+            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+            dataset=str(slug),
+            model=Path(args.model_path).stem,
+            is_param_search=False,
+            allow_resume=True,
         )
-        service.ingest_eval_results(eval_path=eval_path, run_id=run_ctx.run_id, metric_name="passed")
-        service.record_score_summary(
-            run_id=run_ctx.run_id,
-            event_type="score_summary",
-            metrics={"accuracy": metrics.accuracy},
-            samples=metrics.samples,
-            problems=None,
-            log_path=out_path,
+        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+        service.ingest_completions(
+            completions_path=out_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.ingest_eval(
             eval_path=eval_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.record_score(
             score_path=score_path,
-            task="multiple_choice",
-            task_details={
-                "accuracy_by_subject": metrics.accuracy_by_subject,
-                "eval_details_path": str(eval_path),
-            },
+            version_id=version_id,
+            is_param_search=False,
         )
     print(f"✅ direct multiple-choice done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
