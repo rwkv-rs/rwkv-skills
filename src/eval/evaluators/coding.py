@@ -94,7 +94,6 @@ class CodingPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
 
     def run_human_eval(
         self,
@@ -146,10 +145,6 @@ class CodingPipeline:
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         target_path = Path(output_path)
-        sampling_config = normalize_sampling_config_by_stage(
-            [(1, cot_sampling), (2, final_sampling)]
-        )
-
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -172,6 +167,7 @@ class CodingPipeline:
                 return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
 
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
+            sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
                 seq = output_by_idx.get(local_idx)
                 if seq is None:
@@ -251,7 +247,6 @@ class CodingPipeline:
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         target_path = Path(output_path)
-        sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -274,6 +269,7 @@ class CodingPipeline:
                 return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
 
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
+            sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
                 seq = output_by_idx.get(local_idx)
                 if seq is None:
@@ -364,7 +360,6 @@ class CodingPipeline:
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         target_path = Path(output_path)
-        sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         resume = detect_resume_state(target_path, repeats=samples_per_task)
         if resume.has_progress:
             ensure_resume_samples_compatible(target_path, samples_per_task)
@@ -408,6 +403,9 @@ class CodingPipeline:
                 return CodingPipelineResult(dataset_name, len(cot_outputs), target_path, len(records))
 
             writer = JsonlStageWriter(target_path, resume=resume.has_progress)
+            sampling_config = normalize_sampling_config_by_stage(
+                [(1, cot_sampling), (2, final_sampling)]
+            )
             for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
                 cot_seq = cot_by_idx.get(local_idx)
                 final_seq = final_by_idx.get(local_idx)

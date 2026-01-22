@@ -35,9 +35,6 @@ from src.eval.results.layout import (
 )
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -156,11 +153,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    db_service: EvalDbService | None = None
-    if DEFAULT_DB_CONFIG.enabled:
-        db = DatabaseManager.instance()
-        db.initialize(DEFAULT_DB_CONFIG)
-        db_service = EvalDbService(db)
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
@@ -295,31 +287,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_details=task_details,
         )
         write_scores_json_to_path(score_path, payload)
-        if db_service:
-            version_id = db_service.get_or_create_version(
-                job_name="param_search_free_response_judge",
-                job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
-                dataset=str(slug),
-                model=model_name,
-                is_param_search=True,
-                allow_resume=False,
-            )
-            os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-            db_service.ingest_completions(
-                completions_path=completion_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
-            db_service.ingest_eval(
-                eval_path=eval_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
-            db_service.record_score(
-                score_path=score_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
 
         objective = (
             float(metrics_payload["judge_accuracy"])

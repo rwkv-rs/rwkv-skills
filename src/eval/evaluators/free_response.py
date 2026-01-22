@@ -9,7 +9,7 @@ from typing import Any, Iterable
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
@@ -75,7 +75,6 @@ class FreeResponsePipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
 
     def run(
         self,
