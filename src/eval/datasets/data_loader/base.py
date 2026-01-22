@@ -46,5 +46,4 @@ class JsonlDatasetLoader(Generic[RecordT, DatasetT]):
         return self.dataset_cls(list(iter(self)))
 
     def _parse_record(self, payload: dict) -> RecordT:  # pragma: no cover - abstract
-        """Turn a single JSON object into `RecordT`. Must be implemented by subclasses."""
         raise NotImplementedError

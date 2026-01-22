@@ -23,6 +23,9 @@ from src.eval.results.layout import (
 )
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.infer.model import ModelLoadConfig
 
@@ -281,6 +284,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         task="free_response_judge",
         task_details=task_details,
     )
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        service = EvalDbService(db)
+        version_id = service.get_or_create_version(
+            job_name="eval_free_response_judge",
+            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+            dataset=str(slug),
+            model=Path(args.model_path).stem,
+            is_param_search=False,
+            allow_resume=True,
+        )
+        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+        service.ingest_completions(
+            completions_path=output_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.ingest_eval(
+            eval_path=eval_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.record_score(
+            score_path=score_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
     print(f"✅ judge CoT done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")

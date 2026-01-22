@@ -12,6 +12,9 @@ from dataclasses import replace
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infra.database import DatabaseManager
+from src.infra.eval_db_service import EvalDbService
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
@@ -159,6 +162,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
         },
     )
+    if DEFAULT_DB_CONFIG.enabled:
+        db = DatabaseManager.instance()
+        db.initialize(DEFAULT_DB_CONFIG)
+        service = EvalDbService(db)
+        version_id = service.get_or_create_version(
+            job_name="eval_instruction_following",
+            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+            dataset=str(slug),
+            model=Path(args.model_path).stem,
+            is_param_search=False,
+            allow_resume=True,
+        )
+        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+        service.ingest_completions(
+            completions_path=out_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.ingest_eval(
+            eval_path=eval_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
+        service.record_score(
+            score_path=score_path,
+            version_id=version_id,
+            is_param_search=False,
+        )
     print(f"✅ instruction-following done: {result.sample_count} samples -> {result.output_path}")
     print(f"📄 eval details saved: {eval_path}")
     print(f"📊 scores saved: {score_path}")

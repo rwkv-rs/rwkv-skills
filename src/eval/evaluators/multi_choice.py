@@ -86,6 +86,7 @@ class MultipleChoicePipeline:
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.target_token_format = target_token_format
         self._choice_token_cache: dict[int, list[int]] = {}
+        self.model_path = model_config.weights_path
 
     def run_direct(
         self,
