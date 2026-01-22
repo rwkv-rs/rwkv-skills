@@ -9,7 +9,6 @@ from typing import Any, Iterable
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
@@ -117,11 +116,7 @@ class FreeResponsePipeline:
         write_output: bool = True,
         samples_per_task: int | None = None,
         probe_only: bool = False,
-        overwrite_db_task: bool = False,
     ) -> FreeResponsePipelineResult:
-        if DEFAULT_DB_CONFIG.enabled and overwrite_db_task:
-            print("ℹ️  DB 已开启：输出仍写 JSONL，DB 入库在评测阶段完成。")
-
         samples_per_task = (samples_per_task or max(1, max(pass_k) if pass_k else 1)) if not probe_only else 1
         raw_records, resolved_name = self._load_records(dataset_path, sample_limit)
         problem_count = len(raw_records)

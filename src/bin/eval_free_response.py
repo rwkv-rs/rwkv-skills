@@ -107,11 +107,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         help="avg@k values to compute from generated samples (defaults depend on dataset; math500 用 4，AIME 用 16)",
     )
-    parser.add_argument(
-        "--overwrite-db-task",
-        action="store_true",
-        help="在 DB 模式下重跑同一数据集+模型时，先清理该 task_id 的记录再写入。",
-    )
     return parser.parse_args(argv)
 
 
@@ -223,7 +218,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         pad_to_batch=False,
         pass_k=pass_k,
         samples_per_task=samples_per_task,
-        overwrite_db_task=args.overwrite_db_task,
     )
 
     eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
