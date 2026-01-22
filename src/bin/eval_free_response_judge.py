@@ -147,7 +147,7 @@ def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[s
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _load_env_file(Path(".env"))
+    _load_env_file(Path(".env.example"))
     args = parse_args(argv)
     try:
         dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)

@@ -147,7 +147,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _load_env_file(Path(".env"))
+    _load_env_file(Path(".env.example"))
     args = parse_args(argv)
     try:
         dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)

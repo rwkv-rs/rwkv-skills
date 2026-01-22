@@ -394,13 +394,13 @@ def run_llm_checker(
     Returns the written check JSONL path, or None if skipped.
     """
 
-    _load_env_file((REPO_ROOT / ".env").resolve())
+    _load_env_file((REPO_ROOT / ".env.example").resolve())
     if _env_flag("RWKV_SKILLS_DISABLE_CHECKER"):
         print("ℹ️  LLM checker disabled (RWKV_SKILLS_DISABLE_CHECKER=1)")
         return None
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
-        print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env)")
+        print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env.example)")
         return None
 
     eval_path = Path(eval_results_path).expanduser().resolve()

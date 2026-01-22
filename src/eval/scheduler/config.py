@@ -9,10 +9,8 @@ import sys
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
+load_dotenv(REPO_ROOT / ".env.example")
 RESULTS_ROOT = Path(os.environ.get("RUN_RESULTS_DIR", REPO_ROOT / "results"))
 
 
