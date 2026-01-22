@@ -18,19 +18,7 @@ from src.eval.results.schema import dataset_slug_parts, normalize_sampling_confi
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from .common import JsonlStageWriter, SampleRecord, StageRecord, detect_resume_state
 
-DEFAULT_STOP_TOKENS = (0, 261, 24281)
 DEFAULT_BAN_TOKEN = 295
-DEFAULT_SAMPLING = SamplingConfig(
-    max_generate_tokens=4096,
-    temperature=0.3,
-    top_k=50,
-    top_p=0.3,
-    alpha_presence=0.5,
-    alpha_frequency=0.5,
-    alpha_decay=0.99,
-    stop_tokens=DEFAULT_STOP_TOKENS,
-)
-
 
 @dataclass(slots=True)
 class InstructionFollowingPipelineResult:
@@ -50,12 +38,12 @@ class InstructionFollowingPipeline:
         dataset_path: str,
         output_path: str,
         *,
-        sampling: SamplingConfig = DEFAULT_SAMPLING,
+        sampling: SamplingConfig,
         batch_size: int = 128,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
         enable_think: bool = False,
-        stop_tokens: tuple[int, ...] = DEFAULT_STOP_TOKENS,
+        stop_tokens: tuple[int, ...],
         ban_tokens: tuple[int, ...] | None = None,
         samples_per_prompt: int | None = None,
     ) -> InstructionFollowingPipelineResult:

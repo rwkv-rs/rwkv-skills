@@ -47,17 +47,6 @@ Assistant:"""
 ZH_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 综上所述，答案是"""
 
-COT_SAMPLING = SamplingConfig(
-    max_generate_tokens=4096,
-    temperature=0.5,
-    top_k=50,
-    top_p=0.3,
-    alpha_presence=1.0,
-    alpha_frequency=0.1,
-    alpha_decay=0.99,
-    stop_tokens=(0, 261, 24281),
-)
-
 
 @dataclass(frozen=True)
 class PromptTemplates:
@@ -156,7 +145,7 @@ class MultipleChoicePipeline:
         *,
         cot_prompt_template: str | None = None,
         final_answer_template: str | None = None,
-        cot_sampling: SamplingConfig = COT_SAMPLING,
+        cot_sampling: SamplingConfig,
         batch_size: int = 64,
         dataset_name: str | None = None,
         sample_limit: int | None = None,

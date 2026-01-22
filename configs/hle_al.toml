@@ -1,0 +1,11 @@
+[default]
+pass_k = [8]
+avg_k = [8]
+report_pass_k = [8]
+report_avg_k = [8]
+
+[cot]
+template = "math_cot_default"
+
+[final]
+template = "free_response_final_default"

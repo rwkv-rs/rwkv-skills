@@ -10,6 +10,7 @@ from typing import Sequence
 
 import torch
 
+from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
@@ -19,10 +20,7 @@ from src.infra.eval_db_service import EvalDbService
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
 from src.eval.scheduler.profiler import update_batch_cache_locked
-from src.eval.evaluators.multi_choice import (
-    MultipleChoicePipeline,
-    COT_SAMPLING,
-)
+from src.eval.evaluators.multi_choice import MultipleChoicePipeline
 from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
@@ -111,18 +109,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
+    model_name = Path(args.model_path).stem
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
 
     # Quick validation of dataset readability before heavy model init
     _ = JsonlMultipleChoiceLoader(str(dataset_path)).load()
 
+    cot_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        fallback_templates="multi_choice_cot_default",
+    )
+    if cot_sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+
     if args.probe_only:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
             output_path=str(out_path),
-            cot_sampling=COT_SAMPLING,
+            cot_sampling=cot_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
             min_prompt_count=batch_size,
@@ -134,7 +141,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     probe_only = False
     sample_limit: int | None = args.max_samples
-    cot_sampling = COT_SAMPLING
     output_path = out_path
     min_prompt_count: int | None = None
 

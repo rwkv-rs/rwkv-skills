@@ -14,6 +14,7 @@ from src.eval.metrics.free_response import (
     compute_avg_at_k,
     evaluate_free_response,
 )
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.checkers.llm_checker import run_llm_checker
 from src.eval.results.layout import (
     eval_details_path,
@@ -21,42 +22,18 @@ from src.eval.results.layout import (
     write_scores_json,
 )
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.infra.database import DatabaseManager
 from src.infra.eval_db_service import EvalDbService
-from src.eval.evaluators.free_response import (
-    FreeResponsePipeline,
-    DEFAULT_COT_SAMPLING,
-    DEFAULT_FINAL_SAMPLING,
-)
+from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.infer.model import ModelLoadConfig
 
 
-# Free-response 默认只算 pass@1；高难数学集单独放宽
 DEFAULT_PASS_K = (1,)
 DEFAULT_AVG_K: tuple[int, ...] = ()
-AIME_AVG_K = (16,)
-MATH_500_AVG_K = (4,)
-AIME_REPORT_PASS_K = (8,)
-AIME_PASS_K = (1, 2, 4, 8, 16, 32, 64, 128, 256)
-HARD_MATH_PASS_K_SLUGS = {
-    "aime24_test",
-    "aime25_test",
-    "beyond_aime_test",
-    "hmmt_feb25_test",
-    "brumo25_test",
-    "college_math",
-    "hle_al",
-}
-AVG_K_OVERRIDES = {
-    "math_500": MATH_500_AVG_K,
-    "math_500_test": MATH_500_AVG_K,
-}
-HARD_MATH_AVG_K_OVERRIDES = {
-    "aime24_test": AIME_AVG_K,
-    "aime25_test": AIME_AVG_K,
-}
+
+
 def _load_env_file(path: Path) -> None:
     """Lightweight .env loader (key=value, optional quotes, ignores comments)."""
     if not path.exists():
@@ -101,13 +78,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to generate for and compute (default: 1; AIME 默认扩展到 256)",
+        help="pass@k values to generate for and compute (default: 1; can be set in configs/<benchmark>.toml)",
     )
     parser.add_argument(
         "--avg-k",
         type=int,
         action="append",
-        help="avg@k values to compute from generated samples (defaults depend on dataset; math500 用 4，AIME 用 16)",
+        help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
     )
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
@@ -120,38 +97,36 @@ def _max_k(values) -> int:
     return max(values) if values else 0
 
 
-def _resolve_pass_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
+def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
     if args.pass_k:
-        resolved = tuple(args.pass_k)
-        return resolved
-    lower_slug = canonical_slug(str(slug))
-    final_pass_k = AIME_PASS_K if lower_slug in HARD_MATH_PASS_K_SLUGS else DEFAULT_PASS_K
-    return final_pass_k
+        return tuple(args.pass_k)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.pass_k is not None:
+        return config.pass_k
+    return DEFAULT_PASS_K
 
 
-def _resolve_avg_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
+def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
     if args.avg_k:
         return tuple(args.avg_k)
-    lower_slug = canonical_slug(str(slug))
-    if lower_slug in HARD_MATH_AVG_K_OVERRIDES:
-        return HARD_MATH_AVG_K_OVERRIDES[lower_slug]
-    return AVG_K_OVERRIDES.get(lower_slug, DEFAULT_AVG_K)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.avg_k is not None:
+        return config.avg_k
+    return DEFAULT_AVG_K
 
 
-def _report_pass_k(slug: str, final_pass_k: tuple[int, ...]) -> tuple[int, ...]:
-    lower_slug = canonical_slug(str(slug))
-    if lower_slug in {"aime24_test", "aime25_test"}:
-        return AIME_REPORT_PASS_K
-    return final_pass_k
+def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple[int, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_pass_k is not None:
+        return config.report_pass_k
+    return pass_k
 
 
-def _report_avg_k(slug: str, final_avg_k: tuple[int, ...]) -> tuple[int, ...]:
-    lower_slug = canonical_slug(str(slug))
-    if lower_slug in HARD_MATH_AVG_K_OVERRIDES:
-        return HARD_MATH_AVG_K_OVERRIDES[lower_slug]
-    if lower_slug in AVG_K_OVERRIDES:
-        return AVG_K_OVERRIDES[lower_slug]
-    return final_avg_k
+def _report_avg_k(slug: str, model_name: str, avg_k: tuple[int, ...]) -> tuple[int, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_avg_k is not None:
+        return config.report_avg_k
+    return avg_k
 
 
 def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
@@ -183,13 +158,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
-    pass_k_final = _resolve_pass_k(slug, args)
-    avg_k_final = _resolve_avg_k(slug, args)
-    report_pass_k = _report_pass_k(slug, pass_k_final)
-    report_avg_k = _report_avg_k(slug, avg_k_final)
+    model_name = Path(args.model_path).stem
+    pass_k_final = _resolve_pass_k(slug, model_name, args)
+    avg_k_final = _resolve_avg_k(slug, model_name, args)
+    report_pass_k = _report_pass_k(slug, model_name, pass_k_final)
+    report_avg_k = _report_avg_k(slug, model_name, avg_k_final)
 
-    cot_sampling = DEFAULT_COT_SAMPLING.clamp(args.cot_max_tokens)
-    final_sampling = DEFAULT_FINAL_SAMPLING.clamp(args.final_max_tokens)
+    cot_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        stage="cot",
+        fallback_templates="free_response_cot_default",
+    )
+    final_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        stage="final",
+        fallback_templates="free_response_final_default",
+    )
+    if cot_sampling is None or final_sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
+    final_sampling = final_sampling.clamp(args.final_max_tokens)
     sample_limit: int | None = args.max_samples
     output_path = out_path
     generate_pass_k = (1,) if args.probe_only else pass_k_final
@@ -266,10 +256,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "exact_accuracy": evaluation.exact_accuracy,
         "judge_accuracy": evaluation.judge_accuracy,
     }
-    pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@") or (pass_metrics_all or {})
+    pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
+    if report_pass_k and not pass_payload:
+        pass_payload = pass_metrics_all or {}
     if pass_payload:
         metrics_payload.update(pass_payload)
-    avg_payload = _filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@") or (avg_metrics_all or {})
+    avg_payload = _filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
+    if report_avg_k and not avg_payload:
+        avg_payload = avg_metrics_all or {}
     if avg_payload:
         metrics_payload.update(avg_payload)
     task_details = {

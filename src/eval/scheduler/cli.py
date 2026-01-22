@@ -10,7 +10,6 @@ from typing import Sequence
 from .actions import (
     DispatchOptions,
     LogsOptions,
-    QueueOptions,
     StatusOptions,
     StopOptions,
     action_dispatch,
@@ -43,43 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     queue_parser = sub.add_parser("queue", help="查看待调度队列")
     _add_job_filters(queue_parser)
+    _add_dispatch_options(queue_parser)
 
     dispatch_parser = sub.add_parser("dispatch", help="根据 GPU 空闲情况调度任务")
     _add_job_filters(dispatch_parser)
-    dispatch_parser.add_argument("--run-log-dir", default=str(DEFAULT_RUN_LOG_DIR), help="运行日志目录")
-    dispatch_parser.add_argument("--completion-dir", default=str(DEFAULT_COMPLETION_DIR), help="completion JSONL 目录")
-    dispatch_parser.add_argument("--eval-result-dir", default=str(DEFAULT_EVAL_RESULT_DIR), help="评测器结果目录")
-    dispatch_parser.add_argument(
-        "--dispatch-poll-seconds",
-        type=int,
-        default=30,
-        help="空闲 GPU 轮询间隔",
-    )
-    dispatch_parser.add_argument(
-        "--gpu-idle-max-mem",
-        type=int,
-        default=1000,
-        help="将 GPU 视为空闲的显存占用阈值 (MB)",
-    )
-    dispatch_parser.add_argument(
-        "--skip-missing-dataset",
-        action="store_true",
-        help="缺少数据集时跳过该任务",
-    )
-    dispatch_parser.add_argument(
-        "--clean-param-swap",
-        action="store_true",
-        help="启动前清理 log_dir/param_swap",
-    )
-    dispatch_parser.add_argument(
-        "--batch-cache",
-        help="自定义 batch profiler 缓存路径 (默认为 log_dir/batch_cache.json)",
-    )
-    dispatch_parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="忽略 log_dir 中已存在的结果，重新评测并覆盖",
-    )
+    _add_dispatch_options(dispatch_parser)
 
     status_parser = sub.add_parser("status", help="查看正在运行的任务")
     status_parser.add_argument("--pid-dir", default=str(DEFAULT_PID_DIR), help="PID 文件目录")
@@ -164,6 +131,90 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
+    """Add dispatch-related options (also used by `queue` for dry-run parity)."""
+
+    parser.add_argument("--run-log-dir", default=str(DEFAULT_RUN_LOG_DIR), help="运行日志目录")
+    parser.add_argument("--completion-dir", default=str(DEFAULT_COMPLETION_DIR), help="completion JSONL 目录")
+    parser.add_argument("--eval-result-dir", default=str(DEFAULT_EVAL_RESULT_DIR), help="评测器结果目录")
+    parser.add_argument(
+        "--dispatch-poll-seconds",
+        type=int,
+        default=30,
+        help="空闲 GPU 轮询间隔",
+    )
+    parser.add_argument(
+        "--gpu-idle-max-mem",
+        type=int,
+        default=1000,
+        help="将 GPU 视为空闲的显存占用阈值 (MB)",
+    )
+    parser.add_argument(
+        "--skip-missing-dataset",
+        action="store_true",
+        help="缺少数据集时跳过该任务",
+    )
+    parser.add_argument(
+        "--clean-param-swap",
+        action="store_true",
+        help="启动前清理 log_dir/param_swap",
+    )
+    parser.add_argument(
+        "--batch-cache",
+        help="自定义 batch profiler 缓存路径 (默认为 log_dir/batch_cache.json)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="忽略 log_dir 中已存在的结果，重新评测并覆盖",
+    )
+    parser.add_argument(
+        "--disable-checker",
+        action="store_true",
+        help="关闭 LLM wrong-answer checker（不运行 run_llm_checker）",
+    )
+
+
+def _dispatch_options_from_args(
+    args: argparse.Namespace,
+    *,
+    job_list: tuple[str, ...],
+    job_priority: tuple[str, ...] | None,
+    model_globs: tuple[str, ...],
+    skip_dataset_slugs: tuple[str, ...],
+    only_dataset_slugs: tuple[str, ...],
+    model_name_patterns: tuple[re.Pattern[str], ...],
+    min_param_b: float | None,
+    max_param_b: float | None,
+    model_select: str,
+) -> DispatchOptions:
+    batch_cache = Path(args.batch_cache) if getattr(args, "batch_cache", None) else None
+    return DispatchOptions(
+        log_dir=Path(args.log_dir),
+        pid_dir=Path(args.pid_dir),
+        run_log_dir=Path(args.run_log_dir),
+        completion_dir=Path(args.completion_dir),
+        eval_result_dir=Path(args.eval_result_dir),
+        job_order=job_list,
+        job_priority=job_priority,
+        model_select=model_select,
+        min_param_b=min_param_b,
+        max_param_b=max_param_b,
+        skip_dataset_slugs=skip_dataset_slugs,
+        model_globs=model_globs,
+        only_dataset_slugs=only_dataset_slugs,
+        model_name_patterns=model_name_patterns,
+        param_search_scan_mode=str(args.param_search_scan_mode),
+        dispatch_poll_seconds=int(args.dispatch_poll_seconds),
+        gpu_idle_max_mem=int(args.gpu_idle_max_mem),
+        skip_missing_dataset=bool(args.skip_missing_dataset),
+        clean_param_swap=bool(args.clean_param_swap),
+        batch_cache_path=batch_cache,
+        overwrite=bool(args.overwrite),
+        disable_checker=bool(args.disable_checker),
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -188,45 +239,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     model_select = getattr(args, "model_select", "all")
 
     if command == "queue":
-        opts = QueueOptions(
-            log_dir=Path(args.log_dir),
-            pid_dir=Path(args.pid_dir),
-            job_order=job_list,
+        opts = _dispatch_options_from_args(
+            args,
+            job_list=job_list,
             job_priority=job_priority,
-            model_select=model_select,
-            min_param_b=min_param_b,
-            max_param_b=max_param_b,
-            skip_dataset_slugs=skip_dataset_slugs,
             model_globs=model_globs,
+            skip_dataset_slugs=skip_dataset_slugs,
             only_dataset_slugs=only_dataset_slugs,
             model_name_patterns=model_name_patterns,
-            param_search_scan_mode=str(args.param_search_scan_mode),
+            min_param_b=min_param_b,
+            max_param_b=max_param_b,
+            model_select=model_select,
         )
         action_queue(opts)
     elif command == "dispatch":
-        batch_cache = Path(args.batch_cache) if getattr(args, "batch_cache", None) else None
-        opts = DispatchOptions(
-            log_dir=Path(args.log_dir),
-            pid_dir=Path(args.pid_dir),
-            run_log_dir=Path(args.run_log_dir),
-            completion_dir=Path(args.completion_dir),
-            eval_result_dir=Path(args.eval_result_dir),
-            job_order=job_list,
+        opts = _dispatch_options_from_args(
+            args,
+            job_list=job_list,
             job_priority=job_priority,
-            model_select=model_select,
-            min_param_b=min_param_b,
-            max_param_b=max_param_b,
-            skip_dataset_slugs=skip_dataset_slugs,
             model_globs=model_globs,
+            skip_dataset_slugs=skip_dataset_slugs,
             only_dataset_slugs=only_dataset_slugs,
             model_name_patterns=model_name_patterns,
-            param_search_scan_mode=str(args.param_search_scan_mode),
-            dispatch_poll_seconds=int(args.dispatch_poll_seconds),
-            gpu_idle_max_mem=int(args.gpu_idle_max_mem),
-            skip_missing_dataset=bool(args.skip_missing_dataset),
-            clean_param_swap=bool(args.clean_param_swap),
-            batch_cache_path=batch_cache,
-            overwrite=bool(args.overwrite),
+            min_param_b=min_param_b,
+            max_param_b=max_param_b,
+            model_select=model_select,
         )
         action_dispatch(opts)
     elif command == "status":

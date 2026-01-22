@@ -1,0 +1,35 @@
+[default]
+pass_k = [8, 256]
+avg_k = [16]
+report_pass_k = [8]
+report_avg_k = [16]
+
+[cot]
+max_generate_tokens = 16384
+temperature = 0.55
+top_k = 66
+top_p = 0.79
+alpha_presence = 0.14
+alpha_frequency = 0.01
+alpha_decay = 0.997
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[final]
+max_generate_tokens = 64
+temperature = 1.0
+top_k = 1
+top_p = 0.3
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
+stop_tokens = [0, 2402, 4910]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

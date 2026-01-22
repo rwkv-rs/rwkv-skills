@@ -1,58 +1,100 @@
 from __future__ import annotations
 
-"""Prepare MMMLU (multilingual MMLU variant) from ncoop57/mmmlu."""
+"""Prepare MMMLU (OpenAI multilingual MMLU; 14 non-English languages).
 
-import csv
-import io
-import zipfile
+This writes a single combined JSONL under `data/mmmlu/test.jsonl` that contains
+all selected languages + all MMLU subjects.
+"""
+
+import os
 from pathlib import Path
 from typing import Iterable
 
-from ..data_utils import dataset_cache_dir, download_file, write_jsonl
+try:
+    from datasets import load_dataset  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    load_dataset = None  # type: ignore
+
+from ..data_utils import configure_hf_home, write_jsonl
+from .mmlu import _SUBCATEGORIES as _MMLU_SUBCATEGORIES
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
 
-DATA_URL = "https://hf-mirror.com/datasets/ncoop57/mmmlu/resolve/main/data.zip"
-_CHOICE_LETTERS = ("A", "B", "C", "D")
+
+_DATASET_ID = "giuliolovisotto/openai_multilingual_mmlu"
+
+# Default to the 14 non-English languages in OpenAI multilingual MMLU.
+_DEFAULT_LANGUAGE_SPLITS: tuple[str, ...] = (
+    "AR_XY",
+    "BN_BD",
+    "DE_DE",
+    "ES_LA",
+    "FR_FR",
+    "HI_IN",
+    "ID_ID",
+    "IT_IT",
+    "JA_JP",
+    "KO_KR",
+    "PT_BR",
+    "SW_KE",
+    "YO_NG",
+    "ZH_CN",
+)
 
 
-def _iter_rows(zip_path: Path, split: str) -> Iterable[dict]:
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        prefix = f"data/{split}/"
-        for member in sorted(name for name in zf.namelist() if name.startswith(prefix) and name.endswith(".csv")):
-            subject = Path(member).stem
-            if subject.endswith(f"_{split}"):
-                subject = subject[: -len(f"_{split}")]
-            with zf.open(member, "r") as handle:
-                reader = csv.reader(io.TextIOWrapper(handle, encoding="utf-8"))
-                for row in reader:
-                    if len(row) < 6:
-                        continue
-                    question = row[0].strip()
-                    options = [opt.strip() for opt in row[1:1 + len(_CHOICE_LETTERS)] if opt is not None]
-                    answer = row[5].strip().upper() if len(row) > 5 else ""
-                    if not question or not options or not answer:
-                        continue
-                    yield {
-                        "question": question,
-                        "answer": answer,
-                        "subject": subject,
-                        **{letter: options[idx] for idx, letter in enumerate(_CHOICE_LETTERS) if idx < len(options)},
-                    }
+def _parse_language_splits() -> tuple[str, ...]:
+    raw = os.environ.get("RWKV_SKILLS_MMMLU_LANGS", "").strip()
+    if not raw:
+        return _DEFAULT_LANGUAGE_SPLITS
+    parts = [part.strip() for part in raw.replace(";", ",").split(",")]
+    return tuple(part for part in parts if part)
+
+
+def _iter_records(split: str) -> Iterable[dict]:
+    if split != "test":
+        raise ValueError("mmmlu 目前仅提供 test split")
+    if load_dataset is None:  # pragma: no cover - dependency missing
+        raise ModuleNotFoundError("需要安装 `datasets` 才能准备 mmmlu 数据集，请运行 `pip install datasets`")
+
+    configure_hf_home()
+    language_splits = _parse_language_splits()
+    subjects = tuple(sorted(_MMLU_SUBCATEGORIES.keys()))
+
+    for subject in subjects:
+        dataset_by_lang = load_dataset(_DATASET_ID, subject)
+        for language in language_splits:
+            if language not in dataset_by_lang:
+                raise KeyError(
+                    f"mmmlu missing language split {language!r} for subject {subject!r} (available: {list(dataset_by_lang)})"
+                )
+            for row in dataset_by_lang[language]:
+                question = str(row.get("Question", "") or "").strip()
+                option_a = str(row.get("A", "") or "").strip()
+                option_b = str(row.get("B", "") or "").strip()
+                option_c = str(row.get("C", "") or "").strip()
+                option_d = str(row.get("D", "") or "").strip()
+                answer = str(row.get("Answer", "") or "").strip().upper()
+                if not question or not option_a or not option_b or not option_c or not option_d or not answer:
+                    continue
+                yield {
+                    "question": question,
+                    "A": option_a,
+                    "B": option_b,
+                    "C": option_c,
+                    "D": option_d,
+                    "answer": answer,
+                    "subject": subject,
+                    "subset": _MMLU_SUBCATEGORIES.get(subject, "unknown"),
+                    "language": language,
+                    "source_dataset": _DATASET_ID,
+                }
 
 
 @MULTIPLE_CHOICE_REGISTRY.register("mmmlu")
 def prepare_mmmlu(output_root: Path, split: str = "test") -> list[Path]:
-    if split != "test":
-        raise ValueError("mmmlu 目前仅提供 test split")
-
-    cache_dir = dataset_cache_dir(Path("data"), "mmmlu")
-    zip_path = cache_dir / "data.zip"
-    download_file(DATA_URL, zip_path)
-
     dataset_dir = output_root / "mmmlu"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_rows(zip_path, split))
+    write_jsonl(target, _iter_records(split))
     return [target]
 
 

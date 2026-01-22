@@ -131,6 +131,13 @@ def _truncate_text(value: str, *, max_chars: int) -> str:
     return f"{value[:head]}\n\n...[truncated {len(value) - head - tail} chars]...\n\n{value[-tail:]}"
 
 
+def _env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "n", "off"}
+
+
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as fh:
         for line in fh:
@@ -388,6 +395,9 @@ def run_llm_checker(
     """
 
     _load_env_file((REPO_ROOT / ".env").resolve())
+    if _env_flag("RWKV_SKILLS_DISABLE_CHECKER"):
+        print("ℹ️  LLM checker disabled (RWKV_SKILLS_DISABLE_CHECKER=1)")
+        return None
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
         print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env)")

@@ -45,12 +45,6 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_fix": "test",
     "human_eval_cn": "test",
     "livecodebench": "test",
-    "livecodebench_v1": "test",
-    "livecodebench_v2": "test",
-    "livecodebench_v3": "test",
-    "livecodebench_v4": "test",
-    "livecodebench_v5": "test",
-    "livecodebench_v6": "test",
 }
 
 
@@ -141,7 +135,13 @@ def _build_dataset_catalogues() -> tuple[
 
 LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
     canonical_slug(slug)
-    for slug in ("gsm8k_test", "math_500_test", "answer_judge_test", "gaokao2023en_test")
+    for slug in (
+        "gsm8k_test",
+        "math_500_test",
+        "answer_judge_test",
+        "gaokao2023en_test",
+        "minerva_math_test",
+    )
 )
 # judge-only 数据集不再调度到 free_response，避免 math_500 反复被 free_response 拉起
 MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
@@ -258,7 +258,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         name="code_livecodebench",
         module="src.bin.eval_code_livecodebench",
         dataset_slugs=LCB_CODE_SLUGS or (canonical_slug("livecodebench_test"),),
-        is_cot=False,
+        is_cot=True,
         domain="code",
         batch_flag="--batch-size",
         probe_flag="--probe-only",

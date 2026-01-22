@@ -9,11 +9,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
-from src.eval.evaluators.free_response import (
-    DEFAULT_COT_SAMPLING,
-    DEFAULT_FINAL_SAMPLING,
-    FreeResponsePipeline,
-)
+from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
 from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid, NORMAL_COT_GRID, SIMPLE_COT_GRID
 from src.eval.results.layout import (
@@ -168,8 +165,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
 
-    cot_sampling = DEFAULT_COT_SAMPLING.clamp(args.cot_max_tokens)
-    final_sampling = DEFAULT_FINAL_SAMPLING.clamp(args.final_max_tokens)
+    cot_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        stage="cot",
+        fallback_templates="free_response_cot_default",
+    )
+    final_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        stage="final",
+        fallback_templates="free_response_final_default",
+    )
+    if cot_sampling is None or final_sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
+    final_sampling = final_sampling.clamp(args.final_max_tokens)
 
     if args.probe_only:
         batch_size = max(1, args.batch_size)

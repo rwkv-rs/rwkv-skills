@@ -9,6 +9,7 @@ from typing import Sequence
 
 from dataclasses import replace
 
+from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
 from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -16,7 +17,7 @@ from src.infra.database import DatabaseManager
 from src.infra.eval_db_service import EvalDbService
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
-from src.eval.evaluators.instruction_following import InstructionFollowingPipeline, DEFAULT_SAMPLING
+from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
 from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
@@ -111,7 +112,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_avg_k = _report_avg_k(slug, avg_k_final)
     samples_per_prompt = max(_max_k(avg_k_final), 1)
 
-    sampling = DEFAULT_SAMPLING
+    sampling = resolve_sampling_config(
+        slug,
+        Path(args.model_path).stem,
+        fallback_templates="instruction_following_default",
+    )
+    if sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({Path(args.model_path).stem})")
     if args.stop_token:
         sampling = replace(sampling, stop_tokens=tuple(args.stop_token))
     ban_tokens = tuple(args.ban_token) if args.ban_token else None

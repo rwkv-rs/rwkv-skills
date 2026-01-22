@@ -69,14 +69,16 @@ Free-response and instruction-following work similarly via `FreeResponsePipeline
 rwkv-skills-scheduler queue
 rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
 ```
+`queue` is a dry-run of `dispatch` and accepts the same filtering/dispatch flags (including `--overwrite`) to preview what would be scheduled.
 To ignore existing results under `results/scores` and force a rerun, pass `--overwrite` on dispatch; the scheduler will delete old completion / score / eval artifacts before re-evaluating.
+By default the evaluator scripts run the LLM wrong-answer checker when configured; to skip it, pass `--disable-checker` on dispatch.
 
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
 
 The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler entry scripts are provided:
 `src/bin/eval_multi_choice.py`, `eval_multi_choice_cot.py`, `eval_free_response.py`, `eval_free_response_judge.py`, `eval_instruction_following.py`, `eval_code_human_eval.py`, `eval_code_mbpp.py`, `eval_code_livecodebench.py`.
 
-Math QA sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
+Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}` (full grid: `normal` then `simple`; no truncation).
@@ -114,8 +116,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
   Multiple samples are generated and executed against EvalPlus test cases to output pass@k (number of generations equals the maximum k).
 
 ## LiveCodeBench code generation evaluation
-- Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_latest (lite) split and writes `data/livecodebench/test.jsonl`.
-- Versioned datasets: `livecodebench_v1` ... `livecodebench_v6` (lite).
+- Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_v6 (lite) split and writes `data/livecodebench/test.jsonl` (override with `RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG`).
 - Run via CLI:
   ```bash
   python -m src.bin.eval_code_livecodebench \

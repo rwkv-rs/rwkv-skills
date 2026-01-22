@@ -67,6 +67,7 @@ class DispatchOptions(QueueOptions):
     clean_param_swap: bool = False
     batch_cache_path: Path | None = None
     overwrite: bool = False
+    disable_checker: bool = False
 
 
 @dataclass(slots=True)
@@ -113,10 +114,12 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
     failed = {record.key for record in score_records.values() if record.missing_artifacts}
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
+    overwrite = bool(getattr(opts, "overwrite", False))
+    completed_for_queue = set() if overwrite else completed
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
-        completed=completed,
+        completed=completed_for_queue,
         failed=failed,
         running=running_entries.keys(),
         skip_dataset_slugs=opts.skip_dataset_slugs,
@@ -375,6 +378,8 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
                 }
             )
+            if opts.disable_checker:
+                env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
             questions = question_counts.get(dataset_slug)
 

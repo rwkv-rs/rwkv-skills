@@ -1,0 +1,119 @@
+[math_cot_default]
+max_generate_tokens = 4096
+temperature = 0.55
+top_k = 66
+top_p = 0.79
+alpha_presence = 0.14
+alpha_frequency = 0.01
+alpha_decay = 0.997
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[code_default]
+max_generate_tokens = 1024
+temperature = 0.6
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [0, 261, 6884, 21214, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[full_code_cot_default]
+max_generate_tokens = 8192
+temperature = 0.6
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [0]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[full_code_final_default]
+max_generate_tokens = 8192
+temperature = 0.6
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [6884, 21214]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[free_response_cot_default]
+max_generate_tokens = 4096
+temperature = 0.3
+top_k = 500
+top_p = 0.4
+alpha_presence = 0.5
+alpha_frequency = 0.1
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[free_response_final_default]
+max_generate_tokens = 64
+temperature = 1.0
+top_k = 1
+top_p = 0.3
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
+stop_tokens = [0, 2402, 4910]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[instruction_following_default]
+max_generate_tokens = 4096
+temperature = 0.3
+top_k = 50
+top_p = 0.3
+alpha_presence = 0.5
+alpha_frequency = 0.5
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[multi_choice_cot_default]
+max_generate_tokens = 4096
+temperature = 0.5
+top_k = 50
+top_p = 0.3
+alpha_presence = 1.0
+alpha_frequency = 0.1
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+sample_mode = "normal"
+noise = 0.0
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

@@ -18,7 +18,7 @@ from .config import (
     RESULTS_ROOT,
 )
 from .dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
-from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset
+from .jobs import JOB_CATALOGUE, detect_job_from_dataset
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class RunningEntry:
 
 
 _MISSING_ARTIFACT_ALERTS: set[tuple[Path, str]] = set()
+_JOB_DETECTION_ALERTS: set[tuple[Path, str]] = set()
 
 
 def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, CompletedRecord]]:
@@ -90,9 +91,18 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
                     eval_details_path = candidate
 
         dataset_slug = infer_dataset_slug_from_path(dataset_path)
-        is_cot = _detect_is_cot(json_path, raw)
-        job_name = detect_job_from_dataset(dataset_slug, is_cot)
+        detected_is_cot = _detect_is_cot(json_path, raw)
+
+        job_name = detect_job_from_dataset(dataset_slug, detected_is_cot)
+        key_is_cot = detected_is_cot
         if not job_name:
+            job_name, key_is_cot = _infer_job_from_task_field(json_path, raw, dataset_slug, detected_is_cot)
+        if not job_name:
+            _warn_job_detection(
+                json_path,
+                "unknown_job",
+                f"⚠️  无法从结果解析 job，已忽略: dataset={dataset_slug} cot={detected_is_cot} task={raw.get('task')!r}",
+            )
             continue
         raw_problems = raw.get("problems")
         raw_samples = raw.get("samples")
@@ -109,7 +119,7 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
             job=job_name,
             model_slug=safe_slug(model_name),
             dataset_slug=dataset_slug,
-            is_cot=is_cot,
+            is_cot=key_is_cot,
         )
         job_id = _completed_job_id(key)
         if not missing:
@@ -140,6 +150,48 @@ def _warn_missing_artifact(json_path: Path, category: str, path: Path) -> None:
         return
     _MISSING_ARTIFACT_ALERTS.add(key)
     print(f"⚠️  结果 {json_path} 缺少 {category} 文件：{path}")
+
+
+def _warn_job_detection(json_path: Path, category: str, message: str) -> None:
+    key = (json_path, category)
+    if key in _JOB_DETECTION_ALERTS:
+        return
+    _JOB_DETECTION_ALERTS.add(key)
+    print(message)
+
+
+def _infer_job_from_task_field(
+    json_path: Path,
+    payload: Mapping[str, object],
+    dataset_slug: str,
+    detected_is_cot: bool,
+) -> tuple[str | None, bool]:
+    """Best-effort mapping for legacy/buggy score payloads.
+
+    Some bin scripts historically wrote mismatched `cot` flags, which prevents the
+    `dataset_slug + cot` heuristic from mapping back to a JobSpec. When the score
+    payload contains a `task` field that matches a known job, prefer the JobSpec
+    metadata so the scheduler can still converge.
+    """
+
+    task = payload.get("task")
+    if not isinstance(task, str) or not task:
+        return None, detected_is_cot
+    spec = JOB_CATALOGUE.get(task)
+    if spec is None:
+        return None, detected_is_cot
+    if dataset_slug not in spec.dataset_slugs:
+        return None, detected_is_cot
+    if spec.is_cot != detected_is_cot:
+        _warn_job_detection(
+            json_path,
+            "cot_mismatch",
+            (
+                "⚠️  结果 cot 标记与任务定义不一致，已按 JobSpec 纠正: "
+                f"task={task} detected_cot={detected_is_cot} expected_cot={spec.is_cot} ({json_path})"
+            ),
+        )
+    return task, spec.is_cot
 
 
 def _resolve_run_path(path_str: str) -> Path:

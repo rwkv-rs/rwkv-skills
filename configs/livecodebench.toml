@@ -1,0 +1,5 @@
+[cot]
+template = "full_code_cot_default"
+
+[final]
+template = "full_code_final_default"

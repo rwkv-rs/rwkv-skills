@@ -22,28 +22,6 @@ Assistant: <think"""
 DEFAULT_FINAL_PROMPT = """<Q><COT>
 Therefore, the answer is \\(\\boxed{"""
 
-DEFAULT_COT_SAMPLING = SamplingConfig(
-    max_generate_tokens=4096,
-    temperature=0.3,
-    top_k=500,
-    top_p=0.4,
-    alpha_presence=0.5,
-    alpha_frequency=0.1,
-    alpha_decay=0.99,
-    stop_tokens=(0, 261, 24281),
-)
-
-DEFAULT_FINAL_SAMPLING = SamplingConfig(
-    max_generate_tokens=64,
-    temperature=1.0,
-    top_k=1,
-    top_p=0.3,
-    alpha_presence=0.0,
-    alpha_frequency=0.0,
-    alpha_decay=0.99,
-    stop_tokens=(0, 2402, 4910),
-)
-
 
 @dataclass(slots=True)
 class FreeResponsePipelineResult:
@@ -106,8 +84,8 @@ class FreeResponsePipeline:
         *,
         cot_prompt_template: str = DEFAULT_COT_PROMPT,
         final_answer_template: str = DEFAULT_FINAL_PROMPT,
-        cot_sampling: SamplingConfig = DEFAULT_COT_SAMPLING,
-        final_sampling: SamplingConfig = DEFAULT_FINAL_SAMPLING,
+        cot_sampling: SamplingConfig,
+        final_sampling: SamplingConfig,
         batch_size: int = 64,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
