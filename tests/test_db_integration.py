@@ -19,7 +19,7 @@ class TestDatabaseManager(unittest.TestCase):
             enabled=True
         )
 
-    @patch("psycopg.ConnectionPool")
+    @patch("src.db.database.ConnectionPool")
     def test_initialize(self, mock_pool_cls):
         mock_pool = MagicMock()
         mock_pool_cls.return_value = mock_pool
@@ -38,10 +38,10 @@ class TestDatabaseManager(unittest.TestCase):
         mock_conn.execute.assert_called()
         executed_sql = [call_args[0][0] for call_args in mock_conn.execute.call_args_list]
         self.assertTrue(
-            any("CREATE TABLE IF NOT EXISTS eval_run" in sql for sql in executed_sql)
+            any("CREATE TABLE IF NOT EXISTS version" in sql for sql in executed_sql)
         )
 
-    @patch("psycopg.ConnectionPool")
+    @patch("src.db.database.ConnectionPool")
     def test_transaction_commit(self, mock_pool_cls):
         mock_pool = MagicMock()
         mock_pool_cls.return_value = mock_pool
@@ -56,7 +56,7 @@ class TestDatabaseManager(unittest.TestCase):
         # Verify commit was called
         mock_conn.commit.assert_called_once()
 
-    @patch("psycopg.ConnectionPool")
+    @patch("src.db.database.ConnectionPool")
     def test_transaction_rollback(self, mock_pool_cls):
         mock_pool = MagicMock()
         mock_pool_cls.return_value = mock_pool

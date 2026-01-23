@@ -1,18 +1,13 @@
 ## Eval DB
 
 ### 表结构说明
-- `eval_dataset`: 数据集维表，按 `dataset_slug` 唯一，记录 domain/version/meta。
-- `eval_split`: 数据集 split 维表，按 `(dataset_id, split_name)` 唯一。
-- `eval_sample`: 样本维表，按 `(dataset_id, split_id, sample_index)` 唯一，存题目/参考答案/原始 meta。
-- `eval_model`: 模型维表，按 `(model_slug, model_revision)` 唯一（revision 为空时按空串归一）。
-- `eval_task`: 任务维表，`task_id=<dataset_slug>__<model_slug>` 唯一，关联 dataset/model。
-- `eval_run`: 一次运行/实验记录，关联 task，存采样/运行配置、代码版本、状态与时间。
-- `eval_run_sample`: run 下样本实例（含 repeat），按 `(run_id, sample_id, repeat_index)` 唯一。
-- `eval_attempt`: run_sample 的尝试记录，按 `(run_sample_id, attempt_index)` 唯一。
-- `eval_stage_output`: 阶段化输出（cot/final/other），支持 partial 与最终段标记。
-- `eval_cot_checkpoint`: CoT 续跑检查点，`(attempt_id, stage)` 的 latest 仅一条。
-- `eval_metric`: 评测指标记录，挂在 run_sample。
-- `eval_run_event`: 运行事件/汇总记录，挂在 run 或 run_sample。
+- `version`: 评测版本/运行元信息（job/dataset/model/git）
+- `completions`: 模型输出轨迹（prompt/completion/stop/context）
+- `eval`: 样本级评测结果（pass/fail + answer/ref）
+- `score`: 汇总指标（dataset/model/cot）
+- `logs`: 调度/运行事件
+- `view_score_latest`: 最新 score 视图（按 dataset/model/cot）
+- `view_eval_completion`: eval 与 completions 的样本级 join 视图
 
 ### 环境变量
 - DB 连接配置从 `.env` 读取
