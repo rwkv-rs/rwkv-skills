@@ -3,8 +3,7 @@ from __future__ import annotations
 """Code generation / HumanEval evaluation pipeline."""
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
@@ -13,7 +12,7 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
-from .common import JsonlStageWriter, SampleRecord, StageRecord, detect_resume_state, ensure_resume_samples_compatible
+from .common import SampleRecord, StageRecord
 
 # Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
 DEFAULT_PASS_K = (1,)
@@ -86,8 +85,8 @@ def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
 class CodingPipelineResult:
     dataset: str
     sample_count: int
-    output_path: Path
     problem_count: int
+    payloads: list[dict]
 
 
 class CodingPipeline:
@@ -99,7 +98,6 @@ class CodingPipeline:
     def run_human_eval(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         sampling: SamplingConfig,
         batch_size: int = 64,
@@ -108,17 +106,18 @@ class CodingPipeline:
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
         probe_only: bool = False,
-        write_output: bool = True,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
         samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
-        write_output = write_output and (not probe_only)
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
-            return CodingPipelineResult(dataset_name, 0, Path(output_path), 0)
+            return CodingPipelineResult(dataset_name, 0, 0, [])
 
         is_human_eval_fix = "human_eval_fix" in dataset_path.lower()
 
@@ -135,7 +134,7 @@ class CodingPipeline:
                 progress_desc="Probing code",
                 probe_only=True,
             )
-            return CodingPipelineResult(dataset_name, len(prompts), Path(output_path), len(records))
+            return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
@@ -145,21 +144,31 @@ class CodingPipeline:
                 )
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
-        target_path = Path(output_path)
-        sampling_config = normalize_sampling_config_by_stage(
-            [(1, cot_sampling), (2, final_sampling)]
-        )
+        skip_keys = skip_keys or set()
+        total_expected = len(entries)
+        if resume_start_index < 0:
+            resume_start_index = 0
+        if resume_start_index:
+            if resume_start_index >= len(entries):
+                return CodingPipelineResult(dataset_name, len(entries), len(records), [])
+            entries = [
+                entry
+                for entry in entries[resume_start_index:]
+                if (entry[2], entry[3]) not in skip_keys
+            ]
+            print(
+                f"⏩ HumanEval 恢复运行：已完成 {resume_start_index}/{len(records) * samples_per_task}，剩余 {len(entries)}"
+            )
+        else:
+            entries = [entry for entry in entries if (entry[2], entry[3]) not in skip_keys]
+        skipped = total_expected - len(entries)
+        if skipped > 0:
+            print(f"⏩ HumanEval 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
 
-        resume = detect_resume_state(target_path, repeats=samples_per_task)
-        if resume.has_progress:
-            ensure_resume_samples_compatible(target_path, samples_per_task)
-        start_index = min(resume.next_index, len(entries))
-        if start_index and len(entries):
-            remaining = max(len(entries) - start_index, 0)
-            print(f"⏩ HumanEval 恢复运行：已完成 {start_index}/{len(entries)}，剩余 {remaining}")
-        pending_entries = entries[start_index:]
-        if pending_entries:
-            prompts = [entry[0] for entry in pending_entries]
+        sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
+        payloads: list[dict] = []
+        if entries:
+            prompts = [entry[0] for entry in entries]
             outputs = self.engine.generate(
                 prompts,
                 sampling=sampling,
@@ -168,11 +177,7 @@ class CodingPipeline:
             )
             output_by_idx = {item.prompt_index: item for item in outputs}
 
-            if not write_output:
-                return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
-
-            writer = JsonlStageWriter(target_path, resume=resume.has_progress)
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
+            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
                 seq = output_by_idx.get(local_idx)
                 if seq is None:
                     continue
@@ -182,29 +187,28 @@ class CodingPipeline:
                     completion=raw_output,
                     stop_reason=seq.finish_reason,
                 )
-                writer.write(
-                    SampleRecord(
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        sample_index=rec_idx,
-                        repeat_index=sample_idx,
-                        sampling_config=sampling_config,
-                        stages=[stage],
-                    )
-                )
-            writer.close()
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=rec_idx,
+                    repeat_index=sample_idx,
+                    sampling_config=sampling_config,
+                    stages=[stage],
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
 
         return CodingPipelineResult(
             dataset=dataset_name,
             sample_count=len(entries),
-            output_path=target_path,
             problem_count=len(records),
+            payloads=payloads,
         )
 
     def run_mbpp(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         sampling: SamplingConfig,
         batch_size: int = 64,
@@ -213,17 +217,18 @@ class CodingPipeline:
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
         probe_only: bool = False,
-        write_output: bool = True,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
         samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
-        write_output = write_output and (not probe_only)
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
-            return CodingPipelineResult(dataset_name, 0, Path(output_path), 0)
+            return CodingPipelineResult(dataset_name, 0, 0, [])
 
         is_human_eval_fix = "human_eval_fix" in dataset_path.lower()
 
@@ -240,7 +245,7 @@ class CodingPipeline:
                 progress_desc="Probing code",
                 probe_only=True,
             )
-            return CodingPipelineResult(dataset_name, len(prompts), Path(output_path), len(records))
+            return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
@@ -250,18 +255,31 @@ class CodingPipeline:
                 )
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
-        target_path = Path(output_path)
+        skip_keys = skip_keys or set()
+        total_expected = len(entries)
+        if resume_start_index < 0:
+            resume_start_index = 0
+        if resume_start_index:
+            if resume_start_index >= len(entries):
+                return CodingPipelineResult(dataset_name, len(entries), len(records), [])
+            entries = [
+                entry
+                for entry in entries[resume_start_index:]
+                if (entry[2], entry[3]) not in skip_keys
+            ]
+            print(
+                f"⏩ MBPP 恢复运行：已完成 {resume_start_index}/{len(records) * samples_per_task}，剩余 {len(entries)}"
+            )
+        else:
+            entries = [entry for entry in entries if (entry[2], entry[3]) not in skip_keys]
+        skipped = total_expected - len(entries)
+        if skipped > 0:
+            print(f"⏩ MBPP 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
+
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
-        resume = detect_resume_state(target_path, repeats=samples_per_task)
-        if resume.has_progress:
-            ensure_resume_samples_compatible(target_path, samples_per_task)
-        start_index = min(resume.next_index, len(entries))
-        if start_index and len(entries):
-            remaining = max(len(entries) - start_index, 0)
-            print(f"⏩ MBPP 恢复运行：已完成 {start_index}/{len(entries)}，剩余 {remaining}")
-        pending_entries = entries[start_index:]
-        if pending_entries:
-            prompts = [entry[0] for entry in pending_entries]
+        payloads: list[dict] = []
+        if entries:
+            prompts = [entry[0] for entry in entries]
             outputs = self.engine.generate(
                 prompts,
                 sampling=sampling,
@@ -270,11 +288,7 @@ class CodingPipeline:
             )
             output_by_idx = {item.prompt_index: item for item in outputs}
 
-            if not write_output:
-                return CodingPipelineResult(dataset_name, len(outputs), target_path, len(records))
-
-            writer = JsonlStageWriter(target_path, resume=resume.has_progress)
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
+            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
                 seq = output_by_idx.get(local_idx)
                 if seq is None:
                     continue
@@ -284,29 +298,28 @@ class CodingPipeline:
                     completion=raw_output,
                     stop_reason=seq.finish_reason,
                 )
-                writer.write(
-                    SampleRecord(
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        sample_index=rec_idx,
-                        repeat_index=sample_idx,
-                        sampling_config=sampling_config,
-                        stages=[stage],
-                    )
-                )
-            writer.close()
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=rec_idx,
+                    repeat_index=sample_idx,
+                    sampling_config=sampling_config,
+                    stages=[stage],
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
 
         return CodingPipelineResult(
             dataset=dataset_name,
             sample_count=len(entries),
-            output_path=target_path,
             problem_count=len(records),
+            payloads=payloads,
         )
 
     def run_livecodebench(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         cot_sampling: SamplingConfig,
         final_sampling: SamplingConfig,
@@ -316,17 +329,18 @@ class CodingPipeline:
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
         probe_only: bool = False,
-        write_output: bool = True,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
         samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
-        write_output = write_output and (not probe_only)
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
-            return CodingPipelineResult(dataset_name, 0, Path(output_path), 0)
+            return CodingPipelineResult(dataset_name, 0, 0, [])
 
         if probe_only:
             prompts = []
@@ -355,7 +369,7 @@ class CodingPipeline:
                     progress_desc="Probing final code",
                     probe_only=True,
                 )
-            return CodingPipelineResult(dataset_name, len(prompts), Path(output_path), len(records))
+            return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
@@ -363,18 +377,33 @@ class CodingPipeline:
                 prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
-        target_path = Path(output_path)
-        sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
-        resume = detect_resume_state(target_path, repeats=samples_per_task)
-        if resume.has_progress:
-            ensure_resume_samples_compatible(target_path, samples_per_task)
-        start_index = min(resume.next_index, len(entries))
-        if start_index and len(entries):
-            remaining = max(len(entries) - start_index, 0)
-            print(f"⏩ LiveCodeBench 恢复运行：已完成 {start_index}/{len(entries)}，剩余 {remaining}")
-        pending_entries = entries[start_index:]
-        if pending_entries:
-            prompts = [entry[0] for entry in pending_entries]
+        skip_keys = skip_keys or set()
+        total_expected = len(entries)
+        if resume_start_index < 0:
+            resume_start_index = 0
+        if resume_start_index:
+            if resume_start_index >= len(entries):
+                return CodingPipelineResult(dataset_name, len(entries), len(records), [])
+            entries = [
+                entry
+                for entry in entries[resume_start_index:]
+                if (entry[2], entry[3]) not in skip_keys
+            ]
+            print(
+                f"⏩ LiveCodeBench 恢复运行：已完成 {resume_start_index}/{len(records) * samples_per_task}，剩余 {len(entries)}"
+            )
+        else:
+            entries = [entry for entry in entries if (entry[2], entry[3]) not in skip_keys]
+        skipped = total_expected - len(entries)
+        if skipped > 0:
+            print(f"⏩ LiveCodeBench 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
+
+        sampling_config = normalize_sampling_config_by_stage(
+            [(1, cot_sampling), (2, final_sampling)]
+        )
+        payloads: list[dict] = []
+        if entries:
+            prompts = [entry[0] for entry in entries]
             cot_outputs = self.engine.generate(
                 prompts,
                 sampling=cot_sampling,
@@ -385,7 +414,7 @@ class CodingPipeline:
 
             final_prompts: list[str] = []
             final_prompt_indices: list[int] = []
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
+            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
                 cot_seq = cot_by_idx.get(local_idx)
                 if cot_seq is None:
                     continue
@@ -404,11 +433,7 @@ class CodingPipeline:
                 final_prompt_indices[item.prompt_index]: item for item in final_outputs
             }
 
-            if not write_output:
-                return CodingPipelineResult(dataset_name, len(cot_outputs), target_path, len(records))
-
-            writer = JsonlStageWriter(target_path, resume=resume.has_progress)
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(pending_entries):
+            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
                 cot_seq = cot_by_idx.get(local_idx)
                 final_seq = final_by_idx.get(local_idx)
                 if cot_seq is None or final_seq is None:
@@ -426,23 +451,23 @@ class CodingPipeline:
                     completion=final_seq.text,
                     stop_reason=final_seq.finish_reason,
                 )
-                writer.write(
-                    SampleRecord(
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        sample_index=rec_idx,
-                        repeat_index=sample_idx,
-                        sampling_config=sampling_config,
-                        stages=[cot_stage, final_stage],
-                    )
-                )
-            writer.close()
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=rec_idx,
+                    repeat_index=sample_idx,
+                    sampling_config=sampling_config,
+                    stages=[cot_stage, final_stage],
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
 
         return CodingPipelineResult(
             dataset=dataset_name,
             sample_count=len(entries),
-            output_path=target_path,
             problem_count=len(records),
+            payloads=payloads,
         )
 
     def _load_records(

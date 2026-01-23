@@ -13,15 +13,15 @@ import torch
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
 from src.eval.scheduler.profiler import update_batch_cache_locked
 from src.eval.evaluators.multi_choice import MultipleChoicePipeline
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
 
@@ -68,16 +68,6 @@ def _update_batch_cache_record(
     return data
 
 
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=True, model_name=Path(model_path).stem)
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV multiple-choice CoT evaluator")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
@@ -86,7 +76,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation/scoring")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -108,7 +97,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"❌ {exc}")
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     model_name = Path(args.model_path).stem
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
@@ -124,24 +112,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cot_sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
+    if not DEFAULT_DB_CONFIG.enabled:
+        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
+    db = DatabaseManager.instance()
+    db.initialize(DEFAULT_DB_CONFIG)
+    service = EvalDbService(db)
+    version_id = service.get_or_create_version(
+        job_name="eval_multi_choice_cot",
+        job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        allow_resume=True,
+    )
+    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+    skip_keys = service.list_completion_keys(
+        version_id=version_id,
+        is_param_search=False,
+    )
+    writer = CompletionWriteWorker(
+        service=service,
+        version_id=version_id,
+        is_param_search=False,
+    )
+
     if args.probe_only:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
-            output_path=str(out_path),
             cot_sampling=cot_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
             min_prompt_count=batch_size,
             probe_only=True,
-            write_output=False,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
 
     probe_only = False
     sample_limit: int | None = args.max_samples
-    output_path = out_path
     min_prompt_count: int | None = None
 
     target_batch = max(1, args.batch_size)
@@ -151,11 +160,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = pipeline.run_chain_of_thought(
                 dataset_path=str(dataset_path),
-                output_path=str(output_path),
                 cot_sampling=cot_sampling,
                 batch_size=attempt_batch,
                 sample_limit=sample_limit,
                 min_prompt_count=min_prompt_count,
+                skip_keys=skip_keys,
+                on_record=writer.enqueue,
             )
             effective_batch = attempt_batch
             break
@@ -182,57 +192,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         if job_name and model_slug and gpu:
             _update_batch_cache(job_name, model_slug, gpu, effective_batch)
 
-    eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
-    metrics = evaluate_multiple_choice(
-        output_path,
-        dataset_path=dataset_path,
-        eval_output_path=eval_path,
+    writer.close()
+    completions_payloads = service.list_completion_payloads(
+        version_id=version_id,
+        is_param_search=False,
     )
-    score_path = write_scores_json(
+    metrics = evaluate_multiple_choice(
+        completions_payloads,
+        dataset_path=dataset_path,
+    )
+    service.ingest_eval_payloads(
+        payloads=metrics.payloads,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    score_payload = make_score_payload(
         slug,
         is_cot=True,
         model_name=Path(args.model_path).stem,
         metrics={"accuracy": metrics.accuracy},
         samples=metrics.samples,
-        log_path=out_path,
         task="multiple_choice_cot",
         task_details={
             "accuracy_by_subject": metrics.accuracy_by_subject,
-            "eval_details_path": str(eval_path),
         },
     )
-    if DEFAULT_DB_CONFIG.enabled:
-        db = DatabaseManager.instance()
-        db.initialize(DEFAULT_DB_CONFIG)
-        service = EvalDbService(db)
-        version_id = service.get_or_create_version(
-            job_name="eval_multi_choice_cot",
-            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
-            dataset=str(slug),
-            model=Path(args.model_path).stem,
-            is_param_search=False,
-            allow_resume=True,
-        )
-        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-        service.ingest_completions(
-            completions_path=output_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.ingest_eval(
-            eval_path=eval_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.record_score(
-            score_path=score_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-    print(f"✅ CoT multiple-choice done: {result.sample_count} samples -> {result.output_path}")
-    print(f"📄 eval details saved: {eval_path}")
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    service.record_score_payload(
+        payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    print(f"✅ CoT multiple-choice done: {result.sample_count} samples")
     return 0
 
 

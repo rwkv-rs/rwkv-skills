@@ -3,7 +3,7 @@ from __future__ import annotations
 """Multiple-choice 评估流水线：负责读数据、跑模型、导出阶段化 JSONL。"""
 
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -14,7 +14,7 @@ from src.infer.engine import InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
-from .common import JsonlStageWriter, SampleRecord, StageRecord, detect_resume_state
+from .common import SampleRecord, StageRecord
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
@@ -75,7 +75,7 @@ def _select_prompt_templates(dataset_name: str | None) -> PromptTemplates:
 class MultipleChoicePipelineResult:
     dataset: str
     sample_count: int
-    output_path: Path
+    payloads: list[dict]
 
 
 class MultipleChoicePipeline:
@@ -91,11 +91,13 @@ class MultipleChoicePipeline:
     def run_direct(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         prompt_template: str | None = None,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
@@ -104,16 +106,18 @@ class MultipleChoicePipeline:
         if prompt_template is None:
             prompt_template = templates.direct
 
-        resume = detect_resume_state(output_path, repeats=1)
-        start_index = min(resume.next_index, len(records))
-        if start_index and len(records):
-            remaining = max(len(records) - start_index, 0)
-            print(f"⏩ 多选 Direct 恢复运行：已完成 {start_index}/{len(records)}，剩余 {remaining}")
-        indexed_records = list(enumerate(records[start_index:], start=start_index))
+        skip_keys = skip_keys or set()
+        if resume_start_index < 0:
+            resume_start_index = 0
+        indexed_records = [
+            (idx, record)
+            for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
+            if (idx, 0) not in skip_keys
+        ]
         if not indexed_records:
-            return MultipleChoicePipelineResult(dataset_name, len(records), Path(output_path))
+            return MultipleChoicePipelineResult(dataset_name, 0, [])
 
-        writer = JsonlStageWriter(output_path, resume=resume.has_progress)
+        payloads: list[dict] = []
         for idx, record in indexed_records:
             prompt = self._format_prompt(record, prompt_template)
             _, pred_letter = self._score_prompt(record, prompt)
@@ -125,23 +129,22 @@ class MultipleChoicePipeline:
                     stop_reason="logits_only",
                 )
             ]
-            writer.write(
-                SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=idx,
-                    repeat_index=0,
-                    sampling_config={},
-                    stages=stages,
-                )
-            )
-        writer.close()
-        return MultipleChoicePipelineResult(dataset_name, len(records), Path(output_path))
+            payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=idx,
+                repeat_index=0,
+                sampling_config={},
+                stages=stages,
+            ).as_payload()
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
+        return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
 
     def run_chain_of_thought(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         cot_prompt_template: str | None = None,
         final_answer_template: str | None = None,
@@ -151,13 +154,14 @@ class MultipleChoicePipeline:
         sample_limit: int | None = None,
         min_prompt_count: int | None = None,
         probe_only: bool = False,
-        write_output: bool = True,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         templates = _select_prompt_templates(dataset_name)
-        write_output = write_output and (not probe_only)
         batch_size = max(1, int(batch_size))
         if min_prompt_count and min_prompt_count > len(records) and records:
             repeats = (min_prompt_count + len(records) - 1) // len(records)
@@ -174,18 +178,26 @@ class MultipleChoicePipeline:
                 repeat = (batch_size + len(records) - 1) // len(records)
                 records = (records * repeat)[:batch_size]
 
-        if write_output:
-            resume = detect_resume_state(output_path, repeats=1)
-            start_index = min(resume.next_index, len(records))
-            if start_index and len(records):
-                remaining = max(len(records) - start_index, 0)
-                print(f"⏩ 多选 CoT 恢复运行：已完成 {start_index}/{len(records)}，剩余 {remaining}")
+        skip_keys = skip_keys or set()
+        if resume_start_index < 0:
+            resume_start_index = 0
+        if resume_start_index:
+            if resume_start_index >= len(records):
+                return MultipleChoicePipelineResult(dataset_name, len(records), [])
+            remaining_records = [
+                record
+                for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
+                if (idx, 0) not in skip_keys
+            ]
+            print(
+                f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(records)}，剩余 {len(remaining_records)}"
+            )
         else:
-            start_index = 0
-            resume = None
-        remaining_records = records[start_index:]
+            remaining_records = [
+                record for idx, record in enumerate(records) if (idx, 0) not in skip_keys
+            ]
         if not remaining_records:
-            return MultipleChoicePipelineResult(dataset_name, len(records), Path(output_path))
+            return MultipleChoicePipelineResult(dataset_name, 0, [])
 
         prompts = [self._format_prompt(record, cot_prompt_template) for record in remaining_records]
         outputs = self.engine.generate(
@@ -195,14 +207,13 @@ class MultipleChoicePipeline:
             progress_desc="Generating CoT" if not probe_only else "Probing CoT",
             probe_only=probe_only,
         )
-        if probe_only or not write_output:
-            return MultipleChoicePipelineResult(dataset_name, len(records), Path(output_path))
+        if probe_only:
+            return MultipleChoicePipelineResult(dataset_name, len(records), [])
 
-        writer = JsonlStageWriter(output_path, resume=bool(resume and resume.has_progress))
+        payloads: list[dict] = []
         sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling)])
         cot_by_idx = {item.prompt_index: item for item in outputs}
         for local_idx, record in enumerate(remaining_records):
-            global_idx = start_index + local_idx
             cot_seq = cot_by_idx.get(local_idx)
             if cot_seq is None:
                 continue
@@ -226,18 +237,18 @@ class MultipleChoicePipeline:
                 completion=token_text,
                 stop_reason="logits_only",
             )
-            writer.write(
-                SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=global_idx,
-                    repeat_index=0,
-                    sampling_config=sampling_config,
-                    stages=[cot_stage, final_stage],
-                )
-            )
-        writer.close()
-        return MultipleChoicePipelineResult(dataset_name, len(records), Path(output_path))
+            payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=resume_start_index + local_idx,
+                repeat_index=0,
+                sampling_config=sampling_config,
+                stages=[cot_stage, final_stage],
+            ).as_payload()
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
+        return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
 
     # ------------------------------------------------------------------
     # Helpers

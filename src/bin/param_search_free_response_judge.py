@@ -2,13 +2,12 @@ from __future__ import annotations
 
 """Run a full CoT sampling grid search for judge-style math datasets.
 
-Per-trial artifacts are written under results/param_search/.
+Per-trial results are written to DB.
 """
 
 import argparse
 import json
 import os
-import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
@@ -23,21 +22,13 @@ from src.eval.metrics.free_response import (
     evaluate_free_response,
 )
 from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid
-from src.eval.results.layout import (
-    PARAM_SEARCH_COMPLETIONS_ROOT,
-    PARAM_SEARCH_EVAL_RESULTS_ROOT,
-    PARAM_SEARCH_SCORES_ROOT,
-    make_scores_payload,
-    param_search_completion_trial_path,
-    param_search_eval_trial_path,
-    param_search_scores_trial_path,
-    write_scores_json_to_path,
-)
+from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -99,14 +90,6 @@ def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
 
 
-def _cleanup_previous_trials(model_name: str, dataset_slug: str) -> None:
-    model_dir = safe_slug(model_name)
-    dataset_dir = canonical_slug(dataset_slug)
-    for root in (PARAM_SEARCH_COMPLETIONS_ROOT, PARAM_SEARCH_EVAL_RESULTS_ROOT, PARAM_SEARCH_SCORES_ROOT):
-        target = (root / model_dir / dataset_dir).resolve()
-        shutil.rmtree(target, ignore_errors=True)
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search (judge-style free-response)")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
@@ -116,7 +99,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--output", help="Ignored (scheduler compatibility)")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -156,11 +138,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    db_service: EvalDbService | None = None
-    if DEFAULT_DB_CONFIG.enabled:
-        db = DatabaseManager.instance()
-        db.initialize(DEFAULT_DB_CONFIG)
-        db_service = EvalDbService(db)
+    if not DEFAULT_DB_CONFIG.enabled:
+        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
+    db = DatabaseManager.instance()
+    db.initialize(DEFAULT_DB_CONFIG)
+    db_service = EvalDbService(db)
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
@@ -190,7 +172,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run(
             dataset_path=str(dataset_path),
-            output_path=str(param_search_completion_trial_path(slug, model_name=model_name, trial_index=0)),
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
@@ -199,7 +180,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass_k=(1,),
             samples_per_task=1,
             probe_only=True,
-            write_output=False,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
@@ -217,7 +197,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if judge_model and judge_api_key:
         judge = LLMJudge(LLMJudgeConfig(api_key=judge_api_key, model=judge_model, base_url=judge_base_url))
 
-    _cleanup_previous_trials(model_name, slug)
     sizes = grid_size_by_mode()
     if args.scan_mode == "both":
         total = sizes["normal"] + sizes["simple"]
@@ -231,28 +210,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_trial: int | None = None
 
     for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, scan_mode=args.scan_mode):
-        completion_path = param_search_completion_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        eval_path = param_search_eval_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        score_path = param_search_scores_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        completion_path.unlink(missing_ok=True)
-        eval_path.unlink(missing_ok=True)
-        score_path.unlink(missing_ok=True)
-
-        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {completion_path}")
+        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
+        version_id = db_service.get_or_create_version(
+            job_name="param_search_free_response_judge",
+            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+            dataset=str(slug),
+            model=model_name,
+            is_param_search=True,
+            allow_resume=False,
+        )
+        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+        writer = CompletionWriteWorker(
+            service=db_service,
+            version_id=version_id,
+            is_param_search=True,
+        )
         result = pipeline.run(
             dataset_path=str(dataset_path),
-            output_path=str(completion_path),
             cot_sampling=trial_cot,
             final_sampling=final_sampling,
             batch_size=max(1, args.batch_size),
             sample_limit=args.max_samples,
             pass_k=pass_k,
             samples_per_task=samples_per_task,
+            on_record=writer.enqueue,
+        )
+        writer.close()
+        completions_payloads = db_service.list_completion_payloads(
+            version_id=version_id,
+            is_param_search=True,
         )
         evaluation = evaluate_free_response(
-            completion_path,
+            completions_payloads,
             dataset_path=str(dataset_path),
-            eval_output_path=eval_path,
             judge=judge,
         )
 
@@ -270,7 +260,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             metrics_payload.update(avg_payload)
 
         task_details: dict[str, object] = {
-            "eval_details_path": str(eval_path),
             "param_search_trial": {
                 "trial": int(trial_idx),
                 "params": params,
@@ -283,43 +272,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if avg_metrics_all and avg_payload != avg_metrics_all:
             task_details["avg_curve"] = avg_metrics_all
 
-        payload = make_scores_payload(
+        payload = make_score_payload(
             slug,
             is_cot=True,
             model_name=model_name,
             metrics=metrics_payload,
             samples=evaluation.samples,
             problems=result.problem_count,
-            log_path=completion_path,
             task="free_response_judge",
             task_details=task_details,
         )
-        write_scores_json_to_path(score_path, payload)
-        if db_service:
-            version_id = db_service.get_or_create_version(
-                job_name="param_search_free_response_judge",
-                job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
-                dataset=str(slug),
-                model=model_name,
-                is_param_search=True,
-                allow_resume=False,
-            )
-            os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-            db_service.ingest_completions(
-                completions_path=completion_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
-            db_service.ingest_eval(
-                eval_path=eval_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
-            db_service.record_score(
-                score_path=score_path,
-                version_id=version_id,
-                is_param_search=True,
-            )
+        db_service.ingest_eval_payloads(
+            payloads=evaluation.payloads,
+            version_id=version_id,
+            is_param_search=True,
+        )
+        db_service.record_score_payload(
+            payload=payload,
+            version_id=version_id,
+            is_param_search=True,
+        )
 
         objective = (
             float(metrics_payload["judge_accuracy"])

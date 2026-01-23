@@ -11,28 +11,18 @@ from dataclasses import replace
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
 DEFAULT_AVG_K: tuple[int, ...] = ()
 IFEVAL_AVG_K = (4,)
-
-
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=False, model_name=Path(model_path).stem)
 
 
 def _max_k(values) -> int:
@@ -82,7 +72,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
     parser.add_argument(
         "--no-param-search",
         action="store_true",
@@ -105,7 +94,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"❌ {exc}")
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = InstructionFollowingPipeline(config)
     avg_k_final = _resolve_avg_k(slug, args)
@@ -123,9 +111,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         sampling = replace(sampling, stop_tokens=tuple(args.stop_token))
     ban_tokens = tuple(args.ban_token) if args.ban_token else None
 
+    if not DEFAULT_DB_CONFIG.enabled:
+        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
+    db = DatabaseManager.instance()
+    db.initialize(DEFAULT_DB_CONFIG)
+    service = EvalDbService(db)
+    version_id = service.get_or_create_version(
+        job_name="eval_instruction_following",
+        job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        allow_resume=True,
+    )
+    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+    skip_keys = service.list_completion_keys(
+        version_id=version_id,
+        is_param_search=False,
+    )
+    writer = CompletionWriteWorker(
+        service=service,
+        version_id=version_id,
+        is_param_search=False,
+    )
     result = pipeline.run(
         dataset_path=str(dataset_path),
-        output_path=str(out_path),
         sampling=sampling,
         batch_size=max(1, args.batch_size),
         sample_limit=args.max_samples,
@@ -133,17 +143,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_tokens=sampling.stop_tokens,
         ban_tokens=ban_tokens,
         samples_per_prompt=samples_per_prompt,
+        skip_keys=skip_keys,
+        on_record=writer.enqueue,
     )
-    eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
+    writer.close()
+    completions_payloads = service.list_completion_payloads(
+        version_id=version_id,
+        is_param_search=False,
+    )
     metrics = evaluate_instruction_following(
-        out_path,
+        completions_payloads,
         dataset_path=str(dataset_path),
-        eval_output_path=eval_path,
         strict=True,
         avg_k=avg_k_final,
     )
     avg_payload = _filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
-    score_path = write_scores_json(
+    service.ingest_eval_payloads(
+        payloads=metrics.payloads or [],
+        version_id=version_id,
+        is_param_search=False,
+    )
+    score_payload = make_score_payload(
         slug,
         is_cot=False,
         model_name=Path(args.model_path).stem,
@@ -153,47 +173,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             **avg_payload,
         },
         samples=metrics.samples,
-        log_path=out_path,
         task="instruction_following",
         task_details={
             "tier0_accuracy": metrics.tier0_accuracy,
             "tier1_accuracy": metrics.tier1_accuracy,
-            "eval_details_path": str(eval_path),
             **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
         },
     )
-    if DEFAULT_DB_CONFIG.enabled:
-        db = DatabaseManager.instance()
-        db.initialize(DEFAULT_DB_CONFIG)
-        service = EvalDbService(db)
-        version_id = service.get_or_create_version(
-            job_name="eval_instruction_following",
-            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
-            dataset=str(slug),
-            model=Path(args.model_path).stem,
-            is_param_search=False,
-            allow_resume=True,
-        )
-        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-        service.ingest_completions(
-            completions_path=out_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.ingest_eval(
-            eval_path=eval_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.record_score(
-            score_path=score_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-    print(f"✅ instruction-following done: {result.sample_count} samples -> {result.output_path}")
-    print(f"📄 eval details saved: {eval_path}")
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    service.record_score_payload(
+        payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    print(f"✅ instruction-following done: {result.sample_count} samples")
     return 0
 
 

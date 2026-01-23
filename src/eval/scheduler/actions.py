@@ -12,9 +12,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .config import (
-    DEFAULT_COMPLETION_DIR,
     DEFAULT_DISPATCH_POLL_SECONDS,
-    DEFAULT_EVAL_RESULT_DIR,
     DEFAULT_GPU_IDLE_MAX_MEM,
     DEFAULT_MODEL_GLOBS,
     DEFAULT_PYTHON,
@@ -59,8 +57,6 @@ class QueueOptions:
 @dataclass(slots=True)
 class DispatchOptions(QueueOptions):
     run_log_dir: Path = DEFAULT_RUN_LOG_DIR
-    completion_dir: Path = DEFAULT_COMPLETION_DIR
-    eval_result_dir: Path = DEFAULT_EVAL_RESULT_DIR
     dispatch_poll_seconds: int = DEFAULT_DISPATCH_POLL_SECONDS
     gpu_idle_max_mem: int = DEFAULT_GPU_IDLE_MAX_MEM
     skip_missing_dataset: bool = False
@@ -88,25 +84,6 @@ class LogsOptions:
     pid_dir: Path
     tail_lines: int = 60
     rotate_seconds: int = 15
-
-
-def _purge_previous_outputs(completion_path: Path, score_path: Path, eval_path: Path) -> None:
-    targets = [
-        completion_path,
-        completion_path.with_suffix(completion_path.suffix + ".tmp"),
-        score_path,
-        score_path.with_suffix(score_path.suffix + ".tmp"),
-        eval_path,
-        eval_path.with_suffix(eval_path.suffix + ".tmp"),
-    ]
-    for path in targets:
-        path.unlink(missing_ok=True)
-
-
-def _artifact_path(root: Path, rel: Path, suffix: str) -> Path:
-    target = root / rel.parent / f"{rel.name}{suffix}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return target
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
@@ -137,7 +114,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
 
 
 def action_dispatch(opts: DispatchOptions) -> None:
-    ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir, opts.completion_dir, opts.eval_result_dir)
+    ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
     if opts.clean_param_swap:
         _clean_param_swap_records(opts.log_dir)
 
@@ -164,21 +141,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             return
 
         completed, completed_records = scan_completed_jobs(opts.log_dir)
-        failed_keys = {record.key for record in completed_records.values() if record.missing_artifacts}
-        for job_id, record in completed_records.items():
-            if not record.missing_artifacts or job_id in failed_announced:
-                continue
-            missing_desc = "、".join(record.missing_artifacts)
-            print(f"❌ {job_id} 先前运行缺少 {missing_desc}，已标记失败（score: {record.score_path})")
-            log_job_event(
-                "job_fail",
-                job_id,
-                reason="missing_artifacts",
-                missing=record.missing_artifacts,
-                score_path=str(record.score_path),
-                log_path=str(record.completion_path),
-            )
-            failed_announced.add(job_id)
+        failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
         completed_for_queue = completed
         if opts.overwrite:
@@ -202,7 +165,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
         queue = sort_queue_items(queue, question_counts=question_counts, job_priority=job_priority)
         now = time.time()
 
-        completed_ids = {job_id for job_id, record in completed_records.items() if not record.missing_artifacts}
+        completed_ids = set(completed_records.keys())
         new_completed = set() if completed_log_ids is None else completed_ids - completed_log_ids
         if new_completed:
             for job_id in sorted(new_completed):
@@ -215,14 +178,12 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "job": info.key.job,
                     "dataset_slug": info.key.dataset_slug,
                     "model_slug": info.key.model_slug,
-                    "dataset_path": info.dataset_path,
                     "model_name": info.model_name,
-                    "log_path": str(info.completion_path),
                     "runtime_s": runtime,
                     "is_cot": info.key.is_cot,
                 }
-                if info.eval_result_path:
-                    payload["eval_details_path"] = str(info.eval_result_path)
+                if info.version_id:
+                    payload["version_id"] = info.version_id
                 payload.update(meta)
                 log_job_event("job_done", job_id, **payload)
         completed_log_ids = completed_ids
@@ -309,9 +270,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 raise
 
             log_relpath = build_run_log_name(item.model_path, dataset_slug, is_cot=job.is_cot)
-            completion_path = _artifact_path(opts.completion_dir, log_relpath, ".jsonl")
-            score_path = _artifact_path(opts.log_dir, log_relpath, ".json")
-            eval_path = _artifact_path(opts.eval_result_dir, log_relpath, "_results.jsonl")
             console_log_path = _allocate_console_log_path(opts.run_log_dir, log_relpath)
             pid_path = opts.pid_dir / f"{item.job_id}.pid"
             item.dataset_path = dataset_path
@@ -334,10 +292,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                             )
                             continue
                 pid_path.unlink(missing_ok=True)
-
-            if opts.overwrite:
-                _purge_previous_outputs(completion_path, score_path, eval_path)
-                print(f"    ↻ overwrite: cleared previous outputs for {log_relpath}")
 
             completed_key = CompletedKey(
                 job=item.job_name,
@@ -371,10 +325,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RWKV_SKILLS_MODEL_PATH": str(item.model_path),
                     "RWKV_SKILLS_DATASET": str(dataset_path),
                     "RWKV_SKILLS_DATASET_SLUG": dataset_slug,
-                    "RWKV_SKILLS_LOG_PATH": str(completion_path),
                     "RUN_LOG_DIR": str(opts.log_dir),
-                    "RUN_COMPLETION_DIR": str(opts.completion_dir),
-                    "RUN_EVAL_RESULT_DIR": str(opts.eval_result_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
                 }
             )
@@ -404,12 +355,10 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 dataset_path,
                 f"cuda:{gpu}",
                 batch_size=batch_size,
-                output_path=completion_path,
                 extra_args=extra_args,
             )
             print(f"🚀 Launch {item.job_id} -> cuda:{gpu}")
             print(f"    Dataset: {dataset_path}")
-            print(f"    Completion: {completion_path}")
             print(f"    Console: {console_log_path}")
             print(f"    Cmd: {' '.join(command)}")
             meta = job_metadata.setdefault(item.job_id, {})
@@ -419,7 +368,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 dataset_path=str(dataset_path),
                 model_path=str(item.model_path),
                 model_slug=item.model_slug,
-                log_path=str(completion_path),
                 console_log_path=str(console_log_path),
                 gpu=gpu,
             )
@@ -446,7 +394,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 dataset_slug=dataset_slug,
                 dataset_path=str(dataset_path),
                 model_path=str(item.model_path),
-                log_path=str(completion_path),
                 gpu=f"cuda:{gpu}",
                 pid=process.pid,
                 wait_s=wait_s,
@@ -462,7 +409,6 @@ def build_command(
     device: str,
     *,
     batch_size: int | None = None,
-    output_path: Path | None = None,
     extra_args: Sequence[str] = (),
 ) -> list[str]:
     base = [DEFAULT_PYTHON, "-m", job.module]
@@ -476,8 +422,6 @@ def build_command(
     ]
     if batch_size is not None and job.batch_flag:
         args.extend([job.batch_flag, str(batch_size)])
-    if output_path is not None:
-        args.extend(["--output", str(output_path)])
     if job.extra_args:
         args.extend(job.extra_args)
     if extra_args:

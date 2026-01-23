@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from src.infra.database import DatabaseManager
+from src.db.database import DatabaseManager
 from src.eval.scheduler.config import DBConfig
 
 class TestDatabaseManager(unittest.TestCase):

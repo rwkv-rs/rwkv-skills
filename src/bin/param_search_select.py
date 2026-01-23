@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-"""Select the best param-search grid points and promote artifacts.
+"""Select the best param-search grid points and promote scores in DB.
 
-This script reads per-trial score JSONs under:
-  results/param_search/scores/{model}/{benchmark}/trial_{trial}.json
-
-It selects the best shared grid point *per sampling mode* (normal/simple) by summed objective,
-then promotes the corresponding trial artifacts into the canonical results layout using suffixes:
+This script reads per-trial scores from the database (is_param_search=1),
+selects the best shared grid point *per sampling mode* (normal/simple), and
+promotes the corresponding scores into non-param-search records using suffixes:
 - {benchmark} (best overall across modes; backward compatible)
 - {benchmark}__ps_normal
 - {benchmark}__ps_simple
@@ -15,30 +13,18 @@ then promotes the corresponding trial artifacts into the canonical results layou
 import argparse
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Sequence
 
-from src.eval.checkers.llm_checker import run_llm_checker
-from src.eval.results.layout import (
-    eval_details_path,
-    jsonl_path,
-    scores_path,
-    write_scores_json_to_path,
-)
-from src.eval.scheduler.config import REPO_ROOT, RESULTS_ROOT
-from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
+from src.eval.results.payloads import make_score_payload
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.dataset_utils import canonical_slug
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
 
 
 DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
 _MODE_SUFFIXES: dict[str, str] = {"normal": "__ps_normal", "simple": "__ps_simple"}
-
-
-def _resolve_path(path_value: str | Path) -> Path:
-    raw = Path(path_value).expanduser() if not isinstance(path_value, Path) else path_value.expanduser()
-    if raw.is_absolute():
-        return raw
-    return (REPO_ROOT / raw).resolve()
 
 
 def _objective_from_metrics(metrics: dict[str, Any]) -> float:
@@ -76,21 +62,11 @@ def _param_key_from_payload(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _iter_trial_score_files(model_name: str, benchmark: str) -> list[Path]:
-    model_dir = safe_slug(model_name)
-    bench_dir = canonical_slug(benchmark)
-    root = RESULTS_ROOT / "param_search" / "scores" / model_dir / bench_dir
-    if not root.exists():
-        return []
-    return sorted(root.glob("trial_*.json"))
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search selector/promoter")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", help="Ignored (scheduler compatibility)")
     parser.add_argument("--device", help="Ignored (scheduler compatibility)")
-    parser.add_argument("--output", help="Optional JSONL marker output path (scheduler compatibility)")
     parser.add_argument(
         "--benchmarks",
         nargs="+",
@@ -100,79 +76,97 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite promoted artifacts under results/{completions,eval,scores}.",
+        help="Overwrite promoted records in DB.",
     )
     return parser.parse_args(argv)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _promote_trial(
+def _should_skip_promotion(
+    service: EvalDbService,
     *,
-    trial_score_path: Path,
+    dataset: str,
+    model_name: str,
+    overwrite: bool,
+) -> bool:
+    if overwrite:
+        return False
+    existing = service.list_scores_by_dataset(dataset=dataset, model=model_name, is_param_search=False)
+    return bool(existing)
+
+
+def _promote_score(
+    service: EvalDbService,
+    *,
+    source_payload: dict[str, Any],
     dest_dataset: str,
     model_name: str,
     overwrite: bool,
 ) -> None:
-    payload = _load_json(trial_score_path)
-    source_completion = _resolve_path(str(payload.get("log_path", "")))
-    task_details = payload.get("task_details") if isinstance(payload.get("task_details"), dict) else {}
-    eval_details_value = task_details.get("eval_details_path") if isinstance(task_details, dict) else None
-    if not isinstance(eval_details_value, str):
-        raise ValueError(f"score JSON missing task_details.eval_details_path: {trial_score_path}")
-    source_eval = _resolve_path(eval_details_value)
-
-    dest_completion = jsonl_path(dest_dataset, is_cot=True, model_name=model_name)
-    dest_eval = eval_details_path(dest_dataset, is_cot=True, model_name=model_name)
-    dest_score = scores_path(dest_dataset, is_cot=True, model_name=model_name)
-
-    for src, dst in ((source_completion, dest_completion), (source_eval, dest_eval)):
-        if not src.exists():
-            raise FileNotFoundError(f"missing source artifact: {src}")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists() and not overwrite:
-            continue
-        shutil.copy2(src, dst)
-
-    # Rewrite score JSON so canonical artifacts are self-contained.
-    if dest_score.exists() and not overwrite:
+    if _should_skip_promotion(service, dataset=dest_dataset, model_name=model_name, overwrite=overwrite):
         return
-
-    payload["dataset"] = dest_dataset
-    payload["log_path"] = str(dest_completion)
-    if isinstance(payload.get("task_details"), dict):
-        payload["task_details"]["eval_details_path"] = str(dest_eval)
-
-    dest_score.parent.mkdir(parents=True, exist_ok=True)
-    write_scores_json_to_path(dest_score, payload)
+    task_details = source_payload.get("task_details") if isinstance(source_payload.get("task_details"), dict) else {}
+    task_details = dict(task_details)
+    task_details["param_search_selected_from"] = {
+        "version_id": source_payload.get("version_id"),
+        "param_key": _param_key_from_payload(source_payload),
+    }
+    score_payload = make_score_payload(
+        dest_dataset,
+        is_cot=bool(source_payload.get("cot", True)),
+        model_name=model_name,
+        metrics=source_payload.get("metrics") if isinstance(source_payload.get("metrics"), dict) else {},
+        samples=int(source_payload.get("samples", 0) or 0),
+        problems=source_payload.get("problems"),
+        task=str(source_payload.get("task") or "param_search_select"),
+        task_details=task_details,
+    )
+    version_id = service.get_or_create_version(
+        job_name="param_search_select",
+        job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+        dataset=str(dest_dataset),
+        model=model_name,
+        is_param_search=False,
+        allow_resume=False,
+    )
+    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+    service.record_score_payload(
+        payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if not DEFAULT_DB_CONFIG.enabled:
+        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
+    db = DatabaseManager.instance()
+    db.initialize(DEFAULT_DB_CONFIG)
+    service = EvalDbService(db)
     model_name = Path(args.model_path).stem
     benchmarks = tuple(canonical_slug(b) for b in args.benchmarks if b)
     if len(benchmarks) < 2:
         print("❌ 需要至少 2 个 benchmark 才能进行综合选参。")
         return 2
 
-    by_benchmark: dict[str, dict[str, tuple[float, Path]]] = {}
+    by_benchmark: dict[str, dict[str, tuple[float, dict[str, Any]]]] = {}
     for bench in benchmarks:
-        files = _iter_trial_score_files(model_name, bench)
-        if not files:
+        rows = service.list_scores_by_dataset(dataset=bench, model=model_name, is_param_search=True)
+        if not rows:
             print(f"❌ 缺少 param-search trial scores: {bench}")
             return 1
-        mapping: dict[str, tuple[float, Path]] = {}
-        for path in files:
-            payload = _load_json(path)
+        mapping: dict[str, tuple[float, dict[str, Any]]] = {}
+        for payload in rows:
             metrics = payload.get("metrics")
             if not isinstance(metrics, dict):
                 continue
             key = _param_key_from_payload(payload)
             if key is None:
                 continue
-            mapping[key] = (_objective_from_metrics(metrics), path)
+            objective = _objective_from_metrics(metrics)
+            existing = mapping.get(key)
+            if existing is None or objective > existing[0]:
+                mapping[key] = (objective, payload)
         if not mapping:
             print(f"❌ 未能从 {bench} 解析出任何有效 trial score")
             return 1
@@ -183,7 +177,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("❌ 各 benchmark 的 grid 点没有交集（params key 不一致）")
         return 1
 
-    selections: dict[str, tuple[str, float, dict[str, float], dict[str, Path]]] = {}
+    selections: dict[str, tuple[str, float, dict[str, float], dict[str, dict[str, Any]]]] = {}
     for mode in sorted(_MODE_SUFFIXES.keys()):
         mode_keys = {key for key in common_keys if _sample_mode_from_key(key) == mode}
         if not mode_keys:
@@ -192,24 +186,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         best_key: str | None = None
         best_sum: float | None = None
         best_detail: dict[str, float] = {}
-        best_paths: dict[str, Path] = {}
+        best_payloads: dict[str, dict[str, Any]] = {}
         for key in sorted(mode_keys):
             total = 0.0
             detail: dict[str, float] = {}
-            paths: dict[str, Path] = {}
+            payloads: dict[str, dict[str, Any]] = {}
             for bench, mapping in by_benchmark.items():
-                score, path = mapping[key]
+                score, payload = mapping[key]
                 total += float(score)
                 detail[bench] = float(score)
-                paths[bench] = path
+                payloads[bench] = payload
             if best_sum is None or total > best_sum:
                 best_sum = total
                 best_key = key
                 best_detail = detail
-                best_paths = paths
+                best_payloads = payloads
 
         if best_key is not None and best_sum is not None:
-            selections[mode] = (best_key, best_sum, best_detail, best_paths)
+            selections[mode] = (best_key, best_sum, best_detail, best_payloads)
 
     if not selections:
         print("❌ 未找到可用的最佳 grid 点（normal/simple 均无可用交集）")
@@ -217,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Backward compatible: still promote the best overall selection into {benchmark}.
     best_overall_mode, best_overall = max(selections.items(), key=lambda item: item[1][1])
-    best_key, best_sum, best_detail, best_paths = best_overall
+    best_key, best_sum, best_detail, best_payloads = best_overall
 
     print("✅ best param-search selections:")
     print(f"    model: {model_name}")
@@ -232,56 +226,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"    promote: {mode} -> {{benchmark}}{_MODE_SUFFIXES[mode]}")
 
     # 1) Promote best overall into {benchmark}.
-    for bench, score_path in best_paths.items():
-        _promote_trial(
-            trial_score_path=score_path,
+    for bench, payload in best_payloads.items():
+        _promote_score(
+            service,
+            source_payload=payload,
             dest_dataset=bench,
             model_name=model_name,
             overwrite=bool(args.overwrite),
         )
 
     # 2) Promote per-mode best into {benchmark}__ps_{mode}.
-    for mode, (mode_key, _, _, mode_paths) in selections.items():
+    for mode, (mode_key, _, _, mode_payloads) in selections.items():
         suffix = _MODE_SUFFIXES[mode]
-        for bench, score_path in mode_paths.items():
-            _promote_trial(
-                trial_score_path=score_path,
+        for bench, payload in mode_payloads.items():
+            _promote_score(
+                service,
+                source_payload=payload,
                 dest_dataset=f"{bench}{suffix}",
                 model_name=model_name,
                 overwrite=bool(args.overwrite),
             )
-
-    # 3) Run llm_checker over the final promoted selections (__ps_normal/__ps_simple).
-    for mode in ("normal", "simple"):
-        suffix = _MODE_SUFFIXES.get(mode)
-        if not suffix or mode not in selections:
-            continue
-        for bench in benchmarks:
-            promoted_eval = eval_details_path(f"{bench}{suffix}", is_cot=True, model_name=model_name)
-            if not promoted_eval.exists():
-                print(f"⚠️  LLM checker skipped: missing promoted eval {promoted_eval}")
-                continue
-            run_llm_checker(promoted_eval, model_name=model_name)
-
-    # Optional marker output for scheduler/debugging.
-    if args.output and not os.environ.get("RWKV_SKILLS_JOB_ID"):
-        out_path = Path(args.output).expanduser()
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "model": model_name,
-            "benchmarks": list(benchmarks),
-            "best_overall_mode": best_overall_mode,
-            "selections": {
-                mode: {
-                    "objective_sum": float(total),
-                    "objective_by_benchmark": detail,
-                    "params": json.loads(key),
-                }
-                for mode, (key, total, detail, _) in selections.items()
-            },
-        }
-        with out_path.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return 0
 

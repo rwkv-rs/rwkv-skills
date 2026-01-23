@@ -15,6 +15,7 @@
 - `eval_run_event`: 运行事件/汇总记录，挂在 run 或 run_sample。
 
 ### 环境变量
+- DB 连接配置从 `.env` 读取
 - `RWKV_DB_ENABLED=1`
 - `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DBNAME`
 
@@ -23,7 +24,8 @@
 python -m src.bin.init_eval_db --force
 ```
 
-### 评测命令（写入 DB + 产出 JSONL/score）
+### 评测命令（写入 DB）
+DB 模式下不写入 `results` 目录
 ```bash
 python -m src.bin.eval_free_response --model-path <pth> --dataset <jsonl>
 python -m src.bin.eval_free_response_judge --model-path <pth> --dataset <jsonl>
@@ -38,6 +40,10 @@ python -m src.bin.param_search_free_response_judge --model-path <pth> --dataset 
 python -m src.bin.param_search_select --model-path <pth>
 ```
 ```bash
-###使用了--overwrite-db-task会删除旧的的数据库重新跑
-uv run src/bin/eval_free_response.py \ --device cuda:0 \ --model-path models/BlinkDL__rwkv7-g1/rwkv7-g1a-0.4b-20250905-ctx4096.pth \ --dataset gsm8k_test \ --output results/gsm8k_test_db_run.jsonl \ --batch-size 8 \ --max-samples 10 \ --overwrite-db-task
+uv run src/bin/eval_free_response.py \
+  --device cuda:0 \
+  --model-path /home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.4b-20250905-ctx4096.pth \
+  --dataset /home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl \
+  --batch-size 8 \
+  --max-samples 10
 ```

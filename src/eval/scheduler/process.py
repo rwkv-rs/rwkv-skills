@@ -15,8 +15,8 @@ from typing import Mapping, Sequence
 
 from .perf import perf_logger
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
 from .state import stop_all_jobs
 
 

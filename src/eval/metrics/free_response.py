@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import orjson
 import tqdm
 from openai import OpenAI
 
@@ -79,6 +78,13 @@ def _iter_jsonl(path: str | Path) -> Iterable[dict]:
             yield json.loads(line)
 
 
+def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
+    if isinstance(source, (str, Path)):
+        yield from _iter_jsonl(source)
+        return
+    yield from source
+
+
 def _max_stage_index(payload: dict) -> int:
     stage = 0
     for key in payload:
@@ -93,6 +99,7 @@ class FreeResponseEvaluation:
     judge_accuracy: float | None
     samples: int
     rows: list[tuple[int, int, bool]]
+    payloads: list[dict]
 
 
 @dataclass(slots=True)
@@ -168,19 +175,14 @@ class LLMJudge:
 
 
 def evaluate_free_response(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
-    eval_output_path: str | Path | None,
     judge: LLMJudge | None = None,
 ) -> FreeResponseEvaluation:
-    """Evaluate free-response completions and write canonical evaluator JSONL."""
+    """Evaluate free-response completions and return canonical eval payloads."""
 
     dataset = list(JsonlFreeAnswerLoader(str(dataset_path)))
-    eval_path = Path(eval_output_path) if eval_output_path is not None else None
-    if eval_path is not None:
-        eval_path.parent.mkdir(parents=True, exist_ok=True)
-
     payloads: list[dict] = []
     exact_flags: list[bool] = []
     answers: list[str] = []
@@ -188,7 +190,7 @@ def evaluate_free_response(
     judge_inputs: list[tuple[str, str, str]] = []
 
     # First pass: compute exact + gather judge inputs
-    for payload in _iter_jsonl(completions_path):
+    for payload in _iter_completions(completions):
         sample_index = int(payload.get("sample_index", 0))
         if sample_index < 0 or sample_index >= len(dataset):
             prediction = ""
@@ -219,36 +221,23 @@ def evaluate_free_response(
     total_exact = sum(1 for flag in exact_flags if flag)
     total_judge = sum(1 for flag in (judge_flags or []) if flag) if judge_flags is not None else 0
 
-    if eval_path is not None:
-        with eval_path.open("wb") as out_f:
-            for idx, payload in enumerate(payloads):
-                sample_index = int(payload.get("sample_index", 0))
-                repeat_index = int(payload.get("repeat_index", 0))
-                if judge_flags is not None:
-                    passed = bool(judge_flags[idx])
-                else:
-                    passed = bool(exact_flags[idx])
-                rows_for_at_k.append((sample_index, repeat_index, passed))
-                out_f.write(
-                    orjson.dumps(
-                        make_eval_payload(
-                            payload,
-                            is_passed=passed,
-                            answer=answers[idx],
-                            ref_answer=ref_answers[idx],
-                        ),
-                        option=orjson.OPT_APPEND_NEWLINE,
-                    )
-                )
-    else:
-        for idx, payload in enumerate(payloads):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
-            if judge_flags is not None:
-                passed = bool(judge_flags[idx])
-            else:
-                passed = bool(exact_flags[idx])
-            rows_for_at_k.append((sample_index, repeat_index, passed))
+    eval_payloads: list[dict] = []
+    for idx, payload in enumerate(payloads):
+        sample_index = int(payload.get("sample_index", 0))
+        repeat_index = int(payload.get("repeat_index", 0))
+        if judge_flags is not None:
+            passed = bool(judge_flags[idx])
+        else:
+            passed = bool(exact_flags[idx])
+        rows_for_at_k.append((sample_index, repeat_index, passed))
+        eval_payloads.append(
+            make_eval_payload(
+                payload,
+                is_passed=passed,
+                answer=answers[idx],
+                ref_answer=ref_answers[idx],
+            )
+        )
 
     samples = len(payloads)
     exact_accuracy = total_exact / samples if samples else 0.0
@@ -260,6 +249,7 @@ def evaluate_free_response(
         judge_accuracy=judge_accuracy,
         samples=samples,
         rows=rows_for_at_k,
+        payloads=eval_payloads,
     )
 
 

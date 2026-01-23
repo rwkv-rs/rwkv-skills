@@ -9,26 +9,16 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.eval.evaluators.coding import CodingPipeline
 from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
-from src.infra.eval_db_service import EvalDbService
+from src.db.database import DatabaseManager
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.model import ModelLoadConfig
-
-
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=True, model_name=Path(model_path).stem)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -44,7 +34,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, help="Override sampling top-p")
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -67,7 +56,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"❌ {exc}")
         return 1
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     model_name = Path(args.model_path).stem
     cot_sampling = resolve_sampling_config(
         slug,
@@ -102,9 +90,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     default_pass_k = (1,)
     pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
     sample_limit = batch_size if args.probe_only else args.max_samples
+    if not DEFAULT_DB_CONFIG.enabled:
+        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
+    db = DatabaseManager.instance()
+    db.initialize(DEFAULT_DB_CONFIG)
+    service = EvalDbService(db)
+    version_id = service.get_or_create_version(
+        job_name="eval_code_livecodebench",
+        job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        allow_resume=True,
+    )
+    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+    skip_keys = service.list_completion_keys(
+        version_id=version_id,
+        is_param_search=False,
+    )
+    writer = CompletionWriteWorker(
+        service=service,
+        version_id=version_id,
+        is_param_search=False,
+    )
     result = pipeline.run_livecodebench(
         dataset_path=str(dataset_path),
-        output_path=str(out_path),
         cot_sampling=cot_sampling,
         final_sampling=final_sampling,
         batch_size=batch_size,
@@ -113,7 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         eval_workers=args.eval_workers,
         pass_k=pass_k,
         probe_only=args.probe_only,
-        write_output=not args.probe_only,
+        skip_keys=skip_keys,
+        on_record=writer.enqueue,
     )
 
     if args.probe_only:
@@ -123,61 +134,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions -> {result.output_path}")
+    print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions")
 
-    eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
-    eval_metrics = evaluate_livecodebench_dataset(
-        out_path,
+    writer.close()
+    completions_payloads = service.list_completion_payloads(
+        version_id=version_id,
+        is_param_search=False,
+    )
+    eval_metrics, eval_payloads = evaluate_livecodebench_dataset(
+        completions_payloads,
         dataset_path=str(dataset_path),
-        eval_output_path=eval_path,
         pass_k=pass_k,
         n_workers=args.eval_workers,
         timeout=args.eval_timeout,
     )
-    print(f"LiveCodeBench 评测: {eval_metrics} (详情: {eval_path})")
-    score_path = write_scores_json(
+    print(f"LiveCodeBench 评测: {eval_metrics}")
+    service.ingest_eval_payloads(
+        payloads=eval_payloads,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    score_payload = make_score_payload(
         slug,
         is_cot=True,
         model_name=Path(args.model_path).stem,
         metrics=eval_metrics or {},
         samples=result.sample_count,
         problems=result.problem_count,
-        log_path=out_path,
         task="code_livecodebench",
-        task_details={
-            "eval_details_path": str(eval_path),
-        },
     )
-    if DEFAULT_DB_CONFIG.enabled:
-        db = DatabaseManager.instance()
-        db.initialize(DEFAULT_DB_CONFIG)
-        service = EvalDbService(db)
-        version_id = service.get_or_create_version(
-            job_name="eval_code_livecodebench",
-            job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
-            dataset=str(slug),
-            model=Path(args.model_path).stem,
-            is_param_search=False,
-            allow_resume=True,
-        )
-        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-        service.ingest_completions(
-            completions_path=out_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.ingest_eval(
-            eval_path=eval_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-        service.record_score(
-            score_path=score_path,
-            version_id=version_id,
-            is_param_search=False,
-        )
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    service.record_score_payload(
+        payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
     return 0
 
 

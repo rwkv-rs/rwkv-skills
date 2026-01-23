@@ -3,7 +3,7 @@ from __future__ import annotations
 """Instruction-following 评估流水线：生成响应 + 导出 JSONL。"""
 
 from dataclasses import dataclass, replace
-from pathlib import Path
+from typing import Callable
 
 from src.eval.datasets.data_loader.instruction_following import (
     JsonlInstructionFollowingLoader,
@@ -16,7 +16,7 @@ from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from .common import JsonlStageWriter, SampleRecord, StageRecord, detect_resume_state
+from .common import SampleRecord, StageRecord
 
 DEFAULT_BAN_TOKEN = 295
 
@@ -24,7 +24,7 @@ DEFAULT_BAN_TOKEN = 295
 class InstructionFollowingPipelineResult:
     dataset: str
     sample_count: int
-    output_path: Path
+    payloads: list[dict]
 
 
 class InstructionFollowingPipeline:
@@ -36,7 +36,6 @@ class InstructionFollowingPipeline:
     def run(
         self,
         dataset_path: str,
-        output_path: str,
         *,
         sampling: SamplingConfig,
         batch_size: int = 128,
@@ -46,6 +45,9 @@ class InstructionFollowingPipeline:
         stop_tokens: tuple[int, ...],
         ban_tokens: tuple[int, ...] | None = None,
         samples_per_prompt: int | None = None,
+        resume_start_index: int = 0,
+        skip_keys: set[tuple[int, int]] | None = None,
+        on_record: Callable[[dict], None] | None = None,
     ) -> InstructionFollowingPipelineResult:
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
@@ -56,16 +58,31 @@ class InstructionFollowingPipeline:
             for sample_id in range(repeats):
                 expanded.append((idx, record, sample_id))
         if not expanded:
-            return InstructionFollowingPipelineResult(dataset_name, 0, Path(output_path))
+            return InstructionFollowingPipelineResult(dataset_name, 0, [])
 
-        resume = detect_resume_state(output_path, repeats=repeats)
-        start_index = min(resume.next_index, len(expanded))
-        if start_index and len(expanded):
-            remaining = max(len(expanded) - start_index, 0)
-            print(f"⏩ Instruction-following 恢复运行：已完成 {start_index}/{len(expanded)}，剩余 {remaining}")
-        remaining_records = expanded[start_index:]
+        skip_keys = skip_keys or set()
+        total_expected = len(expanded)
+        if resume_start_index < 0:
+            resume_start_index = 0
+        if resume_start_index:
+            if resume_start_index >= len(expanded):
+                return InstructionFollowingPipelineResult(dataset_name, len(expanded), [])
+            remaining_records = [
+                item
+                for item in expanded[resume_start_index:]
+                if (item[0], item[2]) not in skip_keys
+            ]
+            print(
+                f"⏩ Instruction-following 恢复运行：已完成 {resume_start_index}/{len(expanded)}，剩余 {len(remaining_records)}"
+            )
+        else:
+            remaining_records = [item for item in expanded if (item[0], item[2]) not in skip_keys]
         if not remaining_records:
-            return InstructionFollowingPipelineResult(dataset_name, len(expanded), Path(output_path))
+            return InstructionFollowingPipelineResult(dataset_name, 0, [])
+
+        skipped = total_expected - len(remaining_records)
+        if skipped > 0:
+            print(f"⏩ Instruction-following 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
 
         effective_ban = ban_tokens
         if effective_ban is None:
@@ -74,7 +91,6 @@ class InstructionFollowingPipeline:
         sampling_cfg = replace(sampling, stop_tokens=stop_tokens, ban_tokens=effective_ban)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling_cfg)])
 
-        writer = JsonlStageWriter(output_path, resume=resume.has_progress)
         prompts = [self._make_prompt(record.prompt, enable_think) for _, record, _ in remaining_records]
         outputs = self.engine.generate(
             prompts,
@@ -83,6 +99,7 @@ class InstructionFollowingPipeline:
             progress_desc="Generating instruction-following responses",
         )
         output_by_idx = {item.prompt_index: item for item in outputs}
+        payloads: list[dict] = []
         for local_idx, (problem_idx, record, sample_id) in enumerate(remaining_records):
             seq = output_by_idx.get(local_idx)
             if seq is None:
@@ -92,18 +109,18 @@ class InstructionFollowingPipeline:
                 completion=seq.text,
                 stop_reason=seq.finish_reason,
             )
-            writer.write(
-                SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=problem_idx,
-                    repeat_index=sample_id,
-                    sampling_config=sampling_config,
-                    stages=[stage],
-                )
-            )
-        writer.close()
-        return InstructionFollowingPipelineResult(dataset_name, len(expanded), Path(output_path))
+            payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=problem_idx,
+                repeat_index=sample_id,
+                sampling_config=sampling_config,
+                stages=[stage],
+            ).as_payload()
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
+        return InstructionFollowingPipelineResult(dataset_name, len(expanded), payloads)
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:
         suffix = " <think" if enable_think else ""

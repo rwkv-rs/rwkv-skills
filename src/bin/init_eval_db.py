@@ -6,7 +6,7 @@ import argparse
 import sys
 
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infra.database import DatabaseManager
+from src.db.database import DatabaseManager
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
