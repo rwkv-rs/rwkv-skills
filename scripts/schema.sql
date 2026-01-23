@@ -151,4 +151,8 @@ JOIN completions c
  AND c.sample_index = e.sample_index
  AND c.repeat_index = e.repeat_index
 WHERE e.is_param_search = FALSE
-  AND c.is_param_search = FALSE;
+  AND c.is_param_search = FALSE
+  AND e.version_id IN (
+      SELECT version_id
+      FROM view_score_latest
+  );
