@@ -7,10 +7,6 @@ from pathlib import Path
 import os
 import sys
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RESULTS_ROOT = Path(os.environ.get("RUN_RESULTS_DIR", REPO_ROOT / "results"))
@@ -79,30 +75,4 @@ __all__ = [
     "DEFAULT_DISPATCH_POLL_SECONDS",
     "DEFAULT_TAIL_LINES",
     "DEFAULT_ROTATE_SECONDS",
-    "DBConfig",
-    "DEFAULT_DB_CONFIG",
 ]
-
-
-@dataclass(slots=True)
-class DBConfig:
-    host: str = "localhost"
-    port: int = 5432
-    user: str = "postgres"
-    password: str = ""
-    dbname: str = "rwkv_skills"
-    enabled: bool = False
-
-
-def _load_db_config() -> DBConfig:
-    enabled = os.environ.get("RWKV_DB_ENABLED", "0").lower() in ("1", "true", "yes", "on")
-    return DBConfig(
-        host=os.environ.get("PG_HOST", "localhost"),
-        port=int(os.environ.get("PG_PORT", "5432")),
-        user=os.environ.get("PG_USER", "postgres"),
-        password=os.environ.get("PG_PASSWORD", ""),
-        dbname=os.environ.get("PG_DBNAME", "rwkv_skills"),
-        enabled=enabled,
-    )
-
-DEFAULT_DB_CONFIG = _load_db_config()

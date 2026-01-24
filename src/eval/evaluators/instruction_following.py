@@ -31,7 +31,6 @@ class InstructionFollowingPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
 
     def run(
         self,
