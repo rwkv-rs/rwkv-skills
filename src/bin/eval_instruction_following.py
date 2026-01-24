@@ -16,6 +16,7 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
@@ -72,6 +73,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
+    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--no-param-search",
         action="store_true",
@@ -133,6 +136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         service=service,
         version_id=version_id,
         is_param_search=False,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
     )
     result = pipeline.run(
         dataset_path=str(dataset_path),
@@ -182,6 +187,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     service.record_score_payload(
         payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    export_version_results(
+        service,
         version_id=version_id,
         is_param_search=False,
     )

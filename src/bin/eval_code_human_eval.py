@@ -15,6 +15,7 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.coding import CodingPipeline
@@ -35,6 +36,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, help="Override sampling top-p")
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
+    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -101,6 +104,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         service=service,
         version_id=version_id,
         is_param_search=False,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
     )
     result = pipeline.run_human_eval(
         dataset_path=str(dataset_path),
@@ -153,6 +158,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     service.record_score_payload(
         payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    export_version_results(
+        service,
         version_id=version_id,
         is_param_search=False,
     )

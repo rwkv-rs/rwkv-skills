@@ -105,5 +105,4 @@ def _load_db_config() -> DBConfig:
         enabled=enabled,
     )
 
-
 DEFAULT_DB_CONFIG = _load_db_config()

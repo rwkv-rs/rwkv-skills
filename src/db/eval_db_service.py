@@ -272,25 +272,15 @@ class EvalDbService:
         payloads: list[dict[str, Any]] = []
         for row in rows:
             context = row.get("context") if isinstance(row, dict) else None
-            stages = []
-            sampling_cfg = {}
-            if isinstance(context, dict):
-                stages = context.get("stages") or []
-                sampling_cfg = context.get("sampling_config") or {}
+            sampling_cfg = row.get("sampling_config") if isinstance(row, dict) else None
             payload: dict[str, Any] = {
                 "benchmark_name": row.get("benchmark_name", ""),
                 "dataset_split": row.get("dataset_split", ""),
                 "sample_index": int(row.get("sample_index", 0)),
                 "repeat_index": int(row.get("repeat_index", 0)),
                 "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
+                "context": context if isinstance(context, dict) else None,
             }
-            if isinstance(stages, list):
-                for idx, stage in enumerate(stages, start=1):
-                    if not isinstance(stage, dict):
-                        continue
-                    payload[f"prompt{idx}"] = stage.get("prompt", "")
-                    payload[f"completion{idx}"] = stage.get("completion", "")
-                    payload[f"stop_reason{idx}"] = stage.get("stop_reason", "")
             payloads.append(payload)
         return payloads
 
@@ -307,6 +297,44 @@ class EvalDbService:
                 is_param_search=is_param_search,
             )
         return set(rows)
+
+    def list_eval_payloads(
+        self,
+        *,
+        version_id: str,
+        is_param_search: bool,
+    ) -> list[dict[str, Any]]:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_eval_payloads(
+                conn,
+                version_id=version_id,
+                is_param_search=is_param_search,
+            )
+
+    def get_score_payload(
+        self,
+        *,
+        version_id: str,
+        is_param_search: bool,
+    ) -> dict[str, Any] | None:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_score_by_version(
+                conn,
+                version_id=version_id,
+                is_param_search=is_param_search,
+            )
+
+    def list_log_payloads(
+        self,
+        *,
+        version_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_logs_by_version(conn, version_id=version_id)
+
+    def get_version_payload(self, *, version_id: str) -> dict[str, Any] | None:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_version(conn, version_id=version_id)
 
     @staticmethod
     def _build_completion_context(payload: dict[str, Any]) -> dict[str, Any]:

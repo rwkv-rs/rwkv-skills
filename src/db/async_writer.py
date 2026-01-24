@@ -15,7 +15,7 @@ class CompletionWriteWorker:
         service: EvalDbService,
         version_id: str,
         is_param_search: bool,
-        batch_size: int = 8,
+        batch_size: int = 128,
         max_queue: int = 4096,
         max_retries: int = 3,
         retry_backoff_s: float = 0.5,

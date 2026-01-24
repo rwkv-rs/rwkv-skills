@@ -21,6 +21,7 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
+from src.db.export_results import export_version_results
 
 
 DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
@@ -131,6 +132,11 @@ def _promote_score(
     os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
     service.record_score_payload(
         payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    export_version_results(
+        service,
         version_id=version_id,
         is_param_search=False,
     )

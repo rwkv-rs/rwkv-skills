@@ -149,6 +149,72 @@ class EvalDbRepository:
             keys.append((int(row.get("sample_index", 0)), int(row.get("repeat_index", 0))))
         return keys
 
+    def fetch_eval_payloads(
+        self,
+        conn: psycopg.Connection,
+        *,
+        version_id: str,
+        is_param_search: bool,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT benchmark_name, dataset_split, sample_index, repeat_index,
+                   context, answer, ref_answer, is_passed, fail_reason
+            FROM eval
+            WHERE version_id = %s AND is_param_search = %s
+            ORDER BY sample_index ASC, repeat_index ASC
+            """,
+            (version_id, is_param_search),
+        ).fetchall()
+        return list(rows or [])
+
+    def fetch_score_by_version(
+        self,
+        conn: psycopg.Connection,
+        *,
+        version_id: str,
+        is_param_search: bool,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM score
+            WHERE version_id = %s AND is_param_search = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (version_id, is_param_search),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def fetch_logs_by_version(
+        self,
+        conn: psycopg.Connection,
+        *,
+        version_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT event, job_id, payload, created_at
+            FROM logs
+            WHERE version_id = %s
+            ORDER BY created_at ASC
+            """,
+            (version_id,),
+        ).fetchall()
+        return list(rows or [])
+
+    def fetch_version(self, conn: psycopg.Connection, *, version_id: str) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM version
+            WHERE id = %s
+            """,
+            (version_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def insert_completion(
         self,
         conn: psycopg.Connection,

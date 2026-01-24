@@ -14,6 +14,7 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.multi_choice import MultipleChoicePipeline
@@ -28,6 +29,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for scoring")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
+    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     return parser.parse_args(argv)
 
 
@@ -67,6 +70,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         service=service,
         version_id=version_id,
         is_param_search=False,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
     )
     result = pipeline.run_direct(
         dataset_path=str(dataset_path),
@@ -101,6 +106,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     service.record_score_payload(
         payload=score_payload,
+        version_id=version_id,
+        is_param_search=False,
+    )
+    export_version_results(
+        service,
         version_id=version_id,
         is_param_search=False,
     )
