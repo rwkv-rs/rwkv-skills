@@ -139,3 +139,19 @@ python -m src.bin.migrate_old_results --source results_old
 ```
 
 迁移脚本会自动识别多选 / 数学自由问答 / instruction-following 等任务类型，保留科目细分指标，并在默认情况下跳过仓库里已有的 score JSON。
+
+## 数据库结构（当前）
+### 表
+- `benchmark`：评测基准（`benchmark_name` / `benchmark_split` / `status` / `num_samples` 等）。
+- `model`：模型维表（`model_name` / `arch_version` / `data_version` / `num_params`）。
+- `task`：评测任务（关联 `benchmark_id` / `model_id`，含 `config_path` / `"desc"` / `sampling_config` / `status` / `git_hash` / `created_at`）。
+- `completions`：样本级生成结果（`task_id` / `context` / `sample_index` / `repeat_index` / `status` / `created_at`）。
+- `eval`：样本级评测（`completions_id` / `answer` / `ref_answer` / `is_passed` / `fail_reason` / `created_at`）。
+- `scores`：任务级汇总指标（`task_id` / `is_cot` / `metrics` / `created_at`）。
+
+### 视图
+- `view_model_version`：拼接 `arch_version`/`data_version`/`num_params` 作为模型版本字符串。
+
+### 导出结构
+每次评测完成后从数据库导出 JSONL，路径规则：
+`results/<table>/<model_name>/<dataset-name>.jsonl`
