@@ -142,62 +142,63 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.db_write_batch,
             max_queue=args.db_write_queue,
         )
-
-    if args.probe_only:
-        batch_size = max(1, args.batch_size)
-        _ = pipeline.run_chain_of_thought(
-            dataset_path=str(dataset_path),
-            cot_sampling=cot_sampling,
-            batch_size=batch_size,
-            sample_limit=batch_size,
-            min_prompt_count=batch_size,
-            probe_only=True,
-        )
-        print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
-        return 0
-
-    probe_only = False
-    sample_limit: int | None = args.max_samples
-    min_prompt_count: int | None = None
-
-    target_batch = max(1, args.batch_size)
-    effective_batch = target_batch
-    attempt_batch = target_batch
-    while True:
-        try:
-            result = pipeline.run_chain_of_thought(
+        if args.probe_only:
+            batch_size = max(1, args.batch_size)
+            _ = pipeline.run_chain_of_thought(
                 dataset_path=str(dataset_path),
                 cot_sampling=cot_sampling,
-                batch_size=attempt_batch,
-                sample_limit=sample_limit,
-                min_prompt_count=min_prompt_count,
-                skip_keys=skip_keys,
-                on_record=writer.enqueue,
+                batch_size=batch_size,
+                sample_limit=batch_size,
+                min_prompt_count=batch_size,
+                probe_only=True,
             )
-            effective_batch = attempt_batch
-            break
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
-            if not _is_cuda_oom(exc):
-                raise
-            if probe_only or attempt_batch <= 1:
-                raise
-            fallback = max(1, attempt_batch // 2)
-            if fallback == attempt_batch:
-                raise
             print(
-                f"⚠️  CUDA OOM at batch {attempt_batch}; retrying with {fallback}."
+                f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
             )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            attempt_batch = fallback
-            continue
+            return 0
 
-    if effective_batch != target_batch:
-        job_name = os.environ.get("RWKV_SKILLS_JOB_NAME")
-        model_slug = safe_slug(Path(args.model_path).stem)
-        gpu = _extract_gpu_from_device(args.device)
-        if job_name and model_slug and gpu:
-            _update_batch_cache(job_name, model_slug, gpu, effective_batch)
+        probe_only = False
+        sample_limit: int | None = args.max_samples
+        min_prompt_count: int | None = None
+
+        target_batch = max(1, args.batch_size)
+        effective_batch = target_batch
+        attempt_batch = target_batch
+        while True:
+            try:
+                result = pipeline.run_chain_of_thought(
+                    dataset_path=str(dataset_path),
+                    cot_sampling=cot_sampling,
+                    batch_size=attempt_batch,
+                    sample_limit=sample_limit,
+                    min_prompt_count=min_prompt_count,
+                    skip_keys=skip_keys,
+                    on_record=writer.enqueue,
+                )
+                effective_batch = attempt_batch
+                break
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
+                if not _is_cuda_oom(exc):
+                    raise
+                if probe_only or attempt_batch <= 1:
+                    raise
+                fallback = max(1, attempt_batch // 2)
+                if fallback == attempt_batch:
+                    raise
+                print(
+                    f"⚠️  CUDA OOM at batch {attempt_batch}; retrying with {fallback}."
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                attempt_batch = fallback
+                continue
+
+        if effective_batch != target_batch:
+            job_name = os.environ.get("RWKV_SKILLS_JOB_NAME")
+            model_slug = safe_slug(Path(args.model_path).stem)
+            gpu = _extract_gpu_from_device(args.device)
+            if job_name and model_slug and gpu:
+                _update_batch_cache(job_name, model_slug, gpu, effective_batch)
 
         writer.close()
         completions_payloads = service.list_completion_payloads(task_id=task_id)

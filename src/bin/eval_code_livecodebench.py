@@ -137,15 +137,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_keys=skip_keys,
             on_record=writer.enqueue,
         )
+        if args.probe_only:
+            print(
+                "🧪 probe-only run completed: "
+                f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
+            )
+            return 0
 
-    if args.probe_only:
-        print(
-            "🧪 probe-only run completed: "
-            f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
-        )
-        return 0
-
-    print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions")
+        print(f"✅ LiveCodeBench 生成完成：{result.sample_count} completions")
 
         writer.close()
         completions_payloads = service.list_completion_payloads(task_id=task_id)
