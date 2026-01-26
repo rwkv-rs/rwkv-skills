@@ -6,30 +6,18 @@ from typing import Any
 
 import orjson
 
-from src.eval.results.layout import (
-    COMPLETIONS_ROOT,
-    EVAL_RESULTS_ROOT,
-    SCORES_ROOT,
-    CONSOLE_LOG_ROOT,
-)
-from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
+from src.eval.scheduler.config import RESULTS_ROOT
+from src.eval.scheduler.dataset_utils import safe_slug
 
 from .eval_db_service import EvalDbService
 
 
 def _isoformat(value: Any) -> str | None:
     if isinstance(value, datetime):
-        text = value.isoformat()
-        return text.replace("+00:00", "Z")
+        return value.isoformat()
     if isinstance(value, str):
         return value
     return None
-
-
-def _versioned_path(root: Path, model_slug: str, stem: str, suffix: str) -> Path:
-    target = root / model_slug / f"{stem}{suffix}"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return target
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -39,80 +27,51 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             fh.write(orjson.dumps(row, option=orjson.OPT_APPEND_NEWLINE))
 
 
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
+def _normalize_jsonable(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _isoformat(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _normalize_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_jsonable(v) for v in value]
+    return value
+
+
+def _table_jsonl_path(table: str, *, model_name: str, dataset_slug: str) -> Path:
+    model_dir = safe_slug(model_name)
+    filename = f"{safe_slug(dataset_slug)}.jsonl"
+    return RESULTS_ROOT / table / model_dir / filename
 
 
 def export_version_results(
     service: EvalDbService,
     *,
-    version_id: str,
-    is_param_search: bool,
+    task_id: str,
 ) -> None:
-    for path in (COMPLETIONS_ROOT, EVAL_RESULTS_ROOT, SCORES_ROOT, CONSOLE_LOG_ROOT):
-        path.mkdir(parents=True, exist_ok=True)
-    score_payload = service.get_score_payload(version_id=version_id, is_param_search=is_param_search)
-    if not score_payload:
+    bundle = service.get_task_bundle(task_id=task_id)
+    if not bundle:
         return
-    dataset = score_payload.get("dataset")
-    model = score_payload.get("model")
-    is_cot = bool(score_payload.get("cot", False))
-    if not isinstance(dataset, str) or not isinstance(model, str):
-        return
-
-    dataset_slug = canonical_slug(dataset)
-    model_slug = safe_slug(model)
-    stem = f"{dataset_slug}_v{version_id}"
-
-    completions_payloads = service.list_completion_payloads(
-        version_id=version_id,
-        is_param_search=is_param_search,
-    )
-    eval_payloads = service.list_eval_payloads(
-        version_id=version_id,
-        is_param_search=is_param_search,
-    )
-    log_payloads = service.list_log_payloads(version_id=version_id)
-
-    completions_path = _versioned_path(COMPLETIONS_ROOT, model_slug, stem, ".jsonl")
-    eval_path = _versioned_path(EVAL_RESULTS_ROOT, model_slug, stem, "_results.jsonl")
-    score_path = _versioned_path(SCORES_ROOT, model_slug, stem, ".json")
-    logs_path = _versioned_path(CONSOLE_LOG_ROOT, model_slug, stem, ".jsonl")
-
-    _write_jsonl(completions_path, completions_payloads)
-    _write_jsonl(eval_path, eval_payloads)
-    _write_jsonl(
-        logs_path,
-        [
-            {
-                "version_id": version_id,
-                "event": row.get("event"),
-                "job_id": row.get("job_id"),
-                "payload": row.get("payload"),
-                "created_at": _isoformat(row.get("created_at")),
-            }
-            for row in log_payloads
-        ],
-    )
-
-    task_details = score_payload.get("task_details") if isinstance(score_payload.get("task_details"), dict) else {}
-    task_details = dict(task_details)
-    task_details["eval_details_path"] = str(eval_path)
-    task_details.setdefault("check_details_path", None)
-    score_payload_versioned = {
-        "dataset": dataset_slug,
-        "model": model,
-        "cot": bool(is_cot),
-        "metrics": score_payload.get("metrics") if isinstance(score_payload.get("metrics"), dict) else {},
-        "samples": int(score_payload.get("samples", 0)),
-        "problems": score_payload.get("problems"),
-        "created_at": _isoformat(score_payload.get("created_at")),
-        "log_path": str(completions_path),
-        "task": score_payload.get("task"),
-        "task_details": task_details,
+    task_row = bundle.get("task") or {}
+    model_row = bundle.get("model") or {}
+    benchmark_row = bundle.get("benchmark") or {}
+    model_name = str(model_row.get("model_name") or "")
+    benchmark_name = str(benchmark_row.get("benchmark_name") or "")
+    benchmark_split = str(benchmark_row.get("benchmark_split") or "")
+    dataset_name = f"{benchmark_name}_{benchmark_split}" if benchmark_split else benchmark_name
+    table_rows: dict[str, list[dict[str, Any]]] = {
+        "benchmark": [benchmark_row],
+        "model": [model_row],
+        "task": [task_row],
+        "completions": service.list_completions_rows(task_id=task_id),
+        "eval": service.list_eval_rows(task_id=task_id),
+        "scores": service.list_scores_rows(task_id=task_id),
     }
-    _write_json(score_path, score_payload_versioned)
+    for table, rows in table_rows.items():
+        normalized = [_normalize_jsonable(row) for row in rows if isinstance(row, dict)]
+        path = _table_jsonl_path(table, model_name=model_name, dataset_slug=dataset_name)
+        _write_jsonl(path, normalized)
 
     return
 

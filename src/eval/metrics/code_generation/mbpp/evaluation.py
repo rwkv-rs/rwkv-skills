@@ -53,7 +53,7 @@ def evaluate_mbpp(
     if problem_file is None:
         raise ValueError("problem_file is required for MBPP evaluation")
 
-    problems = read_problems(problem_file)
+    problems = {str(key): value for key, value in read_problems(problem_file).items()}
     has_plus_inputs = any("plus_input" in prob for prob in problems.values())
     if has_plus_inputs:
         # MBPP+ 的 base_input/plus_input 在 EvalPlus 原始数据中包含 tuple/set/complex 等非 JSON 类型。
@@ -86,7 +86,7 @@ def _evaluate_mbpp_base(
         results: dict[str, list[tuple[int, dict]]] = defaultdict(list)
 
         for sample in tqdm.tqdm(stream_jsonl(sample_file), desc="Reading samples"):
-            task_id = sample["task_id"]
+            task_id = str(sample["task_id"])
             completion = sample["completion"]
             problem = problems[task_id]
             args = (problem, completion, timeout, completion_id[task_id])

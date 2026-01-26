@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 
@@ -32,13 +33,14 @@ def make_score_payload(
     task_details: dict | None = None,
     extra: dict | None = None,
 ) -> dict:
+    created_at = datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None).isoformat()
     payload = {
         "dataset": dataset_slug,
         "model": model_name,
         "cot": bool(is_cot),
         "metrics": _normalize_jsonable(metrics),
         "samples": int(samples),
-        "created_at": datetime.utcnow().replace(microsecond=False).isoformat() + "Z",
+        "created_at": created_at,
     }
     if problems is not None:
         payload["problems"] = int(problems)

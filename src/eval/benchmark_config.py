@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Benchmark-level overrides loaded from configs/<benchmark>.toml."""
+"""Benchmark-level overrides loaded from configs/<model_name>/<benchmark>.toml."""
 
 import tomllib
 from dataclasses import dataclass, replace
@@ -49,8 +49,11 @@ class BenchmarkModelConfig:
         return replace(base, **self.sampling_overrides)
 
 
-def config_path_for_benchmark(benchmark_name: str) -> Path:
+def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None) -> Path:
     slug = canonical_slug(benchmark_name)
+    if model_name:
+        model_slug = safe_slug(model_name)
+        return CONFIG_ROOT / model_slug / f"{slug}.toml"
     return CONFIG_ROOT / f"{slug}.toml"
 
 
@@ -61,7 +64,7 @@ def resolve_benchmark_model_config(
     stage: str | None = None,
 ) -> BenchmarkModelConfig | None:
     benchmark, _ = split_benchmark_and_split(dataset_slug)
-    tables = _load_benchmark_tables(benchmark)
+    tables = _load_benchmark_tables(benchmark, model_name)
     if not tables:
         return None
     default_table = _select_table(tables, "default")
@@ -84,9 +87,12 @@ def resolve_benchmark_model_config(
     return _parse_table(merged)
 
 
-def _load_benchmark_tables(benchmark_name: str) -> dict[str, Mapping[str, Any]]:
-    path = config_path_for_benchmark(benchmark_name)
+def _load_benchmark_tables(benchmark_name: str, model_name: str) -> dict[str, Mapping[str, Any]]:
+    path = config_path_for_benchmark(benchmark_name, model_name)
     payload = _load_toml(path)
+    if not payload:
+        fallback = config_path_for_benchmark(benchmark_name, None)
+        payload = _load_toml(fallback)
     tables: dict[str, Mapping[str, Any]] = {}
     for key, value in payload.items():
         if isinstance(value, Mapping):

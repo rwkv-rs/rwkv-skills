@@ -14,6 +14,7 @@ answer, ref_answer, is_passed, fail_reason
 """
 
 import json
+import orjson
 from pathlib import Path
 import tempfile
 from typing import Iterable

@@ -108,7 +108,7 @@ def _promote_score(
     task_details = source_payload.get("task_details") if isinstance(source_payload.get("task_details"), dict) else {}
     task_details = dict(task_details)
     task_details["param_search_selected_from"] = {
-        "version_id": source_payload.get("version_id"),
+        "task_id": source_payload.get("task_id"),
         "param_key": _param_key_from_payload(source_payload),
     }
     score_payload = make_score_payload(
@@ -121,7 +121,7 @@ def _promote_score(
         task=str(source_payload.get("task") or "param_search_select"),
         task_details=task_details,
     )
-    version_id = service.get_or_create_version(
+    task_id = service.get_or_create_task(
         job_name="param_search_select",
         job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
         dataset=str(dest_dataset),
@@ -129,17 +129,20 @@ def _promote_score(
         is_param_search=False,
         allow_resume=False,
     )
-    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-    service.record_score_payload(
-        payload=score_payload,
-        version_id=version_id,
-        is_param_search=False,
-    )
-    export_version_results(
-        service,
-        version_id=version_id,
-        is_param_search=False,
-    )
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+    try:
+        service.record_score_payload(
+            payload=score_payload,
+            task_id=task_id,
+        )
+        export_version_results(
+            service,
+            task_id=task_id,
+        )
+    except Exception:
+        service.update_task_status(task_id=task_id, status="failed")
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:

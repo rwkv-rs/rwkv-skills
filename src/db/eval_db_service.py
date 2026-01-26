@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from zoneinfo import ZoneInfo
 from src.db.database import DatabaseManager
+from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices
 from src.eval.scheduler.config import REPO_ROOT
+from src.eval.scheduler.dataset_utils import split_benchmark_and_split
+from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags
 
 from .eval_db_repo import EvalDbRepository
 
@@ -17,6 +23,9 @@ class EvalDbService:
         self._db = db
         self._repo = EvalDbRepository()
 
+    @staticmethod
+    def _now_cn() -> datetime:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None)
     def get_or_create_version(
         self,
         *,
@@ -27,33 +36,102 @@ class EvalDbService:
         is_param_search: bool,
         allow_resume: bool = True,
     ) -> str:
+        return self.get_or_create_task(
+            job_name=job_name,
+            job_id=job_id,
+            dataset=dataset,
+            model=model,
+            is_param_search=is_param_search,
+            allow_resume=allow_resume,
+        )
+
+    def get_or_create_task(
+        self,
+        *,
+        job_name: str | None,
+        job_id: str | None,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+        sampling_config: dict[str, Any] | None = None,
+        allow_resume: bool = True,
+    ) -> str:
         with self._db.get_connection() as conn:
-            if allow_resume:
-                latest = self._repo.get_latest_version_id(
+            benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+            benchmark_id = self._repo.get_benchmark_id(
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                benchmark_id = self._repo.insert_benchmark(
                     conn,
-                    dataset=dataset,
-                    model=model,
+                    benchmark_name=benchmark_name,
+                    benchmark_split=benchmark_split,
+                    url=None,
+                    status="Todo",
+                    num_samples="0",
+                )
+
+            normalized = _normalize_model_identifier(model)
+            arch, data_version, num_params = _parse_model_tags(normalized)
+            arch_version = arch or "unknown"
+            data_version = data_version or "unknown"
+            num_params = num_params or "unknown"
+            model_id = self._repo.get_model_id(
+                conn,
+                model_name=model,
+                arch_version=arch_version,
+                data_version=data_version,
+                num_params=num_params,
+            )
+            if model_id is None:
+                model_id = self._repo.insert_model(
+                    conn,
+                    model_name=model,
+                    arch_version=arch_version,
+                    data_version=data_version,
+                    num_params=num_params,
+                )
+
+            if allow_resume:
+                latest = self._repo.get_latest_task_id(
+                    conn,
+                    benchmark_id=benchmark_id,
+                    model_id=model_id,
                     is_param_search=is_param_search,
                 )
-                if latest and not self._repo.version_has_score(conn, version_id=latest):
-                    return latest
+                if latest and not self._repo.task_has_score(conn, task_id=latest):
+                    self._repo.update_task_status(conn, task_id=latest, status="running")
+                    return str(latest)
+
             git_sha = self._resolve_git_sha()
-            return self._repo.insert_version(
+            config_path = config_path_for_benchmark(benchmark_name, model)
+            if config_path.exists():
+                config_path_str = str(config_path)
+            else:
+                fallback_path = config_path_for_benchmark(benchmark_name, None)
+                config_path_str = str(fallback_path) if fallback_path.exists() else None
+            desc = os.environ.get("RWKV_TASK_DESC")
+            task_id = self._repo.insert_task(
                 conn,
-                job_name=job_name,
-                job_id=job_id,
-                dataset=dataset,
-                model=model,
-                git_sha=git_sha,
+                config_path=config_path_str,
+                evaluator=job_name or "",
                 is_param_search=is_param_search,
+                created_at=self._now_cn(),
+                status="running",
+                git_hash=git_sha,
+                model_id=model_id,
+                benchmark_id=benchmark_id,
+                desc=desc,
+                sampling_config=sampling_config,
+                log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
             )
+            return str(task_id)
 
     def ingest_completions(
         self,
         *,
         completions_path: str | Path,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> int:
         path = Path(completions_path)
         if not path.exists():
@@ -68,10 +146,11 @@ class EvalDbService:
                 context = self._build_completion_context(payload)
                 self._repo.insert_completion(
                     conn,
-                    version_id=version_id,
-                    is_param_search=is_param_search,
+                    task_id=int(task_id),
                     payload=payload,
                     context=context,
+                    created_at=self._now_cn(),
+                    status="final_answer",
                 )
                 inserted += 1
         return inserted
@@ -80,8 +159,7 @@ class EvalDbService:
         self,
         *,
         payloads: Iterable[dict[str, Any]],
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> int:
         inserted = 0
         with self._db.get_connection() as conn:
@@ -89,10 +167,11 @@ class EvalDbService:
                 context = self._build_completion_context(payload)
                 self._repo.insert_completion(
                     conn,
-                    version_id=version_id,
-                    is_param_search=is_param_search,
+                    task_id=int(task_id),
                     payload=payload,
                     context=context,
+                    created_at=self._now_cn(),
+                    status="final_answer",
                 )
                 inserted += 1
         return inserted
@@ -101,41 +180,46 @@ class EvalDbService:
         self,
         *,
         payload: dict[str, Any],
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> None:
         with self._db.get_connection() as conn:
             context = self._build_completion_context(payload)
             self._repo.insert_completion(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
                 payload=payload,
                 context=context,
+                created_at=self._now_cn(),
+                status="final_answer",
             )
 
     def ingest_eval(
         self,
         *,
         eval_path: str | Path,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> int:
         path = Path(eval_path)
         if not path.exists():
             return 0
         inserted = 0
         with path.open("r", encoding="utf-8") as fh, self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
             for line in fh:
                 text = line.strip()
                 if not text:
                     continue
                 payload = json.loads(text)
+                completions_id = mapping.get(
+                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
+                )
+                if completions_id is None:
+                    continue
                 self._repo.insert_eval(
                     conn,
-                    version_id=version_id,
-                    is_param_search=is_param_search,
+                    completions_id=completions_id,
                     payload=payload,
+                    created_at=self._now_cn(),
                 )
                 inserted += 1
         return inserted
@@ -144,17 +228,22 @@ class EvalDbService:
         self,
         *,
         payloads: Iterable[dict[str, Any]],
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> int:
         inserted = 0
         with self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
             for payload in payloads:
+                completions_id = mapping.get(
+                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
+                )
+                if completions_id is None:
+                    continue
                 self._repo.insert_eval(
                     conn,
-                    version_id=version_id,
-                    is_param_search=is_param_search,
+                    completions_id=completions_id,
                     payload=payload,
+                    created_at=self._now_cn(),
                 )
                 inserted += 1
         return inserted
@@ -163,23 +252,27 @@ class EvalDbService:
         self,
         *,
         payload: dict[str, Any],
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> None:
         with self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
+            completions_id = mapping.get(
+                (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
+            )
+            if completions_id is None:
+                return
             self._repo.insert_eval(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                completions_id=completions_id,
                 payload=payload,
+                created_at=self._now_cn(),
             )
 
     def record_score(
         self,
         *,
         score_path: str | Path,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> None:
         path = Path(score_path)
         if not path.exists():
@@ -188,25 +281,38 @@ class EvalDbService:
         with self._db.get_connection() as conn:
             self._repo.insert_score(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
                 payload=payload,
             )
+            samples = payload.get("samples")
+            if samples is not None:
+                self._repo.update_benchmark_num_samples_for_task(
+                    conn,
+                    task_id=int(task_id),
+                    num_samples=str(samples),
+                )
+            self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_score_payload(
         self,
         *,
         payload: dict[str, Any],
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> None:
         with self._db.get_connection() as conn:
             self._repo.insert_score(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
                 payload=payload,
             )
+            samples = payload.get("samples")
+            if samples is not None:
+                self._repo.update_benchmark_num_samples_for_task(
+                    conn,
+                    task_id=int(task_id),
+                    num_samples=str(samples),
+                )
+            self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_log_event(
         self,
@@ -214,16 +320,10 @@ class EvalDbService:
         event: str,
         job_id: str,
         payload: dict[str, Any],
-        version_id: str | None,
+        version_id: str | None = None,
+        task_id: str | None = None,
     ) -> None:
-        with self._db.get_connection() as conn:
-            self._repo.insert_log_event(
-                conn,
-                event=event,
-                job_id=job_id,
-                payload=payload,
-                version_id=version_id,
-            )
+        return
 
     def list_latest_scores(self) -> list[dict[str, Any]]:
         with self._db.get_connection() as conn:
@@ -236,43 +336,43 @@ class EvalDbService:
         model: str,
         is_param_search: bool,
     ) -> list[dict[str, Any]]:
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
         with self._db.get_connection() as conn:
-            return self._repo.fetch_scores_by_dataset(
+            return self._repo.fetch_scores_by_benchmark(
                 conn,
-                dataset=dataset,
-                model=model,
+                benchmark_name=benchmark_name,
+                benchmark_split=benchmark_split,
+                model_name=model,
                 is_param_search=is_param_search,
             )
 
     def count_completions(
         self,
         *,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> int:
         with self._db.get_connection() as conn:
             return self._repo.count_completions(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
             )
 
     def list_completion_payloads(
         self,
         *,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> list[dict[str, Any]]:
         with self._db.get_connection() as conn:
             rows = self._repo.fetch_completions(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
             )
         payloads: list[dict[str, Any]] = []
         for row in rows:
             context = row.get("context") if isinstance(row, dict) else None
-            sampling_cfg = row.get("sampling_config") if isinstance(row, dict) else None
+            sampling_cfg = None
+            if isinstance(context, dict):
+                sampling_cfg = context.get("sampling_config")
             payload: dict[str, Any] = {
                 "benchmark_name": row.get("benchmark_name", ""),
                 "dataset_split": row.get("dataset_split", ""),
@@ -281,60 +381,85 @@ class EvalDbService:
                 "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
                 "context": context if isinstance(context, dict) else None,
             }
+            if isinstance(context, dict):
+                stages = context.get("stages")
+                if isinstance(stages, list):
+                    for idx, stage in enumerate(stages, start=1):
+                        if not isinstance(stage, dict):
+                            continue
+                        payload[f"prompt{idx}"] = stage.get("prompt")
+                        payload[f"completion{idx}"] = stage.get("completion")
+                        payload[f"stop_reason{idx}"] = stage.get("stop_reason")
             payloads.append(payload)
         return payloads
 
     def list_completion_keys(
         self,
         *,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> set[tuple[int, int]]:
         with self._db.get_connection() as conn:
             rows = self._repo.fetch_completion_keys(
                 conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
+                task_id=int(task_id),
             )
         return set(rows)
 
     def list_eval_payloads(
         self,
         *,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> list[dict[str, Any]]:
         with self._db.get_connection() as conn:
-            return self._repo.fetch_eval_payloads(
-                conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
-            )
+            return self._repo.fetch_eval_payloads(conn, task_id=int(task_id))
 
     def get_score_payload(
         self,
         *,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
     ) -> dict[str, Any] | None:
         with self._db.get_connection() as conn:
-            return self._repo.fetch_score_by_version(
-                conn,
-                version_id=version_id,
-                is_param_search=is_param_search,
-            )
+            return self._repo.fetch_score_by_task(conn, task_id=int(task_id))
 
     def list_log_payloads(
         self,
         *,
-        version_id: str,
+        task_id: str,
     ) -> list[dict[str, Any]]:
-        with self._db.get_connection() as conn:
-            return self._repo.fetch_logs_by_version(conn, version_id=version_id)
+        return []
 
-    def get_version_payload(self, *, version_id: str) -> dict[str, Any] | None:
+    def get_task_payload(self, *, task_id: str) -> dict[str, Any] | None:
         with self._db.get_connection() as conn:
-            return self._repo.fetch_version(conn, version_id=version_id)
+            return self._repo.fetch_task(conn, task_id=int(task_id))
+
+    def get_task_bundle(self, *, task_id: str) -> dict[str, Any] | None:
+        with self._db.get_connection() as conn:
+            task = self._repo.fetch_task(conn, task_id=int(task_id))
+            if not task:
+                return None
+            model_id = task.get("model_id")
+            benchmark_id = task.get("benchmark_id")
+            model = self._repo.fetch_model(conn, model_id=int(model_id)) if model_id else None
+            benchmark = (
+                self._repo.fetch_benchmark(conn, benchmark_id=int(benchmark_id)) if benchmark_id else None
+            )
+            return {"task": task, "model": model, "benchmark": benchmark}
+
+    def list_completions_rows(self, *, task_id: str) -> list[dict[str, Any]]:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_completions_rows(conn, task_id=int(task_id))
+
+    def list_eval_rows(self, *, task_id: str) -> list[dict[str, Any]]:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_eval_rows(conn, task_id=int(task_id))
+
+    def list_scores_rows(self, *, task_id: str) -> list[dict[str, Any]]:
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_scores_rows(conn, task_id=int(task_id))
+
+    def update_task_status(self, *, task_id: str, status: str) -> None:
+        with self._db.get_connection() as conn:
+            self._repo.update_task_status(conn, task_id=int(task_id), status=status)
 
     @staticmethod
     def _build_completion_context(payload: dict[str, Any]) -> dict[str, Any]:

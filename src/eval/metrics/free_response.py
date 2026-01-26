@@ -20,6 +20,7 @@ from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
 from src.eval.results.schema import make_eval_payload
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 _PREFERRED_ANSWER_KEYS = (
     "expected_answer",
     "reference_answer",
@@ -52,6 +53,33 @@ def _normalize_answer_value(value: Any) -> str | None:
         return normalized.strip() or None
     normalized = str(value).strip()
     return normalized or None
+
+
+def _extract_number(text: str) -> str | None:
+    if not text:
+        return None
+    matches = _NUM_RE.findall(text)
+    if not matches:
+        return None
+    value = matches[-1].replace(",", "")
+    return value or None
+
+
+def _format_answer_for_storage(prediction: str, reference: str) -> str:
+    ref_num = _extract_number(reference)
+    if ref_num is not None:
+        pred_num = _extract_number(prediction)
+        return pred_num or ""
+    return _normalize_text(prediction)
+
+
+def _is_exact_match(prediction: str, reference: str) -> bool:
+    ref_num = _extract_number(reference)
+    if ref_num is not None:
+        pred_num = _extract_number(prediction)
+        if pred_num is not None:
+            return pred_num == ref_num
+    return _normalize_text(prediction) == _normalize_text(reference)
 
 
 def resolve_reference_answer(record: FreeAnswerRecord) -> str:
@@ -203,11 +231,11 @@ def evaluate_free_response(
             reference = resolve_reference_answer(record)
             last_stage = _max_stage_index(payload)
             prediction = str(payload.get(f"completion{last_stage}", "")).strip()
-            exact = _normalize_text(prediction) == _normalize_text(reference)
+            exact = _is_exact_match(prediction, reference)
 
         payloads.append(payload)
         exact_flags.append(bool(exact))
-        answers.append(prediction)
+        answers.append(_format_answer_for_storage(prediction, reference))
         ref_answers.append(reference)
         if judge is not None:
             judge_inputs.append((question, reference, prediction))

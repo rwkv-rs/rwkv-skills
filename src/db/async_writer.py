@@ -13,23 +13,21 @@ class CompletionWriteWorker:
         self,
         *,
         service: EvalDbService,
-        version_id: str,
-        is_param_search: bool,
+        task_id: str,
         batch_size: int = 128,
         max_queue: int = 4096,
         max_retries: int = 3,
         retry_backoff_s: float = 0.5,
     ) -> None:
         self._service = service
-        self._version_id = version_id
-        self._is_param_search = is_param_search
+        self._task_id = task_id
         self._batch_size = max(1, int(batch_size))
         self._queue: queue.Queue[dict[str, Any] | object] = queue.Queue(maxsize=max_queue)
         self._stop = object()
         self._exc: BaseException | None = None
         self._thread = threading.Thread(
             target=self._run,
-            name=f"CompletionWriteWorker[{version_id}]",
+            name=f"CompletionWriteWorker[{task_id}]",
             daemon=True,
         )
         self._max_retries = max(1, int(max_retries))
@@ -74,8 +72,7 @@ class CompletionWriteWorker:
             try:
                 self._service.ingest_completion_payloads(
                     payloads=batch,
-                    version_id=self._version_id,
-                    is_param_search=self._is_param_search,
+                    task_id=self._task_id,
                 )
                 return
             except Exception as exc:

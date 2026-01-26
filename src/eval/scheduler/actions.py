@@ -20,6 +20,7 @@ from .config import (
     REPO_ROOT,
 )
 from .datasets import DATASET_ROOTS, DATA_OUTPUT_ROOT
+from .dataset_utils import safe_slug, split_benchmark_and_split
 from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset, locate_dataset
 from .naming import build_run_log_name
 from .process import FAILURE_MONITOR, JobFailure, handle_job_failure, launch_job, list_idle_gpus, log_job_event
@@ -36,6 +37,7 @@ from .state import (
     tail_file,
     write_pid_file,
 )
+from src.eval.benchmark_config import config_path_for_benchmark
 
 
 @dataclass(slots=True)
@@ -325,6 +327,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RWKV_SKILLS_MODEL_PATH": str(item.model_path),
                     "RWKV_SKILLS_DATASET": str(dataset_path),
                     "RWKV_SKILLS_DATASET_SLUG": dataset_slug,
+                    "RWKV_TASK_DESC": f"job={item.job_name}, dataset={dataset_slug}",
                     "RUN_LOG_DIR": str(opts.log_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
                 }
@@ -356,6 +359,16 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 f"cuda:{gpu}",
                 batch_size=batch_size,
                 extra_args=extra_args,
+            )
+            _backup_run_config(
+                model_path=item.model_path,
+                dataset_slug=dataset_slug,
+                dataset_path=dataset_path,
+                job_name=item.job_name,
+                job_id=item.job_id,
+                batch_size=batch_size,
+                gpu=f"cuda:{gpu}",
+                log_path=console_log_path,
             )
             print(f"🚀 Launch {item.job_id} -> cuda:{gpu}")
             print(f"    Dataset: {dataset_path}")
@@ -570,6 +583,86 @@ def _log_contains_oom(log_path: Path, *, tail_bytes: int = 65536) -> bool:
     text = chunk.decode("utf-8", errors="ignore").lower()
     keywords = ("out of memory", "cuda oom", "cuda out of memory", "torch.outofmemoryerror")
     return any(keyword in text for keyword in keywords)
+
+
+def _backup_run_config(
+    *,
+    model_path: Path,
+    dataset_slug: str,
+    dataset_path: Path,
+    job_name: str,
+    job_id: str,
+    batch_size: int | None,
+    gpu: str,
+    log_path: Path,
+) -> Path:
+    benchmark, _ = split_benchmark_and_split(dataset_slug)
+    config_path = config_path_for_benchmark(benchmark, model_path.stem)
+    model_dir = safe_slug(model_path.stem)
+    benchmark_dir = safe_slug(benchmark)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    target = REPO_ROOT / "config_backup" / model_dir / benchmark_dir / f"{timestamp}.toml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    base_text = ""
+    if config_path.exists():
+        base_text = config_path.read_text(encoding="utf-8")
+
+    run_block = _render_run_block(
+        benchmark=benchmark,
+        dataset_slug=dataset_slug,
+        model_name=model_path.stem,
+        model_path=model_path,
+        config_path=config_path,
+        job_name=job_name,
+        job_id=job_id,
+        batch_size=batch_size,
+        gpu=gpu,
+        dataset_path=dataset_path,
+        log_path=log_path,
+    )
+    separator = "\n\n" if base_text.strip() else ""
+    target.write_text(f"{base_text.rstrip()}{separator}{run_block}", encoding="utf-8")
+    return target
+
+
+def _render_run_block(
+    *,
+    benchmark: str,
+    dataset_slug: str,
+    model_name: str,
+    model_path: Path,
+    config_path: Path,
+    job_name: str,
+    job_id: str,
+    batch_size: int | None,
+    gpu: str,
+    dataset_path: Path,
+    log_path: Path,
+) -> str:
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "[run]",
+        f"created_at = {_toml_quote(created_at)}",
+        f"benchmark = {_toml_quote(benchmark)}",
+        f"dataset_slug = {_toml_quote(dataset_slug)}",
+        f"model_name = {_toml_quote(model_name)}",
+        f"model_path = {_toml_quote(str(model_path))}",
+        f"config_path = {_toml_quote(str(config_path))}",
+        f"job_name = {_toml_quote(job_name)}",
+        f"job_id = {_toml_quote(job_id)}",
+        f"gpu = {_toml_quote(gpu)}",
+        f"dataset_path = {_toml_quote(str(dataset_path))}",
+        f"log_path = {_toml_quote(str(log_path))}",
+    ]
+    if batch_size is not None:
+        lines.append(f"batch_size = {int(batch_size)}")
+    return "\n".join(lines) + "\n"
+
+
+def _toml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _job_priority_map(job_order: Sequence[str] | None) -> dict[str, int]:

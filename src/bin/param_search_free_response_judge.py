@@ -23,6 +23,7 @@ from src.eval.metrics.free_response import (
 )
 from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -214,94 +215,93 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, scan_mode=args.scan_mode):
         print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
-        version_id = db_service.get_or_create_version(
+        sampling_payload = {
+            "cot": sampling_config_to_dict(trial_cot),
+            "final": sampling_config_to_dict(final_sampling),
+        }
+        task_id = db_service.get_or_create_task(
             job_name="param_search_free_response_judge",
             job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
             dataset=str(slug),
             model=model_name,
             is_param_search=True,
+            sampling_config=sampling_payload,
             allow_resume=False,
         )
-        os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
-        writer = CompletionWriteWorker(
-            service=db_service,
-            version_id=version_id,
-            is_param_search=True,
-            batch_size=args.db_write_batch,
-            max_queue=args.db_write_queue,
-        )
-        result = pipeline.run(
-            dataset_path=str(dataset_path),
-            cot_sampling=trial_cot,
-            final_sampling=final_sampling,
-            batch_size=max(1, args.batch_size),
-            sample_limit=args.max_samples,
-            pass_k=pass_k,
-            samples_per_task=samples_per_task,
-            on_record=writer.enqueue,
-        )
-        writer.close()
-        completions_payloads = db_service.list_completion_payloads(
-            version_id=version_id,
-            is_param_search=True,
-        )
-        evaluation = evaluate_free_response(
-            completions_payloads,
-            dataset_path=str(dataset_path),
-            judge=judge,
-        )
+        os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+        os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+        try:
+            writer = CompletionWriteWorker(
+                service=db_service,
+                task_id=task_id,
+                batch_size=args.db_write_batch,
+                max_queue=args.db_write_queue,
+            )
+            result = pipeline.run(
+                dataset_path=str(dataset_path),
+                cot_sampling=trial_cot,
+                final_sampling=final_sampling,
+                batch_size=max(1, args.batch_size),
+                sample_limit=args.max_samples,
+                pass_k=pass_k,
+                samples_per_task=samples_per_task,
+                on_record=writer.enqueue,
+            )
+            writer.close()
+            completions_payloads = db_service.list_completion_payloads(task_id=task_id)
+            evaluation = evaluate_free_response(
+                completions_payloads,
+                dataset_path=str(dataset_path),
+                judge=judge,
+            )
+            pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
+            avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
+            metrics_payload: dict[str, object] = {
+                "exact_accuracy": float(evaluation.exact_accuracy),
+                "judge_accuracy": float(evaluation.judge_accuracy) if evaluation.judge_accuracy is not None else None,
+            }
+            pass_payload = _filter_metrics_by_k(pass_metrics_all, pass_k, "pass@") or (pass_metrics_all or {})
+            if pass_payload:
+                metrics_payload.update(pass_payload)
+            avg_payload = _filter_metrics_by_k(avg_metrics_all, avg_k, "avg@") or (avg_metrics_all or {})
+            if avg_payload:
+                metrics_payload.update(avg_payload)
 
-        pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
-        avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
-        metrics_payload: dict[str, object] = {
-            "exact_accuracy": float(evaluation.exact_accuracy),
-            "judge_accuracy": float(evaluation.judge_accuracy) if evaluation.judge_accuracy is not None else None,
-        }
-        pass_payload = _filter_metrics_by_k(pass_metrics_all, pass_k, "pass@") or (pass_metrics_all or {})
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = _filter_metrics_by_k(avg_metrics_all, avg_k, "avg@") or (avg_metrics_all or {})
-        if avg_payload:
-            metrics_payload.update(avg_payload)
+            task_details: dict[str, object] = {
+                "param_search_trial": {
+                    "trial": int(trial_idx),
+                    "params": params,
+                    "cot_sampling": _sampling_config_to_dict(trial_cot),
+                    "final_sampling": _sampling_config_to_dict(final_sampling),
+                },
+            }
+            if pass_metrics_all and pass_payload != pass_metrics_all:
+                task_details["pass_curve"] = pass_metrics_all
+            if avg_metrics_all and avg_payload != avg_metrics_all:
+                task_details["avg_curve"] = avg_metrics_all
 
-        task_details: dict[str, object] = {
-            "param_search_trial": {
-                "trial": int(trial_idx),
-                "params": params,
-                "cot_sampling": _sampling_config_to_dict(trial_cot),
-                "final_sampling": _sampling_config_to_dict(final_sampling),
-            },
-        }
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            task_details["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            task_details["avg_curve"] = avg_metrics_all
-
-        payload = make_score_payload(
-            slug,
-            is_cot=True,
-            model_name=model_name,
-            metrics=metrics_payload,
-            samples=evaluation.samples,
-            problems=result.problem_count,
-            task="free_response_judge",
-            task_details=task_details,
-        )
-        db_service.ingest_eval_payloads(
-            payloads=evaluation.payloads,
-            version_id=version_id,
-            is_param_search=True,
-        )
-        db_service.record_score_payload(
-            payload=payload,
-            version_id=version_id,
-            is_param_search=True,
-        )
-        export_version_results(
-            db_service,
-            version_id=version_id,
-            is_param_search=True,
-        )
+            payload = make_score_payload(
+                slug,
+                is_cot=True,
+                model_name=model_name,
+                metrics=metrics_payload,
+                samples=evaluation.samples,
+                problems=result.problem_count,
+                task="free_response_judge",
+                task_details=task_details,
+            )
+            db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
+            db_service.record_score_payload(
+                payload=payload,
+                task_id=task_id,
+            )
+            export_version_results(
+                db_service,
+                task_id=task_id,
+            )
+        except Exception:
+            db_service.update_task_status(task_id=task_id, status="failed")
+            raise
 
         objective = (
             float(metrics_payload["judge_accuracy"])

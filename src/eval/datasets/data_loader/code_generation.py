@@ -35,6 +35,8 @@ class JsonlCodeGenerationLoader(
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 return value
+            if isinstance(value, (int, float)):
+                return str(value)
         raise ValueError(f"{self.path}: {field_name} 字段缺失或类型错误, payload={payload}")
 
     def _parse_record(self, payload: dict) -> CodeGenerationRecord:

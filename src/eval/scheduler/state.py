@@ -105,7 +105,7 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
             problems=raw.get("problems"),
             metrics=raw.get("metrics") if isinstance(raw.get("metrics"), dict) else None,
             task_details=raw.get("task_details") if isinstance(raw.get("task_details"), dict) else None,
-            version_id=str(raw.get("version_id")) if raw.get("version_id") is not None else None,
+            version_id=str(raw.get("task_id")) if raw.get("task_id") is not None else None,
         )
     return completed, records
 

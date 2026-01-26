@@ -14,6 +14,7 @@ from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
@@ -120,26 +121,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)
-    version_id = service.get_or_create_version(
+    task_id = service.get_or_create_task(
         job_name="eval_multi_choice_cot",
         job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        sampling_config={"cot": sampling_config_to_dict(cot_sampling)},
         allow_resume=True,
     )
-    os.environ["RWKV_SKILLS_VERSION_ID"] = version_id
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
     skip_keys = service.list_completion_keys(
-        version_id=version_id,
-        is_param_search=False,
+        task_id=task_id,
     )
-    writer = CompletionWriteWorker(
-        service=service,
-        version_id=version_id,
-        is_param_search=False,
-        batch_size=args.db_write_batch,
-        max_queue=args.db_write_queue,
-    )
+    try:
+        writer = CompletionWriteWorker(
+            service=service,
+            task_id=task_id,
+            batch_size=args.db_write_batch,
+            max_queue=args.db_write_queue,
+        )
 
     if args.probe_only:
         batch_size = max(1, args.batch_size)
@@ -197,43 +199,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         if job_name and model_slug and gpu:
             _update_batch_cache(job_name, model_slug, gpu, effective_batch)
 
-    writer.close()
-    completions_payloads = service.list_completion_payloads(
-        version_id=version_id,
-        is_param_search=False,
-    )
-    metrics = evaluate_multiple_choice(
-        completions_payloads,
-        dataset_path=dataset_path,
-    )
-    service.ingest_eval_payloads(
-        payloads=metrics.payloads,
-        version_id=version_id,
-        is_param_search=False,
-    )
-    score_payload = make_score_payload(
-        slug,
-        is_cot=True,
-        model_name=Path(args.model_path).stem,
-        metrics={"accuracy": metrics.accuracy},
-        samples=metrics.samples,
-        task="multiple_choice_cot",
-        task_details={
-            "accuracy_by_subject": metrics.accuracy_by_subject,
-        },
-    )
-    service.record_score_payload(
-        payload=score_payload,
-        version_id=version_id,
-        is_param_search=False,
-    )
-    export_version_results(
-        service,
-        version_id=version_id,
-        is_param_search=False,
-    )
-    print(f"✅ CoT multiple-choice done: {result.sample_count} samples")
-    return 0
+        writer.close()
+        completions_payloads = service.list_completion_payloads(task_id=task_id)
+        metrics = evaluate_multiple_choice(
+            completions_payloads,
+            dataset_path=dataset_path,
+        )
+        service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=True,
+            model_name=Path(args.model_path).stem,
+            metrics={"accuracy": metrics.accuracy},
+            samples=metrics.samples,
+            task="multiple_choice_cot",
+            task_details={
+                "accuracy_by_subject": metrics.accuracy_by_subject,
+            },
+        )
+        service.record_score_payload(
+            payload=score_payload,
+            task_id=task_id,
+        )
+        export_version_results(
+            service,
+            task_id=task_id,
+        )
+        print(f"✅ CoT multiple-choice done: {result.sample_count} samples")
+        return 0
+    except Exception:
+        service.update_task_status(task_id=task_id, status="failed")
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover
