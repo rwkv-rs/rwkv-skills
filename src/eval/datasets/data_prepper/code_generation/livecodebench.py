@@ -53,9 +53,10 @@ def _prepare_livecodebench(
     dataset_id = _LITE_DATASET_ID
     version_tag = (os.environ.get("RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG") or version_tag).strip()
     dataset = load_dataset(
-        dataset_id,
-        _DATASET_CONFIG,
+        path=dataset_id,
+        name=_DATASET_CONFIG,
         split=split,
+        trust_remote_code=True,
         version_tag=version_tag,
     )
 

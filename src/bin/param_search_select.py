@@ -39,10 +39,7 @@ def _objective_from_metrics(metrics: dict[str, Any]) -> float:
 
 
 def _sample_mode_from_key(key: str) -> str | None:
-    try:
-        params = json.loads(key)
-    except json.JSONDecodeError:
-        return None
+    params = json.loads(key)
     if not isinstance(params, dict):
         return None
     mode = params.get("sample_mode")
@@ -131,18 +128,14 @@ def _promote_score(
     )
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
-    try:
-        service.record_score_payload(
-            payload=score_payload,
-            task_id=task_id,
-        )
-        export_version_results(
-            service,
-            task_id=task_id,
-        )
-    except Exception:
-        service.update_task_status(task_id=task_id, status="failed")
-        raise
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

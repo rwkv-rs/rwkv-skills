@@ -95,11 +95,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
@@ -135,102 +131,68 @@ def main(argv: Sequence[str] | None = None) -> int:
     skip_keys = service.list_completion_keys(
         task_id=task_id,
     )
-    try:
-        writer = CompletionWriteWorker(
-            service=service,
-            task_id=task_id,
-            batch_size=args.db_write_batch,
-            max_queue=args.db_write_queue,
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
+    )
+    if args.probe_only:
+        batch_size = max(1, args.batch_size)
+        _ = pipeline.run_chain_of_thought(
+            dataset_path=str(dataset_path),
+            cot_sampling=cot_sampling,
+            batch_size=batch_size,
+            sample_limit=batch_size,
+            min_prompt_count=batch_size,
+            probe_only=True,
         )
-        if args.probe_only:
-            batch_size = max(1, args.batch_size)
-            _ = pipeline.run_chain_of_thought(
-                dataset_path=str(dataset_path),
-                cot_sampling=cot_sampling,
-                batch_size=batch_size,
-                sample_limit=batch_size,
-                min_prompt_count=batch_size,
-                probe_only=True,
-            )
-            print(
-                f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
-            )
-            return 0
-
-        probe_only = False
-        sample_limit: int | None = args.max_samples
-        min_prompt_count: int | None = None
-
-        target_batch = max(1, args.batch_size)
-        effective_batch = target_batch
-        attempt_batch = target_batch
-        while True:
-            try:
-                result = pipeline.run_chain_of_thought(
-                    dataset_path=str(dataset_path),
-                    cot_sampling=cot_sampling,
-                    batch_size=attempt_batch,
-                    sample_limit=sample_limit,
-                    min_prompt_count=min_prompt_count,
-                    skip_keys=skip_keys,
-                    on_record=writer.enqueue,
-                )
-                effective_batch = attempt_batch
-                break
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as exc:
-                if not _is_cuda_oom(exc):
-                    raise
-                if probe_only or attempt_batch <= 1:
-                    raise
-                fallback = max(1, attempt_batch // 2)
-                if fallback == attempt_batch:
-                    raise
-                print(
-                    f"⚠️  CUDA OOM at batch {attempt_batch}; retrying with {fallback}."
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                attempt_batch = fallback
-                continue
-
-        if effective_batch != target_batch:
-            job_name = os.environ.get("RWKV_SKILLS_JOB_NAME")
-            model_slug = safe_slug(Path(args.model_path).stem)
-            gpu = _extract_gpu_from_device(args.device)
-            if job_name and model_slug and gpu:
-                _update_batch_cache(job_name, model_slug, gpu, effective_batch)
-
-        writer.close()
-        completions_payloads = service.list_completion_payloads(task_id=task_id)
-        metrics = evaluate_multiple_choice(
-            completions_payloads,
-            dataset_path=dataset_path,
+        print(
+            f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
         )
-        service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
-        score_payload = make_score_payload(
-            slug,
-            is_cot=True,
-            model_name=Path(args.model_path).stem,
-            metrics={"accuracy": metrics.accuracy},
-            samples=metrics.samples,
-            task="multiple_choice_cot",
-            task_details={
-                "accuracy_by_subject": metrics.accuracy_by_subject,
-            },
-        )
-        service.record_score_payload(
-            payload=score_payload,
-            task_id=task_id,
-        )
-        export_version_results(
-            service,
-            task_id=task_id,
-        )
-        print(f"✅ CoT multiple-choice done: {result.sample_count} samples")
         return 0
-    except Exception:
-        service.update_task_status(task_id=task_id, status="failed")
-        raise
+
+    sample_limit: int | None = args.max_samples
+    min_prompt_count: int | None = None
+    target_batch = max(1, args.batch_size)
+    result = pipeline.run_chain_of_thought(
+        dataset_path=str(dataset_path),
+        cot_sampling=cot_sampling,
+        batch_size=target_batch,
+        sample_limit=sample_limit,
+        min_prompt_count=min_prompt_count,
+        skip_keys=skip_keys,
+        on_record=writer.enqueue,
+    )
+
+    writer.close()
+    completions_payloads = service.list_completion_payloads(task_id=task_id)
+    metrics = evaluate_multiple_choice(
+        completions_payloads,
+        dataset_path=dataset_path,
+    )
+    service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
+    score_payload = make_score_payload(
+        slug,
+        is_cot=True,
+        model_name=Path(args.model_path).stem,
+        metrics={"accuracy": metrics.accuracy},
+        samples=metrics.samples,
+        task="multiple_choice_cot",
+        task_details={
+            "accuracy_by_subject": metrics.accuracy_by_subject,
+        },
+    )
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
+    print(f"✅ CoT multiple-choice done: {result.sample_count} samples")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

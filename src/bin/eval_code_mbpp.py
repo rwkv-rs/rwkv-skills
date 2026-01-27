@@ -54,11 +54,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     sampling = resolve_sampling_config(
         slug,
@@ -101,66 +97,62 @@ def main(argv: Sequence[str] | None = None) -> int:
     skip_keys = service.list_completion_keys(
         task_id=task_id,
     )
-    try:
-        writer = CompletionWriteWorker(
-            service=service,
-            task_id=task_id,
-            batch_size=args.db_write_batch,
-            max_queue=args.db_write_queue,
-        )
-        result = pipeline.run_mbpp(
-            dataset_path=str(dataset_path),
-            sampling=sampling,
-            batch_size=batch_size,
-            sample_limit=sample_limit,
-            eval_timeout=args.eval_timeout,
-            eval_workers=args.eval_workers,
-            pass_k=pass_k,
-            probe_only=args.probe_only,
-            skip_keys=skip_keys,
-            on_record=writer.enqueue,
-        )
-        if args.probe_only:
-            print(
-                "🧪 probe-only run completed: "
-                f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
-            )
-            return 0
-
-        print(f"✅ MBPP 生成完成：{result.sample_count} completions")
-
-        writer.close()
-        completions_payloads = service.list_completion_payloads(task_id=task_id)
-        eval_metrics, eval_payloads = evaluate_mbpp_dataset(
-            completions_payloads,
-            dataset_path=str(dataset_path),
-            pass_k=pass_k,
-            n_workers=args.eval_workers,
-            timeout=args.eval_timeout,
-        )
-        print(f"MBPP 评测: {eval_metrics}")
-        service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
-        score_payload = make_score_payload(
-            slug,
-            is_cot=False,
-            model_name=Path(args.model_path).stem,
-            metrics=eval_metrics or {},
-            samples=result.sample_count,
-            problems=result.problem_count,
-            task="code_mbpp",
-        )
-        service.record_score_payload(
-            payload=score_payload,
-            task_id=task_id,
-        )
-        export_version_results(
-            service,
-            task_id=task_id,
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
+    )
+    result = pipeline.run_mbpp(
+        dataset_path=str(dataset_path),
+        sampling=sampling,
+        batch_size=batch_size,
+        sample_limit=sample_limit,
+        eval_timeout=args.eval_timeout,
+        eval_workers=args.eval_workers,
+        pass_k=pass_k,
+        probe_only=args.probe_only,
+        skip_keys=skip_keys,
+        on_record=writer.enqueue,
+    )
+    if args.probe_only:
+        print(
+            "🧪 probe-only run completed: "
+            f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
         )
         return 0
-    except Exception:
-        service.update_task_status(task_id=task_id, status="failed")
-        raise
+
+    print(f"✅ MBPP 生成完成：{result.sample_count} completions")
+
+    writer.close()
+    completions_payloads = service.list_completion_payloads(task_id=task_id)
+    eval_metrics, eval_payloads = evaluate_mbpp_dataset(
+        completions_payloads,
+        dataset_path=str(dataset_path),
+        pass_k=pass_k,
+        n_workers=args.eval_workers,
+        timeout=args.eval_timeout,
+    )
+    print(f"MBPP 评测: {eval_metrics}")
+    service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+    score_payload = make_score_payload(
+        slug,
+        is_cot=False,
+        model_name=Path(args.model_path).stem,
+        metrics=eval_metrics or {},
+        samples=result.sample_count,
+        problems=result.problem_count,
+        task="code_mbpp",
+    )
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

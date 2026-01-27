@@ -54,6 +54,8 @@ def evaluate_mbpp(
         raise ValueError("problem_file is required for MBPP evaluation")
 
     problems = {str(key): value for key, value in read_problems(problem_file).items()}
+    for task_id, problem in problems.items():
+        problem["task_id"] = str(task_id)
     has_plus_inputs = any("plus_input" in prob for prob in problems.values())
     if has_plus_inputs:
         # MBPP+ 的 base_input/plus_input 在 EvalPlus 原始数据中包含 tuple/set/complex 等非 JSON 类型。

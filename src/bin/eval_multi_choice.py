@@ -36,11 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
@@ -67,49 +63,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     skip_keys = service.list_completion_keys(
         task_id=task_id,
     )
-    try:
-        writer = CompletionWriteWorker(
-            service=service,
-            task_id=task_id,
-            batch_size=args.db_write_batch,
-            max_queue=args.db_write_queue,
-        )
-        result = pipeline.run_direct(
-            dataset_path=str(dataset_path),
-            sample_limit=args.max_samples,
-            skip_keys=skip_keys,
-            on_record=writer.enqueue,
-        )
-        writer.close()
-        completions_payloads = service.list_completion_payloads(task_id=task_id)
-        metrics = evaluate_multiple_choice(
-            completions_payloads,
-            dataset_path=dataset_path,
-        )
-        service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
-        score_payload = make_score_payload(
-            slug,
-            is_cot=False,
-            model_name=Path(args.model_path).stem,
-            metrics={"accuracy": metrics.accuracy},
-            samples=metrics.samples,
-            task="multiple_choice",
-            task_details={
-                "accuracy_by_subject": metrics.accuracy_by_subject,
-            },
-        )
-        service.record_score_payload(
-            payload=score_payload,
-            task_id=task_id,
-        )
-        export_version_results(
-            service,
-            task_id=task_id,
-        )
-        print(f"✅ direct multiple-choice done: {result.sample_count} samples")
-    except Exception:
-        service.update_task_status(task_id=task_id, status="failed")
-        raise
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        batch_size=args.db_write_batch,
+        max_queue=args.db_write_queue,
+    )
+    result = pipeline.run_direct(
+        dataset_path=str(dataset_path),
+        sample_limit=args.max_samples,
+        skip_keys=skip_keys,
+        on_record=writer.enqueue,
+    )
+    writer.close()
+    completions_payloads = service.list_completion_payloads(task_id=task_id)
+    metrics = evaluate_multiple_choice(
+        completions_payloads,
+        dataset_path=dataset_path,
+    )
+    service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
+    score_payload = make_score_payload(
+        slug,
+        is_cot=False,
+        model_name=Path(args.model_path).stem,
+        metrics={"accuracy": metrics.accuracy},
+        samples=metrics.samples,
+        task="multiple_choice",
+        task_details={
+            "accuracy_by_subject": metrics.accuracy_by_subject,
+        },
+    )
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
+    print(f"✅ direct multiple-choice done: {result.sample_count} samples")
     return 0
 
 
