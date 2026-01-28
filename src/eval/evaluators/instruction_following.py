@@ -11,7 +11,7 @@ from src.eval.datasets.data_loader.instruction_following import (
 from src.eval.datasets.data_struct.instruction_following import (
     InstructionFollowingRecord,
 )
-from src.infer.engine import InferenceEngine
+from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
@@ -91,35 +91,40 @@ class InstructionFollowingPipeline:
         sampling_cfg = replace(sampling, stop_tokens=stop_tokens, ban_tokens=effective_ban)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling_cfg)])
 
-        prompts = [self._make_prompt(record.prompt, enable_think) for _, record, _ in remaining_records]
-        outputs = self.engine.generate(
-            prompts,
-            sampling=sampling_cfg,
-            batch_size=batch_size,
-            progress_desc="Generating instruction-following responses",
-        )
-        output_by_idx = {item.prompt_index: item for item in outputs}
         payloads: list[dict] = []
-        for local_idx, (problem_idx, record, sample_id) in enumerate(remaining_records):
-            seq = output_by_idx.get(local_idx)
-            if seq is None:
-                continue
-            stage = StageRecord(
-                prompt=prompts[local_idx],
-                completion=seq.text,
-                stop_reason=seq.finish_reason,
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, len(remaining_records), chunk_size):
+            chunk = remaining_records[start : start + chunk_size]
+            prompts = [self._make_prompt(record.prompt, enable_think) for _, record, _ in chunk]
+            def _on_complete(output: GenerationOutput) -> None:
+                local_idx = output.prompt_index
+                if local_idx < 0 or local_idx >= len(chunk):
+                    return
+                problem_idx, _record, sample_id = chunk[local_idx]
+                stage = StageRecord(
+                    prompt=prompts[local_idx],
+                    completion=output.text,
+                    stop_reason=output.finish_reason,
+                )
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=problem_idx,
+                    repeat_index=sample_id,
+                    sampling_config=sampling_config,
+                    stages=[stage],
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
+
+            _ = self.engine.generate(
+                prompts,
+                sampling=sampling_cfg,
+                batch_size=min(batch_size, len(prompts)),
+                progress_desc="Generating instruction-following responses",
+                on_complete=_on_complete,
             )
-            payload = SampleRecord(
-                benchmark_name=benchmark_name,
-                dataset_split=dataset_split,
-                sample_index=problem_idx,
-                repeat_index=sample_id,
-                sampling_config=sampling_config,
-                stages=[stage],
-            ).as_payload()
-            if on_record is not None:
-                on_record(payload)
-            payloads.append(payload)
         return InstructionFollowingPipelineResult(dataset_name, len(expanded), payloads)
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:

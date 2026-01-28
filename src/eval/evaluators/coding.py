@@ -9,7 +9,7 @@ from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoa
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.infer.engine import InferenceEngine
+from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord
@@ -168,36 +168,40 @@ class CodingPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict] = []
         if entries:
-            prompts = [entry[0] for entry in entries]
-            outputs = self.engine.generate(
-                prompts,
-                sampling=sampling,
-                batch_size=max(1, min(batch_size, len(prompts))),
-                progress_desc="Generating code",
-            )
-            output_by_idx = {item.prompt_index: item for item in outputs}
+            chunk_size = max(1, int(batch_size))
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start : start + chunk_size]
+                prompts = [entry[0] for entry in chunk]
+                def _on_complete(output: GenerationOutput) -> None:
+                    local_idx = output.prompt_index
+                    if local_idx < 0 or local_idx >= len(chunk):
+                        return
+                    prompt_text, _record, rec_idx, sample_idx = chunk[local_idx]
+                    raw_output = output.text or ""
+                    stage = StageRecord(
+                        prompt=prompt_text,
+                        completion=raw_output,
+                        stop_reason=output.finish_reason,
+                    )
+                    payload = SampleRecord(
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        sample_index=rec_idx,
+                        repeat_index=sample_idx,
+                        sampling_config=sampling_config,
+                        stages=[stage],
+                    ).as_payload()
+                    if on_record is not None:
+                        on_record(payload)
+                    payloads.append(payload)
 
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
-                seq = output_by_idx.get(local_idx)
-                if seq is None:
-                    continue
-                raw_output = seq.text or ""
-                stage = StageRecord(
-                    prompt=prompt_text,
-                    completion=raw_output,
-                    stop_reason=seq.finish_reason,
+                _ = self.engine.generate(
+                    prompts,
+                    sampling=sampling,
+                    batch_size=max(1, min(batch_size, len(prompts))),
+                    progress_desc="Generating code",
+                    on_complete=_on_complete,
                 )
-                payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=rec_idx,
-                    repeat_index=sample_idx,
-                    sampling_config=sampling_config,
-                    stages=[stage],
-                ).as_payload()
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
 
         return CodingPipelineResult(
             dataset=dataset_name,
@@ -279,36 +283,40 @@ class CodingPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict] = []
         if entries:
-            prompts = [entry[0] for entry in entries]
-            outputs = self.engine.generate(
-                prompts,
-                sampling=sampling,
-                batch_size=max(1, min(batch_size, len(prompts))),
-                progress_desc="Generating code",
-            )
-            output_by_idx = {item.prompt_index: item for item in outputs}
+            chunk_size = max(1, int(batch_size))
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start : start + chunk_size]
+                prompts = [entry[0] for entry in chunk]
+                def _on_complete(output: GenerationOutput) -> None:
+                    local_idx = output.prompt_index
+                    if local_idx < 0 or local_idx >= len(chunk):
+                        return
+                    prompt_text, _record, rec_idx, sample_idx = chunk[local_idx]
+                    raw_output = output.text or ""
+                    stage = StageRecord(
+                        prompt=prompt_text,
+                        completion=raw_output,
+                        stop_reason=output.finish_reason,
+                    )
+                    payload = SampleRecord(
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        sample_index=rec_idx,
+                        repeat_index=sample_idx,
+                        sampling_config=sampling_config,
+                        stages=[stage],
+                    ).as_payload()
+                    if on_record is not None:
+                        on_record(payload)
+                    payloads.append(payload)
 
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
-                seq = output_by_idx.get(local_idx)
-                if seq is None:
-                    continue
-                raw_output = seq.text or ""
-                stage = StageRecord(
-                    prompt=prompt_text,
-                    completion=raw_output,
-                    stop_reason=seq.finish_reason,
+                _ = self.engine.generate(
+                    prompts,
+                    sampling=sampling,
+                    batch_size=max(1, min(batch_size, len(prompts))),
+                    progress_desc="Generating code",
+                    on_complete=_on_complete,
                 )
-                payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=rec_idx,
-                    repeat_index=sample_idx,
-                    sampling_config=sampling_config,
-                    stages=[stage],
-                ).as_payload()
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
 
         return CodingPipelineResult(
             dataset=dataset_name,
@@ -403,65 +411,66 @@ class CodingPipeline:
         )
         payloads: list[dict] = []
         if entries:
-            prompts = [entry[0] for entry in entries]
-            cot_outputs = self.engine.generate(
-                prompts,
-                sampling=cot_sampling,
-                batch_size=max(1, min(batch_size, len(prompts))),
-                progress_desc="Generating CoT",
-            )
-            cot_by_idx = {item.prompt_index: item for item in cot_outputs}
-
-            final_prompts: list[str] = []
-            final_prompt_indices: list[int] = []
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
-                cot_seq = cot_by_idx.get(local_idx)
-                if cot_seq is None:
-                    continue
-                final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_seq.text))
-                final_prompt_indices.append(local_idx)
-
-            final_outputs = []
-            if final_prompts:
-                final_outputs = self.engine.generate(
-                    final_prompts,
-                    sampling=final_sampling,
-                    batch_size=max(1, min(batch_size, len(final_prompts))),
-                    progress_desc="Generating final code",
+            chunk_size = max(1, int(batch_size))
+            for start in range(0, len(entries), chunk_size):
+                chunk = entries[start : start + chunk_size]
+                prompts = [entry[0] for entry in chunk]
+                cot_outputs = self.engine.generate(
+                    prompts,
+                    sampling=cot_sampling,
+                    batch_size=max(1, min(batch_size, len(prompts))),
+                    progress_desc="Generating CoT",
                 )
-            final_by_idx = {
-                final_prompt_indices[item.prompt_index]: item for item in final_outputs
-            }
+                cot_by_idx = {item.prompt_index: item for item in cot_outputs}
 
-            for local_idx, (prompt_text, record, rec_idx, sample_idx) in enumerate(entries):
-                cot_seq = cot_by_idx.get(local_idx)
-                final_seq = final_by_idx.get(local_idx)
-                if cot_seq is None or final_seq is None:
-                    continue
-                prior_context = f"{prompt_text}{cot_seq.text}"
-                final_prompt = _format_lcb_final_prompt(prompt_text, cot_seq.text)
-                delta_prompt = prompt_delta(final_prompt, prior_context)
-                cot_stage = StageRecord(
-                    prompt=prompt_text,
-                    completion=cot_seq.text,
-                    stop_reason=cot_seq.finish_reason,
-                )
-                final_stage = StageRecord(
-                    prompt=delta_prompt,
-                    completion=final_seq.text,
-                    stop_reason=final_seq.finish_reason,
-                )
-                payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=rec_idx,
-                    repeat_index=sample_idx,
-                    sampling_config=sampling_config,
-                    stages=[cot_stage, final_stage],
-                ).as_payload()
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
+                final_prompts: list[str] = []
+                final_prompt_indices: list[int] = []
+                for local_idx, (prompt_text, _record, _rec_idx, _sample_idx) in enumerate(chunk):
+                    cot_seq = cot_by_idx.get(local_idx)
+                    if cot_seq is None:
+                        continue
+                    final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_seq.text))
+                    final_prompt_indices.append(local_idx)
+
+                def _on_final_complete(output: GenerationOutput) -> None:
+                    local_idx = final_prompt_indices[output.prompt_index]
+                    prompt_text, _record, rec_idx, sample_idx = chunk[local_idx]
+                    cot_seq = cot_by_idx.get(local_idx)
+                    if cot_seq is None:
+                        return
+                    prior_context = f"{prompt_text}{cot_seq.text}"
+                    final_prompt = _format_lcb_final_prompt(prompt_text, cot_seq.text)
+                    delta_prompt = prompt_delta(final_prompt, prior_context)
+                    cot_stage = StageRecord(
+                        prompt=prompt_text,
+                        completion=cot_seq.text,
+                        stop_reason=cot_seq.finish_reason,
+                    )
+                    final_stage = StageRecord(
+                        prompt=delta_prompt,
+                        completion=output.text,
+                        stop_reason=output.finish_reason,
+                    )
+                    payload = SampleRecord(
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        sample_index=rec_idx,
+                        repeat_index=sample_idx,
+                        sampling_config=sampling_config,
+                        stages=[cot_stage, final_stage],
+                    ).as_payload()
+                    if on_record is not None:
+                        on_record(payload)
+                    payloads.append(payload)
+
+                if final_prompts:
+                    _ = self.engine.generate(
+                        final_prompts,
+                        sampling=final_sampling,
+                        batch_size=max(1, min(batch_size, len(final_prompts))),
+                        progress_desc="Generating final code",
+                        on_complete=_on_final_complete,
+                    )
 
         return CodingPipelineResult(
             dataset=dataset_name,

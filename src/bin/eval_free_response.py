@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     compute_pass_at_k,
     compute_avg_at_k,
@@ -30,6 +31,16 @@ DEFAULT_PASS_K = (1,)
 DEFAULT_AVG_K: tuple[int, ...] = ()
 
 
+def _count_records(path: str | Path, limit: int | None) -> int:
+    loader = JsonlFreeAnswerLoader(str(path))
+    count = 0
+    for _ in loader:
+        count += 1
+        if limit and count >= limit:
+            break
+    return count
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV free-form CoT evaluator")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
@@ -39,8 +50,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -187,24 +198,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
+    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
     writer = CompletionWriteWorker(
         service=service,
         task_id=task_id,
         batch_size=args.db_write_batch,
         max_queue=args.db_write_queue,
     )
-    result = pipeline.run(
-        dataset_path=str(dataset_path),
-        cot_sampling=cot_sampling,
-        final_sampling=final_sampling,
-        batch_size=batch_size,
-        sample_limit=args.max_samples,
-        pad_to_batch=False,
-        pass_k=pass_k,
-        samples_per_task=samples_per_task,
-        skip_keys=skip_keys,
-        on_record=writer.enqueue,
-    )
+    try:
+        result = pipeline.run(
+            dataset_path=str(dataset_path),
+            cot_sampling=cot_sampling,
+            final_sampling=final_sampling,
+            batch_size=batch_size,
+            sample_limit=args.max_samples,
+            pad_to_batch=False,
+            pass_k=pass_k,
+            samples_per_task=samples_per_task,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            actual = service.count_completions(task_id=task_id)
+            status = "completed" if actual == expected_count else "failed"
+            service.update_task_status(task_id=task_id, status=status)
+        raise
     writer.close()
 
     completions_payloads = service.list_completion_payloads(

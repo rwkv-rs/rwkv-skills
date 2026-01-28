@@ -10,6 +10,7 @@ from typing import Sequence
 from dataclasses import replace
 
 from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -37,8 +38,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, help="Override sampling top-p")
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
-    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -104,19 +105,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=args.db_write_batch,
         max_queue=args.db_write_queue,
     )
-    result = pipeline.run_human_eval(
-        dataset_path=str(dataset_path),
-        sampling=sampling,
-        batch_size=batch_size,
-        sample_limit=sample_limit,
-        eval_timeout=args.eval_timeout,
-        eval_workers=args.eval_workers,
-        pass_k=pass_k,
-        probe_only=args.probe_only,
-        skip_keys=skip_keys,
-        on_record=writer.enqueue,
-    )
+    records = JsonlCodeGenerationLoader(str(dataset_path)).load()
+    expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * max(1, max(pass_k))
+    try:
+        result = pipeline.run_human_eval(
+            dataset_path=str(dataset_path),
+            sampling=sampling,
+            batch_size=batch_size,
+            sample_limit=sample_limit,
+            eval_timeout=args.eval_timeout,
+            eval_workers=args.eval_workers,
+            pass_k=pass_k,
+            probe_only=args.probe_only,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            actual = service.count_completions(task_id=task_id)
+            status = "completed" if actual == expected_count else "failed"
+            service.update_task_status(task_id=task_id, status=status)
+        raise
     if args.probe_only:
+        writer.close()
         print(
             "🧪 probe-only run completed: "
             f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."

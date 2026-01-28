@@ -29,8 +29,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for scoring")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
-    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     return parser.parse_args(argv)
 
 
@@ -42,7 +42,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
 
     # Quick validation of dataset readability before heavy model init
-    _ = JsonlMultipleChoiceLoader(str(dataset_path)).load()
+    records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
 
     if not DEFAULT_DB_CONFIG.enabled:
         raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
@@ -69,12 +69,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size=args.db_write_batch,
         max_queue=args.db_write_queue,
     )
-    result = pipeline.run_direct(
-        dataset_path=str(dataset_path),
-        sample_limit=args.max_samples,
-        skip_keys=skip_keys,
-        on_record=writer.enqueue,
-    )
+    sample_limit = args.max_samples
+    expected_count = min(len(records), sample_limit) if sample_limit else len(records)
+    try:
+        result = pipeline.run_direct(
+            dataset_path=str(dataset_path),
+            sample_limit=sample_limit,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            actual = service.count_completions(task_id=task_id)
+            status = "completed" if actual == expected_count else "failed"
+            service.update_task_status(task_id=task_id, status=status)
+        raise
     writer.close()
     completions_payloads = service.list_completion_payloads(task_id=task_id)
     metrics = evaluate_multiple_choice(

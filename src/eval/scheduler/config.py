@@ -90,7 +90,7 @@ class DBConfig:
     port: int = 5432
     user: str = "postgres"
     password: str = ""
-    dbname: str = "rwkv_skills"
+    dbname: str = "rwkv-eval"
     enabled: bool = False
 
 
@@ -101,7 +101,7 @@ def _load_db_config() -> DBConfig:
         port=int(os.environ.get("PG_PORT", "5432")),
         user=os.environ.get("PG_USER", "postgres"),
         password=os.environ.get("PG_PASSWORD", ""),
-        dbname=os.environ.get("PG_DBNAME", "rwkv_skills"),
+        dbname=os.environ.get("PG_DBNAME", "rwkv-eval"),
         enabled=enabled,
     )
 

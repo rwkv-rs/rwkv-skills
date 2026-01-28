@@ -10,7 +10,7 @@ import torch
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.infer.engine import InferenceEngine
+from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
@@ -184,70 +184,74 @@ class MultipleChoicePipeline:
         if resume_start_index:
             if resume_start_index >= len(records):
                 return MultipleChoicePipelineResult(dataset_name, len(records), [])
-            remaining_records = [
-                record
+            remaining_entries = [
+                (idx, record)
                 for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
                 if (idx, 0) not in skip_keys
             ]
             print(
-                f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(records)}，剩余 {len(remaining_records)}"
+                f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(records)}，剩余 {len(remaining_entries)}"
             )
         else:
-            remaining_records = [
-                record for idx, record in enumerate(records) if (idx, 0) not in skip_keys
+            remaining_entries = [
+                (idx, record) for idx, record in enumerate(records) if (idx, 0) not in skip_keys
             ]
-        if not remaining_records:
+        if not remaining_entries:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
-
-        prompts = [self._format_prompt(record, cot_prompt_template) for record in remaining_records]
-        outputs = self.engine.generate(
-            prompts,
-            sampling=cot_sampling,
-            batch_size=batch_size,
-            progress_desc="Generating CoT" if not probe_only else "Probing CoT",
-            probe_only=probe_only,
-        )
-        if probe_only:
-            return MultipleChoicePipelineResult(dataset_name, len(records), [])
 
         payloads: list[dict] = []
         sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling)])
-        cot_by_idx = {item.prompt_index: item for item in outputs}
-        for local_idx, record in enumerate(remaining_records):
-            cot_seq = cot_by_idx.get(local_idx)
-            if cot_seq is None:
-                continue
-            cot_prompt = prompts[local_idx]
-            cot_stage = StageRecord(
-                prompt=cot_prompt,
-                completion=cot_seq.text,
-                stop_reason=cot_seq.finish_reason,
+        chunk_size = max(1, batch_size)
+        for start in range(0, len(remaining_entries), chunk_size):
+            chunk = remaining_entries[start : start + chunk_size]
+            prompts = [self._format_prompt(record, cot_prompt_template) for _, record in chunk]
+            def _on_cot_complete(output: GenerationOutput) -> None:
+                local_idx = output.prompt_index
+                if local_idx < 0 or local_idx >= len(chunk):
+                    return
+                record_idx, record = chunk[local_idx]
+                cot_prompt = prompts[local_idx]
+                cot_stage = StageRecord(
+                    prompt=cot_prompt,
+                    completion=output.text,
+                    stop_reason=output.finish_reason,
+                )
+                final_prompt = (
+                    (final_answer_template or EN_FINAL_ANSWER_TEMPLATE)
+                    .replace("<Q>", cot_prompt)
+                    .replace("<COT>", output.text)
+                )
+                _, pred_letter = self._score_prompt(record, final_prompt)
+                prior_context = f"{cot_prompt}{output.text}"
+                delta_prompt = prompt_delta(final_prompt, prior_context)
+                token_text = self.target_token_format.replace("<LETTER>", pred_letter)
+                final_stage = StageRecord(
+                    prompt=delta_prompt,
+                    completion=token_text,
+                    stop_reason="logits_only",
+                )
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=record_idx,
+                    repeat_index=0,
+                    sampling_config=sampling_config,
+                    stages=[cot_stage, final_stage],
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
+
+            _ = self.engine.generate(
+                prompts,
+                sampling=cot_sampling,
+                batch_size=batch_size,
+                progress_desc="Generating CoT" if not probe_only else "Probing CoT",
+                probe_only=probe_only,
+                on_complete=None if probe_only else _on_cot_complete,
             )
-            final_prompt = (
-                (final_answer_template or EN_FINAL_ANSWER_TEMPLATE)
-                .replace("<Q>", cot_prompt)
-                .replace("<COT>", cot_seq.text)
-            )
-            _, pred_letter = self._score_prompt(record, final_prompt)
-            prior_context = f"{cot_prompt}{cot_seq.text}"
-            delta_prompt = prompt_delta(final_prompt, prior_context)
-            token_text = self.target_token_format.replace("<LETTER>", pred_letter)
-            final_stage = StageRecord(
-                prompt=delta_prompt,
-                completion=token_text,
-                stop_reason="logits_only",
-            )
-            payload = SampleRecord(
-                benchmark_name=benchmark_name,
-                dataset_split=dataset_split,
-                sample_index=resume_start_index + local_idx,
-                repeat_index=0,
-                sampling_config=sampling_config,
-                stages=[cot_stage, final_stage],
-            ).as_payload()
-            if on_record is not None:
-                on_record(payload)
-            payloads.append(payload)
+            if probe_only:
+                return MultipleChoicePipelineResult(dataset_name, len(records), [])
         return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
 
     # ------------------------------------------------------------------

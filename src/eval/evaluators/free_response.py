@@ -9,7 +9,7 @@ from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
-from src.infer.engine import InferenceEngine
+from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord
@@ -135,9 +135,10 @@ class FreeResponsePipeline:
             )
         else:
             remaining_entries = expanded
-        cot_prompts = [cot_prompt_template.replace("<Q>", record.question) for _, record, _ in remaining_entries]
-
         if probe_only:
+            cot_prompts = [
+                cot_prompt_template.replace("<Q>", record.question) for _, record, _ in remaining_entries
+            ]
             _ = self.engine.generate(
                 cot_prompts,
                 sampling=final_sampling,
@@ -147,62 +148,70 @@ class FreeResponsePipeline:
             )
             return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, [])
 
-        cot_outputs = self.engine.generate(
-            cot_prompts,
-            sampling=cot_sampling,
-            batch_size=batch_size,
-            progress_desc="Generating CoT",
-        )
-        cot_by_idx = {item.prompt_index: item for item in cot_outputs}
-
-        final_prompts: list[str] = []
-        for local_idx, _ in enumerate(remaining_entries):
-            cot_seq = cot_by_idx.get(local_idx)
-            cot_text = cot_seq.text if cot_seq else ""
-            prompt = final_answer_template.replace("<Q>", cot_prompts[local_idx]).replace("<COT>", cot_text)
-            final_prompts.append(prompt)
-
-        final_outputs = self.engine.generate(
-            final_prompts,
-            sampling=final_sampling,
-            batch_size=batch_size,
-            progress_desc="Generating answers",
-        )
-
-        final_by_idx = {item.prompt_index: item for item in final_outputs}
         sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling), (2, final_sampling)])
         payloads: list[dict] = []
-
-        for local_idx, (problem_idx, record, sample_id) in enumerate(remaining_entries):
-            cot_seq = cot_by_idx.get(local_idx)
-            ans_seq = final_by_idx.get(local_idx)
-            if cot_seq is None or ans_seq is None:
-                continue
-            prior_context = f"{cot_prompts[local_idx]}{cot_seq.text}"
-            delta_prompt2 = prompt_delta(final_prompts[local_idx], prior_context)
-            stages = [
-                StageRecord(
-                    prompt=cot_prompts[local_idx],
-                    completion=cot_seq.text,
-                    stop_reason=cot_seq.finish_reason,
-                ),
-                StageRecord(
-                    prompt=delta_prompt2,
-                    completion=ans_seq.text,
-                    stop_reason=ans_seq.finish_reason,
-                ),
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, len(remaining_entries), chunk_size):
+            chunk = remaining_entries[start : start + chunk_size]
+            cot_prompts = [
+                cot_prompt_template.replace("<Q>", record.question) for _, record, _ in chunk
             ]
-            payload = SampleRecord(
-                benchmark_name=benchmark_name,
-                dataset_split=dataset_split,
-                sample_index=problem_idx,
-                repeat_index=sample_id,
-                sampling_config=sampling_config,
-                stages=stages,
-            ).as_payload()
-            if on_record is not None:
-                on_record(payload)
-            payloads.append(payload)
+            cot_outputs = self.engine.generate(
+                cot_prompts,
+                sampling=cot_sampling,
+                batch_size=min(batch_size, len(cot_prompts)),
+                progress_desc="Generating CoT",
+            )
+            cot_by_idx = {item.prompt_index: item for item in cot_outputs}
+
+            final_prompts: list[str] = []
+            for local_idx in range(len(chunk)):
+                cot_seq = cot_by_idx.get(local_idx)
+                cot_text = cot_seq.text if cot_seq else ""
+                prompt = final_answer_template.replace("<Q>", cot_prompts[local_idx]).replace("<COT>", cot_text)
+                final_prompts.append(prompt)
+
+            def _on_final_complete(output: GenerationOutput) -> None:
+                local_idx = output.prompt_index
+                if local_idx < 0 or local_idx >= len(chunk):
+                    return
+                cot_seq = cot_by_idx.get(local_idx)
+                if cot_seq is None:
+                    return
+                problem_idx, _record, sample_id = chunk[local_idx]
+                prior_context = f"{cot_prompts[local_idx]}{cot_seq.text}"
+                delta_prompt2 = prompt_delta(final_prompts[local_idx], prior_context)
+                stages = [
+                    StageRecord(
+                        prompt=cot_prompts[local_idx],
+                        completion=cot_seq.text,
+                        stop_reason=cot_seq.finish_reason,
+                    ),
+                    StageRecord(
+                        prompt=delta_prompt2,
+                        completion=output.text,
+                        stop_reason=output.finish_reason,
+                    ),
+                ]
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=problem_idx,
+                    repeat_index=sample_id,
+                    sampling_config=sampling_config,
+                    stages=stages,
+                ).as_payload()
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
+
+            _ = self.engine.generate(
+                final_prompts,
+                sampling=final_sampling,
+                batch_size=min(batch_size, len(final_prompts)),
+                progress_desc="Generating answers",
+                on_complete=_on_final_complete,
+            )
         return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, payloads)
 
     def _load_records(

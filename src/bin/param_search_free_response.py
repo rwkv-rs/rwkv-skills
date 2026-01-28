@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
 from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid, NORMAL_COT_GRID, SIMPLE_COT_GRID
@@ -70,6 +71,16 @@ def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
 
 
+def _count_records(path: str | Path, limit: int | None) -> int:
+    loader = JsonlFreeAnswerLoader(str(path))
+    count = 0
+    for _ in loader:
+        count += 1
+        if limit and count >= limit:
+            break
+    return count
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search (free-response, exact-match)")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
@@ -79,8 +90,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--db-write-batch", type=int, default=128, help="DB completion write batch size")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
+    parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument("--para-grid-normal", default=None, type=str, 
                         help="""Grid search parameter space as a dictionary: \n
                          e.g. \'{\"temperature\":[0.3,0.4],\"top_k\":[50],\"top_p\":[0.3,0.4],\"alpha_presence\":[0.0,0.1],\"alpha_frequency\":[0.1],\"alpha_decay\":[0.99]}\'
@@ -147,6 +158,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pass_k = tuple(args.pass_k) if args.pass_k else DEFAULT_PASS_K
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
+    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -219,16 +231,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.db_write_batch,
             max_queue=args.db_write_queue,
         )
-        result = pipeline.run(
-            dataset_path=str(dataset_path),
-            cot_sampling=trial_cot,
-            final_sampling=final_sampling,
-            batch_size=max(1, args.batch_size),
-            sample_limit=args.max_samples,
-            pass_k=pass_k,
-            samples_per_task=samples_per_task,
-            on_record=writer.enqueue,
-        )
+        try:
+            result = pipeline.run(
+                dataset_path=str(dataset_path),
+                cot_sampling=trial_cot,
+                final_sampling=final_sampling,
+                batch_size=max(1, args.batch_size),
+                sample_limit=args.max_samples,
+                pass_k=pass_k,
+                samples_per_task=samples_per_task,
+                on_record=writer.enqueue,
+            )
+        except BaseException:
+            try:
+                writer.close()
+            finally:
+                actual = db_service.count_completions(task_id=task_id)
+                status = "completed" if actual == expected_count else "failed"
+                db_service.update_task_status(task_id=task_id, status=status)
+            raise
         writer.close()
         completions_payloads = db_service.list_completion_payloads(task_id=task_id)
         evaluation = evaluate_free_response(
