@@ -159,3 +159,72 @@ The migration script automatically recognizes task types (multiple-choice / math
 ### Export layout
 After each evaluation, JSONL is exported from the database using:
 `results/<table>/<model_name>/<dataset-name>.jsonl`
+
+## Full evaluation commands (no RWKV_SKILLS_JOB_ID)
+```bash
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_human_eval \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/human_eval/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_mbpp \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/mbpp/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_livecodebench \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/livecodebench/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response_judge \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_instruction_following \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/ifeval/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice_cot \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response_judge \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+
+RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_select \
+  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
+  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
+  --max-samples 50 --device cuda:0 \
+  --db-write-batch 1 --db-write-queue 1
+```
