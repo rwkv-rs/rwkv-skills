@@ -94,7 +94,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
     overwrite = bool(getattr(opts, "overwrite", False))
-    completed_for_queue = set() if overwrite else completed
+    completed_for_queue = set()
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
@@ -145,9 +145,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
         completed, completed_records = scan_completed_jobs(opts.log_dir)
         failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
-        completed_for_queue = completed
-        if opts.overwrite:
-            completed_for_queue = {key for key in completed if key in overwritten_keys}
+        completed_for_queue = set()
 
         queue = build_queue(
             model_globs=opts.model_globs,

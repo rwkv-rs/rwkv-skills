@@ -16,6 +16,7 @@ from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.job_env import ensure_job_id
 from src.db.database import DatabaseManager
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
@@ -119,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     service = EvalDbService(db)
     task_id = service.get_or_create_task(
         job_name="eval_multi_choice_cot",
-        job_id=os.environ.get("RWKV_SKILLS_JOB_ID"),
+        job_id=ensure_job_id("multi_choice_cot"),
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
