@@ -14,3 +14,4 @@ wheels/
 .env
 /data
 /results.7z
+weights/

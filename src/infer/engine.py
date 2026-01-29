@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
     # flashinfer JIT cache defaults to ~/.cache; some sandboxed environments may have an unwritable HOME.
@@ -59,8 +59,18 @@ class InferenceEngine:
         batch_size: int,
         progress_desc: str = "Generating",
         probe_only: bool = False,
+        on_complete: Callable[[GenerationOutput], None] | None = None,
     ) -> list[GenerationOutput]:
-        return _continuous_batching(self.model, self.tokenizer, prompts, sampling, batch_size, progress_desc, probe_only)
+        return _continuous_batching(
+            self.model,
+            self.tokenizer,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            probe_only,
+            on_complete,
+        )
 
 
 @dataclass(slots=True)
@@ -128,6 +138,7 @@ def _continuous_batching(
     batch_size: int,
     progress_desc: str,
     probe_only: bool = False,
+    on_complete: Callable[[GenerationOutput], None] | None = None,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
@@ -241,15 +252,17 @@ def _continuous_batching(
                 task.generated_tokens.append(new_token)
                 tokens_generated += 1
             if reached_stop or reached_length:
-                outputs.append(
-                    GenerationOutput(
-                        prompt_index=task.prompt_index,
-                        prompt=task.prompt,
-                        token_ids=list(task.generated_tokens),
-                        text="",
-                        finish_reason="stop_token" if reached_stop else "max_length",
-                    )
+                output = GenerationOutput(
+                    prompt_index=task.prompt_index,
+                    prompt=task.prompt,
+                    token_ids=list(task.generated_tokens),
+                    text="",
+                    finish_reason="stop_token" if reached_stop else "max_length",
                 )
+                if on_complete is not None and not probe_only:
+                    output.text = _decode_tokens(tokenizer, output.token_ids)
+                    on_complete(output)
+                outputs.append(output)
                 pbar.update(1)
                 if encoded:
                     prompt_idx, prompt, tokens = encoded.popleft()
@@ -340,15 +353,9 @@ def _continuous_batching(
     pbar.close()
 
     for output in outputs:
-        tokens = list(output.token_ids)
-        text = ""
-        while tokens:
-            try:
-                text = tokenizer.decode(tokens)
-                break
-            except:
-                tokens = tokens[:-1]
-        output.text = text
+        if output.text:
+            continue
+        output.text = _decode_tokens(tokenizer, output.token_ids)
 
     outputs.sort(key=lambda item: item.prompt_index)
     return outputs
@@ -386,6 +393,18 @@ def _prepare_state_container(state):
     if isinstance(state, tuple):
         return list(state)
     raise TypeError("generate_zero_state 必须返回 list 或 tuple")
+
+
+def _decode_tokens(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> str:
+    tokens = list(token_ids)
+    text = ""
+    while tokens:
+        try:
+            text = tokenizer.decode(tokens)
+            break
+        except Exception:
+            tokens = tokens[:-1]
+    return text
 
 
 __all__ = ["InferenceEngine", "GenerationOutput"]

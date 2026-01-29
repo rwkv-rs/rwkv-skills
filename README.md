@@ -143,3 +143,19 @@ python -m src.bin.migrate_old_results --source results_old
 ```
 
 The migration script automatically recognizes task types (multiple-choice / math free-response / instruction-following, etc.), preserves subject-level metrics, and skips score JSONs that already exist in the repo by default.
+
+## Database schema (current)
+### Tables
+- `benchmark`: Benchmark metadata (`benchmark_name` / `benchmark_split` / `status` / `num_samples`, etc.).
+- `model`: Model dimension table (`model_name` / `arch_version` / `data_version` / `num_params`).
+- `task`: Evaluation tasks (joins `benchmark_id` / `model_id`, includes `config_path` / `"desc"` / `sampling_config` / `status` / `git_hash` / `created_at`).
+- `completions`: Per-sample generations (`task_id` / `context` / `sample_index` / `repeat_index` / `status` / `created_at`).
+- `eval`: Per-sample evaluation (`completions_id` / `answer` / `ref_answer` / `is_passed` / `fail_reason` / `created_at`).
+- `scores`: Task-level aggregates (`task_id` / `is_cot` / `metrics` / `created_at`).
+
+### Views
+- `view_model_version`: Concatenates `arch_version`/`data_version`/`num_params` into a model version string.
+
+### Export layout
+After each evaluation, JSONL is exported from the database using:
+`results/<table>/<model_name>/<dataset-name>.jsonl`
