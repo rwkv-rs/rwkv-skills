@@ -146,33 +146,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"✅ HumanEval生成完成：{result.sample_count} completions")
 
     writer.close()
-    completions_payloads = service.list_completion_payloads(task_id=task_id)
-    eval_metrics, eval_payloads = evaluate_human_eval(
-        completions_payloads,
-        dataset_path=str(dataset_path),
-        pass_k=pass_k,
-        n_workers=args.eval_workers,
-        timeout=args.eval_timeout,
-    )
-    print(f"HumanEval 评测: {eval_metrics}")
-    service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
-    score_payload = make_score_payload(
-        slug,
-        is_cot=False,
-        model_name=Path(args.model_path).stem,
-        metrics=eval_metrics or {},
-        samples=result.sample_count,
-        problems=result.problem_count,
-        task="code_humaneval",
-    )
-    service.record_score_payload(
-        payload=score_payload,
-        task_id=task_id,
-    )
-    export_version_results(
-        service,
-        task_id=task_id,
-    )
+    try:
+        completions_payloads = service.list_completion_payloads(task_id=task_id)
+        eval_metrics, eval_payloads = evaluate_human_eval(
+            completions_payloads,
+            dataset_path=str(dataset_path),
+            pass_k=pass_k,
+            n_workers=args.eval_workers,
+            timeout=args.eval_timeout,
+        )
+        print(f"HumanEval 评测: {eval_metrics}")
+        service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=False,
+            model_name=Path(args.model_path).stem,
+            metrics=eval_metrics or {},
+            samples=result.sample_count,
+            problems=result.problem_count,
+            task="code_humaneval",
+        )
+        service.record_score_payload(
+            payload=score_payload,
+            task_id=task_id,
+        )
+        export_version_results(
+            service,
+            task_id=task_id,
+        )
+    except BaseException:
+        if service.get_score_payload(task_id=task_id) is None:
+            service.update_task_status(task_id=task_id, status="failed")
+        raise
     return 0
 
 
