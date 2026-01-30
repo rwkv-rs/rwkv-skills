@@ -67,7 +67,7 @@ print(result)
 `rwkv-skills-scheduler` 暴露了一组命令（队列预览、调度、状态、停止、日志轮播）：
 ```bash
 rwkv-skills-scheduler queue
-rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
+rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 其中 `queue` 是 `dispatch` 的 dry-run，会接受与 `dispatch` 一致的参数（包含 `--overwrite`）并输出将被调度的任务列表。
 若需无视 `results/scores` 中已存在的结果并强制重跑，可在 dispatch 时附上 `--overwrite`，调度器会在启动前删除旧的 completion / score / eval 产物再重新评测。
@@ -138,89 +138,40 @@ python -m src.bin.migrate_old_results --source results_old
 # 只想看看会写哪些文件，可加 --dry-run；已有结果但需要覆盖可加 --overwrite
 ```
 
-迁移脚本会自动识别多选 / 数学自由问答 / instruction-following 等任务类型，保留科目细分指标，并在默认情况下跳过仓库里已有的 score JSON。
+## C. 仅使用调度器（DB）
+### C.1 一次性准备
+1. 准备 PostgreSQL 并可连接（写好 .env / 环境变量）  
+   .env参考 `.env.example`
+2. 准备模型权重：  
+   `/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth`
+3. 准备数据集目录：`/home/jay/workspace/rwkv-skills/data`（包含各任务 JSONL）
 
-## 数据库结构（当前）
-### 表
-- `benchmark`：评测基准（`benchmark_name` / `benchmark_split` / `status` / `num_samples` 等）。
-- `model`：模型维表（`model_name` / `arch_version` / `data_version` / `num_params`）。
-- `task`：评测任务（关联 `benchmark_id` / `model_id`，含 `config_path` / `"desc"` / `sampling_config` / `status` / `git_hash` / `created_at`）。
-- `completions`：样本级生成结果（`task_id` / `context` / `sample_index` / `repeat_index` / `status` / `created_at`）。
-- `eval`：样本级评测（`completions_id` / `answer` / `ref_answer` / `is_passed` / `fail_reason` / `created_at`）。
-- `scores`：任务级汇总指标（`task_id` / `is_cot` / `metrics` / `created_at`）。
-
-### 视图
-- `view_model_version`：拼接 `arch_version`/`data_version`/`num_params` 作为模型版本字符串。
-
-### 导出结构
-每次评测完成后从数据库导出 JSONL，路径规则：
-`results/<table>/<model_name>/<dataset-name>.jsonl`
-
-## 完整评测命令（无需 RWKV_SKILLS_JOB_ID）
+### C.2 调度器队列预览
+用途：确认 8 个入口都会被调度、数据集路径可解析。
 ```bash
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_human_eval \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/human_eval/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_mbpp \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/mbpp/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_livecodebench \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/livecodebench/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response_judge \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_instruction_following \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/ifeval/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice_cot \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response_judge \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_select \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
+RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
 ```
+
+### C.3 执行调度
+用途：实际运行 8 个入口并写入数据库。
+```bash
+RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler dispatch \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
+  --skip-missing-dataset
+```
+
+### C.4 监控/停止
+```bash
+rwkv-skills-scheduler status
+rwkv-skills-scheduler logs
+rwkv-skills-scheduler stop --all
+```
+
+### 多模型续跑逻辑
+以 `model + dataset(+cot)` 为单位判断：若已有分数则下次调度新建 task 重跑；若无分数则续跑最近的 task。任务失败会标记为 `failed`，下次调度在未产出分数前仍会续跑该 task。
+

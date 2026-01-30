@@ -67,7 +67,7 @@ Free-response and instruction-following work similarly via `FreeResponsePipeline
 `rwkv-skills-scheduler` provides commands for queue preview, dispatch, status, stop, and log rotation:
 ```bash
 rwkv-skills-scheduler queue
-rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
+rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 `queue` is a dry-run of `dispatch` and accepts the same filtering/dispatch flags (including `--overwrite`) to preview what would be scheduled.
 To ignore existing results under `results/scores` and force a rerun, pass `--overwrite` on dispatch; the scheduler will delete old completion / score / eval artifacts before re-evaluating.
@@ -142,89 +142,41 @@ python -m src.bin.migrate_old_results --source results_old
 # use --dry-run to preview outputs; use --overwrite to replace existing results
 ```
 
-The migration script automatically recognizes task types (multiple-choice / math free-response / instruction-following, etc.), preserves subject-level metrics, and skips score JSONs that already exist in the repo by default.
+## Scheduler-only workflow (DB)
+### C.1 One-time setup
+1. Prepare PostgreSQL and ensure connectivity (set `.env` / env vars).
+   `.env` reference: `.env.example`
+2. Prepare model weights:
+   `/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth`
+3. Prepare dataset directory: `/home/jay/workspace/rwkv-skills/data` (contains task JSONL files).
 
-## Database schema (current)
-### Tables
-- `benchmark`: Benchmark metadata (`benchmark_name` / `benchmark_split` / `status` / `num_samples`, etc.).
-- `model`: Model dimension table (`model_name` / `arch_version` / `data_version` / `num_params`).
-- `task`: Evaluation tasks (joins `benchmark_id` / `model_id`, includes `config_path` / `"desc"` / `sampling_config` / `status` / `git_hash` / `created_at`).
-- `completions`: Per-sample generations (`task_id` / `context` / `sample_index` / `repeat_index` / `status` / `created_at`).
-- `eval`: Per-sample evaluation (`completions_id` / `answer` / `ref_answer` / `is_passed` / `fail_reason` / `created_at`).
-- `scores`: Task-level aggregates (`task_id` / `is_cot` / `metrics` / `created_at`).
-
-### Views
-- `view_model_version`: Concatenates `arch_version`/`data_version`/`num_params` into a model version string.
-
-### Export layout
-After each evaluation, JSONL is exported from the database using:
-`results/<table>/<model_name>/<dataset-name>.jsonl`
-
-## Full evaluation commands (no RWKV_SKILLS_JOB_ID)
+### C.2 Queue preview
+Purpose: verify all 8 entries are schedulable and dataset paths resolve.
 ```bash
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_human_eval \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/human_eval/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_mbpp \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/mbpp/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_code_livecodebench \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/livecodebench/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_free_response_judge \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_instruction_following \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/ifeval/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.eval_multi_choice_cot \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gpqa/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/math_500/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_free_response_judge \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
-
-RWKV_DB_ENABLED=1 uv run python -m src.bin.param_search_select \
-  --model-path "/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth" \
-  --dataset "/home/jay/workspace/rwkv-skills/data/gsm8k/test.jsonl" \
-  --max-samples 50 --device cuda:0 \
-  --db-write-batch 1 --db-write-queue 1
+RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
 ```
+
+### C.3 Dispatch
+Purpose: run all 8 entries and write into the database.
+```bash
+RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler dispatch \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
+  --skip-missing-dataset
+```
+
+### C.4 Monitor/stop
+```bash
+rwkv-skills-scheduler status
+rwkv-skills-scheduler logs
+rwkv-skills-scheduler stop --all
+```
+
+### Multi-model resume logic
+For each model+dataset(+cot) combination, if a score exists, a new task is created on the next dispatch; if no score exists, the scheduler resumes the latest task. On failures, the task status becomes `failed`, and the next dispatch will resume it unless a score appears.
+
+

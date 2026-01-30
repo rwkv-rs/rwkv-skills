@@ -50,7 +50,8 @@ class BenchmarkModelConfig:
 
 
 def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None) -> Path:
-    slug = canonical_slug(benchmark_name)
+    base,_= split_benchmark_and_split(benchmark_name)
+    slug = safe_slug(base).lower()
     if model_name:
         model_slug = safe_slug(model_name)
         return CONFIG_ROOT / model_slug / f"{slug}.toml"
