@@ -95,7 +95,6 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
     }
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
-    overwrite = bool(getattr(opts, "overwrite", False))
     completed_for_queue = set()
     pending = build_queue(
         model_globs=opts.model_globs,
@@ -148,24 +147,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
         completed, completed_records = scan_completed_jobs(opts.log_dir)
         failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
-        completed_for_queue = session_completed
-
-        queue = build_queue(
-            model_globs=opts.model_globs,
-            job_order=opts.job_order,
-            completed=completed_for_queue,
-            failed=failed_keys,
-            running=running_entries.keys(),
-            skip_dataset_slugs=opts.skip_dataset_slugs,
-            only_dataset_slugs=opts.only_dataset_slugs,
-            model_select=opts.model_select,
-            min_param_b=opts.min_param_b,
-            max_param_b=opts.max_param_b,
-            param_search_scan_mode=opts.param_search_scan_mode,
-            model_name_patterns=opts.model_name_patterns,
-        )
-        question_counts = derive_question_counts(completed_records)
-        queue = sort_queue_items(queue, question_counts=question_counts, job_priority=job_priority)
         now = time.time()
 
         completed_ids = set(completed_records.keys())
@@ -191,6 +172,25 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 payload.update(meta)
                 log_job_event("job_done", job_id, **payload)
         completed_log_ids = completed_ids
+
+        completed_for_queue = session_completed
+
+        queue = build_queue(
+            model_globs=opts.model_globs,
+            job_order=opts.job_order,
+            completed=completed_for_queue,
+            failed=failed_keys,
+            running=running_entries.keys(),
+            skip_dataset_slugs=opts.skip_dataset_slugs,
+            only_dataset_slugs=opts.only_dataset_slugs,
+            model_select=opts.model_select,
+            min_param_b=opts.min_param_b,
+            max_param_b=opts.max_param_b,
+            param_search_scan_mode=opts.param_search_scan_mode,
+            model_name_patterns=opts.model_name_patterns,
+        )
+        question_counts = derive_question_counts(completed_records)
+        queue = sort_queue_items(queue, question_counts=question_counts, job_priority=job_priority)
 
         for position, item in enumerate(queue):
             if item.job_id not in pending_since:

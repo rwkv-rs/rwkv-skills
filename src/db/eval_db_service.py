@@ -346,6 +346,20 @@ class EvalDbService:
                 is_param_search=is_param_search,
             )
 
+    def should_allow_resume(
+        self,
+        *,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+        is_cot: bool,
+    ) -> bool:
+        rows = self.list_scores_by_dataset(dataset=dataset, model=model, is_param_search=is_param_search)
+        for row in rows:
+            if bool(row.get("cot", False)) == bool(is_cot):
+                return False
+        return True
+
     def count_completions(
         self,
         *,

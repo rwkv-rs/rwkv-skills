@@ -85,6 +85,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)
+    allow_resume = service.should_allow_resume(
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        is_cot=False,
+    )
     task_id = service.get_or_create_task(
         job_name="eval_code_mbpp",
         job_id=ensure_job_id("mbpp"),
@@ -92,7 +98,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model=Path(args.model_path).stem,
         is_param_search=False,
         sampling_config=sampling_config_to_dict(sampling),
-        allow_resume=True,
+        allow_resume=allow_resume,
     )
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
