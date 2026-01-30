@@ -89,7 +89,7 @@ class LogsOptions:
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
-    completed, score_records = scan_completed_jobs(opts.log_dir)
+    _completed, score_records = scan_completed_jobs(opts.log_dir)
     failed = {
         record.key for record in score_records.values() if getattr(record, "missing_artifacts", False)
     }
@@ -129,11 +129,11 @@ def action_dispatch(opts: DispatchOptions) -> None:
     pending_since: dict[str, float] = {}
     launch_times: dict[str, float] = {}
     job_metadata: dict[str, dict[str, object]] = {}
-    overwritten_keys: set[CompletedKey] = set()
     completed_versions: dict[str, str | None] = {}
     session_completed: set[CompletedKey] = set()
+    cooldown_until: dict[str, float] = {}
+    previous_running: set[str] = set()
     pending_notice_printed = False
-    failed_announced: set[str] = set()
 
     while True:
         failure = FAILURE_MONITOR.wait_failure(timeout=0)
@@ -144,7 +144,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             print("❗️ 调度因异常退出而终止。")
             return
 
-        completed, completed_records = scan_completed_jobs(opts.log_dir)
+        _completed, completed_records = scan_completed_jobs(opts.log_dir)
         failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
         now = time.time()
@@ -163,6 +163,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 runtime = now - start if start else None
                 pending_since.pop(job_id, None)
                 session_completed.add(info.key)
+                cooldown_until.pop(job_id, None)
                 payload: dict[str, object] = {
                     "job": info.key.job,
                     "dataset_slug": info.key.dataset_slug,
@@ -177,6 +178,14 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 log_job_event("job_done", job_id, **payload)
         completed_versions = current_versions
 
+        # If a job stops without a new score, briefly avoid re-queueing to allow DB writes to land.
+        ended_jobs = previous_running - set(running_entries.keys())
+        for job_id in ended_jobs:
+            if job_id not in completed_records:
+                cooldown_until[job_id] = max(cooldown_until.get(job_id, 0.0), now + 2 * opts.dispatch_poll_seconds)
+        previous_running = set(running_entries.keys())
+
+        cooldown_jobs = {job_id for job_id, until in cooldown_until.items() if until > now}
         completed_for_queue = session_completed
 
         queue = build_queue(
@@ -184,7 +193,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             job_order=opts.job_order,
             completed=completed_for_queue,
             failed=failed_keys,
-            running=running_entries.keys(),
+            running=tuple(set(running_entries.keys()) | cooldown_jobs),
             skip_dataset_slugs=opts.skip_dataset_slugs,
             only_dataset_slugs=opts.only_dataset_slugs,
             model_select=opts.model_select,

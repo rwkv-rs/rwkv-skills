@@ -432,6 +432,32 @@ class EvalDbRepository:
         ).fetchone()
         return dict(row) if row else None
 
+    def fetch_latest_task_by_names(
+        self,
+        conn: psycopg.Connection,
+        *,
+        benchmark_name: str,
+        benchmark_split: str,
+        model_name: str,
+        is_param_search: bool,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT t.*
+            FROM task t
+            JOIN benchmark b ON b.benchmark_id = t.benchmark_id
+            JOIN model m ON m.model_id = t.model_id
+            WHERE b.benchmark_name = %s
+              AND b.benchmark_split = %s
+              AND m.model_name = %s
+              AND t.is_param_search = %s
+            ORDER BY t.created_at DESC
+            LIMIT 1
+            """,
+            (benchmark_name, benchmark_split, model_name, is_param_search),
+        ).fetchone()
+        return dict(row) if row else None
+
     def fetch_model(self, conn: psycopg.Connection, *, model_id: int) -> dict[str, Any] | None:
         row = conn.execute(
             """

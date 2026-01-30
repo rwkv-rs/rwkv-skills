@@ -354,9 +354,22 @@ class EvalDbService:
         is_param_search: bool,
         is_cot: bool,
     ) -> bool:
-        rows = self.list_scores_by_dataset(dataset=dataset, model=model, is_param_search=is_param_search)
-        for row in rows:
-            if bool(row.get("cot", False)) == bool(is_cot):
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        with self._db.get_connection() as conn:
+            latest = self._repo.fetch_latest_task_by_names(
+                conn,
+                benchmark_name=benchmark_name,
+                benchmark_split=benchmark_split,
+                model_name=model,
+                is_param_search=is_param_search,
+            )
+            if not latest:
+                return True
+            status = str(latest.get("status") or "").lower()
+            task_id = latest.get("task_id")
+            if status == "completed":
+                return False
+            if isinstance(task_id, int) and self._repo.task_has_score(conn, task_id=task_id):
                 return False
         return True
 
