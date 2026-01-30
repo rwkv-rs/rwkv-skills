@@ -90,7 +90,9 @@ class LogsOptions:
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
     completed, score_records = scan_completed_jobs(opts.log_dir)
-    failed = {record.key for record in score_records.values() if record.missing_artifacts}
+    failed = {
+        record.key for record in score_records.values() if getattr(record, "missing_artifacts", False)
+    }
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
     overwrite = bool(getattr(opts, "overwrite", False))
@@ -130,6 +132,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
     job_metadata: dict[str, dict[str, object]] = {}
     overwritten_keys: set[CompletedKey] = set()
     completed_log_ids: set[str] | None = None
+    session_completed: set[CompletedKey] = set()
     pending_notice_printed = False
     failed_announced: set[str] = set()
 
@@ -145,7 +148,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
         completed, completed_records = scan_completed_jobs(opts.log_dir)
         failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
-        completed_for_queue = set()
+        completed_for_queue = session_completed
 
         queue = build_queue(
             model_globs=opts.model_globs,
@@ -174,6 +177,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 start = launch_times.pop(job_id, None)
                 runtime = now - start if start else None
                 pending_since.pop(job_id, None)
+                session_completed.add(info.key)
                 payload: dict[str, object] = {
                     "job": info.key.job,
                     "dataset_slug": info.key.dataset_slug,

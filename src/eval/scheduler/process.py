@@ -201,7 +201,7 @@ def list_idle_gpus(max_mem_mb: int) -> list[str]:
             mem_val = float(mem)
         except ValueError:
             continue
-        if util_val == 0.0 and mem_val < max_mem_mb:
+        if mem_val < max_mem_mb:
             idle.append(idx)
     return idle
 
