@@ -130,7 +130,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
     launch_times: dict[str, float] = {}
     job_metadata: dict[str, dict[str, object]] = {}
     overwritten_keys: set[CompletedKey] = set()
-    completed_log_ids: set[str] | None = None
+    completed_versions: dict[str, str | None] = {}
     session_completed: set[CompletedKey] = set()
     pending_notice_printed = False
     failed_announced: set[str] = set()
@@ -149,8 +149,12 @@ def action_dispatch(opts: DispatchOptions) -> None:
         running_entries = load_running(opts.pid_dir)
         now = time.time()
 
-        completed_ids = set(completed_records.keys())
-        new_completed = set() if completed_log_ids is None else completed_ids - completed_log_ids
+        current_versions = {job_id: info.version_id for job_id, info in completed_records.items()}
+        if not completed_versions:
+            completed_versions = current_versions.copy()
+        new_completed = {
+            job_id for job_id, version_id in current_versions.items() if completed_versions.get(job_id) != version_id
+        }
         if new_completed:
             for job_id in sorted(new_completed):
                 info = completed_records[job_id]
@@ -171,7 +175,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     payload["version_id"] = info.version_id
                 payload.update(meta)
                 log_job_event("job_done", job_id, **payload)
-        completed_log_ids = completed_ids
+        completed_versions = current_versions
 
         completed_for_queue = session_completed
 
