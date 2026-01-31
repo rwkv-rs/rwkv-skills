@@ -27,6 +27,8 @@ class DatabaseManager:
     def initialize(self, config: DBConfig) -> None:
         if not config.enabled:
             return
+        if self._pool is not None:
+            return
 
         # 1. Connect to default 'postgres' db to check/create target db
         try:

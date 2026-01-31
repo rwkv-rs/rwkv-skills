@@ -35,7 +35,7 @@ class EvalDbRepository:
         conn: psycopg.Connection,
         *,
         benchmark_id: int,
-    ) -> str | None:
+    ) -> int | None:
         row = conn.execute(
             """
             SELECT num_samples
@@ -47,14 +47,19 @@ class EvalDbRepository:
         if not row:
             return None
         value = row.get("num_samples")
-        return str(value) if value is not None else None
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def update_benchmark_num_samples(
         self,
         conn: psycopg.Connection,
         *,
         benchmark_id: int,
-        num_samples: str,
+        num_samples: int,
     ) -> None:
         conn.execute(
             """
@@ -73,7 +78,7 @@ class EvalDbRepository:
         benchmark_split: str,
         url: str | None,
         status: str,
-        num_samples: str,
+        num_samples: int,
     ) -> int:
         row = conn.execute(
             """
@@ -179,7 +184,7 @@ class EvalDbRepository:
         conn: psycopg.Connection,
         *,
         task_id: int,
-        num_samples: str,
+        num_samples: int,
     ) -> None:
         conn.execute(
             """

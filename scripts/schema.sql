@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS benchmark (
     benchmark_split VARCHAR(255) NOT NULL,
     url VARCHAR(255),
     status VARCHAR(32) NOT NULL,
-    num_samples VARCHAR(255) NOT NULL,
+    num_samples INT4 NOT NULL,
     CONSTRAINT chk_benchmark_status
         CHECK (status IN ('Todo', 'Buggy', 'Low', 'DataSynthesizing', 'Completed'))
 );

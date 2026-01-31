@@ -13,6 +13,7 @@ from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices
 from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
+from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags
 
 from .eval_db_repo import EvalDbRepository
@@ -62,14 +63,27 @@ class EvalDbService:
                 conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if benchmark_id is None:
+                resolved_samples = self._resolve_dataset_sample_count(dataset)
                 benchmark_id = self._repo.insert_benchmark(
                     conn,
                     benchmark_name=benchmark_name,
                     benchmark_split=benchmark_split,
                     url=None,
                     status="Todo",
-                    num_samples="0",
+                    num_samples=resolved_samples if resolved_samples is not None else 0,
                 )
+            else:
+                existing = self._parse_num_samples(
+                    self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
+                )
+                if not existing:
+                    resolved_samples = self._resolve_dataset_sample_count(dataset)
+                    if resolved_samples is not None and resolved_samples > 0:
+                    self._repo.update_benchmark_num_samples(
+                        conn,
+                        benchmark_id=benchmark_id,
+                        num_samples=resolved_samples,
+                    )
 
             normalized = _normalize_model_identifier(model)
             arch, data_version, num_params = _parse_model_tags(normalized)
@@ -126,6 +140,47 @@ class EvalDbService:
                 log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
             )
             return str(task_id)
+
+    def get_benchmark_num_samples(self, *, dataset: str) -> int | None:
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        with self._db.get_connection() as conn:
+            benchmark_id = self._repo.get_benchmark_id(
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                return None
+            return self._parse_num_samples(
+                self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
+            )
+
+    def ensure_benchmark_num_samples(self, *, dataset: str, num_samples: int) -> None:
+        if num_samples <= 0:
+            return
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        with self._db.get_connection() as conn:
+            benchmark_id = self._repo.get_benchmark_id(
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                self._repo.insert_benchmark(
+                    conn,
+                    benchmark_name=benchmark_name,
+                    benchmark_split=benchmark_split,
+                    url=None,
+                    status="Todo",
+                    num_samples=num_samples,
+                )
+                return
+            existing = self._parse_num_samples(
+                self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
+            )
+            if existing == num_samples:
+                return
+            self._repo.update_benchmark_num_samples(
+                conn,
+                benchmark_id=benchmark_id,
+                num_samples=num_samples,
+            )
 
     def ingest_completions(
         self,
@@ -284,13 +339,6 @@ class EvalDbService:
                 task_id=int(task_id),
                 payload=payload,
             )
-            samples = payload.get("samples")
-            if samples is not None:
-                self._repo.update_benchmark_num_samples_for_task(
-                    conn,
-                    task_id=int(task_id),
-                    num_samples=str(samples),
-                )
             self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_score_payload(
@@ -305,13 +353,6 @@ class EvalDbService:
                 task_id=int(task_id),
                 payload=payload,
             )
-            samples = payload.get("samples")
-            if samples is not None:
-                self._repo.update_benchmark_num_samples_for_task(
-                    conn,
-                    task_id=int(task_id),
-                    num_samples=str(samples),
-                )
             self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_log_event(
@@ -503,6 +544,31 @@ class EvalDbService:
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
+
+    @staticmethod
+    def _parse_num_samples(value: object) -> int | None:
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    @classmethod
+    def _resolve_dataset_sample_count(cls, dataset: str) -> int | None:
+        path = find_dataset_file(dataset, DATASET_ROOTS)
+        if path is None or not path.exists():
+            return None
+        try:
+            count = 0
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.strip():
+                        count += 1
+        except OSError:
+            return None
+        return count if count > 0 else None
 
     @staticmethod
     def _resolve_git_sha() -> str:
