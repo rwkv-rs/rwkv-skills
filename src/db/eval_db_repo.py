@@ -132,7 +132,7 @@ class EvalDbRepository:
         is_param_search: bool,
         created_at: datetime,
         status: str,
-        git_hash: str | None,
+        git_hash: str,
         model_id: int,
         benchmark_id: int,
         desc: str | None,

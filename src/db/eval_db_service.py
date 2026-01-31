@@ -505,16 +505,18 @@ class EvalDbService:
         }
 
     @staticmethod
-    def _resolve_git_sha() -> str | None:
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(REPO_ROOT),
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except (OSError, subprocess.CalledProcessError):
-            return None
+    def _resolve_git_sha() -> str:
+        env_sha = os.environ.get("RWKV_GIT_SHA", "").strip()
+        if env_sha:
+            return env_sha
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         sha = result.stdout.strip()
-        return sha or None
+        if not sha:
+            raise RuntimeError("git rev-parse HEAD returned empty output")
+        return sha
