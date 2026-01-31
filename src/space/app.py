@@ -443,7 +443,7 @@ def _render_summary(
         f"- 模型列数：{len(selection.model_sequence)}",
         f"- 基准行数：{benchmark_count}",
         f"- 可见数据集：{len(visible)} / 总分数文件：{len(all_entries)}",
-        "- 排序：架构 > 参数量 > data_version（G0→…→G1b）> domain > dataset / task",
+        "- 排序：架构 > 参数量 > data_version（G0→…→G1d）> domain > dataset / task",
     ]
     if selection.selected_label == AUTO_MODEL_LABEL and selection.skipped_small_params:
         lines.append(f"- 已忽略 {selection.skipped_small_params} 个 0.1B / 0.4B 组合（调度策略）")
@@ -1231,7 +1231,7 @@ def _build_dashboard() -> gr.Blocks:
                 with gr.Row():
                     model_dropdown = gr.Dropdown(
                         label="模型选择",
-                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1b）最新的模型；手动选择时展示单个模型的最新分数文件。",
+                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1d）最新的模型；手动选择时展示单个模型的最新分数文件。",
                         choices=model_choices,
                         value=AUTO_MODEL_LABEL,
                         scale=3,

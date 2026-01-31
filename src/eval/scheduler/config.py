@@ -36,6 +36,7 @@ if _MODEL_GLOBS_ENV:
 else:
     DEFAULT_MODEL_GLOBS = (
         "/public/home/ssjxzkz/Weights/BlinkDL__rwkv7-g1/*.pth",
+        "/home/caizus/Weights/BlinkDL__rwkv7-g1/*.pth",
         str(REPO_ROOT / "weights" / "rwkv7-*.pth"),
     )
 
