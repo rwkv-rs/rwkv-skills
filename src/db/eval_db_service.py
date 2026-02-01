@@ -79,11 +79,11 @@ class EvalDbService:
                 if not existing:
                     resolved_samples = self._resolve_dataset_sample_count(dataset)
                     if resolved_samples is not None and resolved_samples > 0:
-                    self._repo.update_benchmark_num_samples(
-                        conn,
-                        benchmark_id=benchmark_id,
-                        num_samples=resolved_samples,
-                    )
+                        self._repo.update_benchmark_num_samples(
+                            conn,
+                            benchmark_id=benchmark_id,
+                            num_samples=resolved_samples,
+                        )
 
             normalized = _normalize_model_identifier(model)
             arch, data_version, num_params = _parse_model_tags(normalized)

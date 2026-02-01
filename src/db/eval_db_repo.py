@@ -532,6 +532,16 @@ class EvalDbRepository:
         created_at: datetime,
         status: str,
     ) -> None:
+        sample_index = payload.get("sample_index", 0)
+        repeat_index = payload.get("repeat_index", 0)
+        try:
+            sample_index = int(sample_index)
+        except (TypeError, ValueError):
+            sample_index = 0
+        try:
+            repeat_index = int(repeat_index)
+        except (TypeError, ValueError):
+            repeat_index = 0
         conn.execute(
             """
             INSERT INTO completions (
@@ -544,8 +554,8 @@ class EvalDbRepository:
             (
                 task_id,
                 self._json(context or {}),
-                str(payload.get("sample_index", "")),
-                str(payload.get("repeat_index", "")),
+                sample_index,
+                repeat_index,
                 created_at,
                 status,
             ),
