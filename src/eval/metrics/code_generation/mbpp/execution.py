@@ -35,7 +35,7 @@ def unsafe_execute(problem: Dict, completion: str, timeout: float, result):
                 test_sections.append("\n".join(section))
         tests_str = "\n".join(test_sections)
 
-        check_program = problem["prompt"] + completion
+        check_program = completion
         if tests_str:
             if not check_program.endswith("\n"):
                 check_program += "\n"
