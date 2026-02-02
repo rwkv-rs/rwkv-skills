@@ -549,7 +549,10 @@ class EvalDbRepository:
             )
             VALUES (%s, %s, %s, %s, %s, %s)
             ON CONFLICT (task_id, sample_index, repeat_index)
-            DO NOTHING
+            DO UPDATE SET
+                context = EXCLUDED.context,
+                created_at = EXCLUDED.created_at,
+                status = EXCLUDED.status
             """,
             (
                 task_id,
@@ -560,6 +563,28 @@ class EvalDbRepository:
                 status,
             ),
         )
+        
+    def fetch_completion_context(
+        self,
+        conn: psycopg.Connection,
+        *,
+        task_id: int,
+        sample_index: int,
+        repeat_index: int,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            """
+            SELECT context
+            FROM completions
+            WHERE task_id = %s AND sample_index = %s AND repeat_index = %s
+            """,
+            (task_id, sample_index, repeat_index),
+        ).fetchone()
+        if not row:
+            return None
+        context = row.get("context")
+        return context if isinstance(context, dict) else None
+
 
     def insert_eval(
         self,
