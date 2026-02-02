@@ -43,6 +43,21 @@ def _format_prompt_no_echo(prompt: str) -> str:
     )
 
 
+def _extract_function_signature(code: str | None) -> str | None:
+    if not code:
+        return None
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("def ") and stripped.endswith(":"):
+            return stripped
+    return None
+
+
+def _format_signature_prompt(prompt: str, signature: str ) -> str:
+    prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
+    return _format_prompt_no_echo(prompt)
+
+
 _LCB_SYSTEM_MESSAGE = (
     "You are an expert Python programmer. You will be given a question "
     "(problem specification) and will generate a correct Python program "
@@ -234,13 +249,16 @@ class CodingPipeline:
         if not records:
             return CodingPipelineResult(dataset_name, 0, 0, [])
 
-        is_human_eval_fix = "human_eval_fix" in dataset_path.lower()
-
         if probe_only:
             prompts = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
-                prompt_text = _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
+                raw_code = record.metadata.get("code") if record.metadata else None
+                signature = _extract_function_signature(raw_code)
+                if signature:
+                    prompt_text = _format_signature_prompt(record.prompt, signature)
+                else:
+                    prompt_text = _format_prompt_no_echo(record.prompt)
                 prompts.append(prompt_text)
             _ = self.engine.generate(
                 prompts,
@@ -254,9 +272,12 @@ class CodingPipeline:
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
             for sample_idx in range(samples_per_task):
-                prompt_text = (
-                    _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
-                )
+                raw_code = record.metadata.get("code") if record.metadata else None
+                signature = _extract_function_signature(raw_code)
+                if signature:
+                    prompt_text = _format_signature_prompt(record.prompt, signature)
+                else:
+                    prompt_text = _format_prompt_no_echo(record.prompt)
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         skip_keys = skip_keys or set()

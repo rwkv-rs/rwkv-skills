@@ -270,7 +270,7 @@ def _evaluate_mbpp_plus(
         if task_id not in problems:
             continue
         problem = problems[task_id]
-        solution = (problem.get("prompt") or "") + completion
+        solution = completion
         payloads.append(
             (
                 task_id,
