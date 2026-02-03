@@ -33,7 +33,10 @@ def _normalize_jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
-        return {k: _normalize_jsonable(v) for k, v in value.items()}
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized[str(key)] = _normalize_jsonable(item)
+        return normalized
     if isinstance(value, (list, tuple)):
         return [_normalize_jsonable(v) for v in value]
     return value

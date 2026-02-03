@@ -53,6 +53,17 @@ def expand_model_paths(patterns: Sequence[str]) -> list[Path]:
                 matched.add(candidate_path.resolve())
     return sorted(matched)
 
+def normalize_model_name(raw: str) -> str:
+    if not isinstance(raw, str):
+        return raw
+    if raw.endswith(".pth") or "/" in raw or "\\" in raw:
+        try:
+            return Path(raw).stem
+        except OSError:
+            return raw
+    return raw
+
+
 
 def _normalize_model_identifier(raw: str) -> str:
     if not isinstance(raw, str):
@@ -222,4 +233,5 @@ __all__ = [
     "expand_model_paths",
     "filter_model_paths",
     "MODEL_SELECT_CHOICES",
+    "normalize_model_name",
 ]

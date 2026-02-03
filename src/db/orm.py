@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Dict, Iterator, Optional
+from contextlib import contextmanager
 
 from sqlalchemy import (
     Boolean,
@@ -59,7 +60,6 @@ def get_session() -> Iterator[Session]:
 
 class Base(DeclarativeBase):
     pass
-
 
 class Benchmark(Base):
     __tablename__ = "benchmark"

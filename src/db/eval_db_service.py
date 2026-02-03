@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from zoneinfo import ZoneInfo
 from src.db.database import DatabaseManager
@@ -15,7 +16,7 @@ from src.eval.results.schema import iter_stage_indices
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
-from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags
+from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags, normalize_model_name
 
 from .eval_db_repo import EvalDbRepository
 
@@ -87,9 +88,14 @@ class EvalDbService:
                             benchmark_id=benchmark_id,
                             num_samples=resolved_samples,
                         )
-
+            model = normalize_model_name(model)
             normalized = _normalize_model_identifier(model)
             arch, data_version, num_params = _parse_model_tags(normalized)
+            if not arch or not data_version or not num_params:
+                fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
+                arch = arch or fallback_arch
+                data_version = data_version or fallback_data
+                num_params = num_params or fallback_params
             arch_version = arch or "unknown"
             data_version = data_version or "unknown"
             num_params = num_params or "unknown"
@@ -405,6 +411,7 @@ class EvalDbService:
         is_param_search: bool,
     ) -> list[dict[str, Any]]:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
         with get_session() as session:
             return self._repo.fetch_scores_by_benchmark(
                 session,
@@ -423,6 +430,7 @@ class EvalDbService:
         is_cot: bool,
     ) -> bool:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
         with get_session() as session:
             latest = self._repo.fetch_latest_task_by_names(
                 session,
@@ -464,15 +472,26 @@ class EvalDbService:
             )
         payloads: list[dict[str, Any]] = []
         for row in rows:
-            context = row.get("context") if isinstance(row, dict) else None
+            if isinstance(row, Mapping):
+                row_dict: dict[str, Any] = dict(row)
+            elif isinstance(row, dict):
+                row_dict = row
+            else:
+                row_dict = {}
+            context = row_dict.get("context")
+            if isinstance(context, str):
+                try:
+                    context = json.loads(context)
+                except json.JSONDecodeError:
+                    context = None
             sampling_cfg = None
             if isinstance(context, dict):
                 sampling_cfg = context.get("sampling_config")
             payload: dict[str, Any] = {
-                "benchmark_name": row.get("benchmark_name", ""),
-                "dataset_split": row.get("dataset_split", ""),
-                "sample_index": int(row.get("sample_index", 0)),
-                "repeat_index": int(row.get("repeat_index", 0)),
+                "benchmark_name": row_dict.get("benchmark_name", ""),
+                "dataset_split": row_dict.get("benchmark_split", "") or row_dict.get("dataset_split", ""),
+                "sample_index": int(row_dict.get("sample_index", 0)),
+                "repeat_index": int(row_dict.get("repeat_index", 0)),
                 "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
                 "context": context if isinstance(context, dict) else None,
             }
@@ -612,6 +631,23 @@ class EvalDbService:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _fallback_parse_model_tags(raw: str | None) -> tuple[str | None, str | None, str | None]:
+        if not raw:
+            return None, None, None
+        lowered = raw.lower().replace("_", "-")
+        parts = lowered.split("-")
+        arch = parts[0] if parts and parts[0].startswith("rwkv") else None
+        data_version = None
+        num_params = None
+        match = re.search(r"\bg\d[a-z0-9]*\b", lowered)
+        if match:
+            data_version = match.group(0)
+        match = re.search(r"\b\d+(?:\.\d+)?b\b", lowered)
+        if match:
+            num_params = match.group(0)
+        return arch, data_version, num_params
 
 
     @staticmethod

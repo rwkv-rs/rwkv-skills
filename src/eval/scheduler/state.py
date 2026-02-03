@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .dataset_utils import safe_slug
+from .models import normalize_model_name
 from .jobs import JOB_CATALOGUE, detect_job_from_dataset
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.database import DatabaseManager
@@ -61,6 +62,7 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
         dataset_slug = raw.get("dataset")
         if not isinstance(model_name, str) or not isinstance(dataset_slug, str):
             continue
+        model_name = normalize_model_name(model_name)
         detected_is_cot = bool(raw.get("cot"))
         job_name = detect_job_from_dataset(dataset_slug, detected_is_cot)
         key_is_cot = detected_is_cot
