@@ -14,6 +14,7 @@ from ..eval.scheduler.config import DBConfig
 class DatabaseManager:
     _instance = None
     _pool = None
+    _config: DBConfig | None = None
 
     def __init__(self):
         raise RuntimeError("Call instance() instead")
@@ -29,6 +30,7 @@ class DatabaseManager:
             return
         if self._pool is not None:
             return
+        self._config = config
 
         # 1. Connect to default 'postgres' db to check/create target db
         try:
@@ -98,6 +100,10 @@ class DatabaseManager:
         if self._pool:
             self._pool.close()
             self._pool = None
+
+    @property
+    def config(self) -> DBConfig | None:
+        return self._config
 
 
 db_manager = DatabaseManager.instance()
