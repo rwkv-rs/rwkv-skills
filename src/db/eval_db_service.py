@@ -9,10 +9,9 @@ from typing import Any, Iterable
 
 from zoneinfo import ZoneInfo
 from src.db.database import DatabaseManager
-from src.db.orm import get_session, init_orm
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
+from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags
@@ -24,12 +23,10 @@ class EvalDbService:
     def __init__(self, db: DatabaseManager) -> None:
         self._db = db
         self._repo = EvalDbRepository()
-        init_orm(db.config or DEFAULT_DB_CONFIG)
 
     @staticmethod
     def _now_cn() -> datetime:
         return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None)
-
     def get_or_create_version(
         self,
         *,
@@ -60,15 +57,15 @@ class EvalDbService:
         sampling_config: dict[str, Any] | None = None,
         allow_resume: bool = True,
     ) -> str:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
             benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if benchmark_id is None:
                 resolved_samples = self._resolve_dataset_sample_count(dataset)
                 benchmark_id = self._repo.insert_benchmark(
-                    session,
+                    conn,
                     benchmark_name=benchmark_name,
                     benchmark_split=benchmark_split,
                     url=None,
@@ -77,13 +74,13 @@ class EvalDbService:
                 )
             else:
                 existing = self._parse_num_samples(
-                    self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
+                    self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
                 )
                 if not existing:
                     resolved_samples = self._resolve_dataset_sample_count(dataset)
                     if resolved_samples is not None and resolved_samples > 0:
                         self._repo.update_benchmark_num_samples(
-                            session,
+                            conn,
                             benchmark_id=benchmark_id,
                             num_samples=resolved_samples,
                         )
@@ -94,7 +91,7 @@ class EvalDbService:
             data_version = data_version or "unknown"
             num_params = num_params or "unknown"
             model_id = self._repo.get_model_id(
-                session,
+                conn,
                 model_name=model,
                 arch_version=arch_version,
                 data_version=data_version,
@@ -102,7 +99,7 @@ class EvalDbService:
             )
             if model_id is None:
                 model_id = self._repo.insert_model(
-                    session,
+                    conn,
                     model_name=model,
                     arch_version=arch_version,
                     data_version=data_version,
@@ -111,13 +108,13 @@ class EvalDbService:
 
             if allow_resume:
                 latest = self._repo.get_latest_task_id(
-                    session,
+                    conn,
                     benchmark_id=benchmark_id,
                     model_id=model_id,
                     is_param_search=is_param_search,
                 )
-                if latest and not self._repo.task_has_score(session, task_id=latest):
-                    self._repo.update_task_status(session, task_id=latest, status="running")
+                if latest and not self._repo.task_has_score(conn, task_id=latest):
+                    self._repo.update_task_status(conn, task_id=latest, status="running")
                     return str(latest)
 
             git_sha = self._resolve_git_sha()
@@ -129,7 +126,7 @@ class EvalDbService:
                 config_path_str = str(fallback_path) if fallback_path.exists() else None
             desc = os.environ.get("RWKV_TASK_DESC")
             task_id = self._repo.insert_task(
-                session,
+                conn,
                 config_path=config_path_str,
                 evaluator=job_name or "",
                 is_param_search=is_param_search,
@@ -146,27 +143,27 @@ class EvalDbService:
 
     def get_benchmark_num_samples(self, *, dataset: str) -> int | None:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if benchmark_id is None:
                 return None
             return self._parse_num_samples(
-                self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
+                self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
             )
 
     def ensure_benchmark_num_samples(self, *, dataset: str, num_samples: int) -> None:
         if num_samples <= 0:
             return
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+                conn, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if benchmark_id is None:
                 self._repo.insert_benchmark(
-                    session,
+                    conn,
                     benchmark_name=benchmark_name,
                     benchmark_split=benchmark_split,
                     url=None,
@@ -175,12 +172,12 @@ class EvalDbService:
                 )
                 return
             existing = self._parse_num_samples(
-                self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
+                self._repo.get_benchmark_num_samples(conn, benchmark_id=benchmark_id)
             )
             if existing == num_samples:
                 return
             self._repo.update_benchmark_num_samples(
-                session,
+                conn,
                 benchmark_id=benchmark_id,
                 num_samples=num_samples,
             )
@@ -195,7 +192,7 @@ class EvalDbService:
         if not path.exists():
             return 0
         inserted = 0
-        with path.open("r", encoding="utf-8") as fh, get_session() as session:
+        with path.open("r", encoding="utf-8") as fh, self._db.get_connection() as conn:
             for line in fh:
                 text = line.strip()
                 if not text:
@@ -203,7 +200,7 @@ class EvalDbService:
                 payload = json.loads(text)
                 context = self._merge_completion_context(
                     self._repo.fetch_completion_context(
-                        session,
+                        conn,
                         task_id=int(task_id),
                         sample_index=self._parse_index(payload.get("sample_index", 0)),
                         repeat_index=self._parse_index(payload.get("repeat_index", 0)),
@@ -211,7 +208,7 @@ class EvalDbService:
                     self._build_completion_context(payload),
                 )
                 self._repo.insert_completion(
-                    session,
+                    conn,
                     task_id=int(task_id),
                     payload=payload,
                     context=context,
@@ -228,11 +225,11 @@ class EvalDbService:
         task_id: str,
     ) -> int:
         inserted = 0
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             for payload in payloads:
                 context = self._merge_completion_context(
                     self._repo.fetch_completion_context(
-                        session,
+                        conn,
                         task_id=int(task_id),
                         sample_index=self._parse_index(payload.get("sample_index", 0)),
                         repeat_index=self._parse_index(payload.get("repeat_index", 0)),
@@ -240,7 +237,7 @@ class EvalDbService:
                     self._build_completion_context(payload),
                 )
                 self._repo.insert_completion(
-                    session,
+                    conn,
                     task_id=int(task_id),
                     payload=payload,
                     context=context,
@@ -256,10 +253,10 @@ class EvalDbService:
         payload: dict[str, Any],
         task_id: str,
     ) -> None:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             context = self._merge_completion_context(
                 self._repo.fetch_completion_context(
-                    session,
+                    conn,
                     task_id=int(task_id),
                     sample_index=self._parse_index(payload.get("sample_index", 0)),
                     repeat_index=self._parse_index(payload.get("repeat_index", 0)),
@@ -267,7 +264,7 @@ class EvalDbService:
                 self._build_completion_context(payload),
             )
             self._repo.insert_completion(
-                session,
+                conn,
                 task_id=int(task_id),
                 payload=payload,
                 context=context,
@@ -285,8 +282,8 @@ class EvalDbService:
         if not path.exists():
             return 0
         inserted = 0
-        with path.open("r", encoding="utf-8") as fh, get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
+        with path.open("r", encoding="utf-8") as fh, self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
             for line in fh:
                 text = line.strip()
                 if not text:
@@ -298,7 +295,7 @@ class EvalDbService:
                 if completions_id is None:
                     continue
                 self._repo.insert_eval(
-                    session,
+                    conn,
                     completions_id=completions_id,
                     payload=payload,
                     created_at=self._now_cn(),
@@ -313,8 +310,8 @@ class EvalDbService:
         task_id: str,
     ) -> int:
         inserted = 0
-        with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
             for payload in payloads:
                 completions_id = mapping.get(
                     (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
@@ -322,7 +319,7 @@ class EvalDbService:
                 if completions_id is None:
                     continue
                 self._repo.insert_eval(
-                    session,
+                    conn,
                     completions_id=completions_id,
                     payload=payload,
                     created_at=self._now_cn(),
@@ -336,15 +333,15 @@ class EvalDbService:
         payload: dict[str, Any],
         task_id: str,
     ) -> None:
-        with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            mapping = self._repo.fetch_completion_id_map(conn, task_id=int(task_id))
             completions_id = mapping.get(
                 (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
             )
             if completions_id is None:
                 return
             self._repo.insert_eval(
-                session,
+                conn,
                 completions_id=completions_id,
                 payload=payload,
                 created_at=self._now_cn(),
@@ -360,13 +357,13 @@ class EvalDbService:
         if not path.exists():
             return
         payload = json.loads(path.read_text(encoding="utf-8"))
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             self._repo.insert_score(
-                session,
+                conn,
                 task_id=int(task_id),
                 payload=payload,
             )
-            self._repo.update_task_status(session, task_id=int(task_id), status="completed")
+            self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_score_payload(
         self,
@@ -374,13 +371,13 @@ class EvalDbService:
         payload: dict[str, Any],
         task_id: str,
     ) -> None:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             self._repo.insert_score(
-                session,
+                conn,
                 task_id=int(task_id),
                 payload=payload,
             )
-            self._repo.update_task_status(session, task_id=int(task_id), status="completed")
+            self._repo.update_task_status(conn, task_id=int(task_id), status="completed")
 
     def record_log_event(
         self,
@@ -394,8 +391,8 @@ class EvalDbService:
         return
 
     def list_latest_scores(self) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_latest_scores(session)
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_latest_scores(conn)
 
     def list_scores_by_dataset(
         self,
@@ -405,9 +402,9 @@ class EvalDbService:
         is_param_search: bool,
     ) -> list[dict[str, Any]]:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             return self._repo.fetch_scores_by_benchmark(
-                session,
+                conn,
                 benchmark_name=benchmark_name,
                 benchmark_split=benchmark_split,
                 model_name=model,
@@ -423,9 +420,9 @@ class EvalDbService:
         is_cot: bool,
     ) -> bool:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             latest = self._repo.fetch_latest_task_by_names(
-                session,
+                conn,
                 benchmark_name=benchmark_name,
                 benchmark_split=benchmark_split,
                 model_name=model,
@@ -437,7 +434,7 @@ class EvalDbService:
             task_id = latest.get("task_id")
             if status == "completed":
                 return False
-            if isinstance(task_id, int) and self._repo.task_has_score(session, task_id=task_id):
+            if isinstance(task_id, int) and self._repo.task_has_score(conn, task_id=task_id):
                 return False
         return True
 
@@ -446,9 +443,9 @@ class EvalDbService:
         *,
         task_id: str,
     ) -> int:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             return self._repo.count_completions(
-                session,
+                conn,
                 task_id=int(task_id),
             )
 
@@ -457,9 +454,9 @@ class EvalDbService:
         *,
         task_id: str,
     ) -> list[dict[str, Any]]:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             rows = self._repo.fetch_completions(
-                session,
+                conn,
                 task_id=int(task_id),
             )
         payloads: list[dict[str, Any]] = []
@@ -493,9 +490,9 @@ class EvalDbService:
         *,
         task_id: str,
     ) -> set[tuple[int, int]]:
-        with get_session() as session:
+        with self._db.get_connection() as conn:
             rows = self._repo.fetch_completion_keys(
-                session,
+                conn,
                 task_id=int(task_id),
             )
         return set(rows)
@@ -505,16 +502,16 @@ class EvalDbService:
         *,
         task_id: str,
     ) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_eval_payloads(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_eval_payloads(conn, task_id=int(task_id))
 
     def get_score_payload(
         self,
         *,
         task_id: str,
     ) -> dict[str, Any] | None:
-        with get_session() as session:
-            return self._repo.fetch_score_by_task(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_score_by_task(conn, task_id=int(task_id))
 
     def list_log_payloads(
         self,
@@ -524,37 +521,37 @@ class EvalDbService:
         return []
 
     def get_task_payload(self, *, task_id: str) -> dict[str, Any] | None:
-        with get_session() as session:
-            return self._repo.fetch_task(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_task(conn, task_id=int(task_id))
 
     def get_task_bundle(self, *, task_id: str) -> dict[str, Any] | None:
-        with get_session() as session:
-            task = self._repo.fetch_task(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            task = self._repo.fetch_task(conn, task_id=int(task_id))
             if not task:
                 return None
             model_id = task.get("model_id")
             benchmark_id = task.get("benchmark_id")
-            model = self._repo.fetch_model(session, model_id=int(model_id)) if model_id else None
+            model = self._repo.fetch_model(conn, model_id=int(model_id)) if model_id else None
             benchmark = (
-                self._repo.fetch_benchmark(session, benchmark_id=int(benchmark_id)) if benchmark_id else None
+                self._repo.fetch_benchmark(conn, benchmark_id=int(benchmark_id)) if benchmark_id else None
             )
             return {"task": task, "model": model, "benchmark": benchmark}
 
     def list_completions_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_completions_rows(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_completions_rows(conn, task_id=int(task_id))
 
     def list_eval_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_eval_rows(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_eval_rows(conn, task_id=int(task_id))
 
     def list_scores_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_scores_rows(session, task_id=int(task_id))
+        with self._db.get_connection() as conn:
+            return self._repo.fetch_scores_rows(conn, task_id=int(task_id))
 
     def update_task_status(self, *, task_id: str, status: str) -> None:
-        with get_session() as session:
-            self._repo.update_task_status(session, task_id=int(task_id), status=status)
+        with self._db.get_connection() as conn:
+            self._repo.update_task_status(conn, task_id=int(task_id), status=status)
 
     @staticmethod
     def _build_completion_context(payload: dict[str, Any]) -> dict[str, Any]:
