@@ -187,13 +187,14 @@ class EvalDbService:
                 ),
                 self._build_completion_context(payload),
             )
+            status = payload.get("_stage", "answer")
             self._repo.insert_completion(
                 session,
                 task_id=int(task_id),
                 payload=payload,
                 context=context,
                 created_at=self._now_cn(),
-                status="final_answer",
+                status=status,
             )
 
     def ingest_eval_payloads(

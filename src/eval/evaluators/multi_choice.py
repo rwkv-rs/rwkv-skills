@@ -205,6 +205,7 @@ class MultipleChoicePipeline:
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
             prompts = [self._format_prompt(record, cot_prompt_template) for _, record in chunk]
+
             def _on_cot_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
                 if local_idx < 0 or local_idx >= len(chunk):
@@ -216,6 +217,17 @@ class MultipleChoicePipeline:
                     completion=output.text,
                     stop_reason=output.finish_reason,
                 )
+                cot_payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=record_idx,
+                    repeat_index=0,
+                    sampling_config=sampling_config,
+                    stages=[cot_stage],
+                ).as_payload()
+                cot_payload["_stage"] = "cot"
+                if on_record is not None:
+                    on_record(cot_payload)
                 final_prompt = (
                     (final_answer_template or EN_FINAL_ANSWER_TEMPLATE)
                     .replace("<Q>", cot_prompt)
@@ -238,6 +250,7 @@ class MultipleChoicePipeline:
                     sampling_config=sampling_config,
                     stages=[cot_stage, final_stage],
                 ).as_payload()
+                payload["_stage"] = "answer"
                 if on_record is not None:
                     on_record(payload)
                 payloads.append(payload)

@@ -156,11 +156,35 @@ class FreeResponsePipeline:
             cot_prompts = [
                 cot_prompt_template.replace("<Q>", record.question) for _, record, _ in chunk
             ]
+
+            def _on_cot_complete(output: GenerationOutput) -> None:
+                local_idx = output.prompt_index
+                if local_idx < 0 or local_idx >= len(chunk):
+                    return
+                problem_idx, _record, sample_id = chunk[local_idx]
+                cot_stage = StageRecord(
+                    prompt=cot_prompts[local_idx],
+                    completion=output.text,
+                    stop_reason=output.finish_reason,
+                )
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=problem_idx,
+                    repeat_index=sample_id,
+                    sampling_config=sampling_config,
+                    stages=[cot_stage],
+                ).as_payload()
+                payload["_stage"] = "cot"
+                if on_record is not None:
+                    on_record(payload)
+
             cot_outputs = self.engine.generate(
                 cot_prompts,
                 sampling=cot_sampling,
                 batch_size=min(batch_size, len(cot_prompts)),
                 progress_desc="Generating CoT",
+                on_complete=_on_cot_complete,
             )
             cot_by_idx = {item.prompt_index: item for item in cot_outputs}
 
@@ -201,6 +225,7 @@ class FreeResponsePipeline:
                     sampling_config=sampling_config,
                     stages=stages,
                 ).as_payload()
+                payload["_stage"] = "answer"
                 if on_record is not None:
                     on_record(payload)
                 payloads.append(payload)
