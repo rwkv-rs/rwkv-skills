@@ -178,15 +178,7 @@ class EvalDbService:
         task_id: str,
     ) -> None:
         with get_session() as session:
-            context = self._merge_completion_context(
-                self._repo.fetch_completion_context(
-                    session,
-                    task_id=int(task_id),
-                    sample_index=self._parse_index(payload.get("sample_index", 0)),
-                    repeat_index=self._parse_index(payload.get("repeat_index", 0)),
-                ),
-                self._build_completion_context(payload),
-            )
+            context = self._build_completion_context(payload)
             status = payload.get("_stage", "answer")
             self._repo.insert_completion(
                 session,
@@ -407,47 +399,6 @@ class EvalDbService:
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
-
-    @staticmethod
-    def _merge_completion_context(
-        existing: dict[str, Any] | None,
-        incoming: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        if not isinstance(existing, dict) and not isinstance(incoming, dict):
-            return {"stages": [], "sampling_config": {}}
-        base = existing if isinstance(existing, dict) else {}
-        update = incoming if isinstance(incoming, dict) else {}
-
-        stages_by_index: dict[int, dict[str, Any]] = {}
-        base_stages = base.get("stages")
-        if isinstance(base_stages, list):
-            for idx, stage in enumerate(base_stages, start=1):
-                if isinstance(stage, dict):
-                    stages_by_index[idx] = stage
-        update_stages = update.get("stages")
-        if isinstance(update_stages, list):
-            for idx, stage in enumerate(update_stages, start=1):
-                if isinstance(stage, dict):
-                    stages_by_index[idx] = stage
-
-        merged_stages = [stages_by_index[idx] for idx in sorted(stages_by_index)]
-
-        sampling_config: dict[str, Any] = {}
-        base_sampling = base.get("sampling_config")
-        if isinstance(base_sampling, dict):
-            sampling_config.update(base_sampling)
-        update_sampling = update.get("sampling_config")
-        if isinstance(update_sampling, dict):
-            sampling_config.update(update_sampling)
-
-        return {"stages": merged_stages, "sampling_config": sampling_config}
-
-    @staticmethod
-    def _parse_index(value: object) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
 
     @staticmethod
     def _fallback_parse_model_tags(raw: str | None) -> tuple[str | None, str | None, str | None]:

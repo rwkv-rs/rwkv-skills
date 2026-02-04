@@ -429,21 +429,6 @@ class EvalDbRepository:
         )
         session.execute(stmt)
 
-    def fetch_completion_context(
-        self,
-        session: Session,
-        *,
-        task_id: int,
-        sample_index: int,
-        repeat_index: int,
-    ) -> dict[str, Any] | None:
-        stmt = select(Completion.context).where(
-            Completion.task_id == task_id,
-            Completion.sample_index == sample_index,
-            Completion.repeat_index == repeat_index,
-        )
-        return session.execute(stmt).scalar_one_or_none()
-
     def insert_eval(
         self,
         session: Session,
