@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Process orchestration utilities for scheduler."""
 
-import os
 import queue
 import signal
 import subprocess
@@ -14,29 +13,12 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .perf import perf_logger
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.db.database import DatabaseManager
-from src.db.eval_db_service import EvalDbService
 from .state import stop_all_jobs
 
 
 def log_job_event(event: str, job_id: str, **payload: object) -> None:
     if perf_logger.enabled:
         perf_logger.log(event, job_id=job_id, **payload)
-    db = DatabaseManager.instance()
-    db.initialize(DEFAULT_DB_CONFIG)
-    service = EvalDbService(db)
-    version_id = os.environ.get("RWKV_SKILLS_VERSION_ID")
-    normalized = {
-        key: (str(value) if isinstance(value, Path) else value)
-        for key, value in payload.items()
-    }
-    service.record_log_event(
-        event=event,
-        job_id=job_id,
-        payload=normalized,
-        version_id=version_id,
-    )
 
 
 @dataclass

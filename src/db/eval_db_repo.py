@@ -146,17 +146,6 @@ class EvalDbRepository:
         stmt = update(Task).where(Task.task_id == task_id).values(status=status)
         session.execute(stmt)
 
-    def update_benchmark_num_samples_for_task(
-        self,
-        session: Session,
-        *,
-        task_id: int,
-        num_samples: int,
-    ) -> None:
-        subquery = select(Task.benchmark_id).where(Task.task_id == task_id).scalar_subquery()
-        stmt = update(Benchmark).where(Benchmark.benchmark_id == subquery).values(num_samples=num_samples)
-        session.execute(stmt)
-
     def get_latest_task_id(
         self,
         session: Session,
@@ -316,32 +305,6 @@ class EvalDbRepository:
         for completions_id, sample_index, repeat_index in rows:
             mapping[(int(sample_index), int(repeat_index))] = int(completions_id)
         return mapping
-
-    def fetch_eval_payloads(
-        self,
-        session: Session,
-        *,
-        task_id: int,
-    ) -> list[dict[str, Any]]:
-        stmt = (
-            select(
-                Benchmark.benchmark_name.label("benchmark_name"),
-                Benchmark.benchmark_split.label("benchmark_split"),
-                Completion.sample_index,
-                Completion.repeat_index,
-                Completion.context,
-                Eval.answer,
-                Eval.ref_answer,
-                Eval.is_passed,
-                Eval.fail_reason,
-            )
-            .join(Completion, Completion.completions_id == Eval.completions_id)
-            .join(Task, Task.task_id == Completion.task_id)
-            .join(Benchmark, Benchmark.benchmark_id == Task.benchmark_id)
-            .where(Task.task_id == task_id)
-            .order_by(Completion.sample_index.asc(), Completion.repeat_index.asc())
-        )
-        return list(session.execute(stmt).mappings().all())
 
     def fetch_score_by_task(
         self,

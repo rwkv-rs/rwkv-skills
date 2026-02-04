@@ -5,7 +5,6 @@ import os
 import re
 import subprocess
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from zoneinfo import ZoneInfo
@@ -30,25 +29,6 @@ class EvalDbService:
     @staticmethod
     def _now_cn() -> datetime:
         return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None)
-
-    def get_or_create_version(
-        self,
-        *,
-        job_name: str | None,
-        job_id: str | None,
-        dataset: str,
-        model: str,
-        is_param_search: bool,
-        allow_resume: bool = True,
-    ) -> str:
-        return self.get_or_create_task(
-            job_name=job_name,
-            job_id=job_id,
-            dataset=dataset,
-            model=model,
-            is_param_search=is_param_search,
-            allow_resume=allow_resume,
-        )
 
     def get_or_create_task(
         self,
@@ -191,71 +171,6 @@ class EvalDbService:
                 num_samples=num_samples,
             )
 
-    def ingest_completions(
-        self,
-        *,
-        completions_path: str | Path,
-        task_id: str,
-    ) -> int:
-        path = Path(completions_path)
-        if not path.exists():
-            return 0
-        inserted = 0
-        with path.open("r", encoding="utf-8") as fh, get_session() as session:
-            for line in fh:
-                text = line.strip()
-                if not text:
-                    continue
-                payload = json.loads(text)
-                context = self._merge_completion_context(
-                    self._repo.fetch_completion_context(
-                        session,
-                        task_id=int(task_id),
-                        sample_index=self._parse_index(payload.get("sample_index", 0)),
-                        repeat_index=self._parse_index(payload.get("repeat_index", 0)),
-                    ),
-                    self._build_completion_context(payload),
-                )
-                self._repo.insert_completion(
-                    session,
-                    task_id=int(task_id),
-                    payload=payload,
-                    context=context,
-                    created_at=self._now_cn(),
-                    status="final_answer",
-                )
-                inserted += 1
-        return inserted
-
-    def ingest_completion_payloads(
-        self,
-        *,
-        payloads: Iterable[dict[str, Any]],
-        task_id: str,
-    ) -> int:
-        inserted = 0
-        with get_session() as session:
-            for payload in payloads:
-                context = self._merge_completion_context(
-                    self._repo.fetch_completion_context(
-                        session,
-                        task_id=int(task_id),
-                        sample_index=self._parse_index(payload.get("sample_index", 0)),
-                        repeat_index=self._parse_index(payload.get("repeat_index", 0)),
-                    ),
-                    self._build_completion_context(payload),
-                )
-                self._repo.insert_completion(
-                    session,
-                    task_id=int(task_id),
-                    payload=payload,
-                    context=context,
-                    created_at=self._now_cn(),
-                    status="final_answer",
-                )
-                inserted += 1
-        return inserted
-
     def insert_completion_payload(
         self,
         *,
@@ -281,37 +196,6 @@ class EvalDbService:
                 status="final_answer",
             )
 
-    def ingest_eval(
-        self,
-        *,
-        eval_path: str | Path,
-        task_id: str,
-    ) -> int:
-        path = Path(eval_path)
-        if not path.exists():
-            return 0
-        inserted = 0
-        with path.open("r", encoding="utf-8") as fh, get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
-            for line in fh:
-                text = line.strip()
-                if not text:
-                    continue
-                payload = json.loads(text)
-                completions_id = mapping.get(
-                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
-                )
-                if completions_id is None:
-                    continue
-                self._repo.insert_eval(
-                    session,
-                    completions_id=completions_id,
-                    payload=payload,
-                    created_at=self._now_cn(),
-                )
-                inserted += 1
-        return inserted
-
     def ingest_eval_payloads(
         self,
         *,
@@ -336,44 +220,6 @@ class EvalDbService:
                 inserted += 1
         return inserted
 
-    def insert_eval_payload(
-        self,
-        *,
-        payload: dict[str, Any],
-        task_id: str,
-    ) -> None:
-        with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
-            completions_id = mapping.get(
-                (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
-            )
-            if completions_id is None:
-                return
-            self._repo.insert_eval(
-                session,
-                completions_id=completions_id,
-                payload=payload,
-                created_at=self._now_cn(),
-            )
-
-    def record_score(
-        self,
-        *,
-        score_path: str | Path,
-        task_id: str,
-    ) -> None:
-        path = Path(score_path)
-        if not path.exists():
-            return
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        with get_session() as session:
-            self._repo.insert_score(
-                session,
-                task_id=int(task_id),
-                payload=payload,
-            )
-            self._repo.update_task_status(session, task_id=int(task_id), status="completed")
-
     def record_score_payload(
         self,
         *,
@@ -387,17 +233,6 @@ class EvalDbService:
                 payload=payload,
             )
             self._repo.update_task_status(session, task_id=int(task_id), status="completed")
-
-    def record_log_event(
-        self,
-        *,
-        event: str,
-        job_id: str,
-        payload: dict[str, Any],
-        version_id: str | None = None,
-        task_id: str | None = None,
-    ) -> None:
-        return
 
     def list_latest_scores(self) -> list[dict[str, Any]]:
         with get_session() as session:
@@ -519,14 +354,6 @@ class EvalDbService:
             )
         return set(rows)
 
-    def list_eval_payloads(
-        self,
-        *,
-        task_id: str,
-    ) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_eval_payloads(session, task_id=int(task_id))
-
     def get_score_payload(
         self,
         *,
@@ -534,17 +361,6 @@ class EvalDbService:
     ) -> dict[str, Any] | None:
         with get_session() as session:
             return self._repo.fetch_score_by_task(session, task_id=int(task_id))
-
-    def list_log_payloads(
-        self,
-        *,
-        task_id: str,
-    ) -> list[dict[str, Any]]:
-        return []
-
-    def get_task_payload(self, *, task_id: str) -> dict[str, Any] | None:
-        with get_session() as session:
-            return self._repo.fetch_task(session, task_id=int(task_id))
 
     def get_task_bundle(self, *, task_id: str) -> dict[str, Any] | None:
         with get_session() as session:
