@@ -113,7 +113,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
     parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
@@ -150,8 +149,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    if not DEFAULT_DB_CONFIG.enabled:
-        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     db_service = EvalDbService(db)
@@ -242,7 +239,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         writer = CompletionWriteWorker(
             service=db_service,
             task_id=task_id,
-            batch_size=args.db_write_batch,
             max_queue=args.db_write_queue,
         )
         try:

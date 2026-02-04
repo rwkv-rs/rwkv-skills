@@ -149,7 +149,7 @@ python -m src.bin.migrate_old_results --source results_old
 ### C.2 调度器队列预览
 用途：确认 8 个入口都会被调度、数据集路径可解析。
 ```bash
-RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
+uv run rwkv-skills-scheduler queue \
   --model-select all \
   --models "<MODEL_PATH>" \
   --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
@@ -158,7 +158,7 @@ RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
 ### C.3 执行调度
 用途：实际运行 8 个入口并写入数据库。
 ```bash
-RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler dispatch \
+uv run rwkv-skills-scheduler dispatch \
   --model-select all \
   --models "<MODEL_PATH>" \
   --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
@@ -174,4 +174,3 @@ rwkv-skills-scheduler stop --all
 
 ### 多模型续跑逻辑
 以 `model + dataset(+cot)` 为单位判断：若已有分数则下次调度新建 task 重跑；若无分数则续跑最近的 task。任务失败会标记为 `failed`，下次调度在未产出分数前仍会续跑该 task。
-

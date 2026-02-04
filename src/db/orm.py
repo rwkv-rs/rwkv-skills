@@ -35,8 +35,6 @@ def _build_db_url(config: DBConfig) -> str:
 
 def init_orm(config: DBConfig) -> None:
     global _ENGINE, _SESSION_FACTORY
-    if not config.enabled:
-        return
     if _ENGINE is not None and _SESSION_FACTORY is not None:
         return
     _ENGINE = create_engine(_build_db_url(config), pool_pre_ping=True, future=True)

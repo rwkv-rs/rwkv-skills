@@ -153,7 +153,7 @@ python -m src.bin.migrate_old_results --source results_old
 ### C.2 Queue preview
 Purpose: verify all 8 entries are schedulable and dataset paths resolve.
 ```bash
-RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
+uv run rwkv-skills-scheduler queue \
   --model-select all \
   --models "<MODEL_PATH>" \
   --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
@@ -162,7 +162,7 @@ RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler queue \
 ### C.3 Dispatch
 Purpose: run all 8 entries and write into the database.
 ```bash
-RWKV_DB_ENABLED=1 uv run rwkv-skills-scheduler dispatch \
+uv run rwkv-skills-scheduler dispatch \
   --model-select all \
   --models "<MODEL_PATH>" \
   --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
@@ -178,5 +178,3 @@ rwkv-skills-scheduler stop --all
 
 ### Multi-model resume logic
 For each model+dataset(+cot) combination, if a score exists, a new task is created on the next dispatch; if no score exists, the scheduler resumes the latest task. On failures, the task status becomes `failed`, and the next dispatch will resume it unless a score appears.
-
-

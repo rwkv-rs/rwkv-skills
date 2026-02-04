@@ -26,8 +26,6 @@ class DatabaseManager:
         return cls._instance
 
     def initialize(self, config: DBConfig) -> None:
-        if not config.enabled:
-            return
         if self._pool is not None:
             return
         self._config = config
