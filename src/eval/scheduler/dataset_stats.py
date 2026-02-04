@@ -21,9 +21,7 @@ def count_jsonl_records(path: Path) -> int:
 
 
 def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = None) -> None:
-    """Persist dataset sample count into benchmark table (if DB enabled)."""
-    if not DEFAULT_DB_CONFIG.enabled:
-        return
+    """Persist dataset sample count into benchmark table."""
     slug = canonical_slug(dataset_slug or infer_dataset_slug_from_path(str(dataset_path)))
     if not slug:
         return

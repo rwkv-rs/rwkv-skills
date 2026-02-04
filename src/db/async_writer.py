@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any
 
 from .eval_db_service import EvalDbService
 
@@ -14,14 +14,12 @@ class CompletionWriteWorker:
         *,
         service: EvalDbService,
         task_id: str,
-        batch_size: int = 128,
         max_queue: int = 4096,
         max_retries: int = 3,
         retry_backoff_s: float = 0.5,
     ) -> None:
         self._service = service
         self._task_id = task_id
-        self._batch_size = max(1, int(batch_size))
         self._queue: queue.Queue[dict[str, Any] | object] = queue.Queue(maxsize=max_queue)
         self._stop = object()
         self._exc: BaseException | None = None
@@ -46,34 +44,24 @@ class CompletionWriteWorker:
             raise RuntimeError("DB writer thread failed") from self._exc
 
     def _run(self) -> None:
-        batch: list[dict[str, Any]] = []
         try:
             while True:
                 item = self._queue.get()
                 try:
                     if item is self._stop:
-                        if batch:
-                            self._flush(batch)
-                            batch = []
                         break
                     if isinstance(item, dict):
-                        batch.append(item)
-                        if len(batch) >= self._batch_size:
-                            self._flush(batch)
-                            batch = []
+                        self._flush(item)
                 finally:
                     self._queue.task_done()
         except BaseException as exc:
             self._exc = exc
 
-    def _flush(self, batch: Iterable[dict[str, Any]]) -> None:
+    def _flush(self, payload: dict[str, Any]) -> None:
         attempts = 0
         while True:
             try:
-                self._service.ingest_completion_payloads(
-                    payloads=batch,
-                    task_id=self._task_id,
-                )
+                self._service.insert_completion_payload(payload=payload, task_id=self._task_id)
                 return
             except Exception as exc:
                 attempts += 1

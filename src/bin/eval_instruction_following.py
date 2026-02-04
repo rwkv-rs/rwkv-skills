@@ -76,7 +76,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
-    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
     parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument(
         "--no-param-search",
@@ -115,8 +114,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         sampling = replace(sampling, stop_tokens=tuple(args.stop_token))
     ban_tokens = tuple(args.ban_token) if args.ban_token else None
 
-    if not DEFAULT_DB_CONFIG.enabled:
-        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)
@@ -143,7 +140,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     writer = CompletionWriteWorker(
         service=service,
         task_id=task_id,
-        batch_size=args.db_write_batch,
         max_queue=args.db_write_queue,
     )
     try:

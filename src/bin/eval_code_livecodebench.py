@@ -38,7 +38,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, help="Override sampling top-p")
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
-    parser.add_argument("--db-write-batch", type=int, default=1, help="DB completion write batch size")
     parser.add_argument("--db-write-queue", type=int, default=1, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
@@ -92,8 +91,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     default_pass_k = (1,)
     pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
     sample_limit = batch_size if args.probe_only else args.max_samples
-    if not DEFAULT_DB_CONFIG.enabled:
-        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)
@@ -124,7 +121,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     writer = CompletionWriteWorker(
         service=service,
         task_id=task_id,
-        batch_size=args.db_write_batch,
         max_queue=args.db_write_queue,
     )
     records = JsonlCodeGenerationLoader(str(dataset_path)).load()

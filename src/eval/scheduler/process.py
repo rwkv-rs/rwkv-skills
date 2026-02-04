@@ -23,8 +23,6 @@ from .state import stop_all_jobs
 def log_job_event(event: str, job_id: str, **payload: object) -> None:
     if perf_logger.enabled:
         perf_logger.log(event, job_id=job_id, **payload)
-    if not DEFAULT_DB_CONFIG.enabled:
-        return
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)

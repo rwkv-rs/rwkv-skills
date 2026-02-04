@@ -50,8 +50,6 @@ _JOB_DETECTION_ALERTS: set[tuple[Path, str]] = set()
 def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, CompletedRecord]]:
     completed: set[CompletedKey] = set()
     records: dict[str, CompletedRecord] = {}
-    if not DEFAULT_DB_CONFIG.enabled:
-        return completed, records
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)

@@ -141,8 +141,6 @@ def _promote_score(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if not DEFAULT_DB_CONFIG.enabled:
-        raise RuntimeError("DB 未启用：当前仅支持数据库写入模式。")
     db = DatabaseManager.instance()
     db.initialize(DEFAULT_DB_CONFIG)
     service = EvalDbService(db)
