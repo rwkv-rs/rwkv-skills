@@ -211,7 +211,7 @@ def _continuous_batching(
     outputs: list[GenerationOutput] = []
     flashinfer_ok = True
     start_time = time.time()
-    tokens_generated = 0
+    tokens_processed = 0
     window_start_time = start_time
     window_start_tokens = 0
     throughput_ema: float | None = None
@@ -250,7 +250,6 @@ def _continuous_batching(
             if not reached_stop:
                 task.pending_tokens.append(new_token)
                 task.generated_tokens.append(new_token)
-                tokens_generated += 1
             if reached_stop or reached_length:
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
@@ -282,27 +281,28 @@ def _continuous_batching(
             for remove_idx in sorted(accomplished, reverse=True):
                 _remove_slot(remove_idx)
 
-        now = time.time()
-        elapsed = max(now - start_time, 1e-6)
-        window_elapsed = now - window_start_time
-        if window_elapsed >= 0.5:
-            recent_tokens = tokens_generated - window_start_tokens
-            inst_throughput = recent_tokens / max(window_elapsed, 1e-6)
-            throughput_ema = inst_throughput if throughput_ema is None else 0.9 * throughput_ema + 0.1 * inst_throughput
-            window_start_time = now
-            window_start_tokens = tokens_generated
-        inst_display = throughput_ema if throughput_ema is not None else 0.0
-        pbar.set_postfix_str(f"tok/s avg {tokens_generated / elapsed:.1f} cur {inst_display:.1f}")
-        pbar.update(0)
-
-        if not active_tasks:
-            break
-
         next_tokens: list[list[int]] = []
         active_count = len(active_tasks)
         for task in active_tasks:
             token = task.pending_tokens.popleft()
             next_tokens.append([token])
+        tokens_processed += active_count
+
+        now = time.time()
+        elapsed = max(now - start_time, 1e-6)
+        window_elapsed = now - window_start_time
+        if window_elapsed >= 0.5:
+            recent_tokens = tokens_processed - window_start_tokens
+            inst_throughput = recent_tokens / max(window_elapsed, 1e-6)
+            throughput_ema = inst_throughput if throughput_ema is None else 0.9 * throughput_ema + 0.1 * inst_throughput
+            window_start_time = now
+            window_start_tokens = tokens_processed
+        inst_display = throughput_ema if throughput_ema is not None else 0.0
+        pbar.set_postfix_str(f"tok/s avg {tokens_processed / elapsed:.1f} cur {inst_display:.1f}")
+        pbar.update(0)
+
+        if not active_tasks:
+            break
 
         state_view = [
             states[0][:, :, :active_count, :],
