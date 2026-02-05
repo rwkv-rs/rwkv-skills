@@ -20,7 +20,7 @@ from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
 from src.eval.scheduler.dataset_utils import canonical_slug
-from src.db.database import DatabaseManager
+from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
 
@@ -141,9 +141,9 @@ def _promote_score(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    db = DatabaseManager.instance()
-    db.initialize(DEFAULT_DB_CONFIG)
-    service = EvalDbService(db)
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
     model_name = Path(args.model_path).stem
     benchmarks = tuple(canonical_slug(b) for b in args.benchmarks if b)
     if len(benchmarks) < 2:

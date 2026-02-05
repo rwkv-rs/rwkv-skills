@@ -22,7 +22,7 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.db.database import DatabaseManager
+from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
@@ -179,33 +179,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     generate_pass_k = (1,) if args.probe_only else pass_k_final
     samples_per_task = max(_max_k(pass_k_final), _max_k(avg_k_final), 1)
     expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
-    db = DatabaseManager.instance()
-    db.initialize(DEFAULT_DB_CONFIG)
-    service = EvalDbService(db)
-    allow_resume = service.should_allow_resume(
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
+
+    # 三层级联检索：一次查询获取所有续跑信息
+    ctx = service.get_resume_context(
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
-        is_cot=True,
     )
     sampling_payload = {
         "cot": sampling_config_to_dict(cot_sampling),
         "final": sampling_config_to_dict(final_sampling),
     }
-    task_id = service.get_or_create_task(
+    task_id = service.create_task_from_context(
+        ctx=ctx,
         job_name="eval_free_response_judge",
-        job_id=ensure_job_id("free_response_judge"),
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
         sampling_config=sampling_payload,
-        allow_resume=allow_resume,
     )
+    skip_keys = ctx.completed_keys
+
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
-    skip_keys = service.list_completion_keys(
-        task_id=task_id,
-    )
 
     if args.probe_only:
         batch_size = max(1, args.batch_size)

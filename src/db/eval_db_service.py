@@ -4,12 +4,12 @@ import json
 import os
 import re
 import subprocess
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from zoneinfo import ZoneInfo
-from src.db.database import DatabaseManager
-from src.db.orm import get_session, init_orm
+from src.db.orm import get_session, init_orm, transaction
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
@@ -19,16 +19,210 @@ from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_
 
 from .eval_db_repo import EvalDbRepository
 
+# Git SHA cache - resolved once per process
+_GIT_SHA_CACHE: str | None = None
+
+
+def _get_cached_git_sha() -> str:
+    """Get git SHA with caching - only resolves once per process."""
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is not None:
+        return _GIT_SHA_CACHE
+    env_sha = os.environ.get("RWKV_GIT_SHA", "").strip()
+    if env_sha:
+        _GIT_SHA_CACHE = env_sha
+        return _GIT_SHA_CACHE
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(REPO_ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    sha = result.stdout.strip()
+    if not sha:
+        raise RuntimeError("git rev-parse HEAD returned empty output")
+    _GIT_SHA_CACHE = sha
+    return _GIT_SHA_CACHE
+
+
+@dataclass(slots=True)
+class ResumeContext:
+    """三层级联检索结果：一次查询获取所有续跑信息。
+
+    Layer 1: benchmark_id, model_id (实体标识)
+    Layer 2: task_id, can_resume (任务状态)
+    Layer 3: completed_keys (已完成的样本)
+    """
+    benchmark_id: int | None = None
+    model_id: int | None = None
+    task_id: int | None = None
+    can_resume: bool = False
+    completed_keys: set[tuple[int, int]] = field(default_factory=set)
+
+    @property
+    def is_new_task(self) -> bool:
+        """是否需要创建新任务"""
+        return self.task_id is None or not self.can_resume
+
 
 class EvalDbService:
-    def __init__(self, db: DatabaseManager) -> None:
-        self._db = db
+    """Database service for evaluation tasks.
+
+    Usage:
+        # Option 1: Auto-initialize with default config
+        service = EvalDbService()
+
+        # Option 2: Initialize with custom config
+        init_orm(custom_config)
+        service = EvalDbService()
+    """
+
+    def __init__(self) -> None:
         self._repo = EvalDbRepository()
-        init_orm(db.config or DEFAULT_DB_CONFIG)
+        # Auto-initialize if not already done
+        init_orm()
 
     @staticmethod
     def _now_cn() -> datetime:
         return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None)
+
+    def get_resume_context(
+        self,
+        *,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+    ) -> ResumeContext:
+        """三层级联检索：一次查询获取所有续跑信息。
+
+        Layer 1: 查找/创建 benchmark 和 model
+        Layer 2: 查找最新的未完成 task
+        Layer 3: 获取已完成的 completion keys
+        """
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
+        normalized = _normalize_model_identifier(model)
+        arch, data_version, num_params = _parse_model_tags(normalized)
+        if not arch or not data_version or not num_params:
+            fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
+            arch = arch or fallback_arch
+            data_version = data_version or fallback_data
+            num_params = num_params or fallback_params
+        arch_version = arch or "unknown"
+        data_version = data_version or "unknown"
+        num_params = num_params or "unknown"
+
+        ctx = ResumeContext()
+
+        with get_session() as session:
+            # Layer 1: benchmark & model
+            ctx.benchmark_id = self._repo.get_benchmark_id(
+                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if ctx.benchmark_id is None:
+                resolved_samples = self._resolve_dataset_sample_count(dataset)
+                ctx.benchmark_id = self._repo.insert_benchmark(
+                    session,
+                    benchmark_name=benchmark_name,
+                    benchmark_split=benchmark_split,
+                    url=None,
+                    status="Todo",
+                    num_samples=resolved_samples if resolved_samples is not None else 0,
+                )
+            else:
+                existing = self._parse_num_samples(
+                    self._repo.get_benchmark_num_samples(session, benchmark_id=ctx.benchmark_id)
+                )
+                if not existing:
+                    resolved_samples = self._resolve_dataset_sample_count(dataset)
+                    if resolved_samples is not None and resolved_samples > 0:
+                        self._repo.update_benchmark_num_samples(
+                            session,
+                            benchmark_id=ctx.benchmark_id,
+                            num_samples=resolved_samples,
+                        )
+
+            ctx.model_id = self._repo.get_model_id(
+                session,
+                model_name=model,
+                arch_version=arch_version,
+                data_version=data_version,
+                num_params=num_params,
+            )
+            if ctx.model_id is None:
+                ctx.model_id = self._repo.insert_model(
+                    session,
+                    model_name=model,
+                    arch_version=arch_version,
+                    data_version=data_version,
+                    num_params=num_params,
+                )
+
+            # Layer 2: 查找可续跑的 task
+            ctx.task_id = self._repo.get_latest_task_id(
+                session,
+                benchmark_id=ctx.benchmark_id,
+                model_id=ctx.model_id,
+                is_param_search=is_param_search,
+            )
+            if ctx.task_id is not None:
+                has_score = self._repo.task_has_score(session, task_id=ctx.task_id)
+                ctx.can_resume = not has_score
+                # Layer 3: 获取已完成的 keys
+                if ctx.can_resume:
+                    rows = self._repo.fetch_completion_keys(session, task_id=ctx.task_id)
+                    ctx.completed_keys = set(rows)
+
+        return ctx
+
+    def create_task_from_context(
+        self,
+        *,
+        ctx: ResumeContext,
+        job_name: str | None,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+        sampling_config: dict[str, Any] | None = None,
+    ) -> str:
+        """基于 ResumeContext 创建或恢复任务。
+
+        如果 ctx.can_resume 为 True，返回已有的 task_id；
+        否则创建新任务。
+        """
+        if ctx.can_resume and ctx.task_id is not None:
+            with get_session() as session:
+                self._repo.update_task_status(session, task_id=ctx.task_id, status="running")
+            return str(ctx.task_id)
+
+        benchmark_name, _ = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
+        git_sha = _get_cached_git_sha()
+        config_path = config_path_for_benchmark(benchmark_name, model)
+        if config_path.exists():
+            config_path_str = str(config_path)
+        else:
+            fallback_path = config_path_for_benchmark(benchmark_name, None)
+            config_path_str = str(fallback_path) if fallback_path.exists() else None
+        desc = os.environ.get("RWKV_TASK_DESC")
+
+        with get_session() as session:
+            task_id = self._repo.insert_task(
+                session,
+                config_path=config_path_str,
+                evaluator=job_name or "",
+                is_param_search=is_param_search,
+                created_at=self._now_cn(),
+                status="running",
+                git_hash=git_sha,
+                model_id=ctx.model_id,
+                benchmark_id=ctx.benchmark_id,
+                desc=desc,
+                sampling_config=sampling_config,
+                log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
+            )
+        return str(task_id)
 
     def get_or_create_task(
         self,
@@ -106,7 +300,7 @@ class EvalDbService:
                     self._repo.update_task_status(session, task_id=latest, status="running")
                     return str(latest)
 
-            git_sha = self._resolve_git_sha()
+            git_sha = _get_cached_git_sha()
             config_path = config_path_for_benchmark(benchmark_name, model)
             if config_path.exists():
                 config_path_str = str(config_path)
@@ -188,6 +382,34 @@ class EvalDbService:
                 created_at=self._now_cn(),
                 status=status,
             )
+
+    def insert_completion_payloads_batch(
+        self,
+        *,
+        payloads: Sequence[dict[str, Any]],
+        task_id: str,
+    ) -> int:
+        """Batch insert multiple completion payloads in a single transaction.
+
+        Returns the number of payloads inserted.
+        """
+        if not payloads:
+            return 0
+        task_id_int = int(task_id)
+        now = self._now_cn()
+        with transaction() as session:
+            for payload in payloads:
+                context = self._build_completion_context(payload)
+                status = payload.get("_stage", "answer")
+                self._repo.insert_completion(
+                    session,
+                    task_id=task_id_int,
+                    payload=payload,
+                    context=context,
+                    created_at=now,
+                    status=status,
+                )
+        return len(payloads)
 
     def ingest_eval_payloads(
         self,
@@ -417,7 +639,6 @@ class EvalDbService:
             num_params = match.group(0)
         return arch, data_version, num_params
 
-
     @staticmethod
     def _parse_num_samples(value: object) -> int | None:
         if value is None:
@@ -445,17 +666,8 @@ class EvalDbService:
 
     @staticmethod
     def _resolve_git_sha() -> str:
-        env_sha = os.environ.get("RWKV_GIT_SHA", "").strip()
-        if env_sha:
-            return env_sha
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(REPO_ROOT),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        sha = result.stdout.strip()
-        if not sha:
-            raise RuntimeError("git rev-parse HEAD returned empty output")
-        return sha
+        """Deprecated: use _get_cached_git_sha() instead."""
+        return _get_cached_git_sha()
+
+
+__all__ = ["EvalDbService", "ResumeContext"]

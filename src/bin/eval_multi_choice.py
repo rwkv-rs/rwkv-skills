@@ -12,7 +12,7 @@ from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.db.database import DatabaseManager
+from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
@@ -44,29 +44,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
 
-    db = DatabaseManager.instance()
-    db.initialize(DEFAULT_DB_CONFIG)
-    service = EvalDbService(db)
-    allow_resume = service.should_allow_resume(
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
+
+    # 三层级联检索：一次查询获取所有续跑信息
+    ctx = service.get_resume_context(
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
-        is_cot=False,
     )
-    task_id = service.get_or_create_task(
+    task_id = service.create_task_from_context(
+        ctx=ctx,
         job_name="eval_multi_choice",
-        job_id=ensure_job_id("multi_choice"),
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
         sampling_config={"mode": "logits_only"},
-        allow_resume=allow_resume,
     )
+    skip_keys = ctx.completed_keys
+
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
-    skip_keys = service.list_completion_keys(
-        task_id=task_id,
-    )
     writer = CompletionWriteWorker(
         service=service,
         task_id=task_id,

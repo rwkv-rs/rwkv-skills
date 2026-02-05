@@ -20,7 +20,7 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.db.database import DatabaseManager
+from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
@@ -146,9 +146,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    db = DatabaseManager.instance()
-    db.initialize(DEFAULT_DB_CONFIG)
-    db_service = EvalDbService(db)
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    db_service = EvalDbService()
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
