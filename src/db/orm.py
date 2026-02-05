@@ -38,6 +38,7 @@ def init_orm(config: DBConfig) -> None:
         return
     _ENGINE = create_engine(_build_db_url(config), pool_pre_ping=True, future=True)
     _SESSION_FACTORY = sessionmaker(bind=_ENGINE, expire_on_commit=False, class_=Session)
+    Base.metadata.create_all(_ENGINE)
 
 
 @contextmanager
