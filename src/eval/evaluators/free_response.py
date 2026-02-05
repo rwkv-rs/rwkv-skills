@@ -3,12 +3,12 @@ from __future__ import annotations
 """Free-form QA 评估流水线：读数据 -> 两阶段生成 -> JSONL 导出。"""
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Callable, Iterable
 
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
@@ -28,46 +28,6 @@ class FreeResponsePipelineResult:
     sample_count: int
     problem_count: int
     payloads: list[dict]
-
-
-_PREFERRED_ANSWER_KEYS = (
-    "expected_answer",
-    "reference_answer",
-    "target",
-    "final_answer",
-)
-
-
-def _normalize_answer_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        normalized = value.strip()
-        return normalized if normalized else None
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and value.is_integer():
-            value = int(value)
-        normalized = str(value)
-        return normalized.strip() or None
-    normalized = str(value).strip()
-    return normalized or None
-
-
-def _resolve_reference_answer(record: FreeAnswerRecord) -> str:
-    metadata = record.metadata or {}
-    for key in _PREFERRED_ANSWER_KEYS:
-        normalized = _normalize_answer_value(metadata.get(key))
-        if normalized:
-            return normalized
-    raw_record = metadata.get("raw_record")
-    if isinstance(raw_record, dict):
-        for key in _PREFERRED_ANSWER_KEYS:
-            normalized = _normalize_answer_value(raw_record.get(key))
-            if normalized:
-                return normalized
-    return record.answer
 
 
 class FreeResponsePipeline:
