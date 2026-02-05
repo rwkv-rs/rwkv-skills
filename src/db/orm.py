@@ -25,17 +25,35 @@ _ENGINE = None
 _SESSION_FACTORY: sessionmaker[Session] | None = None
 
 
-def _build_db_url(config: DBConfig) -> str:
+def _build_db_url(config: DBConfig, dbname: str | None = None) -> str:
+    db = dbname if dbname is not None else config.dbname
     return (
         f"postgresql+psycopg://{config.user}:{config.password}"
-        f"@{config.host}:{config.port}/{config.dbname}"
+        f"@{config.host}:{config.port}/{db}"
     )
+
+
+def _ensure_database_exists(config: DBConfig) -> None:
+    """Connect to 'postgres' db and create target database if it doesn't exist."""
+    admin_engine = create_engine(
+        _build_db_url(config, dbname="postgres"),
+        isolation_level="AUTOCOMMIT",
+    )
+    with admin_engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT 1 FROM pg_database WHERE datname = :dbname"),
+            {"dbname": config.dbname},
+        )
+        if result.fetchone() is None:
+            conn.execute(text(f'CREATE DATABASE "{config.dbname}"'))
+    admin_engine.dispose()
 
 
 def init_orm(config: DBConfig) -> None:
     global _ENGINE, _SESSION_FACTORY
     if _ENGINE is not None and _SESSION_FACTORY is not None:
         return
+    _ensure_database_exists(config)
     _ENGINE = create_engine(_build_db_url(config), pool_pre_ping=True, future=True)
     _SESSION_FACTORY = sessionmaker(bind=_ENGINE, expire_on_commit=False, class_=Session)
     Base.metadata.create_all(_ENGINE)
