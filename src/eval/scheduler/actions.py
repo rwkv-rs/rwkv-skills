@@ -131,6 +131,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
     job_metadata: dict[str, dict[str, object]] = {}
     completed_versions: dict[str, str | None] = {}
     session_completed: set[CompletedKey] = set()
+    overwritten_keys: set[CompletedKey] = set()
     cooldown_until: dict[str, float] = {}
     previous_running: set[str] = set()
     pending_notice_printed = False
