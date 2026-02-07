@@ -11,7 +11,6 @@ from src.eval.scheduler.config import (
     DEFAULT_LOG_DIR,
     DEFAULT_COMPLETION_DIR,
     DEFAULT_EVAL_RESULT_DIR,
-    DEFAULT_CHECK_RESULT_DIR,
     DEFAULT_RUN_LOG_DIR,
 )
 from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
@@ -19,7 +18,6 @@ from src.eval.scheduler.dataset_utils import canonical_slug, safe_slug
 
 COMPLETIONS_ROOT = DEFAULT_COMPLETION_DIR
 EVAL_RESULTS_ROOT = DEFAULT_EVAL_RESULT_DIR
-CHECK_RESULTS_ROOT = DEFAULT_CHECK_RESULT_DIR
 SCORES_ROOT = DEFAULT_LOG_DIR
 CONSOLE_LOG_ROOT = DEFAULT_RUN_LOG_DIR
 PARAM_SEARCH_ROOT = RESULTS_ROOT / "param_search"
@@ -33,7 +31,6 @@ def ensure_results_structure() -> None:
         RESULTS_ROOT,
         COMPLETIONS_ROOT,
         EVAL_RESULTS_ROOT,
-        CHECK_RESULTS_ROOT,
         SCORES_ROOT,
         CONSOLE_LOG_ROOT,
         PARAM_SEARCH_ROOT,
@@ -78,15 +75,6 @@ def eval_details_path(dataset_slug: str, *, is_cot: bool, model_name: str) -> Pa
     rel = _model_dataset_relpath(dataset_slug, is_cot=is_cot, model_name=model_name)
     return _materialize(rel, suffix="_results.jsonl", root=EVAL_RESULTS_ROOT)
 
-def check_details_path(benchmark_name: str, *, model_name: str) -> Path:
-    """Per-benchmark checker output (results/check/{model}/{benchmark}.jsonl)."""
-    ensure_results_structure()
-    model_dir = safe_slug(model_name)
-    bench = safe_slug(benchmark_name)
-    target = CHECK_RESULTS_ROOT / model_dir / f"{bench}.jsonl"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    return target
-
 def param_search_dir(dataset_slug: str, *, model_name: str, root: Path) -> Path:
     ensure_results_structure()
     model_dir = safe_slug(model_name)
@@ -128,7 +116,6 @@ def param_search_scores_trial_path(
 __all__ = [
     "COMPLETIONS_ROOT",
     "EVAL_RESULTS_ROOT",
-    "CHECK_RESULTS_ROOT",
     "CONSOLE_LOG_ROOT",
     "SCORES_ROOT",
     "PARAM_SEARCH_ROOT",
@@ -139,7 +126,6 @@ __all__ = [
     "jsonl_path",
     "scores_path",
     "eval_details_path",
-    "check_details_path",
     "param_search_dir",
     "param_search_completion_trial_path",
     "param_search_eval_trial_path",

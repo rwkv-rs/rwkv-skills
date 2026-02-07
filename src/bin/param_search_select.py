@@ -119,13 +119,21 @@ def _promote_score(
         task=str(source_payload.get("task") or "param_search_select"),
         task_details=task_details,
     )
-    task_id = service.get_or_create_task(
-        job_name="param_search_select",
-        job_id=ensure_job_id("param_search_select"),
+    ctx = service.get_resume_context(
         dataset=str(dest_dataset),
         model=model_name,
         is_param_search=False,
-        allow_resume=False,
+        is_cot=bool(source_payload.get("cot", True)),
+        evaluator="param_search_select",
+    )
+    # param_search_select 总是创建新任务，不续跑
+    ctx.can_resume = False
+    task_id = service.create_task_from_context(
+        ctx=ctx,
+        job_name="param_search_select",
+        dataset=str(dest_dataset),
+        model=model_name,
+        is_param_search=False,
     )
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id

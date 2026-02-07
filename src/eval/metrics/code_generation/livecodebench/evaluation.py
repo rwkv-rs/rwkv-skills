@@ -4,7 +4,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from pathlib import Path
-from typing import Iterable, List, Union
+from typing import Any, Callable, Iterable, List, Union
 
 import numpy as np
 import tqdm
@@ -13,6 +13,16 @@ from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoa
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.schema import make_eval_payload
 from .execution import check_correctness
+
+
+def _parse_index(value: Any, name: str) -> int:
+    """解析 sample_index/repeat_index，失败时抛出异常而非默认值。"""
+    if value is None:
+        raise ValueError(f"{name} is required but got None")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}: {value}") from e
 
 
 def _iter_jsonl(path: str | Path) -> Iterable[dict]:
@@ -141,14 +151,30 @@ def estimate_pass_at_k(
     return np.array([estimator(int(n), int(c), k) for n, c in zip(num_samples_it, num_correct)])
 
 
-def evaluate_livecodebench_dataset(
+def evaluate_livecodebench_streaming(
     completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
     pass_k: Iterable[int] = (1, 5),
     n_workers: int = 4,
     timeout: float = 6.0,
-) -> tuple[dict[str, float], list[dict]]:
+    on_eval: Callable[[dict], None] | None = None,
+    max_pending: int = 256,
+) -> dict[str, float]:
+    """流式评测 LiveCodeBench，边评测��通过 on_eval 回调写入结果。
+
+    Args:
+        completions: completion payloads 的迭代器或 JSONL 文件路径
+        dataset_path: 数据集 JSONL 路径
+        pass_k: 要计算的 pass@k 值
+        n_workers: 并行执行测试的线程数
+        timeout: 每个测试的超时时间
+        on_eval: 每条 eval 结果的回调函数，用于流式写入数据库
+        max_pending: 最大待处理任务数，控制内存使用
+
+    Returns:
+        pass@k 指标字典
+    """
     pass_k_values = tuple(int(val) for val in pass_k)
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
     sample_map: dict[int, dict] = {}
@@ -162,38 +188,96 @@ def evaluate_livecodebench_dataset(
         if difficulty:
             difficulty_map[idx] = difficulty
 
-    results_by_key: dict[tuple[int, int], dict] = {}
+    # 去重：记录已处理的 (sample_index, repeat_index)
+    seen_keys: set[tuple[int, int]] = set()
     grouped: dict[int, list[bool]] = defaultdict(list)
 
+    # 流式处理：使用滑动窗口控制并发
+    pending: dict[int, tuple[int, int, str, str]] = {}  # future_id -> (sample_index, repeat_index, code, ref_answer)
+    future_id = 0
+    processed = 0
+
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = []
-        for payload in tqdm.tqdm(_iter_completions(completions), desc="Reading completions"):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
-            last_stage = _max_stage_index(payload)
-            completion = str(payload.get(f"completion{last_stage}", "") or "")
-            code = _extract_code(completion)
-            sample = sample_map.get(
-                sample_index,
-                {"input_output": json.dumps({"inputs": [], "outputs": [], "fn_name": None})},
-            )
-            futures.append(
-                executor.submit(
-                    check_correctness,
-                    sample_index,
-                    repeat_index,
-                    sample,
-                    code,
-                    timeout,
-                )
-            )
+        futures: dict[Any, int] = {}
+        completion_iter = iter(_iter_completions(completions))
+        exhausted = False
 
-        for future in tqdm.tqdm(as_completed(futures), total=len(futures), desc="Running test suites"):
-            result = future.result()
-            key = (int(result["sample_index"]), int(result["repeat_index"]))
-            results_by_key[key] = result
-            grouped[int(result["sample_index"])].append(bool(result["passed"]))
+        with tqdm.tqdm(desc="Running test suites") as pbar:
+            while True:
+                # 填充任务队列直到达到 max_pending 或输入耗尽
+                while len(futures) < max_pending and not exhausted:
+                    try:
+                        payload = next(completion_iter)
+                    except StopIteration:
+                        exhausted = True
+                        break
 
+                    sample_index = _parse_index(payload.get("sample_index"), "sample_index")
+                    repeat_index = _parse_index(payload.get("repeat_index"), "repeat_index")
+
+                    # 去重
+                    key = (sample_index, repeat_index)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    last_stage = _max_stage_index(payload)
+                    completion = str(payload.get(f"completion{last_stage}", "") or "")
+                    code = _extract_code(completion)
+                    sample = sample_map.get(
+                        sample_index,
+                        {"input_output": json.dumps({"inputs": [], "outputs": [], "fn_name": None})},
+                    )
+
+                    future = executor.submit(
+                        check_correctness,
+                        sample_index,
+                        repeat_index,
+                        sample,
+                        code,
+                        timeout,
+                    )
+                    futures[future] = future_id
+                    pending[future_id] = (sample_index, repeat_index, code, ref_map.get(sample_index, ""))
+                    future_id += 1
+
+                # 如果没有待处理任务，退出
+                if not futures:
+                    break
+
+                # 等待至少一个任务完成
+                done_futures = []
+                for future in as_completed(futures):
+                    done_futures.append(future)
+                    # 每完成一个就处理，保持流式
+                    break
+
+                for future in done_futures:
+                    fid = futures.pop(future)
+                    sample_index, repeat_index, code, ref_answer = pending.pop(fid)
+
+                    result = future.result()
+                    passed = bool(result.get("passed"))
+                    grouped[sample_index].append(passed)
+
+                    # 流式回调写入 eval
+                    if on_eval is not None:
+                        fail_reason = ""
+                        if not passed:
+                            fail_reason = str(result.get("result") or "")
+                        eval_payload = make_eval_payload(
+                            {"sample_index": sample_index, "repeat_index": repeat_index},
+                            is_passed=passed,
+                            fail_reason=fail_reason,
+                            answer=code,
+                            ref_answer=ref_answer,
+                        )
+                        on_eval(eval_payload)
+
+                    processed += 1
+                    pbar.update(1)
+
+    # 计算 pass@k
     total, correct = [], []
     for flags in grouped.values():
         total.append(len(flags))
@@ -208,6 +292,7 @@ def evaluate_livecodebench_dataset(
             continue
         pass_at_k[f"pass@{val}"] = estimate_pass_at_k(total_arr[mask], correct_arr[mask], int(val)).mean()
 
+    # 按难度计算 pass@k
     difficulty_totals: dict[str, list[int]] = defaultdict(list)
     difficulty_corrects: dict[str, list[int]] = defaultdict(list)
     for sample_index, flags in grouped.items():
@@ -229,29 +314,36 @@ def evaluate_livecodebench_dataset(
             key = f"pass@{val}_{difficulty}"
             pass_at_k[key] = estimate_pass_at_k(totals[mask], corrects[mask], int(val)).mean()
 
+    return pass_at_k
+
+
+def evaluate_livecodebench_dataset(
+    completions: Iterable[dict] | str | Path,
+    *,
+    dataset_path: str | Path,
+    pass_k: Iterable[int] = (1, 5),
+    n_workers: int = 4,
+    timeout: float = 6.0,
+) -> tuple[dict[str, float], list[dict]]:
+    """评测 LiveCodeBench 数据集（兼容旧接口，返回 eval_payloads 列表）。
+
+    注意：此函数会将所有 eval_payloads 收集到内存中，大数据集建议使用
+    evaluate_livecodebench_streaming 配合流式写入。
+    """
     eval_payloads: list[dict] = []
-    for payload in _iter_completions(completions):
-        sample_index = int(payload.get("sample_index", 0))
-        repeat_index = int(payload.get("repeat_index", 0))
-        last_stage = _max_stage_index(payload)
-        completion = str(payload.get(f"completion{last_stage}", "") or "")
-        code = _extract_code(completion)
-        result = results_by_key.get((sample_index, repeat_index))
-        passed = bool(result.get("passed")) if result else False
-        fail_reason = ""
-        if result and not passed:
-            fail_reason = str(result.get("result") or "")
-        eval_payloads.append(
-            make_eval_payload(
-                payload,
-                is_passed=passed,
-                fail_reason=fail_reason,
-                answer=code,
-                ref_answer=ref_map.get(sample_index, ""),
-            )
-        )
 
-    return pass_at_k, eval_payloads
+    def collect_eval(payload: dict) -> None:
+        eval_payloads.append(payload)
+
+    metrics = evaluate_livecodebench_streaming(
+        completions,
+        dataset_path=dataset_path,
+        pass_k=pass_k,
+        n_workers=n_workers,
+        timeout=timeout,
+        on_eval=collect_eval,
+    )
+    return metrics, eval_payloads
 
 
-__all__ = ["evaluate_livecodebench_dataset", "estimate_pass_at_k"]
+__all__ = ["evaluate_livecodebench_dataset", "evaluate_livecodebench_streaming", "estimate_pass_at_k"]
