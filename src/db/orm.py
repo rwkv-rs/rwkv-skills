@@ -13,7 +13,6 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    UniqueConstraint,
     create_engine,
     text,
 )
@@ -153,7 +152,6 @@ class Benchmark(Base):
             "status IN ('Todo', 'Buggy', 'Low', 'DataSynthesizing', 'Completed')",
             name="chk_benchmark_status",
         ),
-        UniqueConstraint("benchmark_name", "benchmark_split", name="uq_benchmark_name_split"),
     )
 
 
@@ -168,13 +166,6 @@ class Model(Base):
 
     # Relationships
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="model", lazy="select")
-
-    __table_args__ = (
-        UniqueConstraint(
-            "model_name", "arch_version", "data_version", "num_params",
-            name="uq_model_identity",
-        ),
-    )
 
 
 class Task(Base):
@@ -250,16 +241,13 @@ class Eval(Base):
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     ref_answer: Mapped[str] = mapped_column(Text, nullable=False)
     is_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    fail_reason: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    fail_reason: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
 
     # Relationships
     completion: Mapped["Completion"] = relationship("Completion", back_populates="evals", lazy="select")
 
-    __table_args__ = (
-        Index("idx_eval_completion", "completions_id"),
-        UniqueConstraint("completions_id", name="uq_eval_completions_id"),
-    )
+    __table_args__ = (Index("idx_eval_completion", "completions_id"),)
 
 
 class Score(Base):

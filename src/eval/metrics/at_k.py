@@ -56,14 +56,8 @@ def compute_avg_at_k(
     rows: Iterable[tuple[int, int, bool]],
     ks: Sequence[int],
 ) -> dict[str, float]:
-    # 去重：对于相同的 (sample_index, repeat_index)，只保留第一个
-    seen: set[tuple[int, int]] = set()
     grouped: dict[int, list[tuple[int, bool]]] = defaultdict(list)
     for sample_index, repeat_index, passed in rows:
-        key = (int(sample_index), int(repeat_index))
-        if key in seen:
-            continue
-        seen.add(key)
         grouped[int(sample_index)].append((int(repeat_index), bool(passed)))
 
     metrics: dict[str, float] = {}
