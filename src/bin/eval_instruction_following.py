@@ -117,12 +117,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     init_orm(DEFAULT_DB_CONFIG)
     
     service = EvalDbService()
+    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
     # 三层级联检索：一次查询获取所有续跑信息
     ctx = service.get_resume_context(
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        force_new_task=force_new_task,
     )
     task_id = service.create_task_from_context(
         ctx=ctx,
@@ -163,7 +165,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             service.update_task_status(task_id=task_id, status=status)
         raise
     writer.close()
-    completions_payloads = service.list_completion_payloads(task_id=task_id)
+    completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
     metrics = evaluate_instruction_following(
         completions_payloads,
         dataset_path=str(dataset_path),

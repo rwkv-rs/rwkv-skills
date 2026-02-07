@@ -11,10 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
-
-
 DEFAULT_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 DEFAULT_TIMEOUT = os.environ.get("HF_HUB_DOWNLOAD_TIMEOUT", "900")
 
@@ -22,6 +18,9 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_ENDPOINT", DEFAULT_ENDPOINT)
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", DEFAULT_TIMEOUT)
 os.environ.setdefault("DATASETS_HTTP_TIMEOUT", DEFAULT_TIMEOUT)
+
+from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 
 
 DownloadSpec = tuple[str, Sequence[str] | str]
@@ -55,6 +54,7 @@ DEFAULT_REVISION = os.environ.get("RWKV_WEIGHTS_REVISION", "main")
 MAX_AUTO_WORKERS = 8
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 300
+PTH_FILENAME_KEYWORD = "g1d"
 
 
 def discover_pth_files(api: HfApi, repo_id: str, revision: str = DEFAULT_REVISION) -> tuple[str, ...]:
@@ -64,12 +64,18 @@ def discover_pth_files(api: HfApi, repo_id: str, revision: str = DEFAULT_REVISIO
         print(f"❌ 无法获取 {repo_id} 的 .pth 列表：{exc}")
         return ()
 
-    pth_files = tuple(sorted(fname for fname in repo_files if fname.endswith(".pth")))
+    pth_files = tuple(
+        sorted(
+            fname
+            for fname in repo_files
+            if fname.endswith(".pth") and PTH_FILENAME_KEYWORD in Path(fname).name.lower()
+        )
+    )
     if not pth_files:
-        print(f"⚠️  未在 {repo_id} 找到任何 .pth 文件")
+        print(f"⚠️  未在 {repo_id} 找到包含 {PTH_FILENAME_KEYWORD} 的 .pth 文件")
         return ()
 
-    print(f"🔍  {repo_id} 发现 {len(pth_files)} 个 .pth 文件")
+    print(f"🔍  {repo_id} 发现 {len(pth_files)} 个包含 {PTH_FILENAME_KEYWORD} 的 .pth 文件")
     return pth_files
 
 
@@ -86,6 +92,7 @@ def download_one(repo_id: str, filename: str, out_dir: Path) -> Path:
     local_path = hf_hub_download(
         repo_id=repo_id,
         filename=filename,
+        endpoint=DEFAULT_ENDPOINT,
         revision=DEFAULT_REVISION,
         local_dir=str(out_dir / repo_id.replace("/", "__")),
         local_dir_use_symlinks=False,
@@ -140,7 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     extra_repos = tuple(args.repo or ())
-    api = HfApi()
+    api = HfApi(endpoint=DEFAULT_ENDPOINT)
     targets = build_download_targets(api)
     for repo in extra_repos:
         files = discover_pth_files(api, repo)

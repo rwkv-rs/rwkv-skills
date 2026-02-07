@@ -105,6 +105,7 @@ def build_queue(
     model_select: str,
     min_param_b: float | None,
     max_param_b: float | None,
+    enable_param_search: bool = False,
     param_search_scan_mode: str = "both",
     model_name_patterns: Sequence[Pattern[str]] | None = None,
 ) -> list[QueueItem]:
@@ -124,7 +125,7 @@ def build_queue(
     scan_mode = _normalize_param_search_scan_mode(param_search_scan_mode)
 
     param_search_enabled: dict[Path, bool] = {}
-    if latest_2_9b_models:
+    if enable_param_search and latest_2_9b_models:
         gsm_slug, math_slug = _PARAM_SEARCH_BENCHMARKS
         for model_path in filtered_models:
             if model_path not in latest_2_9b_models:
@@ -160,7 +161,11 @@ def build_queue(
                         continue
 
                 # Latest 2.9b: replace gsm8k + hendrycks_math eval runs with a param-search workflow.
-                param_search_on = model_path in latest_2_9b_models and param_search_enabled.get(model_path, False)
+                param_search_on = (
+                    enable_param_search
+                    and model_path in latest_2_9b_models
+                    and param_search_enabled.get(model_path, False)
+                )
                 if (
                     param_search_on
                     and canonical_dataset in _PARAM_SEARCH_BENCHMARKS
@@ -168,6 +173,8 @@ def build_queue(
                 ):
                     continue
                 if job_name.startswith("param_search_"):
+                    if not enable_param_search:
+                        continue
                     if not param_search_on:
                         continue
                     if job_name != "param_search_select":

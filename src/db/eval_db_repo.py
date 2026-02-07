@@ -254,8 +254,11 @@ class EvalDbRepository:
         session: Session,
         *,
         task_id: int,
+        status: str | None = None,
     ) -> int:
         stmt = select(func.count()).select_from(Completion).where(Completion.task_id == task_id)
+        if status:
+            stmt = stmt.where(Completion.status == status)
         return int(session.execute(stmt).scalar_one())
 
     def fetch_completions(
@@ -263,6 +266,7 @@ class EvalDbRepository:
         session: Session,
         *,
         task_id: int,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         stmt = (
             select(
@@ -277,6 +281,8 @@ class EvalDbRepository:
             .where(Completion.task_id == task_id)
             .order_by(Completion.sample_index.asc(), Completion.repeat_index.asc())
         )
+        if status:
+            stmt = stmt.where(Completion.status == status)
         return list(session.execute(stmt).mappings().all())
 
     def fetch_completion_keys(
@@ -284,8 +290,11 @@ class EvalDbRepository:
         session: Session,
         *,
         task_id: int,
+        status: str | None = None,
     ) -> list[tuple[int, int]]:
         stmt = select(Completion.sample_index, Completion.repeat_index).where(Completion.task_id == task_id)
+        if status:
+            stmt = stmt.where(Completion.status == status)
         rows = session.execute(stmt).all()
         return [(int(row[0]), int(row[1])) for row in rows]
 

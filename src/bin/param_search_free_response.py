@@ -243,12 +243,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 writer.close()
             finally:
-                actual = db_service.count_completions(task_id=task_id)
+                actual = db_service.count_completions(task_id=task_id, status="answer")
                 status = "completed" if actual == expected_count else "failed"
                 db_service.update_task_status(task_id=task_id, status=status)
             raise
         writer.close()
-        completions_payloads = db_service.list_completion_payloads(task_id=task_id)
+        completions_payloads = db_service.list_completion_payloads(task_id=task_id, status="answer")
         evaluation = evaluate_free_response(
             completions_payloads,
             dataset_path=str(dataset_path),

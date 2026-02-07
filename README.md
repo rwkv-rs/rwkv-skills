@@ -70,7 +70,8 @@ rwkv-skills-scheduler queue
 rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 `queue` is a dry-run of `dispatch` and accepts the same filtering/dispatch flags (including `--overwrite`) to preview what would be scheduled.
-To ignore existing results under `results/scores` and force a rerun, pass `--overwrite` on dispatch; the scheduler will delete old completion / score / eval artifacts before re-evaluating.
+By default, jobs that already have scores are skipped.
+To force a rerun, pass `--overwrite` on dispatch. This creates a new run/version without deleting historical completion / score / eval records.
 By default the evaluator scripts run the LLM wrong-answer checker when configured; to skip it, pass `--disable-checker` on dispatch.
 
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
@@ -177,4 +178,4 @@ rwkv-skills-scheduler stop --all
 ```
 
 ### Multi-model resume logic
-For each model+dataset(+cot) combination, if a score exists, a new task is created on the next dispatch; if no score exists, the scheduler resumes the latest task. On failures, the task status becomes `failed`, and the next dispatch will resume it unless a score appears.
+For each model+dataset(+cot) combination, existing scores are skipped by default. When no score exists, the scheduler resumes the latest unfinished task. If you pass `--overwrite`, the scheduler forces a fresh rerun and writes a new task/version without deleting prior records.

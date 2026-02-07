@@ -21,11 +21,11 @@ from .config import (
 )
 from .datasets import DATASET_ROOTS, DATA_OUTPUT_ROOT
 from .dataset_utils import safe_slug, split_benchmark_and_split
-from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset, locate_dataset
+from .jobs import JOB_CATALOGUE, JobSpec, locate_dataset
 from .naming import build_run_log_name
 from .process import FAILURE_MONITOR, JobFailure, handle_job_failure, launch_job, list_idle_gpus, log_job_event
 from .profiler import BatchProfiler
-from .queue import _PARAM_SEARCH_BENCHMARKS, QueueItem, build_queue, sort_queue_items
+from .queue import QueueItem, build_queue, sort_queue_items
 from .question_counts import derive_question_counts
 from .state import (
     CompletedKey,
@@ -53,6 +53,7 @@ class QueueOptions:
     model_globs: tuple[str, ...] = DEFAULT_MODEL_GLOBS
     only_dataset_slugs: tuple[str, ...] = ()
     model_name_patterns: tuple[re.Pattern[str], ...] = ()
+    enable_param_search: bool = False
     param_search_scan_mode: str = "both"
 
 
@@ -89,13 +90,14 @@ class LogsOptions:
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
-    _completed, score_records = scan_completed_jobs(opts.log_dir)
+    completed, score_records = scan_completed_jobs(opts.log_dir)
     failed = {
         record.key for record in score_records.values() if getattr(record, "missing_artifacts", False)
     }
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
-    completed_for_queue = set()
+    overwrite_mode = bool(getattr(opts, "overwrite", False))
+    completed_for_queue = set() if overwrite_mode else set(completed)
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
@@ -107,6 +109,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
         model_select=opts.model_select,
         min_param_b=opts.min_param_b,
         max_param_b=opts.max_param_b,
+        enable_param_search=opts.enable_param_search,
         param_search_scan_mode=opts.param_search_scan_mode,
         model_name_patterns=opts.model_name_patterns,
     )
@@ -131,7 +134,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
     job_metadata: dict[str, dict[str, object]] = {}
     completed_versions: dict[str, str | None] = {}
     session_completed: set[CompletedKey] = set()
-    overwritten_keys: set[CompletedKey] = set()
     cooldown_until: dict[str, float] = {}
     previous_running: set[str] = set()
     pending_notice_printed = False
@@ -145,7 +147,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             print("❗️ 调度因异常退出而终止。")
             return
 
-        _completed, completed_records = scan_completed_jobs(opts.log_dir)
+        completed, completed_records = scan_completed_jobs(opts.log_dir)
         failed_keys: set[CompletedKey] = set()
         running_entries = load_running(opts.pid_dir)
         now = time.time()
@@ -187,7 +189,11 @@ def action_dispatch(opts: DispatchOptions) -> None:
         previous_running = set(running_entries.keys())
 
         cooldown_jobs = {job_id for job_id, until in cooldown_until.items() if until > now}
-        completed_for_queue = session_completed
+        if opts.overwrite:
+            completed_for_queue = set(session_completed)
+        else:
+            completed_for_queue = set(completed)
+            completed_for_queue.update(session_completed)
 
         queue = build_queue(
             model_globs=opts.model_globs,
@@ -200,6 +206,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             model_select=opts.model_select,
             min_param_b=opts.min_param_b,
             max_param_b=opts.max_param_b,
+            enable_param_search=opts.enable_param_search,
             param_search_scan_mode=opts.param_search_scan_mode,
             model_name_patterns=opts.model_name_patterns,
         )
@@ -311,30 +318,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
                             continue
                 pid_path.unlink(missing_ok=True)
 
-            completed_key = CompletedKey(
-                job=item.job_name,
-                model_slug=item.model_slug,
-                dataset_slug=dataset_slug,
-                is_cot=job.is_cot,
-            )
-            if opts.overwrite:
-                overwritten_keys.add(completed_key)
-                if item.job_name == "param_search_select":
-                    # param_search_select promotes trial artifacts into the canonical eval layout, so the
-                    # "completed" keys that appear under log_dir are the downstream eval jobs (e.g.
-                    # free_response_judge), not param_search_select itself. Register them so overwrite mode
-                    # can converge instead of re-queuing selection indefinitely.
-                    for benchmark_slug in _PARAM_SEARCH_BENCHMARKS:
-                        promoted_job = detect_job_from_dataset(benchmark_slug, True) or "free_response_judge"
-                        overwritten_keys.add(
-                            CompletedKey(
-                                job=promoted_job,
-                                model_slug=item.model_slug,
-                                dataset_slug=benchmark_slug,
-                                is_cot=True,
-                            )
-                        )
-
             env = os.environ.copy()
             env.update(
                 {
@@ -346,6 +329,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RWKV_TASK_DESC": f"job={item.job_name}, dataset={dataset_slug}",
                     "RUN_LOG_DIR": str(opts.log_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
+                    "RWKV_SCHEDULER_OVERWRITE": "1" if opts.overwrite else "0",
                 }
             )
             if opts.disable_checker:

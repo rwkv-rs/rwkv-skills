@@ -70,7 +70,8 @@ rwkv-skills-scheduler queue
 rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 其中 `queue` 是 `dispatch` 的 dry-run，会接受与 `dispatch` 一致的参数（包含 `--overwrite`）并输出将被调度的任务列表。
-若需无视 `results/scores` 中已存在的结果并强制重跑，可在 dispatch 时附上 `--overwrite`，调度器会在启动前删除旧的 completion / score / eval 产物再重新评测。
+默认会跳过已有分数的任务。
+若需强制重跑，可在 dispatch 时附上 `--overwrite`；调度器会创建新一轮/新版本结果，不会删除历史 completion / score / eval 记录。
 评测脚本在配置好 API_KEY/JUDGE_MODEL 时默认会运行 LLM wrong-answer checker；如需关闭，可在 dispatch 时附上 `--disable-checker`。
 可以用 `--only-datasets aime24 aime25` 这类参数仅重测指定 benchmark（名称即可，不需要 `_test` 后缀），也可以用 `--skip-datasets mmlu` 排除特定集合。若想只跑部分模型，无需填写完整路径，可使用 `--model-regex '^rwkv7-.*7\\.2b$'` 等正则过滤模型文件名，配合默认的权重 glob 即可。
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
@@ -173,4 +174,4 @@ rwkv-skills-scheduler stop --all
 ```
 
 ### 多模型续跑逻辑
-以 `model + dataset(+cot)` 为单位判断：若已有分数则下次调度新建 task 重跑；若无分数则续跑最近的 task。任务失败会标记为 `failed`，下次调度在未产出分数前仍会续跑该 task。
+以 `model + dataset(+cot)` 为单位判断：默认会跳过已有分数；若无分数则续跑最近的未完成 task。若传 `--overwrite`，则会强制新建 task 重跑并写入新版本，不删除历史记录。任务失败会标记为 `failed`，下次调度在未产出分数前仍会续跑该 task。

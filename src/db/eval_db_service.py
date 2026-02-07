@@ -23,6 +23,23 @@ from .eval_db_repo import EvalDbRepository
 _GIT_SHA_CACHE: str | None = None
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(1, value)
+
+# Avoid generating oversized multi-row INSERT statements for eval payloads.
+# LiveCodeBench `ref_answer` can be very large; flushing in small chunks keeps
+# each SQL statement bounded and prevents psycopg buffer allocation failures.
+_EVAL_INSERT_FLUSH_ROWS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_ROWS", 32)
+_EVAL_INSERT_FLUSH_CHARS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_CHARS", 2_000_000)
+
+
 def _get_cached_git_sha() -> str:
     """Get git SHA with caching - only resolves once per process."""
     global _GIT_SHA_CACHE
@@ -52,13 +69,14 @@ class ResumeContext:
 
     Layer 1: benchmark_id, model_id (实体标识)
     Layer 2: task_id, can_resume (任务状态)
-    Layer 3: completed_keys (已完成的样本)
+    Layer 3: completed_keys / cot_only_keys (已完成样本 / 仅完成第一阶段样本)
     """
     benchmark_id: int | None = None
     model_id: int | None = None
     task_id: int | None = None
     can_resume: bool = False
     completed_keys: set[tuple[int, int]] = field(default_factory=set)
+    cot_only_keys: set[tuple[int, int]] = field(default_factory=set)
 
     @property
     def is_new_task(self) -> bool:
@@ -87,18 +105,31 @@ class EvalDbService:
     def _now_cn() -> datetime:
         return datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=False, tzinfo=None)
 
+    @staticmethod
+    def _estimate_eval_payload_chars(payload: Mapping[str, Any]) -> int:
+        """Estimate text size of a single eval row for flush chunking."""
+        answer = payload.get("answer")
+        ref_answer = payload.get("ref_answer")
+        fail_reason = payload.get("fail_reason")
+        return (
+            len(str(answer or ""))
+            + len(str(ref_answer or ""))
+            + len(str(fail_reason or ""))
+        )
+
     def get_resume_context(
         self,
         *,
         dataset: str,
         model: str,
         is_param_search: bool,
+        force_new_task: bool = False,
     ) -> ResumeContext:
         """三层级联检索：一次查询获取所有续跑信息。
 
         Layer 1: 查找/创建 benchmark 和 model
         Layer 2: 查找最新的未完成 task
-        Layer 3: 获取已完成的 completion keys
+        Layer 3: 获取已完成的 completion keys（仅 answer 阶段计入 completed）
         """
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
         model = normalize_model_name(model)
@@ -159,6 +190,9 @@ class EvalDbService:
                     num_params=num_params,
                 )
 
+            if force_new_task:
+                return ctx
+
             # Layer 2: 查找可续跑的 task
             ctx.task_id = self._repo.get_latest_task_id(
                 session,
@@ -171,8 +205,18 @@ class EvalDbService:
                 ctx.can_resume = not has_score
                 # Layer 3: 获取已完成的 keys
                 if ctx.can_resume:
-                    rows = self._repo.fetch_completion_keys(session, task_id=ctx.task_id)
-                    ctx.completed_keys = set(rows)
+                    answer_rows = self._repo.fetch_completion_keys(
+                        session,
+                        task_id=ctx.task_id,
+                        status="answer",
+                    )
+                    cot_rows = self._repo.fetch_completion_keys(
+                        session,
+                        task_id=ctx.task_id,
+                        status="cot",
+                    )
+                    ctx.completed_keys = set(answer_rows)
+                    ctx.cot_only_keys = set(cot_rows) - ctx.completed_keys
 
         return ctx
 
@@ -418,6 +462,9 @@ class EvalDbService:
         task_id: str,
     ) -> int:
         inserted = 0
+        pending_rows = 0
+        pending_chars = 0
+        created_at = self._now_cn()
         with get_session() as session:
             mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
             for payload in payloads:
@@ -430,9 +477,23 @@ class EvalDbService:
                     session,
                     completions_id=completions_id,
                     payload=payload,
-                    created_at=self._now_cn(),
+                    created_at=created_at,
                 )
                 inserted += 1
+                pending_rows += 1
+                pending_chars += self._estimate_eval_payload_chars(payload)
+
+                if (
+                    pending_rows >= _EVAL_INSERT_FLUSH_ROWS
+                    or pending_chars >= _EVAL_INSERT_FLUSH_CHARS
+                ):
+                    session.flush()
+                    session.expunge_all()
+                    pending_rows = 0
+                    pending_chars = 0
+
+            if pending_rows > 0:
+                session.flush()
         return inserted
 
     def record_score_payload(
@@ -503,22 +564,26 @@ class EvalDbService:
         self,
         *,
         task_id: str,
+        status: str | None = None,
     ) -> int:
         with get_session() as session:
             return self._repo.count_completions(
                 session,
                 task_id=int(task_id),
+                status=status,
             )
 
     def list_completion_payloads(
         self,
         *,
         task_id: str,
+        status: str | None = None,
     ) -> list[dict[str, Any]]:
         with get_session() as session:
             rows = self._repo.fetch_completions(
                 session,
                 task_id=int(task_id),
+                status=status,
             )
         payloads: list[dict[str, Any]] = []
         for row in rows:
@@ -561,11 +626,13 @@ class EvalDbService:
         self,
         *,
         task_id: str,
+        status: str | None = None,
     ) -> set[tuple[int, int]]:
         with get_session() as session:
             rows = self._repo.fetch_completion_keys(
                 session,
                 task_id=int(task_id),
+                status=status,
             )
         return set(rows)
 
