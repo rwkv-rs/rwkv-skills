@@ -6,7 +6,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Generator, Iterable, Mapping, Sequence
 
 from zoneinfo import ZoneInfo
 from src.db.orm import get_session, init_orm, transaction
@@ -59,6 +59,7 @@ class ResumeContext:
     task_id: int | None = None
     can_resume: bool = False
     completed_keys: set[tuple[int, int]] = field(default_factory=set)
+    is_cot: bool = False
 
     @property
     def is_new_task(self) -> bool:
@@ -93,12 +94,21 @@ class EvalDbService:
         dataset: str,
         model: str,
         is_param_search: bool,
+        is_cot: bool = False,
+        evaluator: str | None = None,
     ) -> ResumeContext:
         """三层级联检索：一次查询获取所有续跑信息。
 
         Layer 1: 查找/创建 benchmark 和 model
-        Layer 2: 查找最新的未完成 task
+        Layer 2: 查找最新的未完成 task（按 evaluator 过滤）
         Layer 3: 获取已完成的 completion keys
+
+        Args:
+            dataset: 数据集名称
+            model: 模型名称
+            is_param_search: 是否为参数搜索任务
+            is_cot: 是否为 CoT 评估，用于判断是否已有对应的 score
+            evaluator: 评估器名称，用于区分不同类型的任务（如 eval_free_response vs eval_multi_choice_cot）
         """
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
         model = normalize_model_name(model)
@@ -113,7 +123,7 @@ class EvalDbService:
         data_version = data_version or "unknown"
         num_params = num_params or "unknown"
 
-        ctx = ResumeContext()
+        ctx = ResumeContext(is_cot=is_cot)
 
         with get_session() as session:
             # Layer 1: benchmark & model
@@ -159,20 +169,21 @@ class EvalDbService:
                     num_params=num_params,
                 )
 
-            # Layer 2: 查找可续跑的 task
+            # Layer 2: 查找可续跑的 task（按 evaluator 过滤）
             ctx.task_id = self._repo.get_latest_task_id(
                 session,
                 benchmark_id=ctx.benchmark_id,
                 model_id=ctx.model_id,
                 is_param_search=is_param_search,
+                evaluator=evaluator,
             )
             if ctx.task_id is not None:
-                has_score = self._repo.task_has_score(session, task_id=ctx.task_id)
+                # 使用 is_cot 判断是否已有对应类型的 score
+                has_score = self._repo.task_has_score(session, task_id=ctx.task_id, is_cot=is_cot)
                 ctx.can_resume = not has_score
-                # Layer 3: 获取已完成的 keys
-                if ctx.can_resume:
-                    rows = self._repo.fetch_completion_keys(session, task_id=ctx.task_id)
-                    ctx.completed_keys = set(rows)
+                # Layer 3: 总是获取已完成的 keys，用于跳过已评估的样本
+                rows = self._repo.fetch_completion_keys(session, task_id=ctx.task_id)
+                ctx.completed_keys = set(rows)
 
         return ctx
 
@@ -223,106 +234,6 @@ class EvalDbService:
                 log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
             )
         return str(task_id)
-
-    def get_or_create_task(
-        self,
-        *,
-        job_name: str | None,
-        job_id: str | None,
-        dataset: str,
-        model: str,
-        is_param_search: bool,
-        sampling_config: dict[str, Any] | None = None,
-        allow_resume: bool = True,
-    ) -> str:
-        with get_session() as session:
-            benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-            benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
-            )
-            if benchmark_id is None:
-                resolved_samples = self._resolve_dataset_sample_count(dataset)
-                benchmark_id = self._repo.insert_benchmark(
-                    session,
-                    benchmark_name=benchmark_name,
-                    benchmark_split=benchmark_split,
-                    url=None,
-                    status="Todo",
-                    num_samples=resolved_samples if resolved_samples is not None else 0,
-                )
-            else:
-                existing = self._parse_num_samples(
-                    self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
-                )
-                if not existing:
-                    resolved_samples = self._resolve_dataset_sample_count(dataset)
-                    if resolved_samples is not None and resolved_samples > 0:
-                        self._repo.update_benchmark_num_samples(
-                            session,
-                            benchmark_id=benchmark_id,
-                            num_samples=resolved_samples,
-                        )
-            model = normalize_model_name(model)
-            normalized = _normalize_model_identifier(model)
-            arch, data_version, num_params = _parse_model_tags(normalized)
-            if not arch or not data_version or not num_params:
-                fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
-                arch = arch or fallback_arch
-                data_version = data_version or fallback_data
-                num_params = num_params or fallback_params
-            arch_version = arch or "unknown"
-            data_version = data_version or "unknown"
-            num_params = num_params or "unknown"
-            model_id = self._repo.get_model_id(
-                session,
-                model_name=model,
-                arch_version=arch_version,
-                data_version=data_version,
-                num_params=num_params,
-            )
-            if model_id is None:
-                model_id = self._repo.insert_model(
-                    session,
-                    model_name=model,
-                    arch_version=arch_version,
-                    data_version=data_version,
-                    num_params=num_params,
-                )
-
-            if allow_resume:
-                latest = self._repo.get_latest_task_id(
-                    session,
-                    benchmark_id=benchmark_id,
-                    model_id=model_id,
-                    is_param_search=is_param_search,
-                )
-                if latest and not self._repo.task_has_score(session, task_id=latest):
-                    self._repo.update_task_status(session, task_id=latest, status="running")
-                    return str(latest)
-
-            git_sha = _get_cached_git_sha()
-            config_path = config_path_for_benchmark(benchmark_name, model)
-            if config_path.exists():
-                config_path_str = str(config_path)
-            else:
-                fallback_path = config_path_for_benchmark(benchmark_name, None)
-                config_path_str = str(fallback_path) if fallback_path.exists() else None
-            desc = os.environ.get("RWKV_TASK_DESC")
-            task_id = self._repo.insert_task(
-                session,
-                config_path=config_path_str,
-                evaluator=job_name or "",
-                is_param_search=is_param_search,
-                created_at=self._now_cn(),
-                status="running",
-                git_hash=git_sha,
-                model_id=model_id,
-                benchmark_id=benchmark_id,
-                desc=desc,
-                sampling_config=sampling_config,
-                log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
-            )
-            return str(task_id)
 
     def get_benchmark_num_samples(self, *, dataset: str) -> int | None:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
@@ -416,14 +327,18 @@ class EvalDbService:
         *,
         payloads: Iterable[dict[str, Any]],
         task_id: str,
+        batch_size: int = 500,
     ) -> int:
         inserted = 0
         with get_session() as session:
             mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
+            batch_count = 0
             for payload in payloads:
-                completions_id = mapping.get(
-                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
-                )
+                sample_index = payload.get("sample_index")
+                repeat_index = payload.get("repeat_index")
+                if sample_index is None or repeat_index is None:
+                    continue
+                completions_id = mapping.get((int(sample_index), int(repeat_index)))
                 if completions_id is None:
                     continue
                 self._repo.insert_eval(
@@ -433,7 +348,33 @@ class EvalDbService:
                     created_at=self._now_cn(),
                 )
                 inserted += 1
+                batch_count += 1
+                # 批量提交以释放内存
+                if batch_count >= batch_size:
+                    session.flush()
+                    session.expunge_all()
+                    batch_count = 0
         return inserted
+
+    def fetch_completion_id_map(self, *, task_id: str) -> dict[tuple[int, int], int]:
+        """获取 (sample_index, repeat_index) -> completions_id 的映射。"""
+        with get_session() as session:
+            return self._repo.fetch_completion_id_map(session, task_id=int(task_id))
+
+    def insert_eval_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        completions_id: int,
+    ) -> None:
+        """逐条写入单个 eval 记录。"""
+        with get_session() as session:
+            self._repo.insert_eval(
+                session,
+                completions_id=completions_id,
+                payload=payload,
+                created_at=self._now_cn(),
+            )
 
     def record_score_payload(
         self,
@@ -470,34 +411,6 @@ class EvalDbService:
                 model_name=model,
                 is_param_search=is_param_search,
             )
-
-    def should_allow_resume(
-        self,
-        *,
-        dataset: str,
-        model: str,
-        is_param_search: bool,
-        is_cot: bool,
-    ) -> bool:
-        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        model = normalize_model_name(model)
-        with get_session() as session:
-            latest = self._repo.fetch_latest_task_by_names(
-                session,
-                benchmark_name=benchmark_name,
-                benchmark_split=benchmark_split,
-                model_name=model,
-                is_param_search=is_param_search,
-            )
-            if not latest:
-                return True
-            status = str(latest.get("status") or "").lower()
-            task_id = latest.get("task_id")
-            if status == "completed":
-                return False
-            if isinstance(task_id, int) and self._repo.task_has_score(session, task_id=task_id):
-                return False
-        return True
 
     def count_completions(
         self,
@@ -537,11 +450,16 @@ class EvalDbService:
             sampling_cfg = None
             if isinstance(context, dict):
                 sampling_cfg = context.get("sampling_config")
+            # 严格校验：sample_index 和 repeat_index 必须存在
+            sample_index = row_dict.get("sample_index")
+            repeat_index = row_dict.get("repeat_index")
+            if sample_index is None or repeat_index is None:
+                raise ValueError(f"Missing sample_index or repeat_index in completion row: {row_dict}")
             payload: dict[str, Any] = {
                 "benchmark_name": row_dict.get("benchmark_name", ""),
                 "dataset_split": row_dict.get("benchmark_split", "") or row_dict.get("dataset_split", ""),
-                "sample_index": int(row_dict.get("sample_index", 0)),
-                "repeat_index": int(row_dict.get("repeat_index", 0)),
+                "sample_index": int(sample_index),
+                "repeat_index": int(repeat_index),
                 "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
                 "context": context if isinstance(context, dict) else None,
             }
@@ -556,6 +474,53 @@ class EvalDbService:
                         payload[f"stop_reason{idx}"] = stage.get("stop_reason")
             payloads.append(payload)
         return payloads
+
+    def iter_completion_payloads(
+        self,
+        *,
+        task_id: str,
+        batch_size: int = 1000,
+    ) -> Generator[dict[str, Any], None, None]:
+        """流式迭代 completion payloads，避免一次性加载全部到内存。"""
+        with get_session() as session:
+            for row in self._repo.iter_completions(
+                session,
+                task_id=int(task_id),
+                batch_size=batch_size,
+            ):
+                row_dict: dict[str, Any] = dict(row) if isinstance(row, Mapping) else row
+                context = row_dict.get("context")
+                if isinstance(context, str):
+                    try:
+                        context = json.loads(context)
+                    except json.JSONDecodeError:
+                        context = None
+                sampling_cfg = None
+                if isinstance(context, dict):
+                    sampling_cfg = context.get("sampling_config")
+                # 严格校验：sample_index 和 repeat_index 必须存在
+                sample_index = row_dict.get("sample_index")
+                repeat_index = row_dict.get("repeat_index")
+                if sample_index is None or repeat_index is None:
+                    raise ValueError(f"Missing sample_index or repeat_index in completion row: {row_dict}")
+                payload: dict[str, Any] = {
+                    "benchmark_name": row_dict.get("benchmark_name", ""),
+                    "dataset_split": row_dict.get("benchmark_split", "") or row_dict.get("dataset_split", ""),
+                    "sample_index": int(sample_index),
+                    "repeat_index": int(repeat_index),
+                    "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
+                    "context": context if isinstance(context, dict) else None,
+                }
+                if isinstance(context, dict):
+                    stages = context.get("stages")
+                    if isinstance(stages, list):
+                        for idx, stage in enumerate(stages, start=1):
+                            if not isinstance(stage, dict):
+                                continue
+                            payload[f"prompt{idx}"] = stage.get("prompt")
+                            payload[f"completion{idx}"] = stage.get("completion")
+                            payload[f"stop_reason{idx}"] = stage.get("stop_reason")
+                yield payload
 
     def list_completion_keys(
         self,
@@ -668,6 +633,79 @@ class EvalDbService:
     def _resolve_git_sha() -> str:
         """Deprecated: use _get_cached_git_sha() instead."""
         return _get_cached_git_sha()
+
+    # ==================== Checker 相关方法 ====================
+
+    def iter_failed_evals_for_checker(
+        self,
+        *,
+        task_id: str,
+        checker_type: str = "llm_checker",
+        batch_size: int = 100,
+    ) -> Generator[dict[str, Any], None, None]:
+        """流式迭代需要 checker 处理的 eval 记录。
+
+        返回 is_passed=False 且 fail_reason 中没有该 checker_type 结果的记录。
+        """
+        with get_session() as session:
+            for row in self._repo.iter_failed_evals_for_checker(
+                session,
+                task_id=int(task_id),
+                checker_type=checker_type,
+                batch_size=batch_size,
+            ):
+                yield row
+
+    def update_eval_fail_reason(
+        self,
+        *,
+        eval_id: int,
+        checker_type: str,
+        checker_result: dict[str, Any],
+    ) -> None:
+        """将 checker 结果 merge 到 eval.fail_reason 中。"""
+        with get_session() as session:
+            self._repo.update_eval_fail_reason(
+                session,
+                eval_id=eval_id,
+                checker_type=checker_type,
+                checker_result=checker_result,
+            )
+
+    def bulk_update_eval_fail_reason(
+        self,
+        *,
+        updates: list[tuple[int, str, dict[str, Any]]],
+    ) -> int:
+        """批量更新 eval.fail_reason。
+
+        Args:
+            updates: [(eval_id, checker_type, result), ...]
+
+        Returns:
+            更新的记录数
+        """
+        with get_session() as session:
+            return self._repo.bulk_update_eval_fail_reason(
+                session,
+                updates=updates,
+            )
+
+    def count_failed_evals_for_checker(
+        self,
+        *,
+        task_id: str,
+        checker_type: str = "llm_checker",
+    ) -> int:
+        """统计需要 checker 处理的 eval 记录数。"""
+        count = 0
+        for _ in self.iter_failed_evals_for_checker(
+            task_id=task_id,
+            checker_type=checker_type,
+            batch_size=1000,
+        ):
+            count += 1
+        return count
 
 
 __all__ = ["EvalDbService", "ResumeContext"]

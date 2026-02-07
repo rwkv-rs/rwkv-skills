@@ -123,6 +123,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        is_cot=False,
+        evaluator="eval_instruction_following",
     )
     task_id = service.create_task_from_context(
         ctx=ctx,

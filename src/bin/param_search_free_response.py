@@ -203,23 +203,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_score: float | None = None
     best_trial: int | None = None
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, 
-                                                               NORMAL_COT_GRID=args.para_grid_normal, 
-                                                               SIMPLE_COT_GRID=args.para_grid_simple, 
+    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling,
+                                                               NORMAL_COT_GRID=args.para_grid_normal,
+                                                               SIMPLE_COT_GRID=args.para_grid_simple,
                                                                scan_mode=args.scan_mode):
         print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
         sampling_payload = {
             "cot": sampling_config_to_dict(trial_cot),
             "final": sampling_config_to_dict(final_sampling),
         }
-        task_id = db_service.get_or_create_task(
+        ctx = db_service.get_resume_context(
+            dataset=str(slug),
+            model=model_name,
+            is_param_search=True,
+            is_cot=True,
+            evaluator="param_search_free_response",
+        )
+        # param_search 每个 trial 都创建新任务
+        ctx.can_resume = False
+        task_id = db_service.create_task_from_context(
+            ctx=ctx,
             job_name="param_search_free_response",
-        job_id=ensure_job_id("param_search_free_response"),
             dataset=str(slug),
             model=model_name,
             is_param_search=True,
             sampling_config=sampling_payload,
-            allow_resume=False,
         )
         os.environ["RWKV_SKILLS_TASK_ID"] = task_id
         os.environ["RWKV_SKILLS_VERSION_ID"] = task_id

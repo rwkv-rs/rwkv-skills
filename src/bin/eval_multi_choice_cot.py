@@ -121,6 +121,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        is_cot=True,
+        evaluator="eval_multi_choice_cot",
     )
     task_id = service.create_task_from_context(
         ctx=ctx,
@@ -134,11 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
-    writer = CompletionWriteWorker(
-        service=service,
-        task_id=task_id,
-        max_queue=args.db_write_queue,
-    )
+
     if args.probe_only:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run_chain_of_thought(
@@ -153,6 +151,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
         )
         return 0
+
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        max_queue=args.db_write_queue,
+    )
 
     sample_limit: int | None = args.max_samples
     min_prompt_count: int | None = None

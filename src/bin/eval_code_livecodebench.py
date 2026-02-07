@@ -11,14 +11,14 @@ from typing import Sequence
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.evaluators.coding import CodingPipeline
-from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
+from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_streaming
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
 from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
-from src.db.async_writer import CompletionWriteWorker
+from src.db.async_writer import CompletionWriteWorker, EvalWriteWorker
 from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -100,6 +100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        is_cot=True,
+        evaluator="eval_code_livecodebench",
     )
     sampling_payload = {
         "cot": sampling_config_to_dict(cot_sampling),
@@ -158,16 +160,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     writer.close()
     try:
-        completions_payloads = service.list_completion_payloads(task_id=task_id)
-        eval_metrics, eval_payloads = evaluate_livecodebench_dataset(
-            completions_payloads,
+        # 使用流式迭代器，避免一次性加载全部 completions 到内存
+        completions_iter = service.iter_completion_payloads(task_id=task_id)
+        # 使用流式写入器，边评测边写入 eval 结果
+        eval_writer = EvalWriteWorker(
+            service=service,
+            task_id=task_id,
+        )
+        eval_metrics = evaluate_livecodebench_streaming(
+            completions_iter,
             dataset_path=str(dataset_path),
             pass_k=pass_k,
             n_workers=args.eval_workers,
             timeout=args.eval_timeout,
+            on_eval=eval_writer.enqueue,
         )
+        eval_inserted = eval_writer.close()
         print(f"LiveCodeBench 评测: {eval_metrics}")
-        service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        print(f"✅ 写入 {eval_inserted} 条 eval 记录")
         score_payload = make_score_payload(
             slug,
             is_cot=True,

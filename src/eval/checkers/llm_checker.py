@@ -11,12 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import orjson
 import jsonschema
 from json import JSONDecodeError
 from openai import OpenAI, OpenAIError
 
-from src.eval.results.layout import check_details_path
 from src.eval.scheduler.config import REPO_ROOT
 
 
@@ -136,28 +134,6 @@ def _env_flag(name: str) -> bool:
     if value is None:
         return False
     return value.strip().lower() not in {"", "0", "false", "no", "n", "off"}
-
-
-def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield orjson.loads(line)
-
-
-def _load_existing_keys(path: Path) -> set[tuple[str, int, int]]:
-    """Return {(dataset_split, sample_index, repeat_index)} already written."""
-    if not path.exists():
-        return set()
-    keys: set[tuple[str, int, int]] = set()
-    for row in _iter_jsonl(path):
-        split = str(row.get("dataset_split", ""))
-        sample_index = int(row.get("sample_index", 0))
-        repeat_index = int(row.get("repeat_index", 0))
-        keys.add((split, sample_index, repeat_index))
-    return keys
 
 
 def _validate_checker_payload(payload: dict[str, Any]) -> None:
@@ -383,72 +359,84 @@ def _get_thread_client(cfg: LLMCheckerConfig) -> OpenAI:
     return client
 
 
-def run_llm_checker(
-    eval_results_path: str | Path,
-    *,
-    model_name: str,
-    config: LLMCheckerConfig | None = None,
-) -> Path | None:
-    """Run wrong-answer checker over a single eval JSONL file.
+def _extract_context_text(row: dict[str, Any]) -> str:
+    """从 eval row 中提取 context 文本。"""
+    context = row.get("context")
+    if context is None:
+        return ""
+    if isinstance(context, str):
+        return context
+    if isinstance(context, dict):
+        # 从 stages 中提取 prompt 和 completion
+        stages = context.get("stages", [])
+        parts = []
+        for stage in stages:
+            if not isinstance(stage, dict):
+                continue
+            prompt = stage.get("prompt")
+            completion = stage.get("completion")
+            if prompt:
+                parts.append(f"[Prompt]\n{prompt}")
+            if completion:
+                parts.append(f"[Completion]\n{completion}")
+        return "\n\n".join(parts)
+    return str(context)
 
-    Returns the written check JSONL path, or None if skipped.
+
+def run_llm_checker_db(
+    *,
+    task_id: str,
+    config: LLMCheckerConfig | None = None,
+    checker_type: str = "llm_checker",
+) -> int:
+    """从 DB 读取失败的 eval 记录，运行 LLM checker，结果写回 DB。
+
+    Args:
+        task_id: 任务 ID
+        config: LLM checker 配置，如果为 None 则从环境变量读取
+        checker_type: checker 类型标识，用于 fail_reason 中的键名
+
+    Returns:
+        成功处理的记录数
     """
+    from src.db.orm import init_orm
+    from src.db.eval_db_service import EvalDbService
+    from src.db.async_writer import CheckerWriteWorker
+    from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+    from datetime import datetime
 
     _load_env_file((REPO_ROOT / ".env").resolve())
     if _env_flag("RWKV_SKILLS_DISABLE_CHECKER"):
         print("ℹ️  LLM checker disabled (RWKV_SKILLS_DISABLE_CHECKER=1)")
-        return None
+        return 0
+
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
         print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env)")
-        return None
+        return 0
 
-    eval_path = Path(eval_results_path).expanduser().resolve()
-    if not eval_path.exists():
-        raise FileNotFoundError(eval_path)
+    init_orm(DEFAULT_DB_CONFIG)
+    service = EvalDbService()
 
-    failed_rows: list[dict[str, Any]] = []
-    benchmark_name: str | None = None
+    # 先统计需要处理的记录数（流式计数，不加载全部到内存）
+    total_count = 0
+    for _ in service.iter_failed_evals_for_checker(
+        task_id=task_id,
+        checker_type=checker_type,
+    ):
+        total_count += 1
 
-    for row in _iter_jsonl(eval_path):
-        if benchmark_name is None:
-            benchmark_name = str(row.get("benchmark_name", "") or "")
-        if bool(row.get("is_passed", False)):
-            continue
-        failed_rows.append(row)
+    if total_count == 0:
+        print(f"✅ LLM checker: no failed samples need checking for task {task_id}")
+        return 0
 
-    if not benchmark_name:
-        print(f"⚠️  LLM checker skipped: empty eval file {eval_path}")
-        return None
+    print(f"🔍 LLM checker: {total_count} samples to check for task {task_id}")
 
-    if not failed_rows:
-        print(f"✅ LLM checker: no failed samples for {benchmark_name} ({eval_path.name})")
-        return None
+    max_workers = max(1, min(int(cfg.max_workers), total_count))
 
-    out_path = check_details_path(benchmark_name, model_name=model_name)
-    seen = _load_existing_keys(out_path)
-
-    to_check: list[dict[str, Any]] = []
-    for row in failed_rows:
-        split = str(row.get("dataset_split", "") or "")
-        sample_index = int(row.get("sample_index", 0))
-        repeat_index = int(row.get("repeat_index", 0))
-        key = (split, sample_index, repeat_index)
-        if key in seen:
-            continue
-        to_check.append(row)
-
-    if not to_check:
-        print(f"✅ LLM checker: all failed samples already checked -> {out_path}")
-        return out_path
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    max_workers = max(1, int(cfg.max_workers))
-    max_workers = min(max_workers, len(to_check))
-
-    def _check_one(row: dict[str, Any]) -> dict[str, Any]:
-        context = _truncate_text(str(row.get("context", "") or ""), max_chars=int(cfg.max_prompt_chars))
+    def _check_one(row: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        eval_id = row["eval_id"]
+        context = _truncate_text(_extract_context_text(row), max_chars=int(cfg.max_prompt_chars))
         answer = _truncate_text(
             str(row.get("answer", "") or ""),
             max_chars=max(1, int(cfg.max_prompt_chars // 4)),
@@ -460,11 +448,10 @@ def run_llm_checker(
         prompt = _build_prompt(context, answer, ref_answer)
         client = _get_thread_client(cfg)
         checked = _call_llm_checker(client, config=cfg, prompt=prompt)
-        return {
-            "benchmark_name": str(row.get("benchmark_name", "") or ""),
-            "dataset_split": str(row.get("dataset_split", "") or ""),
-            "sample_index": int(row.get("sample_index", 0)),
-            "repeat_index": int(row.get("repeat_index", 0)),
+
+        # 构建 checker 结果
+        result = {
+            "checked_at": datetime.utcnow().isoformat() + "Z",
             CHECKER_FIELD_COT: str(checked.get(CHECKER_FIELD_COT, "") or ""),
             CHECKER_FIELD_ANSWER_CORRECT: bool(checked.get(CHECKER_FIELD_ANSWER_CORRECT, False)),
             CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR: bool(
@@ -478,105 +465,126 @@ def run_llm_checker(
             ),
             CHECKER_FIELD_REASON: str(checked.get(CHECKER_FIELD_REASON, "") or ""),
         }
-
-    retry_forever = int(cfg.max_retries) < 0
-
-    def _row_key(row: dict[str, Any]) -> tuple[str, int, int]:
-        return (
-            str(row.get("dataset_split", "") or ""),
-            int(row.get("sample_index", 0)),
-            int(row.get("repeat_index", 0)),
-        )
+        return eval_id, result
 
     def _describe_row(row: dict[str, Any]) -> str:
         return (
-            f"benchmark={row.get('benchmark_name','')} "
-            f"split={row.get('dataset_split','')} "
-            f"sample_index={row.get('sample_index',0)} "
-            f"repeat_index={row.get('repeat_index',0)}"
+            f"eval_id={row.get('eval_id')} "
+            f"sample_index={row.get('sample_index')} "
+            f"repeat_index={row.get('repeat_index')}"
         )
 
     def _backoff_seconds(attempt: int) -> float:
         return min(30.0, 0.5 * (2 ** min(6, max(0, int(attempt) - 1))))
 
+    retry_forever = int(cfg.max_retries) < 0
+
+    # 使用异步写入器
+    writer = CheckerWriteWorker(
+        service=service,
+        checker_type=checker_type,
+        batch_size=50,
+    )
+
     wrote = 0
     failed = 0
     stop_scheduling = False
-    todo = deque(to_check)
-    retry_heap: list[tuple[float, tuple[str, int, int], dict[str, Any]]] = []
-    attempts_by_key: dict[tuple[str, int, int], int] = {}
+    # 使用流式迭代器，避免一次性加载全部到内存
+    row_iter = iter(service.iter_failed_evals_for_checker(
+        task_id=task_id,
+        checker_type=checker_type,
+    ))
+    iter_exhausted = False
+    todo: deque[dict[str, Any]] = deque()
+    retry_heap: list[tuple[float, int, dict[str, Any]]] = []  # (time, eval_id, row)
+    attempts_by_id: dict[int, int] = {}
     pending: dict[object, dict[str, Any]] = {}
 
-    with out_path.open("ab") as out_f, ThreadPoolExecutor(max_workers=max_workers) as executor:
-        while pending or todo or retry_heap:
-            now = time.monotonic()
-            while retry_heap and retry_heap[0][0] <= now:
-                _, _, row = heapq.heappop(retry_heap)
+    def _fill_todo() -> None:
+        """从迭代器填充 todo 队列，最多填充到 max_workers * 2 条。"""
+        nonlocal iter_exhausted
+        while not iter_exhausted and len(todo) < max_workers * 2:
+            try:
+                row = next(row_iter)
                 todo.append(row)
-
-            while not stop_scheduling and len(pending) < max_workers and todo:
-                row = todo.popleft()
-                future = executor.submit(_check_one, row)
-                pending[future] = row
-
-            if not pending:
-                if retry_heap:
-                    sleep_for = max(0.0, retry_heap[0][0] - time.monotonic())
-                    time.sleep(min(1.0, sleep_for))
-                    continue
+            except StopIteration:
+                iter_exhausted = True
                 break
 
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                row = pending.pop(future)
-                if future.cancelled():
-                    continue
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            _fill_todo()  # 初始填充
+            while pending or todo or retry_heap or not iter_exhausted:
+                now = time.monotonic()
+                while retry_heap and retry_heap[0][0] <= now:
+                    _, _, row = heapq.heappop(retry_heap)
+                    todo.append(row)
 
-                try:
-                    output_row = future.result()
-                except LLMCheckerFailure as exc:
-                    failed += 1
+                # 按需从迭代器补充 todo
+                if not stop_scheduling:
+                    _fill_todo()
 
-                    if retry_forever:
-                        key = _row_key(row)
-                        attempt = attempts_by_key.get(key, 0) + 1
-                        attempts_by_key[key] = attempt
-                        delay = _backoff_seconds(attempt)
-                        heapq.heappush(retry_heap, (time.monotonic() + delay, key, row))
-                        print(
-                            "⚠️  LLM checker failed; will retry: "
-                            f"{_describe_row(row)} attempt={attempt} backoff={delay:.1f}s -> {exc}"
-                        )
+                while not stop_scheduling and len(pending) < max_workers and todo:
+                    row = todo.popleft()
+                    future = executor.submit(_check_one, row)
+                    pending[future] = row
+
+                if not pending:
+                    if retry_heap:
+                        sleep_for = max(0.0, retry_heap[0][0] - time.monotonic())
+                        time.sleep(min(1.0, sleep_for))
+                        continue
+                    if not iter_exhausted:
+                        _fill_todo()
+                        continue
+                    break
+
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    row = pending.pop(future)
+                    if future.cancelled():
                         continue
 
-                    if not stop_scheduling:
-                        stop_scheduling = True
-                        print(f"⚠️  LLM checker failed; stop scheduling new requests: {_describe_row(row)} -> {exc}")
-                        for pending_future in pending:
-                            pending_future.cancel()
-                    continue
+                    try:
+                        eval_id, result = future.result()
+                        writer.enqueue(eval_id, result)
+                        wrote += 1
+                    except LLMCheckerFailure as exc:
+                        failed += 1
+                        eval_id = row.get("eval_id", 0)
 
-                out_f.write(orjson.dumps(output_row, option=orjson.OPT_APPEND_NEWLINE))
-                wrote += 1
+                        if retry_forever:
+                            attempt = attempts_by_id.get(eval_id, 0) + 1
+                            attempts_by_id[eval_id] = attempt
+                            delay = _backoff_seconds(attempt)
+                            heapq.heappush(retry_heap, (time.monotonic() + delay, eval_id, row))
+                            print(
+                                "⚠️  LLM checker failed; will retry: "
+                                f"{_describe_row(row)} attempt={attempt} backoff={delay:.1f}s -> {exc}"
+                            )
+                            continue
 
-    if wrote:
-        suffix = f" (+{wrote} rows)"
-        if failed:
-            suffix += f", failed={failed}"
-        if retry_forever:
-            suffix += ", retry_forever=true"
-        print(f"🧩 LLM checker saved: {out_path}{suffix}")
-        return out_path
+                        if not stop_scheduling:
+                            stop_scheduling = True
+                            print(f"⚠️  LLM checker failed; stop scheduling new requests: {_describe_row(row)} -> {exc}")
+                            for pending_future in pending:
+                                pending_future.cancel()
+                        continue
+    finally:
+        updated = writer.close()
+
+    suffix = f" (checked={wrote}, updated={updated})"
     if failed:
-        print(f"⚠️  LLM checker: no new rows written (failed={failed}) -> {out_path}")
-        return out_path if out_path.exists() else None
-    print(f"✅ LLM checker: no new rows written -> {out_path}")
-    return out_path if out_path.exists() else None
+        suffix += f", failed={failed}"
+    if retry_forever:
+        suffix += ", retry_forever=true"
+    print(f"🧩 LLM checker done for task {task_id}{suffix}")
+    return updated
 
 
 __all__ = [
     "LLMCheckerConfig",
-    "run_llm_checker",
+    "run_llm_checker_db",
     "CHECKER_JSON_SCHEMA",
     "CHECKER_FIELD_COT",
     "CHECKER_FIELD_REASON",

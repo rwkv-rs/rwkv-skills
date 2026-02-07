@@ -89,6 +89,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        is_cot=True,
+        evaluator="eval_code_human_eval",
     )
     task_id = service.create_task_from_context(
         ctx=ctx,
@@ -154,7 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
         score_payload = make_score_payload(
             slug,
-            is_cot=False,
+            is_cot=True,
             model_name=Path(args.model_path).stem,
             metrics=eval_metrics or {},
             samples=result.sample_count,

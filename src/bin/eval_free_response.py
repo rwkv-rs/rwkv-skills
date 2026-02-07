@@ -167,6 +167,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
+        is_cot=True,
+        evaluator="eval_free_response",
     )
     sampling_payload = {
         "cot": sampling_config_to_dict(cot_sampling),

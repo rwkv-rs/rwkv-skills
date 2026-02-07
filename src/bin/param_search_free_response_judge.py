@@ -225,14 +225,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cot": sampling_config_to_dict(trial_cot),
             "final": sampling_config_to_dict(final_sampling),
         }
-        task_id = db_service.get_or_create_task(
+        ctx = db_service.get_resume_context(
+            dataset=str(slug),
+            model=model_name,
+            is_param_search=True,
+            is_cot=True,
+            evaluator="param_search_free_response_judge",
+        )
+        # param_search 每个 trial 都创建新任务
+        ctx.can_resume = False
+        task_id = db_service.create_task_from_context(
+            ctx=ctx,
             job_name="param_search_free_response_judge",
-            job_id=ensure_job_id("param_search_free_response_judge"),
             dataset=str(slug),
             model=model_name,
             is_param_search=True,
             sampling_config=sampling_payload,
-            allow_resume=False,
         )
         os.environ["RWKV_SKILLS_TASK_ID"] = task_id
         os.environ["RWKV_SKILLS_VERSION_ID"] = task_id

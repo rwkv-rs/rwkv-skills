@@ -1,101 +1,91 @@
 from __future__ import annotations
 
-"""Run LLM wrong-answer checker over existing `results/eval/*_results.jsonl`.
+"""Run LLM wrong-answer checker over eval results in database.
 
 Typical usage:
-  python -m src.bin.run_llm_checker                # scan default results/eval
-  python -m src.bin.run_llm_checker results/eval/<model_name>
-  python -m src.bin.run_llm_checker results/eval/<model_name>/<bench>_results.jsonl
+  python -m src.bin.run_llm_checker --task-id 123
+  python -m src.bin.run_llm_checker --dataset gsm8k --model rwkv7-g1-1.5b
 """
 
 import argparse
-from pathlib import Path
 from typing import Sequence
 
-from src.eval.checkers.llm_checker import run_llm_checker
-from src.eval.scheduler.config import DEFAULT_EVAL_RESULT_DIR
-
-
-_RESULTS_SUFFIX = "_results.jsonl"
+from src.eval.checkers.llm_checker import run_llm_checker_db
+from src.db.orm import init_orm
+from src.db.eval_db_service import EvalDbService
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run llm_checker over legacy/new eval JSONL files")
+    parser = argparse.ArgumentParser(description="Run llm_checker over eval results in database")
     parser.add_argument(
-        "targets",
-        nargs="*",
-        default=[str(DEFAULT_EVAL_RESULT_DIR)],
-        help="Eval JSONL file or directory (will scan for *_results.jsonl). Default: results/eval",
+        "--task-id",
+        help="Task ID to run checker on",
     )
     parser.add_argument(
-        "--eval-root",
-        default=str(DEFAULT_EVAL_RESULT_DIR),
-        help="Root dir used to infer model_name from path (default: results/eval).",
+        "--dataset",
+        help="Dataset name (used with --model to find latest task)",
     )
     parser.add_argument(
-        "--model-name",
-        help="Force model_name (useful when passing eval files outside --eval-root).",
+        "--model",
+        help="Model name (used with --dataset to find latest task)",
+    )
+    parser.add_argument(
+        "--evaluator",
+        help="Evaluator name to filter tasks (e.g., eval_free_response, eval_multi_choice_cot)",
+    )
+    parser.add_argument(
+        "--checker-type",
+        default="llm_checker",
+        help="Checker type identifier (default: llm_checker)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Only list matched eval files; do not call the checker.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        help="Limit number of eval files processed (after sorting).",
+        help="Only show how many samples need checking; do not call the checker.",
     )
     return parser.parse_args(argv)
 
 
-def _iter_eval_files(targets: list[str]) -> list[Path]:
-    paths: list[Path] = []
-    for raw in targets:
-        path = Path(raw).expanduser()
-        if path.is_dir():
-            paths.extend(sorted(path.rglob(f"*{_RESULTS_SUFFIX}")))
-        else:
-            paths.append(path)
-    return paths
-
-
-def _infer_model_name(eval_path: Path, *, eval_root: Path, forced: str | None) -> str:
-    if forced:
-        return forced
-    eval_path = eval_path.resolve()
-    eval_root = eval_root.resolve()
-    if eval_path.is_relative_to(eval_root):
-        rel = eval_path.relative_to(eval_root)
-        if len(rel.parts) > 1:
-            return rel.parts[0]
-    return eval_path.parent.name
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    eval_root = Path(args.eval_root).expanduser()
-    eval_files = [p for p in _iter_eval_files(list(args.targets)) if p.name.endswith(_RESULTS_SUFFIX)]
-    eval_files = sorted({p.expanduser() for p in eval_files})
-    if args.limit is not None:
-        eval_files = eval_files[: max(0, int(args.limit))]
 
-    if not eval_files:
-        print("⚠️  no eval files found")
-        return 1
+    init_orm(DEFAULT_DB_CONFIG)
+    service = EvalDbService()
+
+    task_id: str | None = args.task_id
+
+    # 如果没有直接指定 task_id，通过 dataset + model 查找
+    if task_id is None:
+        if not args.dataset or not args.model:
+            print("⚠️  Must specify --task-id or both --dataset and --model")
+            return 1
+
+        ctx = service.get_resume_context(
+            dataset=args.dataset,
+            model=args.model,
+            is_param_search=False,
+            evaluator=args.evaluator,
+        )
+        if ctx.task_id is None:
+            print(f"⚠️  No task found for dataset={args.dataset} model={args.model}")
+            return 1
+        task_id = str(ctx.task_id)
+        print(f"📍 Found task_id={task_id} for dataset={args.dataset} model={args.model}")
 
     if args.dry_run:
-        for path in eval_files:
-            model_name = _infer_model_name(path, eval_root=eval_root, forced=args.model_name)
-            print(f"{path}  (model_name={model_name})")
-        print(f"🧪 dry-run: {len(eval_files)} eval files")
+        count = service.count_failed_evals_for_checker(
+            task_id=task_id,
+            checker_type=args.checker_type,
+        )
+        print(f"🧪 dry-run: {count} samples need checking for task {task_id}")
         return 0
 
-    for path in eval_files:
-        model_name = _infer_model_name(path, eval_root=eval_root, forced=args.model_name)
-        run_llm_checker(path, model_name=model_name)
-
-    return 0
+    updated = run_llm_checker_db(
+        task_id=task_id,
+        checker_type=args.checker_type,
+    )
+    return 0 if updated >= 0 else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
