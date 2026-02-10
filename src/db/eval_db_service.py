@@ -117,6 +117,26 @@ class EvalDbService:
             + len(str(fail_reason or ""))
         )
 
+    @classmethod
+    def _sanitize_json_text(cls, value: Any) -> Any:
+        """PostgreSQL JSONB rejects NUL bytes in text values; strip them recursively."""
+        if isinstance(value, str):
+            return value.replace("\x00", "")
+        if isinstance(value, dict):
+            sanitized: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, str):
+                    sanitized_key = cls._sanitize_json_text(key)
+                else:
+                    sanitized_key = key
+                sanitized[sanitized_key] = cls._sanitize_json_text(item)
+            return sanitized
+        if isinstance(value, list):
+            return [cls._sanitize_json_text(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._sanitize_json_text(item) for item in value]
+        return value
+
     def get_resume_context(
         self,
         *,
@@ -464,14 +484,69 @@ class EvalDbService:
         inserted = 0
         pending_rows = 0
         pending_chars = 0
+        pending_payloads: list[tuple[int, dict[str, Any]]] = []
         created_at = self._now_cn()
+        task_id_int = int(task_id)
         with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
-            for payload in payloads:
-                completions_id = mapping.get(
-                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
+            mapping = self._repo.fetch_completion_id_map(session, task_id=task_id_int)
+            existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
+                session,
+                task_id=task_id_int,
+            )
+        for payload in payloads:
+            try:
+                sample_index = int(payload.get("sample_index", 0))
+            except (TypeError, ValueError):
+                sample_index = 0
+            try:
+                repeat_index = int(payload.get("repeat_index", 0))
+            except (TypeError, ValueError):
+                repeat_index = 0
+
+            completions_id = mapping.get((sample_index, repeat_index))
+            if completions_id is None or completions_id in existing_eval_ids:
+                continue
+
+            pending_payloads.append((completions_id, payload))
+            existing_eval_ids.add(completions_id)
+            pending_rows += 1
+            pending_chars += self._estimate_eval_payload_chars(payload)
+
+            if pending_rows >= _EVAL_INSERT_FLUSH_ROWS or pending_chars >= _EVAL_INSERT_FLUSH_CHARS:
+                inserted += self._insert_eval_payload_chunk(
+                    task_id=task_id_int,
+                    rows=pending_payloads,
+                    created_at=created_at,
                 )
-                if completions_id is None:
+                pending_payloads = []
+                pending_rows = 0
+                pending_chars = 0
+
+        if pending_payloads:
+            inserted += self._insert_eval_payload_chunk(
+                task_id=task_id_int,
+                rows=pending_payloads,
+                created_at=created_at,
+            )
+        return inserted
+
+    def _insert_eval_payload_chunk(
+        self,
+        *,
+        task_id: int,
+        rows: Sequence[tuple[int, dict[str, Any]]],
+        created_at: datetime,
+    ) -> int:
+        if not rows:
+            return 0
+        with get_session() as session:
+            known_ids = self._repo.fetch_existing_eval_completion_ids(
+                session,
+                task_id=task_id,
+            )
+            inserted = 0
+            for completions_id, payload in rows:
+                if completions_id in known_ids:
                     continue
                 self._repo.insert_eval(
                     session,
@@ -479,21 +554,8 @@ class EvalDbService:
                     payload=payload,
                     created_at=created_at,
                 )
+                known_ids.add(completions_id)
                 inserted += 1
-                pending_rows += 1
-                pending_chars += self._estimate_eval_payload_chars(payload)
-
-                if (
-                    pending_rows >= _EVAL_INSERT_FLUSH_ROWS
-                    or pending_chars >= _EVAL_INSERT_FLUSH_CHARS
-                ):
-                    session.flush()
-                    session.expunge_all()
-                    pending_rows = 0
-                    pending_chars = 0
-
-            if pending_rows > 0:
-                session.flush()
         return inserted
 
     def record_score_payload(
@@ -513,6 +575,13 @@ class EvalDbService:
     def list_latest_scores(self) -> list[dict[str, Any]]:
         with get_session() as session:
             return self._repo.fetch_latest_scores(session)
+
+    def list_latest_scores_for_space(self, *, include_param_search: bool = False) -> list[dict[str, Any]]:
+        with get_session() as session:
+            return self._repo.fetch_latest_scores_for_space(
+                session,
+                include_param_search=include_param_search,
+            )
 
     def list_scores_by_dataset(
         self,
@@ -684,10 +753,12 @@ class EvalDbService:
                     "stop_reason": payload.get(f"stop_reason{idx}"),
                 }
             )
-        return {
+        context = {
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
+        sanitized = EvalDbService._sanitize_json_text(context)
+        return sanitized if isinstance(sanitized, dict) else {}
 
     @staticmethod
     def _fallback_parse_model_tags(raw: str | None) -> tuple[str | None, str | None, str | None]:

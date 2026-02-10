@@ -6,6 +6,7 @@ import csv
 import html
 import io
 import json
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +17,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from src.eval.results.layout import ensure_results_structure
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from .data import (
     ARCH_VERSIONS,
     DATA_VERSIONS,
     NUM_PARAMS,
-    SPACE_SCORES_ROOT,
     ScoreEntry,
     parse_model_signature,
     latest_entries_for_model,
@@ -32,7 +32,13 @@ from .data import (
 
 
 AUTO_MODEL_LABEL = "每档最新（调度策略）"
-AUTO_EXCLUDED_PARAMS = {"0_1B", "0_4B"}
+TABLE_VIEW_LABELS: dict[str, str] = {
+    "benchmark_detail_latest": "明细（最新）",
+    "field_avg_latest": "领域均分（最新）",
+    "benchmark_detail_delta": "明细（最新 vs 上一代）",
+    "field_avg_delta": "领域均分（最新 vs 上一代）",
+}
+DEFAULT_TABLE_VIEW = "benchmark_detail_latest"
 PRIMARY_KEYS = (
     "judge_accuracy",
     "exact_accuracy",
@@ -175,6 +181,15 @@ class SelectionState:
     model_sequence: list[str]
     aggregated_models: list[dict[str, Any]] | None = None
     skipped_small_params: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class ParamLineage:
+    param: str
+    latest_model: str
+    latest_label: str
+    prev_model: str | None
+    prev_label: str
 
 
 def _rank_token(candidates: Sequence[str], value: str | None) -> int | None:
@@ -332,6 +347,25 @@ def _model_display_name(model: str) -> str:
     return model
 
 
+def _model_data_param_label(model: str, *, include_params: bool = True) -> str:
+    sig = parse_model_signature(model)
+    data = (sig.data or "").lower()
+    params = _format_param(sig.params).lower() if sig.params else ""
+    if include_params:
+        if data and params:
+            return f"{data}-{params}"
+        if params:
+            return params
+        if data:
+            return data
+    else:
+        if data:
+            return data
+        if params:
+            return params
+    return _model_display_name(model)
+
+
 def _format_combo_label(snapshot: dict[str, Any]) -> str:
     if snapshot.get("has_signature"):
         arch = snapshot.get("arch") or "未知架构"
@@ -423,30 +457,33 @@ def _render_summary(
     all_entries: list[ScoreEntry],
     visible: list[ScoreEntry],
     selection: SelectionState,
+    view_mode: str = DEFAULT_TABLE_VIEW,
     warnings: Iterable[str] | None = None,
 ) -> str:
+    db_host = os.environ.get("PG_HOST", DEFAULT_DB_CONFIG.host)
+    db_port = os.environ.get("PG_PORT", str(DEFAULT_DB_CONFIG.port))
+    db_name = os.environ.get("PG_DBNAME", DEFAULT_DB_CONFIG.dbname)
+
     if not all_entries:
-        ensure_results_structure()
-        try:
-            SPACE_SCORES_ROOT.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        return f"未找到任何分数文件，期待路径：`{SPACE_SCORES_ROOT}`。运行评测脚本后再刷新即可。"
+        return (
+            "数据库暂无可展示分数。"
+            f"（连接目标：`{db_host}:{db_port}/{db_name}`，仅统计非 param-search 结果）"
+        )
 
     benchmark_count = len(
         {(_dataset_base(entry.dataset), _method_tag(entry.cot)) for entry in visible}
     )
     lines = [
-        f"- 分数根目录：`{SPACE_SCORES_ROOT}`",
+        f"- 数据源：PostgreSQL (`{db_host}:{db_port}/{db_name}`)",
+        "- 数据范围：仅正式评测（已过滤 param-search）",
         f"- 当前策略：`{selection.selected_label}`" + ("（按排序规则自动选择）" if selection.auto_selected else ""),
+        f"- 表格视图：{TABLE_VIEW_LABELS.get(view_mode, TABLE_VIEW_LABELS[DEFAULT_TABLE_VIEW])}",
         "- 领域分块：knowledge / math / coding / instruction_following / function_call",
         f"- 模型列数：{len(selection.model_sequence)}",
         f"- 基准行数：{benchmark_count}",
-        f"- 可见数据集：{len(visible)} / 总分数文件：{len(all_entries)}",
+        f"- 可见数据集：{len(visible)} / 总分数记录：{len(all_entries)}",
         "- 排序：架构 > 参数量 > data_version（G0→…→G1d）> domain > dataset / task",
     ]
-    if selection.selected_label == AUTO_MODEL_LABEL and selection.skipped_small_params:
-        lines.append(f"- 已忽略 {selection.skipped_small_params} 个 0.1B / 0.4B 组合（调度策略）")
     if selection.aggregated_models:
         lines.extend(_summarise_snapshots(selection.aggregated_models))
     for warn in warnings or ():
@@ -468,20 +505,7 @@ def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None) -
 
     if selection_value == AUTO_MODEL_LABEL or selection_value is None:
         combined_entries, snapshots, ordered_models = _latest_entries_for_signatures(entries)
-        allowed_models: list[str] = []
-        filtered_snapshots: list[dict[str, Any]] = []
-        skipped_small = 0
-        for snap in snapshots:
-            params = snap.get("params")
-            if snap.get("has_signature") and params in AUTO_EXCLUDED_PARAMS:
-                skipped_small += 1
-                continue
-            allowed_models.append(snap["model"])
-            filtered_snapshots.append(snap)
-        if allowed_models:
-            snapshots = filtered_snapshots
-        else:
-            allowed_models = ordered_models
+        allowed_models = ordered_models
         filtered_entries = [entry for entry in combined_entries if entry.model in allowed_models]
         return SelectionState(
             entries=_sort_entries(filtered_entries),
@@ -490,7 +514,7 @@ def _prepare_selection(entries: list[ScoreEntry], selection_value: str | None) -
             auto_selected=False,
             model_sequence=allowed_models,
             aggregated_models=snapshots,
-            skipped_small_params=skipped_small,
+            skipped_small_params=0,
         )
 
     models = set(list_models(entries))
@@ -555,6 +579,39 @@ def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
     if not primary:
         return "—"
     return primary[1]
+
+
+def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float | None:
+    if entry is None:
+        return None
+
+    base = dataset_base.lower()
+    metrics = entry.metrics
+
+    def _numeric_specific(key: str) -> float | None:
+        return _numeric_value(metrics.get(key))
+
+    if base.startswith("aime"):
+        candidates: list[float] = []
+        for key in ("avg@16", "pass@8"):
+            value = _numeric_specific(key)
+            if value is not None:
+                candidates.append(value)
+        if candidates:
+            return max(candidates)
+
+    if base in MATH500_BASES:
+        value = _numeric_specific("avg@4")
+        if value is not None:
+            return value
+
+    if base.startswith("ifeval"):
+        value = _numeric_specific("avg@4")
+        if value is not None:
+            return value
+
+    _, value = _primary_numeric_metric(metrics)
+    return value
 
 
 def _preferred_numeric(metrics: dict[str, Any], keys: Sequence[str]) -> tuple[str | None, float | None]:
@@ -623,7 +680,7 @@ def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) 
 
 
 def _build_pivot_table(selection: SelectionState, entries: Iterable[ScoreEntry] | None = None) -> tuple[list[str], list[list[Any]]]:
-    headers = ["Benchmark"] + [_model_display_name(model) for model in selection.model_sequence]
+    headers = ["Benchmark"] + [_model_data_param_label(model, include_params=True) for model in selection.model_sequence]
     target_entries = list(entries) if entries is not None else selection.entries
     if not target_entries:
         return headers, []
@@ -676,9 +733,14 @@ def _build_pivot_table(selection: SelectionState, entries: Iterable[ScoreEntry] 
     for meta in ordered_rows:
         row_label = f"{meta['base']}_{meta['method']}"
         row: list[Any] = [row_label]
+        numeric_values: list[float | None] = []
         for model in selection.model_sequence:
             entry = grouped.get((model, meta["base"], meta["method"]))
+            numeric_values.append(_cell_numeric_value(entry, dataset_base=meta["base"]))
             row.append(_cell_metric_value(entry, dataset_base=meta["base"]))
+        max_score = _max_percent(numeric_values)
+        if max_score is None or max_score < 10.0:
+            continue
         rows.append(row)
     return headers, rows
 
@@ -707,6 +769,619 @@ def _numeric_value(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _score_to_percent(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if -1.0 <= value <= 1.0:
+        return value * 100.0
+    return value
+
+
+def _max_percent(values: Iterable[float | None]) -> float | None:
+    best: float | None = None
+    for value in values:
+        percent = _score_to_percent(value)
+        if percent is None:
+            continue
+        if best is None or percent > best:
+            best = percent
+    return best
+
+
+def _format_score_1dp(value: float | None) -> str:
+    normalized = _score_to_percent(value)
+    if normalized is None:
+        return "—"
+    return f"{normalized:.1f}"
+
+
+def _format_delta_1dp(latest: float | None, previous: float | None) -> str:
+    latest_n = _score_to_percent(latest)
+    prev_n = _score_to_percent(previous)
+    if latest_n is None or prev_n is None:
+        return "—"
+    delta = latest_n - prev_n
+    sign = "+" if delta > 0 else ""
+    return f"{sign}{delta:.1f}"
+
+
+
+def _format_delta_value(value: float | None) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.1f}"
+
+
+def _score_cell_style(value: float | None, *, mode: str) -> str | None:
+    if value is None:
+        return None
+
+    if mode == "score":
+        percent = _score_to_percent(value)
+        if percent is None:
+            return None
+        delta = percent - 50.0
+        if abs(delta) < 1e-6:
+            return None
+        intensity = min(abs(delta) / 50.0, 1.0)
+    else:
+        delta = value
+        if abs(delta) < 1e-6:
+            return None
+        intensity = min(abs(delta) / 20.0, 1.0)
+
+    base_alpha = 0.06
+    alpha = base_alpha + 0.24 * intensity
+    if delta > 0:
+        color = (34, 197, 94)
+    else:
+        color = (239, 68, 68)
+    return f"background-color: rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
+
+
+
+def _score_cell_style_norm(value: float | None, min_v: float | None, max_v: float | None) -> str | None:
+    if value is None or min_v is None or max_v is None:
+        return None
+    if max_v <= min_v:
+        return None
+    percent = _score_to_percent(value)
+    if percent is None:
+        return None
+    mid = (min_v + max_v) / 2.0
+    delta = percent - mid
+    if abs(delta) < 1e-6:
+        return None
+    intensity = min(abs(delta) / (max_v - min_v), 1.0)
+
+    base_alpha = 0.06
+    alpha = base_alpha + 0.24 * intensity
+    if delta > 0:
+        color = (34, 197, 94)
+    else:
+        color = (239, 68, 68)
+    return f"background-color: rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
+
+def _styled_score_cell(value: float | None) -> tuple[str, str | None]:
+    return _format_score_1dp(value), _score_cell_style(value, mode="score")
+
+
+
+def _styled_score_cell_norm(value: float | None, min_v: float | None, max_v: float | None) -> tuple[str, str | None]:
+    return _format_score_1dp(value), _score_cell_style_norm(value, min_v, max_v)
+
+def _styled_delta_cell(delta_value: float | None) -> tuple[str, str | None]:
+    return _format_delta_value(delta_value), _score_cell_style(delta_value, mode="delta")
+
+
+
+def _parse_display_number(value: Any) -> float | None:
+    if isinstance(value, tuple) and len(value) == 2:
+        value = value[0]
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text == "—":
+        return None
+    text = text.replace("%", "").replace(",", "")
+    if text.startswith("+"):
+        text = text[1:]
+    try:
+        return float(text)
+    except ValueError:
+        return None
+def _benchmark_name(entry: ScoreEntry) -> str:
+    return f"{_dataset_base(entry.dataset)}_{_method_tag(entry.cot)}"
+
+
+def _is_multi_choice_entry(entry: ScoreEntry) -> bool:
+    task = (entry.task or "").lower()
+    if "multi" in task and "choice" in task:
+        return True
+    job_hint = entry.domain in {"mmlu系列", "multi-choice系列"}
+    return job_hint and _numeric_value(entry.metrics.get("accuracy")) is not None
+
+
+def _parse_k_metric(key: str) -> tuple[str, int] | None:
+    token = str(key).strip().lower()
+    if token.startswith("pass@"):
+        try:
+            return "pass", int(token.split("@", 1)[1])
+        except ValueError:
+            return None
+    if token.startswith("avg@"):
+        try:
+            return "avg", int(token.split("@", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _preferred_k_metric(metrics: dict[str, Any]) -> str:
+    avg_candidates: list[tuple[int, str]] = []
+    pass_candidates: list[tuple[int, str]] = []
+    for key, value in metrics.items():
+        parsed = _parse_k_metric(str(key))
+        if parsed is None or _numeric_value(value) is None:
+            continue
+        kind, k = parsed
+        if kind == "avg":
+            avg_candidates.append((k, str(key)))
+        elif kind == "pass":
+            pass_candidates.append((k, str(key)))
+    if avg_candidates:
+        return max(avg_candidates, key=lambda item: item[0])[1]
+    if pass_candidates:
+        return max(pass_candidates, key=lambda item: item[0])[1]
+    return "pass@1"
+
+
+def _score_for_eval_method(entry: ScoreEntry, method: str, k_metric: str) -> float | None:
+    metrics = entry.metrics
+    if method == "logits":
+        acc = _numeric_value(metrics.get("accuracy"))
+        if acc is not None:
+            return acc
+        _, fallback = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
+        return fallback
+    if method == "llm_judge":
+        return _numeric_value(metrics.get("judge_accuracy"))
+
+    # exact_match
+    for key in ("exact_accuracy", "instruction_accuracy", "prompt_accuracy"):
+        number = _numeric_value(metrics.get(key))
+        if number is not None:
+            return number
+    if not _is_multi_choice_entry(entry):
+        acc = _numeric_value(metrics.get("accuracy"))
+        if acc is not None:
+            return acc
+    k_value = _numeric_value(metrics.get(k_metric))
+    if k_value is not None:
+        return k_value
+    _, fallback = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
+    return fallback
+
+
+def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float]]:
+    benchmark = _benchmark_name(entry)
+    k_metric = _preferred_k_metric(entry.metrics)
+    methods: list[str] = []
+    if _is_multi_choice_entry(entry):
+        methods.append("logits")
+    else:
+        if _numeric_value(entry.metrics.get("judge_accuracy")) is not None:
+            methods.append("llm_judge")
+        methods.append("exact_match")
+
+    rows: list[tuple[str, str, str, float]] = []
+    for method in methods:
+        score = _score_for_eval_method(entry, method, k_metric)
+        if score is None:
+            continue
+        rows.append((benchmark, method, k_metric, score))
+    return rows
+
+
+def _field_primary_score(entry: ScoreEntry) -> float | None:
+    if _is_multi_choice_entry(entry):
+        return _score_for_eval_method(entry, "logits", _preferred_k_metric(entry.metrics))
+    if _numeric_value(entry.metrics.get("judge_accuracy")) is not None:
+        return _score_for_eval_method(entry, "llm_judge", _preferred_k_metric(entry.metrics))
+    return _score_for_eval_method(entry, "exact_match", _preferred_k_metric(entry.metrics))
+
+
+def _detail_sort_key(row_key: tuple[str, str, str]) -> tuple[Any, ...]:
+    benchmark, method, k_metric = row_key
+    method_rank = {"llm_judge": 0, "exact_match": 1, "logits": 2}.get(method, 9)
+    parsed = _parse_k_metric(k_metric)
+    if parsed is None:
+        k_rank = (9, 0)
+    else:
+        kind, k = parsed
+        kind_rank = 0 if kind == "avg" else 1
+        k_rank = (kind_rank, k)
+    return benchmark, method_rank, k_rank, k_metric
+
+
+def _field_average_score(entries: Iterable[ScoreEntry]) -> float | None:
+    values: list[float] = []
+    for entry in entries:
+        score = _field_primary_score(entry)
+        if score is not None:
+            values.append(score)
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _build_model_entries_cache(entries: list[ScoreEntry]) -> dict[str, list[ScoreEntry]]:
+    cache: dict[str, list[ScoreEntry]] = {}
+    for model in list_models(entries):
+        cache[model] = latest_entries_for_model(entries, model)
+    return cache
+
+
+def _resolve_param_lineages(entries: list[ScoreEntry], selection: SelectionState) -> list[ParamLineage]:
+    snapshots = [snap for snap in _model_snapshots(entries).values() if snap.get("has_signature")]
+    if not snapshots:
+        return []
+
+    by_arch_param: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for snap in snapshots:
+        arch = snap.get("arch")
+        param = snap.get("params")
+        if not arch or not param:
+            continue
+        by_arch_param.setdefault((arch, param), []).append(snap)
+
+    for items in by_arch_param.values():
+        items.sort(
+            key=lambda snap: (
+                snap.get("data_rank") if snap.get("data_rank") is not None else -1,
+                snap["created"].timestamp(),
+                snap.get("model", ""),
+            )
+        )
+
+    lineages: list[ParamLineage] = []
+
+    if selection.dropdown_value != AUTO_MODEL_LABEL:
+        target_model = selection.dropdown_value
+        sig = parse_model_signature(target_model)
+        if sig.arch and sig.params:
+            items = by_arch_param.get((sig.arch, sig.params), [])
+            prev_model: str | None = None
+            for idx, snap in enumerate(items):
+                if snap.get("model") != target_model:
+                    continue
+                if idx > 0:
+                    prev_model = str(items[idx - 1]["model"])
+                break
+            lineages.append(
+                ParamLineage(
+                    param=sig.params,
+                    latest_model=target_model,
+                    latest_label=_model_display_name(target_model),
+                    prev_model=prev_model,
+                    prev_label=_model_display_name(prev_model) if prev_model else "—",
+                )
+            )
+        else:
+            lineages.append(
+                ParamLineage(
+                    param="custom",
+                    latest_model=target_model,
+                    latest_label=_model_display_name(target_model),
+                    prev_model=None,
+                    prev_label="—",
+                )
+            )
+        return lineages
+
+    by_param: dict[str, list[dict[str, Any]]] = {}
+    for (_, param), items in by_arch_param.items():
+        if not items:
+            continue
+        by_param.setdefault(param, []).append(items[-1])
+
+    for param, candidates in by_param.items():
+        latest = max(
+            candidates,
+            key=lambda snap: (
+                snap.get("data_rank") if snap.get("data_rank") is not None else -1,
+                snap["created"].timestamp(),
+                snap.get("arch_rank") if snap.get("arch_rank") is not None else -1,
+                snap.get("model", ""),
+            ),
+        )
+        latest_model = str(latest["model"])
+        arch = str(latest["arch"])
+        chain = by_arch_param.get((arch, param), [])
+        prev_model: str | None = None
+        for idx, snap in enumerate(chain):
+            if snap.get("model") != latest_model:
+                continue
+            if idx > 0:
+                prev_model = str(chain[idx - 1]["model"])
+            break
+        lineages.append(
+            ParamLineage(
+                param=param,
+                latest_model=latest_model,
+                latest_label=_model_display_name(latest_model),
+                prev_model=prev_model,
+                prev_label=_model_display_name(prev_model) if prev_model else "—",
+            )
+        )
+
+    lineages.sort(
+        key=lambda item: (
+            _rank_token(NUM_PARAMS, item.param) if _rank_token(NUM_PARAMS, item.param) is not None else len(NUM_PARAMS),
+            item.param,
+        )
+    )
+    return lineages
+
+
+def _entries_for_model_in_domains(
+    model_cache: dict[str, list[ScoreEntry]],
+    model: str | None,
+    domains: set[str],
+) -> list[ScoreEntry]:
+    if not model:
+        return []
+    return [entry for entry in model_cache.get(model, []) if entry.domain in domains]
+
+
+def _build_detail_score_map(entries: Iterable[ScoreEntry]) -> dict[tuple[str, str, str], float]:
+    mapped: dict[tuple[str, str, str], float] = {}
+    for entry in entries:
+        for benchmark, method, k_metric, score in _detail_rows_for_entry(entry):
+            key = (benchmark, method, k_metric)
+            previous = mapped.get(key)
+            if previous is None or score > previous:
+                mapped[key] = score
+    return mapped
+
+
+def _build_field_avg_latest_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+    domains: set[str],
+    field_label: str,
+) -> tuple[list[str], list[list[Any]]]:
+    headers = ["field_name", "metric_rule"] + [
+        f"{_format_param(item.param).lower()} · {_model_data_param_label(item.latest_model, include_params=False)}"
+        for item in lineages
+    ]
+    if not lineages:
+        return headers, []
+    row: list[Any] = [field_label, "benchmark_equal_weight"]
+    score_values: list[float | None] = []
+    for item in lineages:
+        entries = _entries_for_model_in_domains(model_cache, item.latest_model, domains)
+        score = _field_average_score(entries)
+        score_values.append(score)
+        row.append(_format_score_1dp(score))
+    max_score = _max_percent(score_values)
+    if max_score is None or max_score < 10.0:
+        return headers, []
+    return headers, [row]
+
+
+def _build_field_avg_delta_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+    domains: set[str],
+    field_label: str,
+) -> tuple[list[str], list[list[Any]]]:
+    headers = ["field_name", "metric_rule"]
+    for item in lineages:
+        param_label = _format_param(item.param).lower()
+        latest_label = _model_data_param_label(item.latest_model, include_params=False)
+        prev_label = _model_data_param_label(item.prev_model, include_params=False) if item.prev_model else "—"
+        headers.extend(
+            [
+                f"{param_label} latest ({latest_label})",
+                f"{param_label} prev ({prev_label})",
+                f"{param_label} delta",
+            ]
+        )
+    if not lineages:
+        return headers, []
+
+    row: list[Any] = [field_label, "benchmark_equal_weight"]
+    score_values: list[float | None] = []
+    for item in lineages:
+        latest_entries = _entries_for_model_in_domains(model_cache, item.latest_model, domains)
+        prev_entries = _entries_for_model_in_domains(model_cache, item.prev_model, domains)
+        latest_score = _field_average_score(latest_entries)
+        prev_score = _field_average_score(prev_entries)
+        score_values.extend([latest_score, prev_score])
+        delta_value = None
+        if latest_score is not None and prev_score is not None:
+            delta_value = _score_to_percent(latest_score) - _score_to_percent(prev_score)
+        row.extend(
+            [
+                _format_score_1dp(latest_score),
+                _format_score_1dp(prev_score),
+                _styled_delta_cell(delta_value),
+            ]
+        )
+    max_score = _max_percent(score_values)
+    if max_score is None or max_score < 10.0:
+        return headers, []
+    return headers, [row]
+
+
+def _build_benchmark_detail_latest_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+    domains: set[str],
+) -> tuple[list[str], list[list[Any]]]:
+    headers = ["benchmark_name", "eval_method", "k_metric"] + [
+        f"{_format_param(item.param).lower()} · {_model_data_param_label(item.latest_model, include_params=False)}"
+        for item in lineages
+    ]
+    if not lineages:
+        return headers, []
+
+    row_values: dict[tuple[str, str, str], dict[str, float]] = {}
+    for item in lineages:
+        model_entries = _entries_for_model_in_domains(model_cache, item.latest_model, domains)
+        score_map = _build_detail_score_map(model_entries)
+        for row_key, score in score_map.items():
+            row_values.setdefault(row_key, {})[item.param] = score
+
+    rows: list[list[Any]] = []
+    for row_key in sorted(row_values, key=_detail_sort_key):
+        row = [row_key[0], row_key[1], row_key[2]]
+        values = row_values[row_key]
+        max_score = _max_percent(values.get(item.param) for item in lineages)
+        if max_score is None or max_score < 10.0:
+            continue
+        for item in lineages:
+            row.append(_format_score_1dp(values.get(item.param)))
+        rows.append(row)
+    return headers, rows
+
+
+def _build_benchmark_detail_delta_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+    domains: set[str],
+) -> tuple[list[str], list[list[Any]]]:
+    headers = ["benchmark_name", "eval_method", "k_metric"]
+    for item in lineages:
+        param_label = _format_param(item.param).lower()
+        latest_label = _model_data_param_label(item.latest_model, include_params=False)
+        prev_label = _model_data_param_label(item.prev_model, include_params=False) if item.prev_model else "—"
+        headers.extend(
+            [
+                f"{param_label} latest ({latest_label})",
+                f"{param_label} prev ({prev_label})",
+                f"{param_label} delta",
+            ]
+        )
+    if not lineages:
+        return headers, []
+
+    latest_by_param: dict[str, dict[tuple[str, str, str], float]] = {}
+    prev_by_param: dict[str, dict[tuple[str, str, str], float]] = {}
+    row_keys: set[tuple[str, str, str]] = set()
+    for item in lineages:
+        latest_map = _build_detail_score_map(_entries_for_model_in_domains(model_cache, item.latest_model, domains))
+        prev_map = _build_detail_score_map(_entries_for_model_in_domains(model_cache, item.prev_model, domains))
+        latest_by_param[item.param] = latest_map
+        prev_by_param[item.param] = prev_map
+        row_keys.update(latest_map.keys())
+        row_keys.update(prev_map.keys())
+
+    rows_with_meta: list[tuple[float, tuple[Any, ...], list[Any]]] = []
+    for row_key in row_keys:
+        max_score = _max_percent(
+            [
+                score
+                for item in lineages
+                for score in (
+                    latest_by_param.get(item.param, {}).get(row_key),
+                    prev_by_param.get(item.param, {}).get(row_key),
+                )
+            ]
+        )
+        if max_score is None or max_score < 10.0:
+            continue
+        row = [row_key[0], row_key[1], row_key[2]]
+        delta_values: list[float] = []
+        for item in lineages:
+            latest_score = latest_by_param.get(item.param, {}).get(row_key)
+            prev_score = prev_by_param.get(item.param, {}).get(row_key)
+            delta_value = None
+            if latest_score is not None and prev_score is not None:
+                delta_value = _score_to_percent(latest_score) - _score_to_percent(prev_score)
+                delta_values.append(delta_value)
+            row.extend(
+                [
+                    _format_score_1dp(latest_score),
+                    _format_score_1dp(prev_score),
+                    _styled_delta_cell(delta_value),
+                ]
+            )
+        avg_delta = sum(delta_values) / len(delta_values) if delta_values else float("-inf")
+        rows_with_meta.append((avg_delta, _detail_sort_key(row_key), row))
+    rows = [row for _, _, row in sorted(rows_with_meta, key=lambda item: (-item[0], item[1]))]
+    return headers, rows
+
+
+def _build_all_field_avg_latest_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+) -> tuple[list[str], list[list[Any]]]:
+    headers: list[str] | None = None
+    rows: list[list[Any]] = []
+    for group in DOMAIN_GROUPS:
+        table_headers, table_rows = _build_field_avg_latest_table(
+            lineages=lineages,
+            model_cache=model_cache,
+            domains=set(group["domains"]),
+            field_label=group["label"],
+        )
+        if headers is None:
+            headers = table_headers
+        rows.extend(table_rows)
+    return headers or ["field_name", "metric_rule"], rows
+
+
+def _build_all_field_avg_delta_table(
+    *,
+    lineages: list[ParamLineage],
+    model_cache: dict[str, list[ScoreEntry]],
+) -> tuple[list[str], list[list[Any]]]:
+    headers: list[str] | None = None
+    rows_with_meta: list[tuple[float, int, list[Any]]] = []
+    delta_indices: list[int] | None = None
+    for idx, group in enumerate(DOMAIN_GROUPS):
+        table_headers, table_rows = _build_field_avg_delta_table(
+            lineages=lineages,
+            model_cache=model_cache,
+            domains=set(group["domains"]),
+            field_label=group["label"],
+        )
+        if headers is None:
+            headers = table_headers
+            delta_indices = [
+                i for i, name in enumerate(headers)
+                if str(name).strip().endswith("delta")
+            ]
+        if not table_rows:
+            continue
+        row = table_rows[0]
+        values: list[float] = []
+        for i in delta_indices or []:
+            if i >= len(row):
+                continue
+            num = _parse_display_number(row[i])
+            if num is not None:
+                values.append(num)
+        avg_delta = sum(values) / len(values) if values else float("-inf")
+        rows_with_meta.append((avg_delta, idx, row))
+
+    if headers is None:
+        return ["field_name", "metric_rule"], []
+
+    rows = [row for _, _, row in sorted(rows_with_meta, key=lambda item: (-item[0], item[1]))]
+    return headers, rows
 
 
 def _extract_pass_curve(entry: ScoreEntry) -> dict[int, float]:
@@ -945,12 +1620,50 @@ def _build_aime_plot(selection: SelectionState) -> go.Figure | None:
     return fig
 
 
-def _build_domain_tables(selection: SelectionState) -> dict[str, str]:
+def _build_domain_tables(
+    selection: SelectionState,
+    *,
+    all_entries: list[ScoreEntry],
+    view_mode: str,
+) -> dict[str, str]:
+    mode = view_mode if view_mode in TABLE_VIEW_LABELS else DEFAULT_TABLE_VIEW
+    source_entries = all_entries if all_entries else selection.entries
+    model_cache = _build_model_entries_cache(source_entries)
+    lineages = _resolve_param_lineages(source_entries, selection)
+
+    if mode == "field_avg_latest":
+        headers, rows = _build_all_field_avg_latest_table(
+            lineages=lineages,
+            model_cache=model_cache,
+        )
+        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
+        return {group["key"]: table_html for group in DOMAIN_GROUPS}
+
+    if mode == "field_avg_delta":
+        headers, rows = _build_all_field_avg_delta_table(
+            lineages=lineages,
+            model_cache=model_cache,
+        )
+        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
+        return {group["key"]: table_html for group in DOMAIN_GROUPS}
+
     tables: dict[str, str] = {}
     for group in DOMAIN_GROUPS:
-        filtered = [entry for entry in selection.entries if entry.domain in group["domains"]]
-        headers, rows = _build_pivot_table(selection, entries=filtered)
-        tables[group["key"]] = _render_pivot_html(headers, rows, title=group["title"])
+        domains = set(group["domains"])
+        if mode == "benchmark_detail_delta":
+            headers, rows = _build_benchmark_detail_delta_table(
+                lineages=lineages,
+                model_cache=model_cache,
+                domains=domains,
+            )
+        else:
+            headers, rows = _build_benchmark_detail_latest_table(
+                lineages=lineages,
+                model_cache=model_cache,
+                domains=domains,
+            )
+        title = f"{group['title']} · {TABLE_VIEW_LABELS[mode]}"
+        tables[group["key"]] = _render_pivot_html(headers, rows, title=title)
     return tables
 
 
@@ -1149,8 +1862,17 @@ def _render_pivot_html(headers: list[str], rows: list[list[Any]], *, title: str 
         for idx, cell in enumerate(row):
             # First cell is model name, others are metrics
             # Add TITLE attribute for hover tooltips
-            cell_html = _html(cell)
-            cells.append(f'<td title="{cell_html}">{cell_html}</td>')
+            style_attr = ""
+            class_attr = ""
+            display_value = cell
+            if isinstance(cell, tuple) and len(cell) == 2:
+                display_value, style = cell
+                if style:
+                    style_attr = f' style="{_html(style)}"'
+            if _parse_display_number(display_value) is not None:
+                class_attr = ' class="score-cell"'
+            cell_html = _html(display_value)
+            cells.append(f'<td title="{cell_html}"{class_attr}{style_attr}>{cell_html}</td>')
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     rows_html = "".join(body_rows) if body_rows else '<tr><td colspan="999">当前筛选条件下没有数据。</td></tr>'
@@ -1190,19 +1912,20 @@ def _build_dashboard() -> gr.Blocks:
     entries, selection, load_errors = _initial_payload()
     model_choices = _compute_choices(entries)
     warnings = load_errors + ([style_warning] if style_warning else [])
+    initial_view_mode = DEFAULT_TABLE_VIEW
 
     summary = _render_summary(
         all_entries=entries,
         visible=selection.entries,
         selection=selection,
+        view_mode=initial_view_mode,
         warnings=warnings,
     )
-    domain_tables = _build_domain_tables(selection)
-    aime_plot_value = _build_aime_plot(selection)
-    knowledge_radar_value = _build_knowledge_radar(selection)
-    instruction_bar_value = _build_instruction_bar(selection)
-    coding_bar_value = _build_coding_bar(selection)
-    coding_example_value = _load_coding_example(selection)
+    domain_tables = _build_domain_tables(
+        selection,
+        all_entries=entries,
+        view_mode=initial_view_mode,
+    )
     csv_export_path = _export_selection_csv(selection)
 
     # Inject JS to force dark mode
@@ -1231,7 +1954,7 @@ def _build_dashboard() -> gr.Blocks:
                 with gr.Row():
                     model_dropdown = gr.Dropdown(
                         label="模型选择",
-                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1d）最新的模型；手动选择时展示单个模型的最新分数文件。",
+                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1d）最新的模型；手动选择时展示单个模型的最新数据库分数。",
                         choices=model_choices,
                         value=AUTO_MODEL_LABEL,
                         scale=3,
@@ -1240,14 +1963,16 @@ def _build_dashboard() -> gr.Blocks:
                     refresh_btn = gr.Button("刷新分数", variant="primary", scale=1)
                     download_btn = gr.DownloadButton("导出为 CSV", scale=1, value=csv_export_path)
 
+                table_view = gr.Radio(
+                    label="表格视图",
+                    choices=[(label, key) for key, label in TABLE_VIEW_LABELS.items()],
+                    value=initial_view_mode,
+                    info="在旧表位置切换：最新明细 / 最新均分 / 与上一代对比",
+                )
+
                 summary_md = gr.Markdown(summary, elem_classes="space-info-card")
 
             tables: dict[str, gr.HTML] = {}
-            plot_aime: gr.Plot | None = None
-            plot_knowledge: gr.Plot | None = None
-            plot_instruction: gr.Plot | None = None
-            plot_coding: gr.Plot | None = None
-            coding_example: gr.Markdown | None = None
 
             # Main Content Tabs
             with gr.Tabs(elem_classes="tabs"):
@@ -1257,60 +1982,17 @@ def _build_dashboard() -> gr.Blocks:
                         # Use a spacer
                         gr.HTML('<div class="space-spacer"></div>')
                         
-                        # Charts Section
-                        if group["key"] == "knowledge":
-                            with gr.Column(elem_classes="space-section-card"):
-                                gr.Markdown("### Knowledge Accuracy by Subject (Horizontal Bar)", elem_classes="chart-title")
-                                plot_knowledge = gr.Plot(
-                                    value=knowledge_radar_value,
-                                    show_label=False,
-                                    elem_classes="space-chart-container",
-                                )
-                        
-                        if group["key"] == "math":
-                            with gr.Column(elem_classes="space-section-card"):
-                                gr.Markdown("### AIME pass@k Curve", elem_classes="chart-title")
-                                plot_aime = gr.Plot(
-                                    value=aime_plot_value,
-                                    show_label=False,
-                                    elem_classes="space-chart-container",
-                                )
-
-                        if group["key"] == "coding":
-                            with gr.Column(elem_classes="space-section-card"):
-                                gr.Markdown("### Coding Benchmark (pass@1 priority)", elem_classes="chart-title")
-                                plot_coding = gr.Plot(
-                                    value=coding_bar_value,
-                                    show_label=False,
-                                    elem_classes="space-chart-container",
-                                )
-                            with gr.Column(elem_classes="space-section-card"):
-                                coding_example = gr.Markdown(
-                                    value=coding_example_value or "暂未找到 Coding 示例。",
-                                    elem_classes="prose",
-                                )
-
-                        if group["key"] == "instruction_following":
-                            with gr.Column(elem_classes="space-section-card"):
-                                plot_instruction = gr.Plot(
-                                    value=instruction_bar_value,
-                                    show_label=False,
-                                    elem_classes="space-chart-container",
-                                )
-
                         # Table Section
-                        # Tables already rendered with .space-section-card in _render_pivot_html wrapper if we want consistent look,
-                        # BUT _render_pivot_html returns a string HTML.
-                        # I updated _render_pivot_html to include the card wrapper div.
                         tables[group["key"]] = gr.HTML(
                             domain_tables.get(group["key"], _render_pivot_html([], [])),
                         )
             
-            def update_dashboard(selected_model: str):
+            def update_dashboard(selected_model: str, selected_view_mode: str):
                 load_errors: list[str] = []
                 entries = load_scores(errors=load_errors)
                 model_choices = _compute_choices(entries)
                 dropdown_value = selected_model if selected_model in model_choices else AUTO_MODEL_LABEL
+                view_mode = selected_view_mode if selected_view_mode in TABLE_VIEW_LABELS else DEFAULT_TABLE_VIEW
                 
                 selection_state = _prepare_selection(entries, dropdown_value)
                 warnings = load_errors + ([style_warning] if style_warning else [])
@@ -1320,14 +2002,14 @@ def _build_dashboard() -> gr.Blocks:
                     all_entries=entries,
                     visible=selection_state.entries,
                     selection=selection_state,
+                    view_mode=view_mode,
                     warnings=warnings,
                 )
-                domain_table_values = _build_domain_tables(selection_state)
-                aime_plot_fig = _build_aime_plot(selection_state)
-                knowledge_radar_fig = _build_knowledge_radar(selection_state)
-                instruction_bar_fig = _build_instruction_bar(selection_state)
-                coding_bar_fig = _build_coding_bar(selection_state)
-                coding_example_md = _load_coding_example(selection_state) or "暂未找到 Coding 示例。"
+                domain_table_values = _build_domain_tables(
+                    selection_state,
+                    all_entries=entries,
+                    view_mode=view_mode,
+                )
 
                 outputs: list[Any] = [
                     gr.update(choices=model_choices, value=selection_state.dropdown_value),
@@ -1336,53 +2018,48 @@ def _build_dashboard() -> gr.Blocks:
                 ]
                 for group in DOMAIN_GROUPS:
                     outputs.append(gr.update(value=domain_table_values.get(group["key"])))
-                    if group["key"] == "knowledge" and plot_knowledge is not None:
-                        outputs.append(gr.update(value=knowledge_radar_fig))
-                    if group["key"] == "math" and plot_aime is not None:
-                        outputs.append(gr.update(value=aime_plot_fig))
-                    if group["key"] == "coding" and plot_coding is not None:
-                        outputs.append(gr.update(value=coding_bar_fig))
-                        if coding_example is not None:
-                            outputs.append(gr.update(value=coding_example_md))
-                    if group["key"] == "instruction_following" and plot_instruction is not None:
-                        outputs.append(gr.update(value=instruction_bar_fig))
                 return outputs
 
             model_dropdown.change(
                 update_dashboard,
-                inputs=[model_dropdown],
+                inputs=[model_dropdown, table_view],
                 outputs=[c for c in [
                     model_dropdown,
                     download_btn,
                     summary_md,
                     tables["knowledge"],
-                    plot_knowledge,
                     tables["math"],
-                    plot_aime,
                     tables["coding"],
-                    plot_coding,
-                    coding_example,
                     tables["instruction_following"],
-                    plot_instruction,
                     tables["function_call"],
                 ] if c is not None],
             )
             refresh_btn.click(
                 update_dashboard,
-                inputs=[model_dropdown],
+                inputs=[model_dropdown, table_view],
                 outputs=[c for c in [
                     model_dropdown,
                     download_btn,
                     summary_md,
                     tables["knowledge"],
-                    plot_knowledge,
                     tables["math"],
-                    plot_aime,
                     tables["coding"],
-                    plot_coding,
-                    coding_example,
                     tables["instruction_following"],
-                    plot_instruction,
+                    tables["function_call"],
+                ] if c is not None],
+            )
+
+            table_view.change(
+                update_dashboard,
+                inputs=[model_dropdown, table_view],
+                outputs=[c for c in [
+                    model_dropdown,
+                    download_btn,
+                    summary_md,
+                    tables["knowledge"],
+                    tables["math"],
+                    tables["coding"],
+                    tables["instruction_following"],
                     tables["function_call"],
                 ] if c is not None],
             )
@@ -1404,7 +2081,7 @@ def _build_dashboard() -> gr.Blocks:
 
 def main() -> None:
     demo = _build_dashboard()
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":  # pragma: no cover

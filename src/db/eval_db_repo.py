@@ -215,6 +215,52 @@ class EvalDbRepository:
         )
         return list(session.execute(stmt).mappings().all())
 
+    def fetch_latest_scores_for_space(
+        self,
+        session: Session,
+        *,
+        include_param_search: bool,
+    ) -> list[dict[str, Any]]:
+        row_number = func.row_number().over(
+            partition_by=(Task.model_id, Task.benchmark_id, Score.is_cot),
+            order_by=(Score.created_at.desc(), Score.score_id.desc()),
+        ).label("rn")
+        subquery = (
+            select(
+                Score.task_id.label("task_id"),
+                Score.is_cot.label("cot"),
+                Score.metrics.label("metrics"),
+                Score.created_at.label("created_at"),
+                Task.is_param_search.label("is_param_search"),
+                row_number,
+            )
+            .join(Task, Task.task_id == Score.task_id)
+            .subquery()
+        )
+        stmt = (
+            select(
+                subquery.c.task_id,
+                subquery.c.cot,
+                subquery.c.metrics,
+                subquery.c.created_at,
+                subquery.c.is_param_search,
+                Model.model_name.label("model"),
+                self._dataset_label().label("dataset"),
+                Benchmark.num_samples.label("samples"),
+                Benchmark.num_samples.label("problems"),
+                Task.evaluator.label("task"),
+                cast(None, Integer).label("task_details"),
+                Task.log_path.label("log_path"),
+            )
+            .join(Task, Task.task_id == subquery.c.task_id)
+            .join(Model, Model.model_id == Task.model_id)
+            .join(Benchmark, Benchmark.benchmark_id == Task.benchmark_id)
+            .where(subquery.c.rn == 1)
+        )
+        if not include_param_search:
+            stmt = stmt.where(Task.is_param_search.is_(False))
+        return list(session.execute(stmt).mappings().all())
+
     def fetch_scores_by_benchmark(
         self,
         session: Session,
@@ -314,6 +360,20 @@ class EvalDbRepository:
         for completions_id, sample_index, repeat_index in rows:
             mapping[(int(sample_index), int(repeat_index))] = int(completions_id)
         return mapping
+
+    def fetch_existing_eval_completion_ids(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+    ) -> set[int]:
+        stmt = (
+            select(Eval.completions_id)
+            .join(Completion, Completion.completions_id == Eval.completions_id)
+            .where(Completion.task_id == task_id)
+        )
+        rows = session.execute(stmt).all()
+        return {int(row[0]) for row in rows}
 
     def fetch_score_by_task(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 from pathlib import Path
 from typing import Sequence
 
@@ -19,7 +20,6 @@ from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.job_env import ensure_job_id
 from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
@@ -51,7 +51,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--db-write-queue", type=int, default=16, help="DB completion write queue max size")
+    parser.add_argument("--db-write-queue", type=int, default=8, help="DB completion write queue max size")
+    parser.add_argument(
+        "--db-drain-every",
+        type=int,
+        default=8,
+        help="Force DB writer to drain every N completion payloads (0 disables)",
+    )
+    parser.add_argument(
+        "--db-close-timeout-s",
+        type=float,
+        default=30.0,
+        help="Max seconds to wait for DB writer drain/close on shutdown",
+    )
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -204,11 +216,42 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
     expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+    close_timeout_s = max(0.0, float(args.db_close_timeout_s))
     writer = CompletionWriteWorker(
         service=service,
         task_id=task_id,
         max_queue=args.db_write_queue,
+        drain_every=args.db_drain_every,
     )
+
+    should_exit = {"active": False}
+    original_signal_handlers: dict[signal.Signals, object] = {}
+
+    def _restore_signal_handlers() -> None:
+        for sig, handler in original_signal_handlers.items():
+            signal.signal(sig, handler)
+        original_signal_handlers.clear()
+
+    def _handle_termination(signum: int, _frame: object) -> None:
+        if should_exit["active"]:
+            raise SystemExit(128 + signum)
+        should_exit["active"] = True
+        signame = signal.Signals(signum).name
+        print(f"⚠️ Received {signame}; draining completion writer before exit...")
+        try:
+            writer.close(timeout_s=close_timeout_s)
+        except Exception as exc:
+            print(f"⚠️ Failed to close completion writer during {signame}: {exc}")
+        try:
+            service.update_task_status(task_id=task_id, status="failed")
+        except Exception as exc:
+            print(f"⚠️ Failed to mark task {task_id} failed after {signame}: {exc}")
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        original_signal_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handle_termination)
+
     try:
         result = pipeline.run(
             dataset_path=str(dataset_path),
@@ -222,15 +265,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_keys=skip_keys,
             on_record=writer.enqueue,
         )
+        writer.close(timeout_s=close_timeout_s)
     except BaseException:
         try:
-            writer.close()
+            writer.close(timeout_s=close_timeout_s)
         finally:
             actual = service.count_completions(task_id=task_id, status="answer")
-            status = "completed" if actual == expected_count else "failed"
+            status = "failed" if should_exit["active"] else ("completed" if actual == expected_count else "failed")
             service.update_task_status(task_id=task_id, status=status)
         raise
-    writer.close()
+    finally:
+        _restore_signal_handlers()
 
     completions_payloads = service.list_completion_payloads(
         task_id=task_id,

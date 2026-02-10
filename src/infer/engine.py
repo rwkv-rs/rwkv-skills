@@ -164,6 +164,47 @@ def _continuous_batching(
                 return _torch_top_k_top_p(logits_tensor.cpu(), sampling.top_k, sampling.top_p)
             raise
 
+    def _sanitize_sampled_tokens(
+        sampled_tokens: torch.Tensor | Sequence[int],
+        logits_tensor: torch.Tensor,
+        active_count: int,
+        *,
+        sampled_with_flashinfer: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        # Some flashinfer kernels can sporadically return corrupted token ids (e.g. huge negatives).
+        # Validate sampled ids and resample with torch to keep generation alive.
+        disable_flashinfer = False
+        sampled = torch.as_tensor(sampled_tokens, device=logits_tensor.device)
+        if sampled.ndim == 0:
+            sampled = sampled.unsqueeze(0)
+        sampled = sampled.reshape(-1).to(dtype=torch.int64)
+
+        valid_mask = sampled.numel() == active_count
+        if valid_mask:
+            valid_mask = bool(torch.all((sampled >= 0) & (sampled < vocab_size)).item())
+
+        if not valid_mask:
+            preview = sampled[: min(4, sampled.numel())].tolist()
+            source = "flashinfer" if sampled_with_flashinfer else "sampler"
+            print(f"⚠️ {source} produced invalid token ids {preview}; falling back to torch sampling.")
+            sampled = _torch_sample(logits_tensor, force_cpu=sampled_with_flashinfer and logits_tensor.is_cuda)
+            sampled = sampled.reshape(-1).to(device=logits_tensor.device, dtype=torch.int64)
+            disable_flashinfer = sampled_with_flashinfer
+            if sampled.numel() != active_count:
+                raise RuntimeError(
+                    f"Sampler returned {sampled.numel()} tokens for active_count={active_count}; cannot continue."
+                )
+            invalid = (sampled < 0) | (sampled >= vocab_size)
+            if torch.any(invalid):
+                print("⚠️ torch fallback still produced invalid token ids; forcing greedy fallback for those rows.")
+                greedy = torch.argmax(logits_tensor, dim=-1).to(dtype=torch.int64)
+                sampled = torch.where(invalid, greedy, sampled)
+
+        # Hard safety net to prevent invalid indices from crashing penalty/state updates.
+        sampled = sampled.clamp(0, vocab_size - 1)
+
+        return sampled, disable_flashinfer
+
     encoded = deque()
     for idx, prompt in enumerate(prompts):
         tokens = tokenizer.encode(prompt)
@@ -326,6 +367,7 @@ def _continuous_batching(
             temp = sampling.temperature or 1.0
             out /= temp
 
+        sampled_with_flashinfer = False
         if is_simple:
             logits = out
             if noise:
@@ -333,6 +375,7 @@ def _continuous_batching(
             new_tokens = torch.argmax(logits, dim=-1)
         elif flashinfer_ok:
             logits = out.float().contiguous()
+            sampled_with_flashinfer = True
             try:
                 new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                     logits, sampling.top_k, sampling.top_p
@@ -340,15 +383,26 @@ def _continuous_batching(
             except RuntimeError as exc:
                 print(f"⚠️ flashinfer sampling failed: {exc}; falling back to torch sampling.")
                 flashinfer_ok = False
+                sampled_with_flashinfer = False
                 error_text = str(exc).lower()
                 force_cpu = logits.is_cuda and ("illegal memory access" in error_text or "cuda error" in error_text)
                 new_tokens = _torch_sample(logits, force_cpu=force_cpu)
         else:
             logits = out.float().contiguous()
             new_tokens = _torch_sample(logits)
-        new_tokens = new_tokens.tolist()
+
+        sampled_tensor, disable_flashinfer = _sanitize_sampled_tokens(
+            new_tokens,
+            logits,
+            active_count,
+            sampled_with_flashinfer=sampled_with_flashinfer,
+        )
+        if disable_flashinfer:
+            flashinfer_ok = False
+
+        sampled_list = sampled_tensor.tolist()
         for idx, task in enumerate(active_tasks):
-            task.new_token = new_tokens[idx]
+            task.new_token = int(sampled_list[idx])
 
     pbar.close()
 
