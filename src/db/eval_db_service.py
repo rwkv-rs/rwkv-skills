@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 from src.db.orm import get_session, init_orm, transaction
 from src.eval.benchmark_config import config_path_for_benchmark
-from src.eval.results.schema import iter_stage_indices
+from src.eval.results.schema import iter_stage_indices, IndexValidationError, strict_nonneg_int
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
@@ -468,11 +468,13 @@ class EvalDbService:
         with get_session() as session:
             mapping = self._repo.fetch_completion_id_map(session, task_id=int(task_id))
             for payload in payloads:
-                completions_id = mapping.get(
-                    (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
-                )
+                sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+                repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+                completions_id = mapping.get((sample_index, repeat_index))
                 if completions_id is None:
-                    continue
+                    raise IndexValidationError(
+                        f"completions_id not found for sample_index={sample_index}, repeat_index={repeat_index}"
+                    )
                 self._repo.insert_eval(
                     session,
                     completions_id=completions_id,
@@ -605,8 +607,8 @@ class EvalDbService:
             payload: dict[str, Any] = {
                 "benchmark_name": row_dict.get("benchmark_name", ""),
                 "dataset_split": row_dict.get("benchmark_split", "") or row_dict.get("dataset_split", ""),
-                "sample_index": int(row_dict.get("sample_index", 0)),
-                "repeat_index": int(row_dict.get("repeat_index", 0)),
+                "sample_index": strict_nonneg_int(row_dict.get("sample_index"), "sample_index"),
+                "repeat_index": strict_nonneg_int(row_dict.get("repeat_index"), "repeat_index"),
                 "sampling_config": sampling_cfg if isinstance(sampling_cfg, dict) else {},
                 "context": context if isinstance(context, dict) else None,
             }

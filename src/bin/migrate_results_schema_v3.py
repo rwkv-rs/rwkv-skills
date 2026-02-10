@@ -29,6 +29,7 @@ from src.eval.results.schema import (
     build_context_from_completions,
     dataset_slug_parts,
     strip_artifact_suffix,
+    IndexValidationError,
 )
 
 
@@ -114,13 +115,17 @@ def _convert_completions_record(
         elif isinstance(raw_idx, int):
             sample_index = raw_idx
         else:
-            sample_index = 0
+            raise IndexValidationError(
+                f"sample_index is required but could not be resolved from legacy record: {legacy.keys()}"
+            )
     if not isinstance(repeat_index, int):
         raw_idx = legacy.get("sample_index")
         if isinstance(raw_idx, int) and repeats > 0:
             repeat_index = raw_idx % repeats
         else:
-            repeat_index = 0
+            raise IndexValidationError(
+                f"repeat_index is required but could not be resolved from legacy record: {legacy.keys()}"
+            )
 
     stages = _stage_indices(legacy)
     out: dict[str, Any] = {
@@ -229,7 +234,9 @@ def _eval_key_from_legacy(
     # Or derive from global row index + repeats
     if isinstance(sample_index, int) and repeats > 0:
         return int(sample_index // repeats), int(sample_index % repeats)
-    return 0, 0
+    raise IndexValidationError(
+        f"sample_index/repeat_index could not be resolved from legacy eval record: {legacy.keys()}"
+    )
 
 
 def _infer_pass_fail(legacy: dict[str, Any]) -> tuple[bool, str]:
@@ -256,7 +263,13 @@ def migrate_eval_file(in_path: Path, out_path: Path, *, completions_path: Path, 
     # Build context map from migrated completions.
     context_map: dict[tuple[int, int], tuple[str, str, str]] = {}
     for payload in _iter_jsonl(completions_path):
-        key = (int(payload.get("sample_index", 0)), int(payload.get("repeat_index", 0)))
+        sample_index = payload.get("sample_index")
+        repeat_index = payload.get("repeat_index")
+        if not isinstance(sample_index, int) or not isinstance(repeat_index, int):
+            raise IndexValidationError(
+                f"sample_index/repeat_index must be int in completions: got {sample_index!r}, {repeat_index!r}"
+            )
+        key = (sample_index, repeat_index)
         context_map[key] = (
             str(payload.get("benchmark_name", "")),
             str(payload.get("dataset_split", "")),

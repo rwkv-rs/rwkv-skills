@@ -17,6 +17,7 @@ from json import JSONDecodeError
 from openai import OpenAI, OpenAIError
 
 from src.eval.results.layout import check_details_path
+from src.eval.results.schema import strict_nonneg_int
 from src.eval.scheduler.config import REPO_ROOT
 
 
@@ -154,8 +155,8 @@ def _load_existing_keys(path: Path) -> set[tuple[str, int, int]]:
     keys: set[tuple[str, int, int]] = set()
     for row in _iter_jsonl(path):
         split = str(row.get("dataset_split", ""))
-        sample_index = int(row.get("sample_index", 0))
-        repeat_index = int(row.get("repeat_index", 0))
+        sample_index = strict_nonneg_int(row.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(row.get("repeat_index"), "repeat_index")
         keys.add((split, sample_index, repeat_index))
     return keys
 
@@ -431,8 +432,8 @@ def run_llm_checker(
     to_check: list[dict[str, Any]] = []
     for row in failed_rows:
         split = str(row.get("dataset_split", "") or "")
-        sample_index = int(row.get("sample_index", 0))
-        repeat_index = int(row.get("repeat_index", 0))
+        sample_index = strict_nonneg_int(row.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(row.get("repeat_index"), "repeat_index")
         key = (split, sample_index, repeat_index)
         if key in seen:
             continue
@@ -463,8 +464,8 @@ def run_llm_checker(
         return {
             "benchmark_name": str(row.get("benchmark_name", "") or ""),
             "dataset_split": str(row.get("dataset_split", "") or ""),
-            "sample_index": int(row.get("sample_index", 0)),
-            "repeat_index": int(row.get("repeat_index", 0)),
+            "sample_index": strict_nonneg_int(row.get("sample_index"), "sample_index"),
+            "repeat_index": strict_nonneg_int(row.get("repeat_index"), "repeat_index"),
             CHECKER_FIELD_COT: str(checked.get(CHECKER_FIELD_COT, "") or ""),
             CHECKER_FIELD_ANSWER_CORRECT: bool(checked.get(CHECKER_FIELD_ANSWER_CORRECT, False)),
             CHECKER_FIELD_INSTRUCTION_FOLLOWING_ERROR: bool(
@@ -484,8 +485,8 @@ def run_llm_checker(
     def _row_key(row: dict[str, Any]) -> tuple[str, int, int]:
         return (
             str(row.get("dataset_split", "") or ""),
-            int(row.get("sample_index", 0)),
-            int(row.get("repeat_index", 0)),
+            strict_nonneg_int(row.get("sample_index"), "sample_index"),
+            strict_nonneg_int(row.get("repeat_index"), "repeat_index"),
         )
 
     def _describe_row(row: dict[str, Any]) -> str:

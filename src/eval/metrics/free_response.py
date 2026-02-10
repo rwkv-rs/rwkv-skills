@@ -17,7 +17,7 @@ from openai import OpenAI
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
-from src.eval.results.schema import make_eval_payload
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
@@ -219,7 +219,7 @@ def evaluate_free_response(
 
     # First pass: compute exact + gather judge inputs
     for payload in _iter_completions(completions):
-        sample_index = int(payload.get("sample_index", 0))
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         if sample_index < 0 or sample_index >= len(dataset):
             prediction = ""
             reference = ""
@@ -251,8 +251,8 @@ def evaluate_free_response(
 
     eval_payloads: list[dict] = []
     for idx, payload in enumerate(payloads):
-        sample_index = int(payload.get("sample_index", 0))
-        repeat_index = int(payload.get("repeat_index", 0))
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         if judge_flags is not None:
             passed = bool(judge_flags[idx])
         else:

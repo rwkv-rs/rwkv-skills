@@ -226,6 +226,8 @@ class Completion(Base):
     __table_args__ = (
         Index("idx_completions_task", "task_id"),
         Index("uq_completions_sample", "task_id", "sample_index", "repeat_index", unique=True),
+        CheckConstraint("sample_index >= 0", name="chk_completions_sample_index"),
+        CheckConstraint("repeat_index >= 0", name="chk_completions_repeat_index"),
     )
 
 

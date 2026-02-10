@@ -22,7 +22,7 @@ from typing import Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
-from src.eval.results.schema import build_context_from_completions
+from src.eval.results.schema import build_context_from_completions, strict_nonneg_int
 from src.eval.metrics.code_generation.human_eval import evaluate_functional_correctness
 from src.eval.metrics.code_generation.mbpp import evaluate_mbpp
 
@@ -62,8 +62,8 @@ def _write_temp_samples(
     count = 0
     with temp_path.open("wb") as out_f:
         for payload in _iter_completions(completions):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             task_id = ""
             if 0 <= sample_index < len(dataset_records):
                 task_id = str(getattr(dataset_records[sample_index], "task_id", ""))
@@ -116,14 +116,15 @@ def _build_canonical_eval_from_results(
             payload = json.loads(line)
             passed = bool(payload.get("passed", False))
             result = str(payload.get("result", "") or "")
-            sample_index = int(payload.get("sample_index", 0))
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             record = dataset_records[sample_index] if 0 <= sample_index < len(dataset_records) else None
             eval_payloads.append(
                 {
                     "benchmark_name": str(payload.get("benchmark_name", "")),
                     "dataset_split": str(payload.get("dataset_split", "")),
                     "sample_index": sample_index,
-                    "repeat_index": int(payload.get("repeat_index", 0)),
+                    "repeat_index": repeat_index,
                     "context": str(payload.get("context", "")),
                     "answer": str(payload.get("completion", "") or ""),
                     "ref_answer": _resolve_reference_answer(record),
