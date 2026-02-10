@@ -11,7 +11,7 @@ import tqdm
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
-from src.eval.results.schema import make_eval_payload
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 from .execution import check_correctness
 
 
@@ -168,8 +168,8 @@ def evaluate_livecodebench_dataset(
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = []
         for payload in tqdm.tqdm(_iter_completions(completions), desc="Reading completions"):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             last_stage = _max_stage_index(payload)
             completion = str(payload.get(f"completion{last_stage}", "") or "")
             code = _extract_code(completion)
@@ -231,8 +231,8 @@ def evaluate_livecodebench_dataset(
 
     eval_payloads: list[dict] = []
     for payload in _iter_completions(completions):
-        sample_index = int(payload.get("sample_index", 0))
-        repeat_index = int(payload.get("repeat_index", 0))
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         last_stage = _max_stage_index(payload)
         completion = str(payload.get(f"completion{last_stage}", "") or "")
         code = _extract_code(completion)

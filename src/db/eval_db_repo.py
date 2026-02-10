@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from .orm import Benchmark, Completion, Eval, Model, Score, Task
+from src.eval.results.schema import IndexValidationError, strict_nonneg_int
 
 
 class EvalDbRepository:
@@ -470,16 +471,8 @@ class EvalDbRepository:
         created_at: datetime,
         status: str,
     ) -> None:
-        sample_index = payload.get("sample_index", 0)
-        repeat_index = payload.get("repeat_index", 0)
-        try:
-            sample_index = int(sample_index)
-        except (TypeError, ValueError):
-            sample_index = 0
-        try:
-            repeat_index = int(repeat_index)
-        except (TypeError, ValueError):
-            repeat_index = 0
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         stmt = pg_insert(Completion).values(
             task_id=task_id,
             context=context or {},

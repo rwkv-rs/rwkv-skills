@@ -147,7 +147,7 @@ def detect_resume_state(path: str | Path, *, repeats: int = 1) -> ResumeState:
                 except orjson.JSONDecodeError:
                     continue
                 sample_index = payload.get("sample_index")
-                repeat_index = payload.get("repeat_index", 0)
+                repeat_index = payload.get("repeat_index")
                 if not (isinstance(sample_index, int) and sample_index >= 0):
                     continue
                 if not (isinstance(repeat_index, int) and repeat_index >= 0):

@@ -27,7 +27,7 @@ from src.eval.datasets.data_loader.instruction_following import JsonlInstruction
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.free_response import resolve_reference_answer as resolve_free_response_reference_answer
 from src.eval.metrics.instruction_following import instructions_registry
-from src.eval.results.schema import strip_artifact_suffix
+from src.eval.results.schema import strip_artifact_suffix, strict_nonneg_int
 from src.eval.scheduler.config import DEFAULT_COMPLETION_DIR, DEFAULT_EVAL_RESULT_DIR
 from src.eval.scheduler.datasets import find_dataset_file
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
@@ -194,8 +194,8 @@ def _extract_answers_from_completions(job_name: str, completions_path: Path) -> 
     """Return {(sample_index, repeat_index): answer}."""
     answers: dict[tuple[int, int], str] = {}
     for payload in _iter_jsonl(completions_path):
-        sample_index = int(payload.get("sample_index", 0))
-        repeat_index = int(payload.get("repeat_index", 0))
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         last_stage = _max_stage_index(payload)
         completion = str(payload.get(f"completion{last_stage}", "") or "")
 
@@ -277,8 +277,8 @@ def backfill_eval_file(eval_path: Path, *, prepare_missing: bool, overwrite: boo
                 yield row
                 continue
 
-            sample_index = int(row.get("sample_index", 0))
-            repeat_index = int(row.get("repeat_index", 0))
+            sample_index = strict_nonneg_int(row.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(row.get("repeat_index"), "repeat_index")
             answer = answer_map.get((sample_index, repeat_index), "")
             if not answer:
                 missing_answer += 1

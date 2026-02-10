@@ -10,7 +10,7 @@ from typing import Iterable
 
 
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
-from src.eval.results.schema import make_eval_payload
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _LETTER_RE = re.compile(r"[A-Z]")
@@ -67,7 +67,7 @@ def evaluate_multiple_choice(
     eval_payloads: list[dict] = []
 
     for payload in _iter_completions(completions):
-        sample_index = int(payload.get("sample_index", 0))
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         last_stage = _max_stage_index(payload)
         token_text = str(payload.get(f"completion{last_stage}", ""))
         predicted = _extract_choice_letter(token_text)
