@@ -67,10 +67,11 @@ Free-response and instruction-following work similarly via `FreeResponsePipeline
 `rwkv-skills-scheduler` provides commands for queue preview, dispatch, status, stop, and log rotation:
 ```bash
 rwkv-skills-scheduler queue
-rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
+rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 `queue` is a dry-run of `dispatch` and accepts the same filtering/dispatch flags (including `--overwrite`) to preview what would be scheduled.
-To ignore existing results under `results/scores` and force a rerun, pass `--overwrite` on dispatch; the scheduler will delete old completion / score / eval artifacts before re-evaluating.
+By default, jobs that already have scores are skipped.
+To force a rerun, pass `--overwrite` on dispatch. This creates a new run/version without deleting historical completion / score / eval records.
 By default the evaluator scripts run the LLM wrong-answer checker when configured; to skip it, pass `--disable-checker` on dispatch.
 
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
@@ -142,4 +143,39 @@ python -m src.bin.migrate_old_results --source results_old
 # use --dry-run to preview outputs; use --overwrite to replace existing results
 ```
 
-The migration script automatically recognizes task types (multiple-choice / math free-response / instruction-following, etc.), preserves subject-level metrics, and skips score JSONs that already exist in the repo by default.
+## Scheduler-only workflow (DB)
+### C.1 One-time setup
+1. Prepare PostgreSQL and ensure connectivity (set `.env` / env vars).
+   `.env` reference: `.env.example`
+2. Prepare model weights:
+   `/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth`
+3. Prepare dataset directory: `/home/jay/workspace/rwkv-skills/data` (contains task JSONL files).
+
+### C.2 Queue preview
+Purpose: verify all 8 entries are schedulable and dataset paths resolve.
+```bash
+uv run rwkv-skills-scheduler queue \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
+```
+
+### C.3 Dispatch
+Purpose: run all 8 entries and write into the database.
+```bash
+uv run rwkv-skills-scheduler dispatch \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
+  --skip-missing-dataset
+```
+
+### C.4 Monitor/stop
+```bash
+rwkv-skills-scheduler status
+rwkv-skills-scheduler logs
+rwkv-skills-scheduler stop --all
+```
+
+### Multi-model resume logic
+For each model+dataset(+cot) combination, existing scores are skipped by default. When no score exists, the scheduler resumes the latest unfinished task. If you pass `--overwrite`, the scheduler forces a fresh rerun and writes a new task/version without deleting prior records.

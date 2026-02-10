@@ -10,26 +10,23 @@ from typing import Sequence
 from dataclasses import replace
 
 from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.job_env import ensure_job_id
+from src.db.orm import init_orm
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
 
 DEFAULT_AVG_K: tuple[int, ...] = ()
 IFEVAL_AVG_K = (4,)
-
-
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=False, model_name=Path(model_path).stem)
 
 
 def _max_k(values) -> int:
@@ -79,7 +76,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--no-param-search",
         action="store_true",
@@ -96,18 +93,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = InstructionFollowingPipeline(config)
     avg_k_final = _resolve_avg_k(slug, args)
     report_avg_k = _report_avg_k(slug, avg_k_final)
     samples_per_prompt = max(_max_k(avg_k_final), 1)
+    records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
+    expected_count = (min(len(records), args.max_samples) if args.max_samples else len(records)) * samples_per_prompt
 
     sampling = resolve_sampling_config(
         slug,
@@ -120,27 +114,67 @@ def main(argv: Sequence[str] | None = None) -> int:
         sampling = replace(sampling, stop_tokens=tuple(args.stop_token))
     ban_tokens = tuple(args.ban_token) if args.ban_token else None
 
-    result = pipeline.run(
-        dataset_path=str(dataset_path),
-        output_path=str(out_path),
-        sampling=sampling,
-        batch_size=max(1, args.batch_size),
-        sample_limit=args.max_samples,
-        enable_think=bool(args.enable_think),
-        stop_tokens=sampling.stop_tokens,
-        ban_tokens=ban_tokens,
-        samples_per_prompt=samples_per_prompt,
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
+    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
+
+    # 三层级联检索：一次查询获取所有续跑信息
+    ctx = service.get_resume_context(
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        force_new_task=force_new_task,
     )
-    eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
+    task_id = service.create_task_from_context(
+        ctx=ctx,
+        job_name="eval_instruction_following",
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        sampling_config=sampling_config_to_dict(sampling),
+    )
+    skip_keys = ctx.completed_keys
+
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        max_queue=args.db_write_queue,
+    )
+    try:
+        result = pipeline.run(
+            dataset_path=str(dataset_path),
+            sampling=sampling,
+            batch_size=max(1, args.batch_size),
+            sample_limit=args.max_samples,
+            enable_think=bool(args.enable_think),
+            stop_tokens=sampling.stop_tokens,
+            ban_tokens=ban_tokens,
+            samples_per_prompt=samples_per_prompt,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            actual = service.count_completions(task_id=task_id)
+            status = "completed" if actual == expected_count else "failed"
+            service.update_task_status(task_id=task_id, status=status)
+        raise
+    writer.close()
+    completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
     metrics = evaluate_instruction_following(
-        out_path,
+        completions_payloads,
         dataset_path=str(dataset_path),
-        eval_output_path=eval_path,
         strict=True,
         avg_k=avg_k_final,
     )
     avg_payload = _filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
-    score_path = write_scores_json(
+    service.ingest_eval_payloads(payloads=metrics.payloads or [], task_id=task_id)
+    score_payload = make_score_payload(
         slug,
         is_cot=False,
         model_name=Path(args.model_path).stem,
@@ -150,19 +184,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             **avg_payload,
         },
         samples=metrics.samples,
-        log_path=out_path,
         task="instruction_following",
         task_details={
             "tier0_accuracy": metrics.tier0_accuracy,
             "tier1_accuracy": metrics.tier1_accuracy,
-            "eval_details_path": str(eval_path),
             **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
         },
     )
-    print(f"✅ instruction-following done: {result.sample_count} samples -> {result.output_path}")
-    print(f"📄 eval details saved: {eval_path}")
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
+    print(f"✅ instruction-following done: {result.sample_count} samples")
     return 0
 
 

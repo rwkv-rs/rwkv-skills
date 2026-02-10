@@ -1,29 +1,12 @@
 from __future__ import annotations
 
-"""Shared helper structures for evaluator pipelines (JSONL 输出 & 调试工具).
-
-This module defines the canonical schema for `results/completions` JSONL files.
-
-Contract (per line):
-- benchmark_name: str
-- dataset_split: str
-- sample_index: int
-- repeat_index: int
-- sampling_config: dict (only stages that actually sampled)
-- promptN / completionN / stop_reasonN for N=1..K
-
-No other fields are permitted in completions artifacts.
-"""
+"""Shared helper structures for evaluator pipelines (调试工具)."""
 
 from dataclasses import dataclass, field
-import errno
 import json
 import os
 from pathlib import Path
-import threading
-from queue import Queue
 from typing import Sequence
-import sys
 
 import orjson
 
@@ -82,99 +65,6 @@ class ResumeState:
     def has_progress(self) -> bool:
         return self.append
 
-
-class JsonlStageWriter:
-    _SENTINEL = object()
-
-    def __init__(self, path: str | Path, *, resume: bool = False):
-        self.path = Path(path)
-        self._mode = "ab" if resume else "wb"
-        self._fh = None
-        self._open_file()
-        self._queue: Queue[SampleRecord | object] = Queue()
-        self._closed = False
-        self._worker_exc: BaseException | None = None
-        self._worker = threading.Thread(
-            target=self._writer_loop,
-            name=f"JsonlStageWriter[{self.path.name}]",
-            daemon=True,
-        )
-        self._worker.start()
-
-    def write(self, record: SampleRecord) -> None:
-        self._ensure_ready()
-        self._queue.put(record)
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._queue.put(self._SENTINEL)
-        if self._worker.is_alive():
-            self._worker.join()
-        if self._worker_exc:
-            raise RuntimeError("JSONL writer thread failed") from self._worker_exc
-
-    def __enter__(self) -> "JsonlStageWriter":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    def _writer_loop(self) -> None:
-        try:
-            while True:
-                item = self._queue.get()
-                try:
-                    if item is self._SENTINEL:
-                        break
-                    payload = orjson.dumps(item.as_payload(), option=orjson.OPT_APPEND_NEWLINE)
-                    self._write_payload(payload)
-                finally:
-                    self._queue.task_done()
-        except BaseException as exc:
-            self._worker_exc = exc
-        finally:
-            try:
-                if self._fh:
-                    self._fh.close()
-            except OSError:
-                pass
-
-    def _ensure_ready(self) -> None:
-        if self._worker_exc:
-            raise RuntimeError("JSONL writer thread failed") from self._worker_exc
-        if self._closed:
-            raise RuntimeError("JSONL writer already closed")
-
-    def _open_file(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = self.path.open(self._mode)
-        self._mode = "ab"
-
-    def _reopen_file(self) -> None:
-        try:
-            if self._fh:
-                self._fh.close()
-        except OSError:
-            pass
-        self._open_file()
-
-    def _write_payload(self, payload: bytes) -> None:
-        attempts = 0
-        while True:
-            try:
-                if not self._fh:
-                    self._open_file()
-                self._fh.write(payload)
-                self._fh.flush()
-                return
-            except OSError as exc:
-                if exc.errno != errno.ENOENT or attempts >= 1:
-                    raise FileNotFoundError(f"结果文件 {self.path} 无法写入：{exc}") from exc
-                attempts += 1
-                print(f"[writer] 结果目录缺失，正在重新创建：{self.path.parent}", file=sys.stderr)
-                self._reopen_file()
 
 
 @dataclass(slots=True)
@@ -257,7 +147,7 @@ def detect_resume_state(path: str | Path, *, repeats: int = 1) -> ResumeState:
                 except orjson.JSONDecodeError:
                     continue
                 sample_index = payload.get("sample_index")
-                repeat_index = payload.get("repeat_index", 0)
+                repeat_index = payload.get("repeat_index")
                 if not (isinstance(sample_index, int) and sample_index >= 0):
                     continue
                 if not (isinstance(repeat_index, int) and repeat_index >= 0):
@@ -312,7 +202,6 @@ __all__ = [
     "ProbeConfig",
     "StageRecord",
     "SampleRecord",
-    "JsonlStageWriter",
     "ResumeState",
     "DebugCaptureConfig",
     "DebugCaptureBuffer",

@@ -67,10 +67,11 @@ print(result)
 `rwkv-skills-scheduler` 暴露了一组命令（队列预览、调度、状态、停止、日志轮播）：
 ```bash
 rwkv-skills-scheduler queue
-rwkv-skills-scheduler dispatch --completion-dir results/completions --run-log-dir results/logs --eval-result-dir results/eval
+rwkv-skills-scheduler dispatch --run-log-dir results/logs
 ```
 其中 `queue` 是 `dispatch` 的 dry-run，会接受与 `dispatch` 一致的参数（包含 `--overwrite`）并输出将被调度的任务列表。
-若需无视 `results/scores` 中已存在的结果并强制重跑，可在 dispatch 时附上 `--overwrite`，调度器会在启动前删除旧的 completion / score / eval 产物再重新评测。
+默认会跳过已有分数的任务。
+若需强制重跑，可在 dispatch 时附上 `--overwrite`；调度器会创建新一轮/新版本结果，不会删除历史 completion / score / eval 记录。
 评测脚本在配置好 API_KEY/JUDGE_MODEL 时默认会运行 LLM wrong-answer checker；如需关闭，可在 dispatch 时附上 `--disable-checker`。
 可以用 `--only-datasets aime24 aime25` 这类参数仅重测指定 benchmark（名称即可，不需要 `_test` 后缀），也可以用 `--skip-datasets mmlu` 排除特定集合。若想只跑部分模型，无需填写完整路径，可使用 `--model-regex '^rwkv7-.*7\\.2b$'` 等正则过滤模型文件名，配合默认的权重 glob 即可。
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
@@ -138,4 +139,39 @@ python -m src.bin.migrate_old_results --source results_old
 # 只想看看会写哪些文件，可加 --dry-run；已有结果但需要覆盖可加 --overwrite
 ```
 
-迁移脚本会自动识别多选 / 数学自由问答 / instruction-following 等任务类型，保留科目细分指标，并在默认情况下跳过仓库里已有的 score JSON。
+## C. 仅使用调度器（DB）
+### C.1 一次性准备
+1. 准备 PostgreSQL 并可连接（写好 .env / 环境变量）  
+   .env参考 `.env.example`
+2. 准备模型权重：  
+   `/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth`
+3. 准备数据集目录：`/home/jay/workspace/rwkv-skills/data`（包含各任务 JSONL）
+
+### C.2 调度器队列预览
+用途：确认 8 个入口都会被调度、数据集路径可解析。
+```bash
+uv run rwkv-skills-scheduler queue \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot
+```
+
+### C.3 执行调度
+用途：实际运行 8 个入口并写入数据库。
+```bash
+uv run rwkv-skills-scheduler dispatch \
+  --model-select all \
+  --models "<MODEL_PATH>" \
+  --only-jobs code_human_eval code_livecodebench code_mbpp free_response free_response_judge instruction_following multi_choice_plain multi_choice_cot \
+  --skip-missing-dataset
+```
+
+### C.4 监控/停止
+```bash
+rwkv-skills-scheduler status
+rwkv-skills-scheduler logs
+rwkv-skills-scheduler stop --all
+```
+
+### 多模型续跑逻辑
+以 `model + dataset(+cot)` 为单位判断：默认会跳过已有分数；若无分数则续跑最近的未完成 task。若传 `--overwrite`，则会强制新建 task 重跑并写入新版本，不删除历史记录。任务失败会标记为 `failed`，下次调度在未产出分数前仍会续跑该 task。

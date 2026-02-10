@@ -9,23 +9,20 @@ from typing import Sequence
 from dataclasses import replace
 
 from src.eval.benchmark_config import resolve_sampling_config
-from src.eval.results.layout import eval_details_path, jsonl_path, write_scores_json
+from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
+from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.job_env import ensure_job_id
+from src.db.orm import init_orm
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.coding import CodingPipeline
 from src.eval.metrics.code_generation.evaluate import evaluate_mbpp_dataset
-from src.eval.checkers.llm_checker import run_llm_checker
 from src.infer.model import ModelLoadConfig
-
-
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=False, model_name=Path(model_path).stem)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -41,7 +38,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, help="Override sampling top-p")
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -58,13 +55,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    out_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     sampling = resolve_sampling_config(
         slug,
         Path(args.model_path).stem,
@@ -87,53 +79,101 @@ def main(argv: Sequence[str] | None = None) -> int:
     default_pass_k = (1,)
     pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
     sample_limit = batch_size if args.probe_only else args.max_samples
-    result = pipeline.run_mbpp(
-        dataset_path=str(dataset_path),
-        output_path=str(out_path),
-        sampling=sampling,
-        batch_size=batch_size,
-        sample_limit=sample_limit,
-        eval_timeout=args.eval_timeout,
-        eval_workers=args.eval_workers,
-        pass_k=pass_k,
-        probe_only=args.probe_only,
-        write_output=not args.probe_only,
-    )
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
+    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
+    # 三层级联检索：一次查询获取所有续跑信息
+    ctx = service.get_resume_context(
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        force_new_task=force_new_task,
+    )
+    task_id = service.create_task_from_context(
+        ctx=ctx,
+        job_name="eval_code_mbpp",
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        sampling_config=sampling_config_to_dict(sampling),
+    )
+    skip_keys = ctx.completed_keys
+
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        max_queue=args.db_write_queue,
+    )
+    records = JsonlCodeGenerationLoader(str(dataset_path)).load()
+    expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * max(1, max(pass_k))
+    try:
+        result = pipeline.run_mbpp(
+            dataset_path=str(dataset_path),
+            sampling=sampling,
+            batch_size=batch_size,
+            sample_limit=sample_limit,
+            eval_timeout=args.eval_timeout,
+            eval_workers=args.eval_workers,
+            pass_k=pass_k,
+            probe_only=args.probe_only,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    except BaseException:
+        try:
+            writer.close()
+        finally:
+            actual = service.count_completions(task_id=task_id)
+            status = "completed" if actual == expected_count else "failed"
+            service.update_task_status(task_id=task_id, status=status)
+        raise
     if args.probe_only:
+        writer.close()
         print(
             "🧪 probe-only run completed: "
             f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
         )
         return 0
 
-    print(f"✅ MBPP 生成完成：{result.sample_count} completions -> {result.output_path}")
+    print(f"✅ MBPP 生成完成：{result.sample_count} completions")
 
-    eval_path = eval_details_path(slug, is_cot=False, model_name=Path(args.model_path).stem)
-    eval_metrics = evaluate_mbpp_dataset(
-        out_path,
-        dataset_path=str(dataset_path),
-        eval_output_path=eval_path,
-        pass_k=pass_k,
-        n_workers=args.eval_workers,
-        timeout=args.eval_timeout,
-    )
-    print(f"MBPP 评测: {eval_metrics} (详情: {eval_path})")
-    score_path = write_scores_json(
-        slug,
-        is_cot=False,
-        model_name=Path(args.model_path).stem,
-        metrics=eval_metrics or {},
-        samples=result.sample_count,
-        problems=result.problem_count,
-        log_path=out_path,
-        task="code_mbpp",
-        task_details={
-            "eval_details_path": str(eval_path),
-        },
-    )
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    writer.close()
+    try:
+        completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
+        eval_metrics, eval_payloads = evaluate_mbpp_dataset(
+            completions_payloads,
+            dataset_path=str(dataset_path),
+            pass_k=pass_k,
+            n_workers=args.eval_workers,
+            timeout=args.eval_timeout,
+        )
+        print(f"MBPP 评测: {eval_metrics}")
+        service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=False,
+            model_name=Path(args.model_path).stem,
+            metrics=eval_metrics or {},
+            samples=len(completions_payloads),
+            problems=result.problem_count,
+            task="code_mbpp",
+        )
+        service.record_score_payload(
+            payload=score_payload,
+            task_id=task_id,
+        )
+        export_version_results(
+            service,
+            task_id=task_id,
+        )
+    except BaseException:
+        if service.get_score_payload(task_id=task_id) is None:
+            service.update_task_status(task_id=task_id, status="failed")
+        raise
     return 0
 
 

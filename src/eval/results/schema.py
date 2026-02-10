@@ -18,6 +18,22 @@ from src.eval.scheduler.dataset_utils import canonical_slug, split_benchmark_and
 from src.infer.sampling import SamplingConfig
 
 
+class IndexValidationError(ValueError):
+    pass
+
+
+def strict_nonneg_int(value: Any, field_name: str) -> int:
+    if value is None:
+        raise IndexValidationError(f"{field_name} is required but got None")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise IndexValidationError(
+            f"{field_name} must be int, got {type(value).__name__}: {value!r}"
+        )
+    if value < 0:
+        raise IndexValidationError(f"{field_name} must be >= 0, got {value}")
+    return value
+
+
 def sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     raw = asdict(config)
     normalized: dict[str, object] = {}
@@ -69,11 +85,17 @@ def make_eval_payload(
     """Build a canonical `results/eval` line from a `results/completions` line."""
     passed = bool(is_passed)
     reason = "" if passed else (fail_reason or "incorrect")
+    sample_index = strict_nonneg_int(
+        completions_payload.get("sample_index"), "sample_index"
+    )
+    repeat_index = strict_nonneg_int(
+        completions_payload.get("repeat_index"), "repeat_index"
+    )
     return {
         "benchmark_name": str(completions_payload.get("benchmark_name", "")),
         "dataset_split": str(completions_payload.get("dataset_split", "")),
-        "sample_index": int(completions_payload.get("sample_index", 0)),
-        "repeat_index": int(completions_payload.get("repeat_index", 0)),
+        "sample_index": sample_index,
+        "repeat_index": repeat_index,
         "context": build_context_from_completions(completions_payload),
         "answer": "" if answer is None else str(answer),
         "ref_answer": "" if ref_answer is None else str(ref_answer),

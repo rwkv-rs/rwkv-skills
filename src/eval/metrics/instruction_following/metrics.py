@@ -7,11 +7,10 @@ import json
 from pathlib import Path
 from typing import Iterable
 
-import orjson
 
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
 from src.eval.metrics.at_k import compute_avg_at_k
-from src.eval.results.schema import make_eval_payload
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 from . import instructions_registry
 
@@ -24,6 +23,7 @@ class InstructionFollowingMetrics:
     tier1_accuracy: dict[str, float]
     avg_at_k: dict[str, float] | None = None
     samples: int = 0
+    payloads: list[dict] | None = None
 
 
 def _iter_jsonl(path: str | Path) -> Iterable[dict]:
@@ -33,6 +33,13 @@ def _iter_jsonl(path: str | Path) -> Iterable[dict]:
             if not line:
                 continue
             yield json.loads(line)
+
+
+def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
+    if isinstance(source, (str, Path)):
+        yield from _iter_jsonl(source)
+        return
+    yield from source
 
 
 def _max_stage_index(payload: dict) -> int:
@@ -54,10 +61,9 @@ def _response_from_completion(payload: dict) -> str:
 
 
 def evaluate_instruction_following(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
-    eval_output_path: str | Path,
     strict: bool = True,
     avg_k: tuple[int, ...] = (),
 ) -> InstructionFollowingMetrics:
@@ -75,75 +81,69 @@ def evaluate_instruction_following(
 
     rows_for_avg: list[tuple[int, int, bool]] = []
 
-    eval_output_path = Path(eval_output_path)
-    eval_output_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_payloads: list[dict] = []
+    for payload in _iter_completions(completions):
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
 
-    with eval_output_path.open("wb") as out_f:
-        for payload in _iter_jsonl(completions_path):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
+        if sample_index < 0 or sample_index >= len(dataset):
+            response = _response_from_completion(payload)
+            follow_list: list[bool] = []
+            ref_answer = ""
+        else:
+            record = dataset[sample_index]
+            response = _response_from_completion(payload)
+            follow_list = []
+            ref_parts: list[str] = []
 
-            if sample_index < 0 or sample_index >= len(dataset):
-                response = _response_from_completion(payload)
-                follow_list: list[bool] = []
-                ref_answer = ""
-            else:
-                record = dataset[sample_index]
-                response = _response_from_completion(payload)
-                follow_list = []
-                ref_parts: list[str] = []
+            variants = None if strict else _build_loose_variants(response)
+            for idx, instruction_id in enumerate(record.instruction_ids):
+                instruction_cls = registry[instruction_id]
+                instruction = instruction_cls(instruction_id)
+                kwargs = record.kwargs_list[idx]
+                description = instruction.build_description(**kwargs)
+                args = instruction.get_instruction_args()
+                if args and "prompt" in args:
+                    description = instruction.build_description(prompt=record.prompt)
 
-                variants = None if strict else _build_loose_variants(response)
-                for idx, instruction_id in enumerate(record.instruction_ids):
-                    instruction_cls = registry[instruction_id]
-                    instruction = instruction_cls(instruction_id)
-                    kwargs = record.kwargs_list[idx]
-                    description = instruction.build_description(**kwargs)
-                    args = instruction.get_instruction_args()
-                    if args and "prompt" in args:
-                        description = instruction.build_description(prompt=record.prompt)
+                if strict:
+                    is_following = bool(response.strip() and instruction.check_following(response))
+                else:
+                    is_following = False
+                    for variant in variants:
+                        if variant.strip() and instruction.check_following(variant):
+                            is_following = True
+                            break
+                follow_list.append(is_following)
+                if description:
+                    ref_parts.append(f"{instruction_id}: {description}")
+                else:
+                    ref_parts.append(str(instruction_id))
 
-                    if strict:
-                        is_following = bool(response.strip() and instruction.check_following(response))
-                    else:
-                        is_following = False
-                        for variant in variants:
-                            if variant.strip() and instruction.check_following(variant):
-                                is_following = True
-                                break
-                    follow_list.append(is_following)
-                    if description:
-                        ref_parts.append(f"{instruction_id}: {description}")
-                    else:
-                        ref_parts.append(str(instruction_id))
+                tier0_key = instruction_id.split(":")[0]
+                tier0_total[tier0_key] = tier0_total.get(tier0_key, 0) + 1
+                tier1_total[instruction_id] = tier1_total.get(instruction_id, 0) + 1
+                if is_following:
+                    tier0_correct[tier0_key] = tier0_correct.get(tier0_key, 0) + 1
+                    tier1_correct[instruction_id] = tier1_correct.get(instruction_id, 0) + 1
+            ref_answer = "\n".join(ref_parts)
 
-                    tier0_key = instruction_id.split(":")[0]
-                    tier0_total[tier0_key] = tier0_total.get(tier0_key, 0) + 1
-                    tier1_total[instruction_id] = tier1_total.get(instruction_id, 0) + 1
-                    if is_following:
-                        tier0_correct[tier0_key] = tier0_correct.get(tier0_key, 0) + 1
-                        tier1_correct[instruction_id] = tier1_correct.get(instruction_id, 0) + 1
-                ref_answer = "\n".join(ref_parts)
+        follow_all = bool(follow_list) and all(follow_list)
+        prompt_total += 1
+        if follow_all:
+            prompt_correct += 1
+        instruction_total += len(follow_list)
+        instruction_correct += sum(1 for flag in follow_list if flag)
 
-            follow_all = bool(follow_list) and all(follow_list)
-            prompt_total += 1
-            if follow_all:
-                prompt_correct += 1
-            instruction_total += len(follow_list)
-            instruction_correct += sum(1 for flag in follow_list if flag)
-
-            rows_for_avg.append((sample_index, repeat_index, follow_all))
-            out_f.write(
-                orjson.dumps(
-                    make_eval_payload(
-                        payload,
-                        is_passed=follow_all,
-                        answer=response,
-                        ref_answer=ref_answer,
-                    ),
-                    option=orjson.OPT_APPEND_NEWLINE,
-                )
+        rows_for_avg.append((sample_index, repeat_index, follow_all))
+        eval_payloads.append(
+            make_eval_payload(
+                payload,
+                is_passed=follow_all,
+                answer=response,
+                ref_answer=ref_answer,
             )
+        )
 
     prompt_accuracy = prompt_correct / prompt_total if prompt_total else 0.0
     instruction_accuracy = instruction_correct / instruction_total if instruction_total else 0.0
@@ -162,6 +162,7 @@ def evaluate_instruction_following(
         tier0_accuracy=tier0_accuracy,
         tier1_accuracy=tier1_accuracy,
         samples=prompt_total,
+        payloads=eval_payloads,
     )
     if avg_k:
         metrics.avg_at_k = compute_avg_at_k(rows_for_avg, avg_k)

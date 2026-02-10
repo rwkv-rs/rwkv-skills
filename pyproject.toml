@@ -5,15 +5,6 @@ description = "RWKV Evalution Server"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # chirrup
-    # "fastapi>=0.121.0",
-    # "ninja>=1.13.0",
-    # "numpy>=2.3.3",
-    # "pydantic>=2.12.3",
-    # "pydantic-settings>=2.0.0",
-    # "pyyaml>=6.0.3",
-    # "snowflake-id>=1.0.2",
-    # "uvicorn>=0.38.0",
     # rwkv-skills
     "bitsandbytes>=0.46.0",
     "datasets>=3.6.0,<4.0.0",
@@ -66,6 +57,8 @@ dependencies = [
     "nvidia-nvshmem-cu12>=3.3.20",
     "nvidia-nvtx-cu12>=12.6.77",
     "jsonschema>=4.25.1",
+    "psycopg[binary,pool]>=3.3.2",
+    "socksio>=1.0.0",
 ]
 
 [build-system]
@@ -131,6 +124,11 @@ explicit = true
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm6.4"
 explicit = true
+
+[[tool.uv.index]]
+name = "ustc"
+url = "https://mirrors.ustc.edu.cn/pypi/simple"
+default = true
 
 [project.scripts]
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"

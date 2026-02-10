@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .datasets import DATA_OUTPUT_ROOT, DATASET_ROOTS
 from .dataset_utils import canonical_slug, infer_dataset_slug_from_path
+from .dataset_stats import record_dataset_samples
 from .jobs import locate_dataset
 
 
@@ -20,6 +21,7 @@ def resolve_or_prepare_dataset(dataset_arg: str, *, verbose: bool = True) -> Pat
 
     candidate = Path(dataset_arg).expanduser()
     if candidate.exists():
+        record_dataset_samples(candidate)
         return candidate
 
     slug = canonical_slug(infer_dataset_slug_from_path(dataset_arg))

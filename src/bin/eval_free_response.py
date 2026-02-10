@@ -4,23 +4,26 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     compute_pass_at_k,
     compute_avg_at_k,
     evaluate_free_response,
 )
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
-from src.eval.checkers.llm_checker import run_llm_checker
-from src.eval.results.layout import (
-    eval_details_path,
-    jsonl_path,
-    write_scores_json,
-)
+from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.db.orm import init_orm
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.infer.model import ModelLoadConfig
 
@@ -28,14 +31,15 @@ from src.infer.model import ModelLoadConfig
 DEFAULT_PASS_K = (1,)
 DEFAULT_AVG_K: tuple[int, ...] = ()
 
-def _resolve_output_path(dataset: str, model_path: str, user_path: str | None) -> Path:
-    if user_path:
-        return Path(user_path).expanduser()
-    env_path = os.environ.get("RWKV_SKILLS_LOG_PATH")
-    if env_path:
-        return Path(env_path).expanduser()
-    slug = infer_dataset_slug_from_path(dataset)
-    return jsonl_path(slug, is_cot=True, model_name=Path(model_path).stem)
+
+def _count_records(path: str | Path, limit: int | None) -> int:
+    loader = JsonlFreeAnswerLoader(str(path))
+    count = 0
+    for _ in loader:
+        count += 1
+        if limit and count >= limit:
+            break
+    return count
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -47,7 +51,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--output", help="Output JSONL path (defaults to results/completions layout)")
+    parser.add_argument("--db-write-queue", type=int, default=8, help="DB completion write queue max size")
+    parser.add_argument(
+        "--db-drain-every",
+        type=int,
+        default=8,
+        help="Force DB writer to drain every N completion payloads (0 disables)",
+    )
+    parser.add_argument(
+        "--db-close-timeout-s",
+        type=float,
+        default=30.0,
+        help="Max seconds to wait for DB writer drain/close on shutdown",
+    )
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -123,14 +139,9 @@ def _filter_metrics_by_k(metric_map: dict[str, float] | None, ks: tuple[int, ...
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
 
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    output_path = _resolve_output_path(str(dataset_path), args.model_path, args.output)
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
 
@@ -159,10 +170,38 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     batch_size = max(1, args.batch_size)
 
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    service = EvalDbService()
+    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
+
+    # 三层级联检索：一次查询获取所有续跑信息
+    ctx = service.get_resume_context(
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        force_new_task=force_new_task,
+    )
+    sampling_payload = {
+        "cot": sampling_config_to_dict(cot_sampling),
+        "final": sampling_config_to_dict(final_sampling),
+    }
+    task_id = service.create_task_from_context(
+        ctx=ctx,
+        job_name="eval_free_response",
+        dataset=str(slug),
+        model=Path(args.model_path).stem,
+        is_param_search=False,
+        sampling_config=sampling_payload,
+    )
+    skip_keys = ctx.completed_keys
+
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+
     if args.probe_only:
         _ = pipeline.run(
             dataset_path=str(dataset_path),
-            output_path=str(output_path),
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
@@ -171,34 +210,85 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass_k=(1,),
             samples_per_task=1,
             probe_only=True,
-            write_output=False,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
 
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
-    result = pipeline.run(
-        dataset_path=str(dataset_path),
-        output_path=str(output_path),
-        cot_sampling=cot_sampling,
-        final_sampling=final_sampling,
-        batch_size=batch_size,
-        sample_limit=args.max_samples,
-        pad_to_batch=False,
-        pass_k=pass_k,
-        samples_per_task=samples_per_task,
+    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+    close_timeout_s = max(0.0, float(args.db_close_timeout_s))
+    writer = CompletionWriteWorker(
+        service=service,
+        task_id=task_id,
+        max_queue=args.db_write_queue,
+        drain_every=args.db_drain_every,
     )
 
-    eval_path = eval_details_path(slug, is_cot=True, model_name=Path(args.model_path).stem)
+    should_exit = {"active": False}
+    original_signal_handlers: dict[signal.Signals, object] = {}
+
+    def _restore_signal_handlers() -> None:
+        for sig, handler in original_signal_handlers.items():
+            signal.signal(sig, handler)
+        original_signal_handlers.clear()
+
+    def _handle_termination(signum: int, _frame: object) -> None:
+        if should_exit["active"]:
+            raise SystemExit(128 + signum)
+        should_exit["active"] = True
+        signame = signal.Signals(signum).name
+        print(f"⚠️ Received {signame}; draining completion writer before exit...")
+        try:
+            writer.close(timeout_s=close_timeout_s)
+        except Exception as exc:
+            print(f"⚠️ Failed to close completion writer during {signame}: {exc}")
+        try:
+            service.update_task_status(task_id=task_id, status="failed")
+        except Exception as exc:
+            print(f"⚠️ Failed to mark task {task_id} failed after {signame}: {exc}")
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        original_signal_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handle_termination)
+
+    try:
+        result = pipeline.run(
+            dataset_path=str(dataset_path),
+            cot_sampling=cot_sampling,
+            final_sampling=final_sampling,
+            batch_size=batch_size,
+            sample_limit=args.max_samples,
+            pad_to_batch=False,
+            pass_k=pass_k,
+            samples_per_task=samples_per_task,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+        writer.close(timeout_s=close_timeout_s)
+    except BaseException:
+        try:
+            writer.close(timeout_s=close_timeout_s)
+        finally:
+            actual = service.count_completions(task_id=task_id, status="answer")
+            status = "failed" if should_exit["active"] else ("completed" if actual == expected_count else "failed")
+            service.update_task_status(task_id=task_id, status=status)
+        raise
+    finally:
+        _restore_signal_handlers()
+
+    completions_payloads = service.list_completion_payloads(
+        task_id=task_id,
+        status="answer",
+    )
     evaluation = evaluate_free_response(
-        output_path,
+        completions_payloads,
         dataset_path=str(dataset_path),
-        eval_output_path=eval_path,
         judge=None,
     )
     pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
     avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
-    task_details: dict[str, object] = {"eval_details_path": str(eval_path)}
+    task_details: dict[str, object] = {}
     metrics_payload = {
         "exact_accuracy": evaluation.exact_accuracy,
         "judge_accuracy": evaluation.judge_accuracy,
@@ -219,21 +309,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if avg_metrics_all and avg_payload != avg_metrics_all:
         task_details["avg_curve"] = avg_metrics_all
 
-    score_path = write_scores_json(
+    service.ingest_eval_payloads(
+        payloads=evaluation.payloads,
+        task_id=task_id,
+    )
+    score_payload = make_score_payload(
         slug,
         is_cot=True,
         model_name=Path(args.model_path).stem,
         metrics=metrics_payload,
         samples=evaluation.samples,
         problems=result.problem_count,
-        log_path=output_path,
         task="free_response",
         task_details=task_details,
     )
-    print(f"✅ CoT free-form done: {result.sample_count} samples -> {result.output_path}")
-    print(f"📄 eval details saved: {eval_path}")
-    print(f"📊 scores saved: {score_path}")
-    run_llm_checker(eval_path, model_name=Path(args.model_path).stem)
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+    export_version_results(
+        service,
+        task_id=task_id,
+    )
+    print(f"✅ CoT free-form done: {result.sample_count} samples")
     return 0
 
 

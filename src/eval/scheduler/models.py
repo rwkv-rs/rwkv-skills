@@ -33,9 +33,10 @@ DATA_VERSION_ORDER: Final[tuple[str, ...]] = (
     "g1a4",
     "g1b",
     "g1c",
+    "g1d",
 )
 NUM_PARAM_ORDER: Final[tuple[str, ...]] = ("0.1b", "0.4b", "1.5b", "2.9b", "7.2b", "13.3b")
-NUM_PARAM_SKIP: Final[set[str]] = {"0.1b", "0.4b"}
+NUM_PARAM_SKIP: Final[set[str]] = {}
 
 
 def expand_model_paths(patterns: Sequence[str]) -> list[Path]:
@@ -51,6 +52,17 @@ def expand_model_paths(patterns: Sequence[str]) -> list[Path]:
             if candidate_path.is_file():
                 matched.add(candidate_path.resolve())
     return sorted(matched)
+
+def normalize_model_name(raw: str) -> str:
+    if not isinstance(raw, str):
+        return raw
+    if raw.endswith(".pth") or "/" in raw or "\\" in raw:
+        try:
+            return Path(raw).stem
+        except OSError:
+            return raw
+    return raw
+
 
 
 def _normalize_model_identifier(raw: str) -> str:
@@ -221,4 +233,5 @@ __all__ = [
     "expand_model_paths",
     "filter_model_paths",
     "MODEL_SELECT_CHOICES",
+    "normalize_model_name",
 ]

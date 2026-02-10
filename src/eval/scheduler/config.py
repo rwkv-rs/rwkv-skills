@@ -7,6 +7,10 @@ from pathlib import Path
 import os
 import sys
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RESULTS_ROOT = Path(os.environ.get("RUN_RESULTS_DIR", REPO_ROOT / "results"))
@@ -32,6 +36,7 @@ if _MODEL_GLOBS_ENV:
 else:
     DEFAULT_MODEL_GLOBS = (
         "/public/home/ssjxzkz/Weights/BlinkDL__rwkv7-g1/*.pth",
+        "/home/caizus/Weights/BlinkDL__rwkv7-g1/*.pth",
         str(REPO_ROOT / "weights" / "rwkv7-*.pth"),
     )
 
@@ -75,4 +80,27 @@ __all__ = [
     "DEFAULT_DISPATCH_POLL_SECONDS",
     "DEFAULT_TAIL_LINES",
     "DEFAULT_ROTATE_SECONDS",
+    "DBConfig",
+    "DEFAULT_DB_CONFIG",
 ]
+
+
+@dataclass(slots=True)
+class DBConfig:
+    host: str = "localhost"
+    port: int = 5432
+    user: str = "postgres"
+    password: str = ""
+    dbname: str = "rwkv-eval"
+
+
+def _load_db_config() -> DBConfig:
+    return DBConfig(
+        host=os.environ.get("PG_HOST", "localhost"),
+        port=int(os.environ.get("PG_PORT", "5432")),
+        user=os.environ.get("PG_USER", "postgres"),
+        password=os.environ.get("PG_PASSWORD", ""),
+        dbname=os.environ.get("PG_DBNAME", "rwkv-eval"),
+    )
+
+DEFAULT_DB_CONFIG = _load_db_config()

@@ -7,12 +7,11 @@ from pathlib import Path
 from typing import Iterable, List, Union
 
 import numpy as np
-import orjson
 import tqdm
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
-from src.eval.results.schema import make_eval_payload
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 from .execution import check_correctness
 
 
@@ -23,6 +22,13 @@ def _iter_jsonl(path: str | Path) -> Iterable[dict]:
             if not line:
                 continue
             yield json.loads(line)
+
+
+def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
+    if isinstance(source, (str, Path)):
+        yield from _iter_jsonl(source)
+        return
+    yield from source
 
 
 def _max_stage_index(payload: dict) -> int:
@@ -136,14 +142,13 @@ def estimate_pass_at_k(
 
 
 def evaluate_livecodebench_dataset(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
-    eval_output_path: str | Path,
     pass_k: Iterable[int] = (1, 5),
     n_workers: int = 4,
     timeout: float = 6.0,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], list[dict]]:
     pass_k_values = tuple(int(val) for val in pass_k)
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
     sample_map: dict[int, dict] = {}
@@ -162,9 +167,9 @@ def evaluate_livecodebench_dataset(
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = []
-        for payload in tqdm.tqdm(_iter_jsonl(completions_path), desc="Reading completions"):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
+        for payload in tqdm.tqdm(_iter_completions(completions), desc="Reading completions"):
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             last_stage = _max_stage_index(payload)
             completion = str(payload.get(f"completion{last_stage}", "") or "")
             code = _extract_code(completion)
@@ -224,30 +229,29 @@ def evaluate_livecodebench_dataset(
             key = f"pass@{val}_{difficulty}"
             pass_at_k[key] = estimate_pass_at_k(totals[mask], corrects[mask], int(val)).mean()
 
-    eval_output_path = Path(eval_output_path)
-    eval_output_path.parent.mkdir(parents=True, exist_ok=True)
-    with eval_output_path.open("wb") as out_f:
-        for payload in _iter_jsonl(completions_path):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
-            last_stage = _max_stage_index(payload)
-            completion = str(payload.get(f"completion{last_stage}", "") or "")
-            code = _extract_code(completion)
-            result = results_by_key.get((sample_index, repeat_index))
-            passed = bool(result.get("passed")) if result else False
-            fail_reason = ""
-            if result and not passed:
-                fail_reason = str(result.get("result") or "")
-            eval_payload = make_eval_payload(
+    eval_payloads: list[dict] = []
+    for payload in _iter_completions(completions):
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+        last_stage = _max_stage_index(payload)
+        completion = str(payload.get(f"completion{last_stage}", "") or "")
+        code = _extract_code(completion)
+        result = results_by_key.get((sample_index, repeat_index))
+        passed = bool(result.get("passed")) if result else False
+        fail_reason = ""
+        if result and not passed:
+            fail_reason = str(result.get("result") or "")
+        eval_payloads.append(
+            make_eval_payload(
                 payload,
                 is_passed=passed,
                 fail_reason=fail_reason,
                 answer=code,
                 ref_answer=ref_map.get(sample_index, ""),
             )
-            out_f.write(orjson.dumps(eval_payload, option=orjson.OPT_APPEND_NEWLINE))
+        )
 
-    return pass_at_k
+    return pass_at_k, eval_payloads
 
 
 __all__ = ["evaluate_livecodebench_dataset", "estimate_pass_at_k"]

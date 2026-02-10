@@ -208,12 +208,11 @@ body {
 }
 
 .space-table-wrapper table {
-  width: 100%;
-  /* FORCE FULL WIDTH */
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   font-size: 13px;
-  table-layout: fixed;
-  /* Keep fixed layout for alignment */
+  table-layout: auto;
 }
 
 .space-table-wrapper th,
@@ -221,11 +220,14 @@ body {
   padding: 12px 16px;
   border-bottom: 1px solid var(--space-border-color);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   text-align: right;
   /* Numbers align right usually, but keeping center for consistency with previous */
   text-align: center;
+}
+
+.space-table-wrapper th:not(:first-child),
+.space-table-wrapper td:not(:first-child) {
+  min-width: 110px;
 }
 
 .space-table-wrapper th {
@@ -240,12 +242,18 @@ body {
   font-family: var(--space-font-mono);
 }
 
+.space-table-wrapper td.score-cell {
+  color: var(--space-text-primary);
+  font-weight: 600;
+  font-size: 15px;
+}
+
 /* Sticky First Column */
 .space-table-wrapper td:first-child,
 .space-table-wrapper th:first-child {
   text-align: left;
   font-family: var(--space-font-sans);
-  width: 250px;
+  width: 260px;
   color: var(--space-accent);
   position: sticky;
   left: 0;
@@ -256,6 +264,33 @@ body {
 }
 
 .space-table-wrapper th:first-child {
+  background: var(--space-header-bg);
+}
+
+.space-table-wrapper td:nth-child(2),
+.space-table-wrapper th:nth-child(2) {
+  position: sticky;
+  left: 260px;
+  z-index: 9;
+  background: var(--space-bg-color);
+  text-align: left;
+  font-family: var(--space-font-sans);
+  width: 150px;
+}
+
+.space-table-wrapper td:nth-child(3),
+.space-table-wrapper th:nth-child(3) {
+  position: sticky;
+  left: 410px;
+  z-index: 8;
+  background: var(--space-bg-color);
+  text-align: left;
+  font-family: var(--space-font-sans);
+  width: 120px;
+}
+
+.space-table-wrapper th:nth-child(2),
+.space-table-wrapper th:nth-child(3) {
   background: var(--space-header-bg);
 }
 

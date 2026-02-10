@@ -19,8 +19,6 @@ from .actions import (
     action_stop,
 )
 from .config import (
-    DEFAULT_COMPLETION_DIR,
-    DEFAULT_EVAL_RESULT_DIR,
     DEFAULT_LOG_DIR,
     DEFAULT_MODEL_GLOBS,
     DEFAULT_PID_DIR,
@@ -67,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_job_filters(parser: argparse.ArgumentParser) -> None:
     domain_choices = sorted({spec.domain for spec in JOB_CATALOGUE.values() if spec.domain})
-    parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR), help="评估 JSON 结果目录")
+    parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR), help="调度器日志/缓存目录")
     parser.add_argument("--pid-dir", default=str(DEFAULT_PID_DIR), help="PID 文件目录")
     parser.add_argument(
         "--models",
@@ -124,10 +122,15 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
         help="跳过指定 benchmark（名称即可，无需 *_test 后缀）",
     )
     parser.add_argument(
+        "--enable-param-search",
+        action="store_true",
+        help="启用 param-search（默认关闭，仅对最新 2.9b 生效）",
+    )
+    parser.add_argument(
         "--param-search-scan-mode",
         choices=("both", "normal", "simple"),
         default="both",
-        help="param-search 扫描模式：both/normal/simple（默认 both）",
+        help="param-search 扫描模式：both/normal/simple（默认 both，仅在启用 param-search 时生效）",
     )
 
 
@@ -135,8 +138,6 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     """Add dispatch-related options (also used by `queue` for dry-run parity)."""
 
     parser.add_argument("--run-log-dir", default=str(DEFAULT_RUN_LOG_DIR), help="运行日志目录")
-    parser.add_argument("--completion-dir", default=str(DEFAULT_COMPLETION_DIR), help="completion JSONL 目录")
-    parser.add_argument("--eval-result-dir", default=str(DEFAULT_EVAL_RESULT_DIR), help="评测器结果目录")
     parser.add_argument(
         "--dispatch-poll-seconds",
         type=int,
@@ -166,7 +167,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="忽略 log_dir 中已存在的结果，重新评测并覆盖",
+        help="忽略已存在分数并强制重跑（写入新版本，不删除历史记录）",
     )
     parser.add_argument(
         "--disable-checker",
@@ -193,8 +194,6 @@ def _dispatch_options_from_args(
         log_dir=Path(args.log_dir),
         pid_dir=Path(args.pid_dir),
         run_log_dir=Path(args.run_log_dir),
-        completion_dir=Path(args.completion_dir),
-        eval_result_dir=Path(args.eval_result_dir),
         job_order=job_list,
         job_priority=job_priority,
         model_select=model_select,
@@ -204,6 +203,7 @@ def _dispatch_options_from_args(
         model_globs=model_globs,
         only_dataset_slugs=only_dataset_slugs,
         model_name_patterns=model_name_patterns,
+        enable_param_search=bool(args.enable_param_search),
         param_search_scan_mode=str(args.param_search_scan_mode),
         dispatch_poll_seconds=int(args.dispatch_poll_seconds),
         gpu_idle_max_mem=int(args.gpu_idle_max_mem),

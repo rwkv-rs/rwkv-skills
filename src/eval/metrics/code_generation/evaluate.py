@@ -14,15 +14,15 @@ answer, ref_answer, is_passed, fail_reason
 """
 
 import json
+import orjson
 from pathlib import Path
 import tempfile
 from typing import Iterable
 
-import orjson
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
-from src.eval.results.schema import build_context_from_completions
+from src.eval.results.schema import build_context_from_completions, strict_nonneg_int
 from src.eval.metrics.code_generation.human_eval import evaluate_functional_correctness
 from src.eval.metrics.code_generation.mbpp import evaluate_mbpp
 
@@ -36,6 +36,13 @@ def _iter_jsonl(path: str | Path) -> Iterable[dict]:
             yield json.loads(line)
 
 
+def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
+    if isinstance(source, (str, Path)):
+        yield from _iter_jsonl(source)
+        return
+    yield from source
+
+
 def _max_stage_index(payload: dict) -> int:
     stage = 0
     for key in payload:
@@ -45,7 +52,7 @@ def _max_stage_index(payload: dict) -> int:
 
 
 def _write_temp_samples(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_records: list,
     temp_path: Path,
@@ -54,9 +61,9 @@ def _write_temp_samples(
 
     count = 0
     with temp_path.open("wb") as out_f:
-        for payload in _iter_jsonl(completions_path):
-            sample_index = int(payload.get("sample_index", 0))
-            repeat_index = int(payload.get("repeat_index", 0))
+        for payload in _iter_completions(completions):
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             task_id = ""
             if 0 <= sample_index < len(dataset_records):
                 task_id = str(getattr(dataset_records[sample_index], "task_id", ""))
@@ -95,14 +102,13 @@ def _resolve_reference_answer(record: CodeGenerationRecord | None) -> str:
         return str(tests)
 
 
-def _write_canonical_eval_from_results(
+def _build_canonical_eval_from_results(
     results_path: Path,
     *,
-    eval_output_path: Path,
     dataset_records: list[CodeGenerationRecord],
-) -> None:
-    eval_output_path.parent.mkdir(parents=True, exist_ok=True)
-    with results_path.open("r", encoding="utf-8") as in_f, eval_output_path.open("wb") as out_f:
+) -> list[dict]:
+    eval_payloads: list[dict] = []
+    with results_path.open("r", encoding="utf-8") as in_f:
         for line in in_f:
             line = line.strip()
             if not line:
@@ -110,41 +116,41 @@ def _write_canonical_eval_from_results(
             payload = json.loads(line)
             passed = bool(payload.get("passed", False))
             result = str(payload.get("result", "") or "")
-            sample_index = int(payload.get("sample_index", 0))
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             record = dataset_records[sample_index] if 0 <= sample_index < len(dataset_records) else None
-            out_row = {
-                "benchmark_name": str(payload.get("benchmark_name", "")),
-                "dataset_split": str(payload.get("dataset_split", "")),
-                "sample_index": sample_index,
-                "repeat_index": int(payload.get("repeat_index", 0)),
-                "context": str(payload.get("context", "")),
-                "answer": str(payload.get("completion", "") or ""),
-                "ref_answer": _resolve_reference_answer(record),
-                "is_passed": passed,
-                "fail_reason": "" if passed else result,
-            }
-            out_f.write(orjson.dumps(out_row, option=orjson.OPT_APPEND_NEWLINE))
+            eval_payloads.append(
+                {
+                    "benchmark_name": str(payload.get("benchmark_name", "")),
+                    "dataset_split": str(payload.get("dataset_split", "")),
+                    "sample_index": sample_index,
+                    "repeat_index": repeat_index,
+                    "context": str(payload.get("context", "")),
+                    "answer": str(payload.get("completion", "") or ""),
+                    "ref_answer": _resolve_reference_answer(record),
+                    "is_passed": passed,
+                    "fail_reason": "" if passed else result,
+                }
+            )
+    return eval_payloads
 
 
 def evaluate_human_eval(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
-    eval_output_path: str | Path,
     pass_k: tuple[int, ...] = (1,),
     n_workers: int = 4,
     timeout: float = 3.0,
-) -> dict[str, float]:
-    """Run HumanEval functional correctness eval and write canonical eval JSONL."""
+) -> tuple[dict[str, float], list[dict]]:
+    """Run HumanEval functional correctness eval and return canonical eval payloads."""
 
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
-    eval_output_path = Path(eval_output_path)
-
     with tempfile.TemporaryDirectory(prefix="rwkv_skills_humaneval_") as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         sample_file = tmp_dir_path / "samples.jsonl"
         _write_temp_samples(
-            completions_path,
+            completions,
             dataset_records=dataset_records,
             temp_path=sample_file,
         )
@@ -155,33 +161,29 @@ def evaluate_human_eval(
             timeout=timeout,
             problem_file=str(dataset_path),
         )
-        _write_canonical_eval_from_results(
+        eval_payloads = _build_canonical_eval_from_results(
             Path(results_path_str),
-            eval_output_path=eval_output_path,
             dataset_records=dataset_records,
         )
-        return metrics or {}
+        return metrics or {}, eval_payloads
 
 
 def evaluate_mbpp_dataset(
-    completions_path: str | Path,
+    completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
-    eval_output_path: str | Path,
     pass_k: tuple[int, ...] = (1,),
     n_workers: int = 4,
     timeout: float = 3.0,
-) -> dict[str, float]:
-    """Run MBPP (or MBPP+) eval and write canonical eval JSONL."""
+) -> tuple[dict[str, float], list[dict]]:
+    """Run MBPP (or MBPP+) eval and return canonical eval payloads."""
 
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
-    eval_output_path = Path(eval_output_path)
-
     with tempfile.TemporaryDirectory(prefix="rwkv_skills_mbpp_") as tmp_dir:
         tmp_dir_path = Path(tmp_dir)
         sample_file = tmp_dir_path / "samples.jsonl"
         _write_temp_samples(
-            completions_path,
+            completions,
             dataset_records=dataset_records,
             temp_path=sample_file,
         )
@@ -192,12 +194,11 @@ def evaluate_mbpp_dataset(
             timeout=timeout,
             problem_file=str(dataset_path),
         )
-        _write_canonical_eval_from_results(
+        eval_payloads = _build_canonical_eval_from_results(
             Path(results_path_str),
-            eval_output_path=eval_output_path,
             dataset_records=dataset_records,
         )
-        return metrics or {}
+        return metrics or {}, eval_payloads
 
 
 __all__ = ["evaluate_human_eval", "evaluate_mbpp_dataset"]

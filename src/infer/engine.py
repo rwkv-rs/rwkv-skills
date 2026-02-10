@@ -8,7 +8,7 @@ import math
 import os
 from pathlib import Path
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
     # flashinfer JIT cache defaults to ~/.cache; some sandboxed environments may have an unwritable HOME.
@@ -59,8 +59,18 @@ class InferenceEngine:
         batch_size: int,
         progress_desc: str = "Generating",
         probe_only: bool = False,
+        on_complete: Callable[[GenerationOutput], None] | None = None,
     ) -> list[GenerationOutput]:
-        return _continuous_batching(self.model, self.tokenizer, prompts, sampling, batch_size, progress_desc, probe_only)
+        return _continuous_batching(
+            self.model,
+            self.tokenizer,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            probe_only,
+            on_complete,
+        )
 
 
 @dataclass(slots=True)
@@ -128,6 +138,7 @@ def _continuous_batching(
     batch_size: int,
     progress_desc: str,
     probe_only: bool = False,
+    on_complete: Callable[[GenerationOutput], None] | None = None,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
@@ -152,6 +163,47 @@ def _continuous_batching(
                 print(f"⚠️ torch sampling on CUDA failed: {exc}; retrying on CPU.")
                 return _torch_top_k_top_p(logits_tensor.cpu(), sampling.top_k, sampling.top_p)
             raise
+
+    def _sanitize_sampled_tokens(
+        sampled_tokens: torch.Tensor | Sequence[int],
+        logits_tensor: torch.Tensor,
+        active_count: int,
+        *,
+        sampled_with_flashinfer: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        # Some flashinfer kernels can sporadically return corrupted token ids (e.g. huge negatives).
+        # Validate sampled ids and resample with torch to keep generation alive.
+        disable_flashinfer = False
+        sampled = torch.as_tensor(sampled_tokens, device=logits_tensor.device)
+        if sampled.ndim == 0:
+            sampled = sampled.unsqueeze(0)
+        sampled = sampled.reshape(-1).to(dtype=torch.int64)
+
+        valid_mask = sampled.numel() == active_count
+        if valid_mask:
+            valid_mask = bool(torch.all((sampled >= 0) & (sampled < vocab_size)).item())
+
+        if not valid_mask:
+            preview = sampled[: min(4, sampled.numel())].tolist()
+            source = "flashinfer" if sampled_with_flashinfer else "sampler"
+            print(f"⚠️ {source} produced invalid token ids {preview}; falling back to torch sampling.")
+            sampled = _torch_sample(logits_tensor, force_cpu=sampled_with_flashinfer and logits_tensor.is_cuda)
+            sampled = sampled.reshape(-1).to(device=logits_tensor.device, dtype=torch.int64)
+            disable_flashinfer = sampled_with_flashinfer
+            if sampled.numel() != active_count:
+                raise RuntimeError(
+                    f"Sampler returned {sampled.numel()} tokens for active_count={active_count}; cannot continue."
+                )
+            invalid = (sampled < 0) | (sampled >= vocab_size)
+            if torch.any(invalid):
+                print("⚠️ torch fallback still produced invalid token ids; forcing greedy fallback for those rows.")
+                greedy = torch.argmax(logits_tensor, dim=-1).to(dtype=torch.int64)
+                sampled = torch.where(invalid, greedy, sampled)
+
+        # Hard safety net to prevent invalid indices from crashing penalty/state updates.
+        sampled = sampled.clamp(0, vocab_size - 1)
+
+        return sampled, disable_flashinfer
 
     encoded = deque()
     for idx, prompt in enumerate(prompts):
@@ -200,7 +252,7 @@ def _continuous_batching(
     outputs: list[GenerationOutput] = []
     flashinfer_ok = True
     start_time = time.time()
-    tokens_generated = 0
+    tokens_processed = 0
     window_start_time = start_time
     window_start_tokens = 0
     throughput_ema: float | None = None
@@ -239,17 +291,18 @@ def _continuous_batching(
             if not reached_stop:
                 task.pending_tokens.append(new_token)
                 task.generated_tokens.append(new_token)
-                tokens_generated += 1
             if reached_stop or reached_length:
-                outputs.append(
-                    GenerationOutput(
-                        prompt_index=task.prompt_index,
-                        prompt=task.prompt,
-                        token_ids=list(task.generated_tokens),
-                        text="",
-                        finish_reason="stop_token" if reached_stop else "max_length",
-                    )
+                output = GenerationOutput(
+                    prompt_index=task.prompt_index,
+                    prompt=task.prompt,
+                    token_ids=list(task.generated_tokens),
+                    text="",
+                    finish_reason="stop_token" if reached_stop else "max_length",
                 )
+                if on_complete is not None and not probe_only:
+                    output.text = _decode_tokens(tokenizer, output.token_ids)
+                    on_complete(output)
+                outputs.append(output)
                 pbar.update(1)
                 if encoded:
                     prompt_idx, prompt, tokens = encoded.popleft()
@@ -269,27 +322,28 @@ def _continuous_batching(
             for remove_idx in sorted(accomplished, reverse=True):
                 _remove_slot(remove_idx)
 
-        now = time.time()
-        elapsed = max(now - start_time, 1e-6)
-        window_elapsed = now - window_start_time
-        if window_elapsed >= 0.5:
-            recent_tokens = tokens_generated - window_start_tokens
-            inst_throughput = recent_tokens / max(window_elapsed, 1e-6)
-            throughput_ema = inst_throughput if throughput_ema is None else 0.9 * throughput_ema + 0.1 * inst_throughput
-            window_start_time = now
-            window_start_tokens = tokens_generated
-        inst_display = throughput_ema if throughput_ema is not None else 0.0
-        pbar.set_postfix_str(f"tok/s avg {tokens_generated / elapsed:.1f} cur {inst_display:.1f}")
-        pbar.update(0)
-
-        if not active_tasks:
-            break
-
         next_tokens: list[list[int]] = []
         active_count = len(active_tasks)
         for task in active_tasks:
             token = task.pending_tokens.popleft()
             next_tokens.append([token])
+        tokens_processed += active_count
+
+        now = time.time()
+        elapsed = max(now - start_time, 1e-6)
+        window_elapsed = now - window_start_time
+        if window_elapsed >= 0.5:
+            recent_tokens = tokens_processed - window_start_tokens
+            inst_throughput = recent_tokens / max(window_elapsed, 1e-6)
+            throughput_ema = inst_throughput if throughput_ema is None else 0.9 * throughput_ema + 0.1 * inst_throughput
+            window_start_time = now
+            window_start_tokens = tokens_processed
+        inst_display = throughput_ema if throughput_ema is not None else 0.0
+        pbar.set_postfix_str(f"tok/s avg {tokens_processed / elapsed:.1f} cur {inst_display:.1f}")
+        pbar.update(0)
+
+        if not active_tasks:
+            break
 
         state_view = [
             states[0][:, :, :active_count, :],
@@ -313,6 +367,7 @@ def _continuous_batching(
             temp = sampling.temperature or 1.0
             out /= temp
 
+        sampled_with_flashinfer = False
         if is_simple:
             logits = out
             if noise:
@@ -320,6 +375,7 @@ def _continuous_batching(
             new_tokens = torch.argmax(logits, dim=-1)
         elif flashinfer_ok:
             logits = out.float().contiguous()
+            sampled_with_flashinfer = True
             try:
                 new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                     logits, sampling.top_k, sampling.top_p
@@ -327,28 +383,33 @@ def _continuous_batching(
             except RuntimeError as exc:
                 print(f"⚠️ flashinfer sampling failed: {exc}; falling back to torch sampling.")
                 flashinfer_ok = False
+                sampled_with_flashinfer = False
                 error_text = str(exc).lower()
                 force_cpu = logits.is_cuda and ("illegal memory access" in error_text or "cuda error" in error_text)
                 new_tokens = _torch_sample(logits, force_cpu=force_cpu)
         else:
             logits = out.float().contiguous()
             new_tokens = _torch_sample(logits)
-        new_tokens = new_tokens.tolist()
+
+        sampled_tensor, disable_flashinfer = _sanitize_sampled_tokens(
+            new_tokens,
+            logits,
+            active_count,
+            sampled_with_flashinfer=sampled_with_flashinfer,
+        )
+        if disable_flashinfer:
+            flashinfer_ok = False
+
+        sampled_list = sampled_tensor.tolist()
         for idx, task in enumerate(active_tasks):
-            task.new_token = new_tokens[idx]
+            task.new_token = int(sampled_list[idx])
 
     pbar.close()
 
     for output in outputs:
-        tokens = list(output.token_ids)
-        text = ""
-        while tokens:
-            try:
-                text = tokenizer.decode(tokens)
-                break
-            except:
-                tokens = tokens[:-1]
-        output.text = text
+        if output.text:
+            continue
+        output.text = _decode_tokens(tokenizer, output.token_ids)
 
     outputs.sort(key=lambda item: item.prompt_index)
     return outputs
@@ -386,6 +447,18 @@ def _prepare_state_container(state):
     if isinstance(state, tuple):
         return list(state)
     raise TypeError("generate_zero_state 必须返回 list 或 tuple")
+
+
+def _decode_tokens(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> str:
+    tokens = list(token_ids)
+    text = ""
+    while tokens:
+        try:
+            text = tokenizer.decode(tokens)
+            break
+        except Exception:
+            tokens = tokens[:-1]
+    return text
 
 
 __all__ = ["InferenceEngine", "GenerationOutput"]

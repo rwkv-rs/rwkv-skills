@@ -291,10 +291,12 @@ def detect_job_from_dataset(dataset_slug: str, is_cot: bool) -> str | None:
 
 def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> Path:
     from .datasets import find_dataset_file, refresh_dataset_index
+    from .dataset_stats import record_dataset_samples
 
     canonical = canonical_slug(slug)
     found = find_dataset_file(canonical, search)
     if found:
+        record_dataset_samples(found, dataset_slug=canonical)
         return found
 
     spec = DATASET_PREP_SPECS.get(canonical)
@@ -309,9 +311,11 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
     for path in prepared_paths:
         detected = canonical_slug(path.stem)
         if detected == canonical:
+            record_dataset_samples(path, dataset_slug=canonical)
             return path
     refreshed = find_dataset_file(canonical, search)
     if refreshed:
+        record_dataset_samples(refreshed, dataset_slug=canonical)
         return refreshed
     raise FileNotFoundError(f"数据集 {slug!r} 未生成 JSONL，prepare_dataset 返回 {prepared_paths}")
 

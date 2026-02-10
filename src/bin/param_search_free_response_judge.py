@@ -2,18 +2,18 @@ from __future__ import annotations
 
 """Run a full CoT sampling grid search for judge-style math datasets.
 
-Per-trial artifacts are written under results/param_search/.
+Per-trial results are written to DB.
 """
 
 import argparse
 import json
 import os
-import shutil
 from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import (
     LLMJudge,
@@ -23,18 +23,16 @@ from src.eval.metrics.free_response import (
     evaluate_free_response,
 )
 from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid
-from src.eval.results.layout import (
-    PARAM_SEARCH_COMPLETIONS_ROOT,
-    PARAM_SEARCH_EVAL_RESULTS_ROOT,
-    PARAM_SEARCH_SCORES_ROOT,
-    make_scores_payload,
-    param_search_completion_trial_path,
-    param_search_eval_trial_path,
-    param_search_scores_trial_path,
-    write_scores_json_to_path,
-)
+from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.job_env import ensure_job_id
+from src.db.orm import init_orm
+from src.db.eval_db_service import EvalDbService
+from src.db.async_writer import CompletionWriteWorker
+from src.db.export_results import export_version_results
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -96,12 +94,14 @@ def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
 
 
-def _cleanup_previous_trials(model_name: str, dataset_slug: str) -> None:
-    model_dir = safe_slug(model_name)
-    dataset_dir = canonical_slug(dataset_slug)
-    for root in (PARAM_SEARCH_COMPLETIONS_ROOT, PARAM_SEARCH_EVAL_RESULTS_ROOT, PARAM_SEARCH_SCORES_ROOT):
-        target = (root / model_dir / dataset_dir).resolve()
-        shutil.rmtree(target, ignore_errors=True)
+def _count_records(path: str | Path, limit: int | None) -> int:
+    loader = JsonlFreeAnswerLoader(str(path))
+    count = 0
+    for _ in loader:
+        count += 1
+        if limit and count >= limit:
+            break
+    return count
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -113,7 +113,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
-    parser.add_argument("--output", help="Ignored (scheduler compatibility)")
+    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -146,13 +146,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     _load_env_file(Path(".env"))
     args = parse_args(argv)
-    try:
-        dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    except FileNotFoundError as exc:
-        print(f"❌ {exc}")
-        return 1
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
+    init_orm(DEFAULT_DB_CONFIG)
+    
+    db_service = EvalDbService()
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = FreeResponsePipeline(config)
@@ -160,6 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pass_k = tuple(args.pass_k) if args.pass_k else DEFAULT_PASS_K
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
+    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -182,7 +182,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run(
             dataset_path=str(dataset_path),
-            output_path=str(param_search_completion_trial_path(slug, model_name=model_name, trial_index=0)),
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
@@ -191,7 +190,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass_k=(1,),
             samples_per_task=1,
             probe_only=True,
-            write_output=False,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
@@ -209,7 +207,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if judge_model and judge_api_key:
         judge = LLMJudge(LLMJudgeConfig(api_key=judge_api_key, model=judge_model, base_url=judge_base_url))
 
-    _cleanup_previous_trials(model_name, slug)
     sizes = grid_size_by_mode()
     if args.scan_mode == "both":
         total = sizes["normal"] + sizes["simple"]
@@ -223,31 +220,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_trial: int | None = None
 
     for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, scan_mode=args.scan_mode):
-        completion_path = param_search_completion_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        eval_path = param_search_eval_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        score_path = param_search_scores_trial_path(slug, model_name=model_name, trial_index=trial_idx)
-        completion_path.unlink(missing_ok=True)
-        eval_path.unlink(missing_ok=True)
-        score_path.unlink(missing_ok=True)
-
-        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {completion_path}")
-        result = pipeline.run(
-            dataset_path=str(dataset_path),
-            output_path=str(completion_path),
-            cot_sampling=trial_cot,
-            final_sampling=final_sampling,
-            batch_size=max(1, args.batch_size),
-            sample_limit=args.max_samples,
-            pass_k=pass_k,
-            samples_per_task=samples_per_task,
+        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
+        sampling_payload = {
+            "cot": sampling_config_to_dict(trial_cot),
+            "final": sampling_config_to_dict(final_sampling),
+        }
+        task_id = db_service.get_or_create_task(
+            job_name="param_search_free_response_judge",
+            job_id=ensure_job_id("param_search_free_response_judge"),
+            dataset=str(slug),
+            model=model_name,
+            is_param_search=True,
+            sampling_config=sampling_payload,
+            allow_resume=False,
         )
+        os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+        os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+        writer = CompletionWriteWorker(
+            service=db_service,
+            task_id=task_id,
+            max_queue=args.db_write_queue,
+        )
+        try:
+            result = pipeline.run(
+                dataset_path=str(dataset_path),
+                cot_sampling=trial_cot,
+                final_sampling=final_sampling,
+                batch_size=max(1, args.batch_size),
+                sample_limit=args.max_samples,
+                pass_k=pass_k,
+                samples_per_task=samples_per_task,
+                on_record=writer.enqueue,
+            )
+        except BaseException:
+            try:
+                writer.close()
+            finally:
+                actual = db_service.count_completions(task_id=task_id, status="answer")
+                status = "completed" if actual == expected_count else "failed"
+                db_service.update_task_status(task_id=task_id, status=status)
+            raise
+        writer.close()
+        completions_payloads = db_service.list_completion_payloads(task_id=task_id, status="answer")
         evaluation = evaluate_free_response(
-            completion_path,
+            completions_payloads,
             dataset_path=str(dataset_path),
-            eval_output_path=eval_path,
             judge=judge,
         )
-
         pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
         avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
         metrics_payload: dict[str, object] = {
@@ -262,7 +281,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             metrics_payload.update(avg_payload)
 
         task_details: dict[str, object] = {
-            "eval_details_path": str(eval_path),
             "param_search_trial": {
                 "trial": int(trial_idx),
                 "params": params,
@@ -275,18 +293,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if avg_metrics_all and avg_payload != avg_metrics_all:
             task_details["avg_curve"] = avg_metrics_all
 
-        payload = make_scores_payload(
+        payload = make_score_payload(
             slug,
             is_cot=True,
             model_name=model_name,
             metrics=metrics_payload,
             samples=evaluation.samples,
             problems=result.problem_count,
-            log_path=completion_path,
             task="free_response_judge",
             task_details=task_details,
         )
-        write_scores_json_to_path(score_path, payload)
+        db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
+        db_service.record_score_payload(
+            payload=payload,
+            task_id=task_id,
+        )
+        export_version_results(
+            db_service,
+            task_id=task_id,
+        )
 
         objective = (
             float(metrics_payload["judge_accuracy"])
