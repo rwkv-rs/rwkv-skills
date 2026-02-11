@@ -728,6 +728,67 @@ class EvalDbService:
         with get_session() as session:
             return self._repo.fetch_eval_rows(session, task_id=int(task_id))
 
+    def list_eval_records_for_space(
+        self,
+        *,
+        task_id: str,
+        only_wrong: bool,
+        limit: int | None = None,
+        offset: int = 0,
+        include_context: bool = True,
+    ) -> list[dict[str, Any]]:
+        safe_limit = int(limit) if isinstance(limit, int) or (isinstance(limit, str) and limit.isdigit()) else None
+        if safe_limit is not None and safe_limit <= 0:
+            safe_limit = None
+        try:
+            safe_offset = int(offset)
+        except (TypeError, ValueError):
+            safe_offset = 0
+        safe_offset = max(0, safe_offset)
+
+        with get_session() as session:
+            rows = self._repo.fetch_eval_with_completions_by_task(
+                session,
+                task_id=int(task_id),
+                only_wrong=bool(only_wrong),
+                limit=safe_limit,
+                offset=safe_offset,
+                include_context=bool(include_context),
+            )
+        payloads: list[dict[str, Any]] = []
+        for row in rows:
+            mapping = dict(row) if isinstance(row, Mapping) else row
+            if not isinstance(mapping, dict):
+                continue
+            payload: dict[str, Any] = {
+                "sample_index": int(mapping.get("sample_index", 0)),
+                "repeat_index": int(mapping.get("repeat_index", 0)),
+                "is_passed": bool(mapping.get("is_passed", False)),
+                "answer": str(mapping.get("answer") or ""),
+                "ref_answer": str(mapping.get("ref_answer") or ""),
+                "fail_reason": str(mapping.get("fail_reason") or ""),
+                "context_preview": str(mapping.get("context_preview") or ""),
+            }
+            if include_context:
+                payload["context"] = mapping.get("context")
+            payloads.append(payload)
+        return payloads
+
+    def get_eval_context_for_space(
+        self,
+        *,
+        task_id: str,
+        sample_index: int,
+        repeat_index: int,
+    ) -> Any | None:
+        with get_session() as session:
+            return self._repo.fetch_eval_context_by_task_sample_repeat(
+                session,
+                task_id=int(task_id),
+                sample_index=int(sample_index),
+                repeat_index=int(repeat_index),
+            )
+
     def list_scores_rows(self, *, task_id: str) -> list[dict[str, Any]]:
         with get_session() as session:
             return self._repo.fetch_scores_rows(session, task_id=int(task_id))

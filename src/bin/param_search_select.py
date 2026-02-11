@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-"""Select the best param-search grid points and promote scores in DB.
+"""Select the best shared param-search grid point and promote scores in DB.
 
 This script reads per-trial scores from the database (is_param_search=1),
-selects the best shared grid point *per sampling mode* (normal/simple), and
-promotes the corresponding scores into non-param-search records using suffixes:
-- {benchmark} (best overall across modes; backward compatible)
-- {benchmark}__ps_normal
-- {benchmark}__ps_simple
+selects a single best shared grid point across benchmarks, and promotes the
+corresponding scores into non-param-search records for the original datasets.
 """
 
 import argparse
@@ -18,15 +15,14 @@ from typing import Any, Sequence
 
 from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.job_env import ensure_job_id
 from src.eval.scheduler.dataset_utils import canonical_slug
-from src.db.orm import init_orm
+from src.eval.scheduler.job_env import ensure_job_id
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
+from src.db.orm import init_orm
 
 
 DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
-_MODE_SUFFIXES: dict[str, str] = {"normal": "__ps_normal", "simple": "__ps_simple"}
 
 
 def _objective_from_metrics(metrics: dict[str, Any]) -> float:
@@ -37,17 +33,6 @@ def _objective_from_metrics(metrics: dict[str, Any]) -> float:
     if isinstance(exact, (int, float)):
         return float(exact)
     return 0.0
-
-
-def _sample_mode_from_key(key: str) -> str | None:
-    params = json.loads(key)
-    if not isinstance(params, dict):
-        return None
-    mode = params.get("sample_mode")
-    if not isinstance(mode, str):
-        return None
-    mode = mode.strip().lower()
-    return mode if mode in _MODE_SUFFIXES else None
 
 
 def _param_key_from_payload(payload: dict[str, Any]) -> str | None:
@@ -142,7 +127,7 @@ def _promote_score(
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     service = EvalDbService()
     model_name = Path(args.model_path).stem
     benchmarks = tuple(canonical_slug(b) for b in args.benchmarks if b)
@@ -178,55 +163,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("❌ 各 benchmark 的 grid 点没有交集（params key 不一致）")
         return 1
 
-    selections: dict[str, tuple[str, float, dict[str, float], dict[str, dict[str, Any]]]] = {}
-    for mode in sorted(_MODE_SUFFIXES.keys()):
-        mode_keys = {key for key in common_keys if _sample_mode_from_key(key) == mode}
-        if not mode_keys:
-            continue
+    best_key: str | None = None
+    best_sum: float | None = None
+    best_detail: dict[str, float] = {}
+    best_payloads: dict[str, dict[str, Any]] = {}
 
-        best_key: str | None = None
-        best_sum: float | None = None
-        best_detail: dict[str, float] = {}
-        best_payloads: dict[str, dict[str, Any]] = {}
-        for key in sorted(mode_keys):
-            total = 0.0
-            detail: dict[str, float] = {}
-            payloads: dict[str, dict[str, Any]] = {}
-            for bench, mapping in by_benchmark.items():
-                score, payload = mapping[key]
-                total += float(score)
-                detail[bench] = float(score)
-                payloads[bench] = payload
-            if best_sum is None or total > best_sum:
-                best_sum = total
-                best_key = key
-                best_detail = detail
-                best_payloads = payloads
+    for key in sorted(common_keys):
+        total = 0.0
+        detail: dict[str, float] = {}
+        payloads: dict[str, dict[str, Any]] = {}
+        for bench, mapping in by_benchmark.items():
+            score, payload = mapping[key]
+            total += float(score)
+            detail[bench] = float(score)
+            payloads[bench] = payload
+        if best_sum is None or total > best_sum:
+            best_sum = total
+            best_key = key
+            best_detail = detail
+            best_payloads = payloads
 
-        if best_key is not None and best_sum is not None:
-            selections[mode] = (best_key, best_sum, best_detail, best_payloads)
-
-    if not selections:
-        print("❌ 未找到可用的最佳 grid 点（normal/simple 均无可用交集）")
+    if best_key is None or best_sum is None:
+        print("❌ 未找到可用的最佳 grid 点")
         return 1
 
-    # Backward compatible: still promote the best overall selection into {benchmark}.
-    best_overall_mode, best_overall = max(selections.items(), key=lambda item: item[1][1])
-    best_key, best_sum, best_detail, best_payloads = best_overall
-
-    print("✅ best param-search selections:")
+    detail_text = ", ".join(f"{bench}={best_detail.get(bench, 0.0):.6f}" for bench in benchmarks)
+    print("✅ best param-search selection:")
     print(f"    model: {model_name}")
-    for mode in ("normal", "simple"):
-        if mode not in selections:
-            continue
-        _, total, detail, _ = selections[mode]
-        print(f"    {mode}: total={total:.6f} ({', '.join(f'{b}={detail.get(b, 0.0):.6f}' for b in benchmarks)})")
-    print(f"    promote default: {best_overall_mode} -> {{benchmark}}")
-    for mode in ("normal", "simple"):
-        if mode in selections:
-            print(f"    promote: {mode} -> {{benchmark}}{_MODE_SUFFIXES[mode]}")
+    print(f"    total={best_sum:.6f} ({detail_text})")
 
-    # 1) Promote best overall into {benchmark}.
     for bench, payload in best_payloads.items():
         _promote_score(
             service,
@@ -235,18 +200,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_name=model_name,
             overwrite=bool(args.overwrite),
         )
-
-    # 2) Promote per-mode best into {benchmark}__ps_{mode}.
-    for mode, (mode_key, _, _, mode_payloads) in selections.items():
-        suffix = _MODE_SUFFIXES[mode]
-        for bench, payload in mode_payloads.items():
-            _promote_score(
-                service,
-                source_payload=payload,
-                dest_dataset=f"{bench}{suffix}",
-                model_name=model_name,
-                overwrite=bool(args.overwrite),
-            )
 
     return 0
 

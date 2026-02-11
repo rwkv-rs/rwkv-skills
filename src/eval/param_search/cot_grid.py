@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from itertools import product
-from typing import Iterable
+from typing import Iterable, Mapping, Sequence
 
 from src.infer.sampling import SamplingConfig
 
 
-NORMAL_COT_GRID: dict[str, tuple[float, ...]] = {
+COT_GRID: dict[str, tuple[float, ...]] = {
     "temperature": (0.3, 0.4, 0.6, 0.8),
     "top_p": (0.3, 0.4, 0.5, 0.6),
     "alpha_presence": (0.5, 1.0, 1.5, 2.0),
@@ -15,65 +15,46 @@ NORMAL_COT_GRID: dict[str, tuple[float, ...]] = {
     "alpha_decay": (0.99,),
 }
 
-SIMPLE_COT_GRID: dict[str, tuple[float, ...]] = {
-    "temperature": (0.8, 0.6, 0.4, 0.3),
-    "noise": (1.0, 2.0, 3.0),
-}
+
+def _normalize_grid(grid: Mapping[str, Sequence[float]] | None) -> dict[str, tuple[float, ...]]:
+    source = COT_GRID if grid is None else grid
+    required = ("temperature", "top_p", "alpha_presence", "alpha_frequency", "alpha_decay")
+    normalized: dict[str, tuple[float, ...]] = {}
+    for key in required:
+        values = source.get(key)
+        if not values:
+            raise ValueError(f"参数网格缺少字段: {key}")
+        normalized[key] = tuple(float(v) for v in values)
+    return normalized
 
 
-def grid_size_by_mode() -> dict[str, int]:
-    normal = (
-        len(NORMAL_COT_GRID["temperature"])
-        * len(NORMAL_COT_GRID["top_p"])
-        * len(NORMAL_COT_GRID["alpha_presence"])
-        * len(NORMAL_COT_GRID["alpha_frequency"])
-        * len(NORMAL_COT_GRID["alpha_decay"])
+def grid_size(grid: Mapping[str, Sequence[float]] | None = None) -> int:
+    normalized = _normalize_grid(grid)
+    return (
+        len(normalized["temperature"])
+        * len(normalized["top_p"])
+        * len(normalized["alpha_presence"])
+        * len(normalized["alpha_frequency"])
+        * len(normalized["alpha_decay"])
     )
-    simple = len(SIMPLE_COT_GRID["temperature"]) * len(SIMPLE_COT_GRID["noise"])
-    return {"normal": normal, "simple": simple}
-
-
-def grid_size(scan_mode: str = "both") -> int:
-    mode = (scan_mode or "both").strip().lower()
-    sizes = grid_size_by_mode()
-    if mode == "both":
-        return int(sizes["normal"]) + int(sizes["simple"])
-    if mode in sizes:
-        return int(sizes[mode])
-    raise ValueError(f"未知的 scan_mode: {scan_mode!r} (expected: both/normal/simple)")
 
 
 def iter_cot_sampling_grid(
     base: SamplingConfig,
-    NORMAL_COT_GRID,
-    SIMPLE_COT_GRID,
-    *,
-    scan_mode: str = "both",
+    grid: Mapping[str, Sequence[float]] | None = None,
 ) -> Iterable[tuple[int, SamplingConfig, dict[str, object]]]:
-    """Yield (trial_index, cot_sampling_cfg, params_dict) in a stable order.
-
-    Order: all normal grid points first, then all simple grid points.
-    """
-
-    mode = (scan_mode or "both").strip().lower()
-    if mode not in {"both", "normal", "simple"}:
-        raise ValueError(f"未知的 scan_mode: {scan_mode!r} (expected: both/normal/simple)")
-    include_normal = mode in {"both", "normal"}
-    include_simple = mode in {"both", "simple"}
-
+    normalized = _normalize_grid(grid)
     trial_idx = 0
-    normal_grid = product(
-        NORMAL_COT_GRID["temperature"],
-        NORMAL_COT_GRID["top_p"],
-        NORMAL_COT_GRID["alpha_presence"],
-        NORMAL_COT_GRID["alpha_frequency"],
-        NORMAL_COT_GRID["alpha_decay"],
+    search_space = product(
+        normalized["temperature"],
+        normalized["top_p"],
+        normalized["alpha_presence"],
+        normalized["alpha_frequency"],
+        normalized["alpha_decay"],
     )
-    for temperature, top_p, alpha_presence, alpha_frequency, alpha_decay in normal_grid:
+    for temperature, top_p, alpha_presence, alpha_frequency, alpha_decay in search_space:
         cfg = replace(
             base,
-            sample_mode="normal",
-            noise=0.0,
             temperature=float(temperature),
             top_p=float(top_p),
             alpha_presence=float(alpha_presence),
@@ -81,43 +62,18 @@ def iter_cot_sampling_grid(
             alpha_decay=float(alpha_decay),
         )
         params = {
-            "sample_mode": "normal",
             "temperature": float(temperature),
             "top_p": float(top_p),
             "alpha_presence": float(alpha_presence),
             "alpha_frequency": float(alpha_frequency),
             "alpha_decay": float(alpha_decay),
         }
-        if include_normal:
-            yield trial_idx, cfg, params
-        trial_idx += 1
-
-    simple_grid = product(
-        SIMPLE_COT_GRID["temperature"],
-        SIMPLE_COT_GRID["noise"],
-    )
-    for temperature, noise in simple_grid:
-        cfg = replace(
-            base,
-            sample_mode="simple",
-            temperature=float(temperature),
-            noise=float(noise),
-        )
-        params = {
-            "sample_mode": "simple",
-            "temperature": float(temperature),
-            "noise": float(noise),
-        }
-        if include_simple:
-            yield trial_idx, cfg, params
+        yield trial_idx, cfg, params
         trial_idx += 1
 
 
 __all__ = [
-    "NORMAL_COT_GRID",
-    "SIMPLE_COT_GRID",
-    "grid_size_by_mode",
+    "COT_GRID",
     "grid_size",
-    "total_grid_size",
     "iter_cot_sampling_grid",
 ]

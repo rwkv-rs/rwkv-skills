@@ -13,17 +13,17 @@ from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
-from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid, NORMAL_COT_GRID, SIMPLE_COT_GRID
+from src.eval.param_search.cot_grid import COT_GRID, grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.db.orm import init_orm
-from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
+from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
+from src.db.orm import init_orm
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -41,9 +41,7 @@ def _sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for key, value in data.items():
         if isinstance(value, tuple):
-            normalized[key] = [
-                _round_float(item) if isinstance(item, float) else item for item in value
-            ]
+            normalized[key] = [_round_float(item) if isinstance(item, float) else item for item in value]
         elif isinstance(value, float):
             normalized[key] = _round_float(value)
         else:
@@ -92,14 +90,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
-    parser.add_argument("--para-grid-normal", default=None, type=str, 
-                        help="""Grid search parameter space as a dictionary: \n
-                         e.g. \'{\"temperature\":[0.3,0.4],\"top_k\":[50],\"top_p\":[0.3,0.4],\"alpha_presence\":[0.0,0.1],\"alpha_frequency\":[0.1],\"alpha_decay\":[0.99]}\'
-                         """)
-    parser.add_argument("--para-grid-simple", default=None, type=str, 
-                        help="""Grid search parameter space as a dictionary: \n
-                         e.g. \'{\"temperature\":[0.3,0.4],\"noise\":[1.0, 2.0, 3.0]}\'
-                         """)
+    parser.add_argument(
+        "--para-grid",
+        default=None,
+        type=str,
+        help=(
+            "Grid search parameter space as JSON dict, e.g. "
+            '"{"temperature":[0.3,0.4],"top_p":[0.3,0.4],"alpha_presence":[0.5],"alpha_frequency":[0.1],"alpha_decay":[0.99]}"'
+        ),
+    )
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -117,28 +116,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         help="avg@k values to compute from generated samples (default: none)",
     )
-    parser.add_argument(
-        "--scan-mode",
-        choices=("both", "normal", "simple"),
-        default="both",
-        help="Which sampling grid(s) to scan (default: both)",
-    )
     return parser.parse_args(argv)
 
-def _check_para_grid(args):
-    if args.scan_mode in ['normal', 'both']:
-        if args.para_grid_normal is None: 
-            raise ValueError("When scan_mode is 'normal' or 'both', --para-grid-normal must be provided.")
-        else: 
-            args.para_grid_normal = json.loads(args.para_grid_normal)
-    if args.scan_mode in ['simple', 'both']:
-        if args.para_grid_simple is None: raise ValueError("When scan_mode is 'simple' or 'both', --para-grid-simple must be provided.")
-        else: args.para_grid_simple = json.loads(args.para_grid_simple)
 
-    # Set default as a placeholder if not provided
-    if args.para_grid_normal is None: args.para_grid_normal = NORMAL_COT_GRID
-    if args.para_grid_simple is None: args.para_grid_simple = SIMPLE_COT_GRID
+def _check_para_grid(args: argparse.Namespace) -> argparse.Namespace:
+    if args.para_grid is None:
+        args.para_grid = COT_GRID
+    else:
+        args.para_grid = json.loads(args.para_grid)
     return args
+
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
@@ -147,7 +134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     db_service = EvalDbService()
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
@@ -191,30 +178,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
 
-    sizes = grid_size_by_mode(args.para_grid_normal, args.para_grid_simple)
-    if args.scan_mode == "both":
-        total = sizes["normal"] + sizes["simple"]
-        print(f"🔍 Param-search grid: normal={sizes['normal']} + simple={sizes['simple']} (total={total})")
-    else:
-        print(f"🔍 Param-search grid: {args.scan_mode}={sizes[args.scan_mode]}")
+    total = grid_size(args.para_grid)
+    print(f"🔍 Param-search grid size: {total}")
     print(f"    Dataset: {slug} | Model: {model_name}")
 
     best_key: str | None = None
     best_score: float | None = None
     best_trial: int | None = None
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, 
-                                                               NORMAL_COT_GRID=args.para_grid_normal, 
-                                                               SIMPLE_COT_GRID=args.para_grid_simple, 
-                                                               scan_mode=args.scan_mode):
-        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
+    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, grid=args.para_grid):
+        print(f"🔍 trial {trial_idx}: {slug}")
         sampling_payload = {
             "cot": sampling_config_to_dict(trial_cot),
             "final": sampling_config_to_dict(final_sampling),
         }
         task_id = db_service.get_or_create_task(
             job_name="param_search_free_response",
-        job_id=ensure_job_id("param_search_free_response"),
+            job_id=ensure_job_id("param_search_free_response"),
             dataset=str(slug),
             model=model_name,
             is_param_search=True,

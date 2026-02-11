@@ -147,6 +147,7 @@ class ModelSignature:
 
 @dataclass(slots=True, frozen=True)
 class ScoreEntry:
+    task_id: int | None
     dataset: str
     model: str
     metrics: dict[str, Any]
@@ -255,6 +256,7 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
 
     is_cot = bool(payload.get("cot", False))
     task = str(payload.get("task")).strip() if payload.get("task") else None
+    task_id = _parse_int(payload.get("task_id"), field="task_id", default=None, errors=errors)
     metrics = _normalize_metrics(payload, dataset=dataset, is_cot=is_cot, task=task)
     created_at = _parse_created_at(payload.get("created_at"))
     samples = _parse_int(payload.get("samples"), field="samples", default=0, errors=errors)
@@ -280,10 +282,10 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
         "is_param_search",
     }
     extra = {k: v for k, v in payload.items() if k not in known_keys}
-    task_id = payload.get("task_id")
     relative = Path(str(task_id)) if task_id is not None else DB_PLACEHOLDER_PATH
 
     return ScoreEntry(
+        task_id=task_id,
         dataset=dataset,
         model=model,
         metrics=metrics,

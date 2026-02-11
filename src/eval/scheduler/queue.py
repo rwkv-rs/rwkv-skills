@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Collection, Mapping, Sequence, Pattern
 
-from src.eval.param_search.cot_grid import grid_size_by_mode
+from src.eval.param_search.cot_grid import grid_size
 
 from .config import RESULTS_ROOT
 from .dataset_utils import canonical_slug, safe_slug
@@ -46,24 +46,8 @@ _EARLY_DATASET_SLUGS = frozenset(
 _PARAM_SEARCH_BENCHMARKS = tuple(canonical_slug(slug) for slug in ("gsm8k_test", "math_500_test"))
 
 
-def _normalize_param_search_scan_mode(mode: str | None) -> str:
-    normalized = (mode or "both").strip().lower()
-    if normalized not in {"both", "normal", "simple"}:
-        raise ValueError(f"未知的 param-search scan mode: {mode!r} (expected: both/normal/simple)")
-    return normalized
-
-
-def _param_search_required_trial_indices(scan_mode: str) -> range:
-    sizes = grid_size_by_mode()
-    normal = int(sizes["normal"])
-    simple = int(sizes["simple"])
-    total = normal + simple
-    mode = _normalize_param_search_scan_mode(scan_mode)
-    if mode == "normal":
-        return range(0, normal)
-    if mode == "simple":
-        return range(normal, total)
-    return range(0, total)
+def _param_search_required_trial_indices() -> range:
+    return range(0, int(grid_size()))
 
 
 def _param_search_score_dir(model_slug: str, dataset_slug: str) -> Path:
@@ -87,8 +71,8 @@ def _param_search_trial_indices_present(model_slug: str, dataset_slug: str) -> s
     return present
 
 
-def _param_search_done(model_slug: str, dataset_slug: str, *, scan_mode: str) -> bool:
-    required = _param_search_required_trial_indices(scan_mode)
+def _param_search_done(model_slug: str, dataset_slug: str) -> bool:
+    required = _param_search_required_trial_indices()
     present = _param_search_trial_indices_present(model_slug, dataset_slug)
     return all(idx in present for idx in required)
 
@@ -106,7 +90,6 @@ def build_queue(
     min_param_b: float | None,
     max_param_b: float | None,
     enable_param_search: bool = False,
-    param_search_scan_mode: str = "both",
     model_name_patterns: Sequence[Pattern[str]] | None = None,
 ) -> list[QueueItem]:
     model_paths = expand_model_paths(model_globs)
@@ -122,7 +105,6 @@ def build_queue(
     only_datasets = {canonical_slug(slug) for slug in only_dataset_slugs or []}
     running_set = set(running)
     compiled_patterns = tuple(model_name_patterns or ())
-    scan_mode = _normalize_param_search_scan_mode(param_search_scan_mode)
 
     param_search_enabled: dict[Path, bool] = {}
     if enable_param_search and latest_2_9b_models:
@@ -178,10 +160,10 @@ def build_queue(
                     if not param_search_on:
                         continue
                     if job_name != "param_search_select":
-                        if _param_search_done(model_slug, canonical_dataset, scan_mode=scan_mode):
+                        if _param_search_done(model_slug, canonical_dataset):
                             continue
                     else:
-                        if not all(_param_search_done(model_slug, slug, scan_mode=scan_mode) for slug in _PARAM_SEARCH_BENCHMARKS):
+                        if not all(_param_search_done(model_slug, slug) for slug in _PARAM_SEARCH_BENCHMARKS):
                             continue
 
                 key = CompletedKey(
@@ -196,8 +178,6 @@ def build_queue(
                 if job_id in running_set:
                     continue
                 extra_args: tuple[str, ...] = ()
-                if job_name in {"param_search_free_response", "param_search_free_response_judge"} and scan_mode != "both":
-                    extra_args = ("--scan-mode", scan_mode)
                 pending.append(
                     QueueItem(
                         job_name=job_name,

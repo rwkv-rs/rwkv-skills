@@ -3,6 +3,8 @@ from __future__ import annotations
 """Gradio space to visualise evaluation scores."""
 
 import csv
+from datetime import datetime
+import hashlib
 import html
 import io
 import json
@@ -17,6 +19,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
+from src.db.eval_db_service import EvalDbService
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from .data import (
     ARCH_VERSIONS,
@@ -39,6 +42,27 @@ TABLE_VIEW_LABELS: dict[str, str] = {
     "field_avg_delta": "领域均分（最新 vs 上一代）",
 }
 DEFAULT_TABLE_VIEW = "benchmark_detail_latest"
+
+
+def _normalize_table_view(raw_value: Any) -> str:
+    if isinstance(raw_value, str):
+        value = raw_value.strip()
+        if value in TABLE_VIEW_LABELS:
+            return value
+        for key, label in TABLE_VIEW_LABELS.items():
+            if value == label:
+                return key
+    return DEFAULT_TABLE_VIEW
+
+
+EVAL_PAGE_SIZE = 15
+EVAL_PRELOAD_PAGES = 2
+EVAL_PRELOAD_ROWS = EVAL_PAGE_SIZE * EVAL_PRELOAD_PAGES
+EVAL_FETCH_ROWS = EVAL_PAGE_SIZE
+EVAL_OVERSCAN_ROWS = 1
+EVAL_CONTEXT_PREVIEW_LIMIT = 20
+
+
 PRIMARY_KEYS = (
     "judge_accuracy",
     "exact_accuracy",
@@ -190,6 +214,38 @@ class ParamLineage:
     latest_label: str
     prev_model: str | None
     prev_label: str
+
+
+@dataclass(slots=True, frozen=True)
+class DetailPoint:
+    score: float
+    entry: ScoreEntry
+
+
+@dataclass(slots=True, frozen=True)
+class TableCellMeta:
+    cell_id: str
+    task_id: int | None
+    benchmark_name: str
+    eval_method: str
+    k_metric: str
+    column_label: str
+    model: str | None
+    tooltip: str | None
+    clickable: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "cell_id": self.cell_id,
+            "task_id": self.task_id,
+            "benchmark_name": self.benchmark_name,
+            "eval_method": self.eval_method,
+            "k_metric": self.k_metric,
+            "column_label": self.column_label,
+            "model": self.model,
+            "tooltip": self.tooltip,
+            "clickable": self.clickable,
+        }
 
 
 def _rank_token(candidates: Sequence[str], value: str | None) -> int | None:
@@ -1139,15 +1195,100 @@ def _entries_for_model_in_domains(
     return [entry for entry in model_cache.get(model, []) if entry.domain in domains]
 
 
-def _build_detail_score_map(entries: Iterable[ScoreEntry]) -> dict[tuple[str, str, str], float]:
-    mapped: dict[tuple[str, str, str], float] = {}
+def _build_detail_point_map(entries: Iterable[ScoreEntry]) -> dict[tuple[str, str, str], DetailPoint]:
+    mapped: dict[tuple[str, str, str], DetailPoint] = {}
     for entry in entries:
         for benchmark, method, k_metric, score in _detail_rows_for_entry(entry):
             key = (benchmark, method, k_metric)
             previous = mapped.get(key)
-            if previous is None or score > previous:
-                mapped[key] = score
+            if previous is None or score > previous.score or (
+                score == previous.score and entry.created_at > previous.entry.created_at
+            ):
+                mapped[key] = DetailPoint(score=score, entry=entry)
     return mapped
+
+
+def _sorted_numeric_items(raw_map: dict[str, Any], *, limit: int = 8) -> list[tuple[str, float]]:
+    items: list[tuple[str, float]] = []
+    for key, value in raw_map.items():
+        num = _numeric_value(value)
+        if num is None:
+            continue
+        items.append((str(key), num))
+    items.sort(key=lambda item: (-item[1], item[0]))
+    return items[: max(1, limit)]
+
+
+def _format_tooltip_lines(title: str, items: list[tuple[str, float]]) -> str | None:
+    if not items:
+        return None
+    lines = [title]
+    for key, value in items:
+        score = _score_to_percent(value)
+        if score is None:
+            continue
+        lines.append(f"{key}: {score:.1f}%")
+    if len(lines) <= 1:
+        return None
+    return "\n".join(lines)
+
+
+def _mmlu_tooltip(entry: ScoreEntry) -> str | None:
+    details = entry.task_details or {}
+    accuracy_by_subject = details.get("accuracy_by_subject")
+    if not isinstance(accuracy_by_subject, dict):
+        return None
+
+    grouped: dict[str, list[float]] = {}
+    for raw_subject, raw_value in accuracy_by_subject.items():
+        num = _numeric_value(raw_value)
+        if num is None:
+            continue
+        subdomain = _map_subject_to_subdomain(str(raw_subject))
+        grouped.setdefault(subdomain, []).append(num)
+
+    items: list[tuple[str, float]] = []
+    for subdomain in SUBDOMAIN_ORDER:
+        values = grouped.get(subdomain)
+        if not values:
+            continue
+        items.append((subdomain.replace("_", " "), sum(values) / len(values)))
+
+    return _format_tooltip_lines("MMLU 子领域", items[:8])
+
+
+def _ifeval_tooltip(entry: ScoreEntry) -> str | None:
+    details = entry.task_details or {}
+    tier0 = details.get("tier0_accuracy")
+    if not isinstance(tier0, dict):
+        return None
+    items = _sorted_numeric_items(tier0, limit=10)
+    pretty = [(name.replace("_", " "), value) for name, value in items]
+    return _format_tooltip_lines("IFEval 子领域", pretty)
+
+
+def _metric_fallback_tooltip(entry: ScoreEntry) -> str | None:
+    items = _sorted_numeric_items(entry.metrics, limit=8)
+    return _format_tooltip_lines("指标明细", items)
+
+
+def _tooltip_for_entry(entry: ScoreEntry) -> str | None:
+    dataset = _dataset_base(entry.dataset).lower()
+    if dataset.startswith("mmlu") or entry.domain in {"mmlu系列", "multi-choice系列"}:
+        tooltip = _mmlu_tooltip(entry)
+        if tooltip:
+            return tooltip
+    if dataset.startswith("ifeval") or entry.domain == "instruction following系列":
+        tooltip = _ifeval_tooltip(entry)
+        if tooltip:
+            return tooltip
+    return _metric_fallback_tooltip(entry)
+
+
+def _make_cell_id(*parts: str) -> str:
+    token = "|".join(parts)
+    digest = hashlib.sha1(token.encode("utf-8")).hexdigest()[:16]
+    return f"cell-{digest}"
 
 
 def _build_field_avg_latest_table(
@@ -1227,32 +1368,58 @@ def _build_benchmark_detail_latest_table(
     lineages: list[ParamLineage],
     model_cache: dict[str, list[ScoreEntry]],
     domains: set[str],
-) -> tuple[list[str], list[list[Any]]]:
+) -> tuple[list[str], list[list[Any]], dict[tuple[int, int], TableCellMeta]]:
     headers = ["benchmark_name", "eval_method", "k_metric"] + [
         f"{_format_param(item.param).lower()} · {_model_data_param_label(item.latest_model, include_params=False)}"
         for item in lineages
     ]
     if not lineages:
-        return headers, []
+        return headers, [], {}
 
-    row_values: dict[tuple[str, str, str], dict[str, float]] = {}
+    row_values: dict[tuple[str, str, str], dict[str, DetailPoint]] = {}
     for item in lineages:
         model_entries = _entries_for_model_in_domains(model_cache, item.latest_model, domains)
-        score_map = _build_detail_score_map(model_entries)
-        for row_key, score in score_map.items():
-            row_values.setdefault(row_key, {})[item.param] = score
+        point_map = _build_detail_point_map(model_entries)
+        for row_key, point in point_map.items():
+            row_values.setdefault(row_key, {})[item.param] = point
 
     rows: list[list[Any]] = []
+    cell_meta: dict[tuple[int, int], TableCellMeta] = {}
+    row_idx = 0
     for row_key in sorted(row_values, key=_detail_sort_key):
         row = [row_key[0], row_key[1], row_key[2]]
-        values = row_values[row_key]
-        max_score = _max_percent(values.get(item.param) for item in lineages)
+        points = row_values[row_key]
+        max_score = _max_percent(points.get(item.param).score if points.get(item.param) else None for item in lineages)
         if max_score is None or max_score < 10.0:
             continue
-        for item in lineages:
-            row.append(_format_score_1dp(values.get(item.param)))
+        for col_offset, item in enumerate(lineages, start=3):
+            point = points.get(item.param)
+            row.append(_format_score_1dp(point.score if point else None))
+            if point is None:
+                continue
+            entry = point.entry
+            cell_id = _make_cell_id(
+                "latest",
+                row_key[0],
+                row_key[1],
+                row_key[2],
+                item.param,
+                item.latest_model,
+            )
+            cell_meta[(row_idx, col_offset)] = TableCellMeta(
+                cell_id=cell_id,
+                task_id=entry.task_id,
+                benchmark_name=row_key[0],
+                eval_method=row_key[1],
+                k_metric=row_key[2],
+                column_label=headers[col_offset],
+                model=entry.model,
+                tooltip=_tooltip_for_entry(entry),
+                clickable=entry.task_id is not None,
+            )
         rows.append(row)
-    return headers, rows
+        row_idx += 1
+    return headers, rows, cell_meta
 
 
 def _build_benchmark_detail_delta_table(
@@ -1260,7 +1427,7 @@ def _build_benchmark_detail_delta_table(
     lineages: list[ParamLineage],
     model_cache: dict[str, list[ScoreEntry]],
     domains: set[str],
-) -> tuple[list[str], list[list[Any]]]:
+) -> tuple[list[str], list[list[Any]], dict[tuple[int, int], TableCellMeta]]:
     headers = ["benchmark_name", "eval_method", "k_metric"]
     for item in lineages:
         param_label = _format_param(item.param).lower()
@@ -1274,28 +1441,32 @@ def _build_benchmark_detail_delta_table(
             ]
         )
     if not lineages:
-        return headers, []
+        return headers, [], {}
 
-    latest_by_param: dict[str, dict[tuple[str, str, str], float]] = {}
-    prev_by_param: dict[str, dict[tuple[str, str, str], float]] = {}
+    latest_by_param: dict[str, dict[tuple[str, str, str], DetailPoint]] = {}
+    prev_by_param: dict[str, dict[tuple[str, str, str], DetailPoint]] = {}
     row_keys: set[tuple[str, str, str]] = set()
     for item in lineages:
-        latest_map = _build_detail_score_map(_entries_for_model_in_domains(model_cache, item.latest_model, domains))
-        prev_map = _build_detail_score_map(_entries_for_model_in_domains(model_cache, item.prev_model, domains))
+        latest_map = _build_detail_point_map(_entries_for_model_in_domains(model_cache, item.latest_model, domains))
+        prev_map = _build_detail_point_map(_entries_for_model_in_domains(model_cache, item.prev_model, domains))
         latest_by_param[item.param] = latest_map
         prev_by_param[item.param] = prev_map
         row_keys.update(latest_map.keys())
         row_keys.update(prev_map.keys())
 
-    rows_with_meta: list[tuple[float, tuple[Any, ...], list[Any]]] = []
+    rows_with_meta: list[tuple[float, tuple[Any, ...], list[Any], dict[int, TableCellMeta]]] = []
     for row_key in row_keys:
         max_score = _max_percent(
             [
                 score
                 for item in lineages
                 for score in (
-                    latest_by_param.get(item.param, {}).get(row_key),
-                    prev_by_param.get(item.param, {}).get(row_key),
+                    latest_by_param.get(item.param, {}).get(row_key).score
+                    if latest_by_param.get(item.param, {}).get(row_key)
+                    else None,
+                    prev_by_param.get(item.param, {}).get(row_key).score
+                    if prev_by_param.get(item.param, {}).get(row_key)
+                    else None,
                 )
             ]
         )
@@ -1303,13 +1474,17 @@ def _build_benchmark_detail_delta_table(
             continue
         row = [row_key[0], row_key[1], row_key[2]]
         delta_values: list[float] = []
+        row_cell_meta: dict[int, TableCellMeta] = {}
         for item in lineages:
-            latest_score = latest_by_param.get(item.param, {}).get(row_key)
-            prev_score = prev_by_param.get(item.param, {}).get(row_key)
+            latest_point = latest_by_param.get(item.param, {}).get(row_key)
+            prev_point = prev_by_param.get(item.param, {}).get(row_key)
+            latest_score = latest_point.score if latest_point else None
+            prev_score = prev_point.score if prev_point else None
             delta_value = None
             if latest_score is not None and prev_score is not None:
                 delta_value = _score_to_percent(latest_score) - _score_to_percent(prev_score)
                 delta_values.append(delta_value)
+            latest_col_idx = len(row)
             row.extend(
                 [
                     _format_score_1dp(latest_score),
@@ -1317,10 +1492,56 @@ def _build_benchmark_detail_delta_table(
                     _styled_delta_cell(delta_value),
                 ]
             )
+            if latest_point is not None:
+                latest_entry = latest_point.entry
+                row_cell_meta[latest_col_idx] = TableCellMeta(
+                    cell_id=_make_cell_id(
+                        "delta_latest",
+                        row_key[0],
+                        row_key[1],
+                        row_key[2],
+                        item.param,
+                        item.latest_model,
+                    ),
+                    task_id=latest_entry.task_id,
+                    benchmark_name=row_key[0],
+                    eval_method=row_key[1],
+                    k_metric=row_key[2],
+                    column_label=headers[latest_col_idx],
+                    model=latest_entry.model,
+                    tooltip=_tooltip_for_entry(latest_entry),
+                    clickable=latest_entry.task_id is not None,
+                )
+            if prev_point is not None and item.prev_model:
+                prev_entry = prev_point.entry
+                prev_col_idx = latest_col_idx + 1
+                row_cell_meta[prev_col_idx] = TableCellMeta(
+                    cell_id=_make_cell_id(
+                        "delta_prev",
+                        row_key[0],
+                        row_key[1],
+                        row_key[2],
+                        item.param,
+                        item.prev_model,
+                    ),
+                    task_id=prev_entry.task_id,
+                    benchmark_name=row_key[0],
+                    eval_method=row_key[1],
+                    k_metric=row_key[2],
+                    column_label=headers[prev_col_idx],
+                    model=prev_entry.model,
+                    tooltip=_tooltip_for_entry(prev_entry),
+                    clickable=prev_entry.task_id is not None,
+                )
         avg_delta = sum(delta_values) / len(delta_values) if delta_values else float("-inf")
-        rows_with_meta.append((avg_delta, _detail_sort_key(row_key), row))
-    rows = [row for _, _, row in sorted(rows_with_meta, key=lambda item: (-item[0], item[1]))]
-    return headers, rows
+        rows_with_meta.append((avg_delta, _detail_sort_key(row_key), row, row_cell_meta))
+    ordered = sorted(rows_with_meta, key=lambda item: (-item[0], item[1]))
+    rows = [row for _, _, row, _ in ordered]
+    cell_meta: dict[tuple[int, int], TableCellMeta] = {}
+    for row_idx, (_, _, _, row_cells) in enumerate(ordered):
+        for col_idx, meta in row_cells.items():
+            cell_meta[(row_idx, col_idx)] = meta
+    return headers, rows, cell_meta
 
 
 def _build_all_field_avg_latest_table(
@@ -1625,11 +1846,12 @@ def _build_domain_tables(
     *,
     all_entries: list[ScoreEntry],
     view_mode: str,
-) -> dict[str, str]:
-    mode = view_mode if view_mode in TABLE_VIEW_LABELS else DEFAULT_TABLE_VIEW
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    mode = _normalize_table_view(view_mode)
     source_entries = all_entries if all_entries else selection.entries
     model_cache = _build_model_entries_cache(source_entries)
     lineages = _resolve_param_lineages(source_entries, selection)
+    interaction_meta: dict[str, dict[str, Any]] = {}
 
     if mode == "field_avg_latest":
         headers, rows = _build_all_field_avg_latest_table(
@@ -1637,7 +1859,7 @@ def _build_domain_tables(
             model_cache=model_cache,
         )
         table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
-        return {group["key"]: table_html for group in DOMAIN_GROUPS}
+        return {group["key"]: table_html for group in DOMAIN_GROUPS}, interaction_meta
 
     if mode == "field_avg_delta":
         headers, rows = _build_all_field_avg_delta_table(
@@ -1645,26 +1867,28 @@ def _build_domain_tables(
             model_cache=model_cache,
         )
         table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
-        return {group["key"]: table_html for group in DOMAIN_GROUPS}
+        return {group["key"]: table_html for group in DOMAIN_GROUPS}, interaction_meta
 
     tables: dict[str, str] = {}
     for group in DOMAIN_GROUPS:
         domains = set(group["domains"])
         if mode == "benchmark_detail_delta":
-            headers, rows = _build_benchmark_detail_delta_table(
+            headers, rows, cell_meta = _build_benchmark_detail_delta_table(
                 lineages=lineages,
                 model_cache=model_cache,
                 domains=domains,
             )
         else:
-            headers, rows = _build_benchmark_detail_latest_table(
+            headers, rows, cell_meta = _build_benchmark_detail_latest_table(
                 lineages=lineages,
                 model_cache=model_cache,
                 domains=domains,
             )
         title = f"{group['title']} · {TABLE_VIEW_LABELS[mode]}"
-        tables[group["key"]] = _render_pivot_html(headers, rows, title=title)
-    return tables
+        tables[group["key"]] = _render_pivot_html(headers, rows, title=title, cell_meta=cell_meta)
+        for meta in cell_meta.values():
+            interaction_meta[meta.cell_id] = meta.as_dict()
+    return tables, interaction_meta
 
 
 
@@ -1850,29 +2074,54 @@ def _export_selection_csv(selection: SelectionState) -> str:
     return str(path)
 
 
-def _render_pivot_html(headers: list[str], rows: list[list[Any]], *, title: str = "明细") -> str:
+def _render_pivot_html(
+    headers: list[str],
+    rows: list[list[Any]],
+    *,
+    title: str = "明细",
+    cell_meta: dict[tuple[int, int], TableCellMeta] | None = None,
+) -> str:
     """Render pivot table into a HTML table with predictable column widths."""
     if not headers:
         return '<div class="space-table-empty">当前筛选条件下没有数据。</div>'
 
     header_cells = "".join(f'<th title="{_html(title)}">{_html(title)}</th>' for title in headers)
     body_rows: list[str] = []
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         cells: list[str] = []
-        for idx, cell in enumerate(row):
-            # First cell is model name, others are metrics
-            # Add TITLE attribute for hover tooltips
+        for col_idx, cell in enumerate(row):
             style_attr = ""
-            class_attr = ""
+            class_names: list[str] = []
+            data_attrs: list[str] = []
             display_value = cell
             if isinstance(cell, tuple) and len(cell) == 2:
                 display_value, style = cell
                 if style:
                     style_attr = f' style="{_html(style)}"'
-            if _parse_display_number(display_value) is not None:
-                class_attr = ' class="score-cell"'
+
+            numeric_value = _parse_display_number(display_value)
+            if numeric_value is not None:
+                class_names.append("score-cell")
+
+            meta = cell_meta.get((row_idx, col_idx)) if cell_meta else None
+            tooltip_text = meta.tooltip if meta and meta.tooltip else str(display_value)
+            if meta and meta.tooltip:
+                data_attrs.append(f'data-tooltip="{_html(meta.tooltip)}"')
+            if meta:
+                data_attrs.append(f'data-cell-id="{_html(meta.cell_id)}"')
+                if meta.clickable:
+                    class_names.append("space-clickable-score")
+                    data_attrs.append('data-clickable="1"')
+
+            class_attr = f' class="{" ".join(class_names)}"' if class_names else ""
+            data_attr = f" {' '.join(data_attrs)}" if data_attrs else ""
             cell_html = _html(display_value)
-            cells.append(f'<td title="{cell_html}"{class_attr}{style_attr}>{cell_html}</td>')
+
+            if meta and meta.clickable:
+                inner_html = f'<button type="button" class="space-score-button">{cell_html}</button>'
+            else:
+                inner_html = cell_html
+            cells.append(f'<td title="{_html(tooltip_text)}"{class_attr}{style_attr}{data_attr}>{inner_html}</td>')
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     rows_html = "".join(body_rows) if body_rows else '<tr><td colspan="999">当前筛选条件下没有数据。</td></tr>'
@@ -1894,6 +2143,348 @@ def _render_pivot_html(headers: list[str], rows: list[list[Any]], *, title: str 
     </div>
 </div>
 """.strip()
+
+
+def _parse_click_payload(payload: str) -> str | None:
+    if not payload:
+        return None
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    cell_id = parsed.get("cell_id")
+    if isinstance(cell_id, str) and cell_id.strip():
+        return cell_id.strip()
+    return None
+
+
+def _parse_context_payload(payload: str) -> tuple[str | None, int | None, int | None]:
+    if not payload:
+        return None, None, None
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return None, None, None
+    if not isinstance(parsed, dict):
+        return None, None, None
+
+    cell_id = parsed.get("cell_id")
+    sample_index = parsed.get("sample_index")
+    repeat_index = parsed.get("repeat_index")
+    if not isinstance(cell_id, str) or not cell_id.strip():
+        return None, None, None
+    try:
+        sample = int(sample_index)
+        repeat = int(repeat_index)
+    except (TypeError, ValueError):
+        return None, None, None
+    if sample < 0 or repeat < 0:
+        return None, None, None
+    return cell_id.strip(), sample, repeat
+
+
+def _context_text(value: Any) -> str:
+
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
+def _truncate_preview(text: str, limit: int = EVAL_CONTEXT_PREVIEW_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
+def _empty_eval_loader_state() -> dict[str, Any]:
+    return {
+        "cell_id": None,
+        "task_id": None,
+        "only_wrong": False,
+        "next_offset": 0,
+        "page_size": EVAL_FETCH_ROWS,
+        "has_more": False,
+        "meta": None,
+    }
+
+
+def _render_eval_records_html(
+    *,
+    meta: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+    only_wrong: bool,
+    is_loading: bool = False,
+) -> str:
+    if meta is None:
+        return """
+<div class="space-section-card space-eval-panel">
+  <div class="space-header" style="padding:0; margin-bottom:12px;">
+    <h3 style="font-size:18px; color:var(--space-text-primary); margin:0;">Eval 记录</h3>
+    <div class="subtitle">点击上方分数后，这里会展示对应样本记录。</div>
+  </div>
+</div>
+""".strip()
+
+    benchmark = _html(meta.get("benchmark_name") or "N/A")
+    method = _html(meta.get("eval_method") or "N/A")
+    model = _html(meta.get("model") or "N/A")
+    filter_tag = "仅错题" if only_wrong else "全部样本"
+
+    if not records:
+        loading_text = " · 还有更多，请点击“下一页”" if is_loading else ""
+        return f"""
+<div class="space-section-card space-eval-panel">
+  <div class="space-header" style="padding:0; margin-bottom:12px; text-align:left;">
+    <h3 style="font-size:18px; color:var(--space-text-primary); margin:0;">Eval 记录</h3>
+    <div class="subtitle">{benchmark} · {method} · {model} · {filter_tag}{loading_text}</div>
+  </div>
+  <div class="space-table-empty">当前筛选下没有样本记录。</div>
+</div>
+""".strip()
+
+    header_cells = "".join(
+        f"<th>{name}</th>"
+        for name in ("sample_index", "repeat_index", "is_passed", "answer", "ref_answer", "fail_reason", "context")
+    )
+    body_rows: list[str] = []
+    sorted_rows = sorted(
+        records,
+        key=lambda item: (
+            int(item.get("sample_index", 0)),
+            int(item.get("repeat_index", 0)),
+        ),
+    )
+    meta_cell_id = meta.get("cell_id") if isinstance(meta.get("cell_id"), str) else ""
+    for row in sorted_rows:
+        try:
+            sample_index = int(row.get("sample_index", 0))
+        except (TypeError, ValueError):
+            sample_index = 0
+        try:
+            repeat_index = int(row.get("repeat_index", 0))
+        except (TypeError, ValueError):
+            repeat_index = 0
+
+        preview_source = str(row.get("context_preview") or "")
+        if not preview_source and "context" in row:
+            preview_source = _context_text(row.get("context"))
+        preview = _truncate_preview(preview_source, limit=EVAL_CONTEXT_PREVIEW_LIMIT)
+
+        if meta_cell_id:
+            context_button = (
+                f'<button type="button" class="space-context-open" '
+                f'data-context-cell-id="{_html(meta_cell_id)}" '
+                f'data-sample-index="{sample_index}" '
+                f'data-repeat-index="{repeat_index}">'
+                f'{_html(preview)}</button>'
+            )
+        else:
+            context_button = _html(preview)
+
+        values = [
+            _html(sample_index),
+            _html(repeat_index),
+            "✓" if bool(row.get("is_passed")) else "✕",
+            _html(row.get("answer") or ""),
+            _html(row.get("ref_answer") or ""),
+            _html(row.get("fail_reason") or ""),
+            context_button,
+        ]
+        cells = "".join(f"<td>{value}</td>" for value in values)
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    rows_html = "".join(body_rows)
+    load_status = (
+        f"已加载 {len(sorted_rows)} 条（每页 {EVAL_PAGE_SIZE} 条，点击“下一页”继续加载）"
+        if is_loading
+        else f"已加载 {len(sorted_rows)} 条（每页 {EVAL_PAGE_SIZE} 条，已全部加载）"
+    )
+    return f"""
+<div class="space-section-card space-eval-panel">
+  <div class="space-header" style="padding:0; margin-bottom:12px; text-align:left;">
+    <h3 style="font-size:18px; color:var(--space-text-primary); margin:0;">Eval 记录</h3>
+    <div class="subtitle">{benchmark} · {method} · {model} · {filter_tag}</div>
+    <div class="subtitle">{load_status}</div>
+  </div>
+  <div class="space-table-wrapper">
+    <table>
+      <thead><tr>{header_cells}</tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+</div>
+""".strip()
+
+
+def _resolve_eval_records(
+    *,
+    cell_id: str | None,
+    only_wrong: bool,
+    interaction_meta: dict[str, dict[str, Any]],
+) -> tuple[str, str | None]:
+    if not cell_id:
+        return _render_eval_records_html(meta=None, records=[], only_wrong=only_wrong), None
+
+    meta = interaction_meta.get(cell_id)
+    if not meta:
+        return _render_eval_records_html(meta=None, records=[], only_wrong=only_wrong), None
+
+    task_id = meta.get("task_id")
+    if not isinstance(task_id, int):
+        return _render_eval_records_html(meta=meta, records=[], only_wrong=only_wrong), cell_id
+
+    try:
+        records = EvalDbService().list_eval_records_for_space(task_id=str(task_id), only_wrong=only_wrong)
+    except Exception as exc:  # noqa: BLE001
+        error_html = f'<div class="space-table-empty">读取 Eval 记录失败：{_html(exc)}</div>'
+        return error_html, cell_id
+
+    return _render_eval_records_html(meta=meta, records=records, only_wrong=only_wrong), cell_id
+
+
+def _start_eval_records_load(
+    *,
+    cell_id: str | None,
+    only_wrong: bool,
+    interaction_meta: dict[str, dict[str, Any]],
+) -> tuple[str, str | None, list[dict[str, Any]], dict[str, Any], bool]:
+    if not cell_id:
+        return _render_eval_records_html(meta=None, records=[], only_wrong=only_wrong), None, [], _empty_eval_loader_state(), False
+
+    meta = interaction_meta.get(cell_id)
+    if not meta:
+        return _render_eval_records_html(meta=None, records=[], only_wrong=only_wrong), None, [], _empty_eval_loader_state(), False
+
+    task_id = meta.get("task_id")
+    if not isinstance(task_id, int):
+        return _render_eval_records_html(meta=meta, records=[], only_wrong=only_wrong), cell_id, [], _empty_eval_loader_state(), False
+
+    try:
+        first_batch = EvalDbService().list_eval_records_for_space(
+            task_id=str(task_id),
+            only_wrong=bool(only_wrong),
+            limit=EVAL_PRELOAD_ROWS + EVAL_OVERSCAN_ROWS,
+            offset=0,
+            include_context=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        error_html = f'<div class="space-table-empty">读取 Eval 记录失败：{_html(exc)}</div>'
+        return error_html, cell_id, [], _empty_eval_loader_state(), False
+
+    visible_rows = first_batch[:EVAL_PRELOAD_ROWS]
+    has_more = len(first_batch) > EVAL_PRELOAD_ROWS
+    loader_state = {
+        "cell_id": cell_id,
+        "task_id": task_id,
+        "only_wrong": bool(only_wrong),
+        "next_offset": len(visible_rows),
+        "page_size": EVAL_FETCH_ROWS,
+        "has_more": has_more,
+        "meta": meta,
+    }
+    html = _render_eval_records_html(
+        meta=meta,
+        records=visible_rows,
+        only_wrong=bool(only_wrong),
+        is_loading=has_more,
+    )
+    return html, cell_id, visible_rows, loader_state, has_more
+
+
+def _continue_eval_records_load(
+    *,
+    loader_state: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], dict[str, Any], bool]:
+    state = dict(loader_state) if isinstance(loader_state, dict) else _empty_eval_loader_state()
+    safe_records = list(records) if isinstance(records, list) else []
+    meta = state.get("meta") if isinstance(state.get("meta"), dict) else None
+    only_wrong = bool(state.get("only_wrong", False))
+
+    if not state.get("has_more"):
+        html = _render_eval_records_html(meta=meta, records=safe_records, only_wrong=only_wrong, is_loading=False)
+        return html, safe_records, state, False
+
+    task_id = state.get("task_id")
+    if not isinstance(task_id, int):
+        state["has_more"] = False
+        html = _render_eval_records_html(meta=meta, records=safe_records, only_wrong=only_wrong, is_loading=False)
+        return html, safe_records, state, False
+
+    try:
+        next_offset = int(state.get("next_offset", len(safe_records)))
+    except (TypeError, ValueError):
+        next_offset = len(safe_records)
+    next_offset = max(0, next_offset)
+
+    try:
+        page_size = int(state.get("page_size", EVAL_FETCH_ROWS))
+    except (TypeError, ValueError):
+        page_size = EVAL_FETCH_ROWS
+    page_size = max(1, page_size)
+
+    try:
+        next_batch = EvalDbService().list_eval_records_for_space(
+            task_id=str(task_id),
+            only_wrong=only_wrong,
+            limit=page_size + EVAL_OVERSCAN_ROWS,
+            offset=next_offset,
+            include_context=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        state["has_more"] = False
+        base_html = _render_eval_records_html(meta=meta, records=safe_records, only_wrong=only_wrong, is_loading=False)
+        error_html = base_html + f'<div class="space-table-empty">加载下一页失败：{_html(exc)}</div>'
+        return error_html, safe_records, state, False
+
+    append_rows = next_batch[:page_size]
+    merged_records = safe_records + append_rows
+    state["next_offset"] = next_offset + len(append_rows)
+    state["has_more"] = len(next_batch) > page_size
+
+    html = _render_eval_records_html(
+        meta=meta,
+        records=merged_records,
+        only_wrong=only_wrong,
+        is_loading=bool(state["has_more"]),
+    )
+    return html, merged_records, state, bool(state["has_more"])
+
+
+def _resolve_context_text_for_modal(
+    *,
+    payload: str,
+    interaction_meta: dict[str, dict[str, Any]],
+) -> str:
+    cell_id, sample_index, repeat_index = _parse_context_payload(payload)
+    if not cell_id:
+        return ""
+
+    meta = interaction_meta.get(cell_id) if isinstance(interaction_meta, dict) else None
+    if not isinstance(meta, dict):
+        return "未找到对应分数单元格，请重新点击分数后再试。"
+
+    task_id = meta.get("task_id")
+    if not isinstance(task_id, int):
+        return "该分数没有可查询的 task_id。"
+
+    try:
+        context_value = EvalDbService().get_eval_context_for_space(
+            task_id=str(task_id),
+            sample_index=sample_index,
+            repeat_index=repeat_index,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"读取 context 失败：{exc}"
+
+    if context_value is None:
+        return "当前样本没有 context 内容。"
+    return _context_text(context_value)
 
 
 def _compute_choices(entries: list[ScoreEntry]) -> list[str]:
@@ -1921,25 +2512,279 @@ def _build_dashboard() -> gr.Blocks:
         view_mode=initial_view_mode,
         warnings=warnings,
     )
-    domain_tables = _build_domain_tables(
+    domain_tables, interaction_meta = _build_domain_tables(
         selection,
         all_entries=entries,
         view_mode=initial_view_mode,
     )
+    initial_eval_html = _render_eval_records_html(meta=None, records=[], only_wrong=False)
+    initial_eval_rows: list[dict[str, Any]] = []
+    initial_eval_loader = _empty_eval_loader_state()
     csv_export_path = _export_selection_csv(selection)
 
-    # Inject JS to force dark mode
+    modal_html = """
+<div id="space-context-modal" class="space-modal" aria-hidden="true">
+  <div class="space-modal-content">
+    <button type="button" class="space-modal-close" data-close-modal="1">关闭</button>
+    <pre id="space-context-modal-body" class="space-modal-body"></pre>
+  </div>
+</div>
+"""
+
     js_func = """
     () => {
+        const app = document.querySelector('gradio-app');
+        const root = (app && app.shadowRoot) ? app.shadowRoot : document;
+        if (app) {
+            app.style.backgroundColor = 'var(--space-bg-color)';
+        }
         document.body.classList.add('dark');
-        document.querySelector('gradio-app').style.backgroundColor = 'var(--space-bg-color)';
+
+        if (window.__rwkvSpaceHandlersBound) {
+            return;
+        }
+        window.__rwkvSpaceHandlersBound = true;
+
+        const escapeId = (id) => {
+            if (window.CSS && typeof CSS.escape === 'function') {
+                return CSS.escape(id);
+            }
+            return id.replace(/([ #;?%&,.+*~':"!^$\\[\\]()=>|/@])/g, '\\$1');
+        };
+
+        const queryById = (id) => root.querySelector(`#${escapeId(id)}`);
+
+        const closeModal = () => {
+            const modal = queryById('space-context-modal');
+            if (!modal) {
+                return;
+            }
+            modal.classList.remove('open');
+            modal.setAttribute('aria-hidden', 'true');
+        };
+
+        const openModal = (text) => {
+            const modal = queryById('space-context-modal');
+            const modalBody = queryById('space-context-modal-body');
+            if (!modal || !modalBody) {
+                return;
+            }
+            modalBody.textContent = text || '';
+            modal.classList.add('open');
+            modal.setAttribute('aria-hidden', 'false');
+        };
+
+        const getTextboxInput = (elemId) => {
+            const rootNode = queryById(elemId);
+            if (!rootNode) {
+                return null;
+            }
+            return rootNode.matches('textarea, input')
+                ? rootNode
+                : rootNode.querySelector('textarea, input');
+        };
+
+        const setTextboxValue = (elemId, value) => {
+            const input = getTextboxInput(elemId);
+            if (!input) {
+                return;
+            }
+            if (input.value === value) {
+                return;
+            }
+            input.value = value;
+            input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+        };
+
+        const parseContextResultText = (rawValue) => {
+            if (!rawValue) {
+                return '';
+            }
+            let text = rawValue;
+            try {
+                const parsed = JSON.parse(rawValue);
+                if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string') {
+                    text = parsed.text;
+                }
+            } catch (error) {
+                // Keep raw string payload as fallback.
+            }
+            return text;
+        };
+
+        let contextWatchToken = 0;
+
+        const watchContextResult = (previousValue) => {
+            const currentToken = ++contextWatchToken;
+            const deadline = Date.now() + 30000;
+
+            const poll = () => {
+                if (currentToken !== contextWatchToken) {
+                    return;
+                }
+
+                const input = getTextboxInput('space-context-result');
+                const rawValue = input ? (input.value || '') : '';
+                if (rawValue && rawValue !== previousValue) {
+                    openModal(parseContextResultText(rawValue));
+                    return;
+                }
+
+                if (Date.now() >= deadline) {
+                    if (rawValue) {
+                        openModal(parseContextResultText(rawValue));
+                    } else {
+                        openModal('读取完整 context 超时，请重试。');
+                    }
+                    return;
+                }
+
+                window.setTimeout(poll, 120);
+            };
+
+            poll();
+        };
+        window.rwkvSpaceOpenContext = (text) => {
+            openModal(text || '');
+        };
+
+        window.rwkvSpaceRequestContext = (cellId, sampleIndex, repeatIndex) => {
+            if (!cellId) {
+                return;
+            }
+            const contextResultInput = getTextboxInput('space-context-result');
+            const previousValue = contextResultInput ? contextResultInput.value : '';
+            openModal('正在加载完整 context...');
+            setTextboxValue(
+                'space-context-payload',
+                JSON.stringify({
+                    cell_id: cellId,
+                    sample_index: Number(sampleIndex),
+                    repeat_index: Number(repeatIndex),
+                    ts: Date.now(),
+                }),
+            );
+            watchContextResult(previousValue);
+        };
+
+        window.rwkvSpaceCellClick = (cellId) => {
+            if (!cellId) {
+                return;
+            }
+            setTextboxValue(
+                'space-click-payload',
+                JSON.stringify({ cell_id: cellId, ts: Date.now() }),
+            );
+        };
+
+
+        let tooltip = document.getElementById('space-hover-tooltip');
+        if (!tooltip) {
+            tooltip = document.createElement('div');
+            tooltip.id = 'space-hover-tooltip';
+            tooltip.className = 'space-hover-tooltip';
+            document.body.appendChild(tooltip);
+        }
+
+        const hideTooltip = () => {
+            if (!tooltip) {
+                return;
+            }
+            tooltip.classList.remove('open');
+            tooltip.innerHTML = '';
+        };
+
+        const showTooltip = (text, x, y) => {
+            if (!tooltip || !text) {
+                hideTooltip();
+                return;
+            }
+            tooltip.innerHTML = String(text).replace(/\\n/g, '<br>');
+            tooltip.style.left = `${x + 14}px`;
+            tooltip.style.top = `${y + 14}px`;
+            tooltip.classList.add('open');
+        };
+
+        const firstElementFromEvent = (event) => {
+            if (typeof event.composedPath === 'function') {
+                const path = event.composedPath();
+                for (const node of path) {
+                    if (node instanceof Element) {
+                        return node;
+                    }
+                }
+            }
+            return event.target instanceof Element ? event.target : null;
+        };
+
+        root.addEventListener('click', (event) => {
+            const target = firstElementFromEvent(event);
+            if (!target) {
+                return;
+            }
+
+            const contextButton = target.closest('button.space-context-open[data-context-cell-id]');
+            if (contextButton) {
+                event.preventDefault();
+                const cellId = contextButton.getAttribute('data-context-cell-id');
+                const sampleIndex = contextButton.getAttribute('data-sample-index');
+                const repeatIndex = contextButton.getAttribute('data-repeat-index');
+                if (cellId) {
+                    window.rwkvSpaceRequestContext(cellId, sampleIndex, repeatIndex);
+                }
+                return;
+            }
+
+            const scoreCell = target.closest('td[data-clickable="1"][data-cell-id]');
+            if (scoreCell) {
+                event.preventDefault();
+                const cellId = scoreCell.getAttribute('data-cell-id');
+                if (cellId) {
+                    window.rwkvSpaceCellClick(cellId);
+                }
+                return;
+            }
+
+            if (target.id === 'space-context-modal' || target.getAttribute('data-close-modal') === '1') {
+                closeModal();
+            }
+        });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                closeModal();
+            }
+        });
+
+        root.addEventListener('mousemove', (event) => {
+            const target = firstElementFromEvent(event);
+            if (!target) {
+                hideTooltip();
+                return;
+            }
+            const cell = target.closest('td[data-tooltip]');
+            if (!cell) {
+                hideTooltip();
+                return;
+            }
+            const tooltipText = cell.getAttribute('data-tooltip');
+            if (!tooltipText) {
+                hideTooltip();
+                return;
+            }
+            showTooltip(tooltipText, event.clientX, event.clientY);
+        });
+
+        root.addEventListener('scroll', hideTooltip, true);
+        window.addEventListener('scroll', hideTooltip, true);
     }
     """
 
+
     with gr.Blocks(css=css, theme=gr.themes.Base(), js=js_func) as demo:
         with gr.Column(elem_classes="space-root"):
-            
-            # Header
+
             gr.HTML(
                 """
 <div class="space-header">
@@ -1949,7 +2794,6 @@ def _build_dashboard() -> gr.Blocks:
 """
             )
 
-            # Controls
             with gr.Group(elem_classes="space-controls-card"):
                 with gr.Row():
                     model_dropdown = gr.Dropdown(
@@ -1958,7 +2802,7 @@ def _build_dashboard() -> gr.Blocks:
                         choices=model_choices,
                         value=AUTO_MODEL_LABEL,
                         scale=3,
-                        elem_classes="space-dropdown"
+                        elem_classes="space-dropdown",
                     )
                     refresh_btn = gr.Button("刷新分数", variant="primary", scale=1)
                     download_btn = gr.DownloadButton("导出为 CSV", scale=1, value=csv_export_path)
@@ -1972,32 +2816,81 @@ def _build_dashboard() -> gr.Blocks:
 
                 summary_md = gr.Markdown(summary, elem_classes="space-info-card")
 
+            interaction_state = gr.State(interaction_meta)
+            selected_cell_state = gr.State(None)
+            eval_records_state = gr.State(initial_eval_rows)
+            eval_loader_state = gr.State(initial_eval_loader)
             tables: dict[str, gr.HTML] = {}
 
-            # Main Content Tabs
             with gr.Tabs(elem_classes="tabs"):
                 for group in DOMAIN_GROUPS:
                     with gr.Tab(group["label"]):
-                        
-                        # Use a spacer
                         gr.HTML('<div class="space-spacer"></div>')
-                        
-                        # Table Section
                         tables[group["key"]] = gr.HTML(
                             domain_tables.get(group["key"], _render_pivot_html([], [])),
                         )
-            
-            def update_dashboard(selected_model: str, selected_view_mode: str):
+
+            with gr.Row(elem_classes="space-eval-toggle-row"):
+                wrong_only_toggle = gr.Checkbox(
+                    label="仅展示错题",
+                    value=False,
+                    elem_id="space-wrong-only-toggle",
+                    container=False,
+                )
+
+            eval_records_html = gr.HTML(initial_eval_html, elem_id="space-eval-records-panel")
+
+            with gr.Row(elem_classes="space-eval-pagination-row"):
+                load_next_page_btn = gr.Button(
+                    f"下一页（每次 {EVAL_FETCH_ROWS} 条）",
+                    variant="secondary",
+                    interactive=False,
+                    elem_id="space-load-next-page-btn",
+                )
+
+            gr.HTML(modal_html)
+
+            click_payload = gr.Textbox(
+                value="",
+                visible=True,
+                container=False,
+                show_label=False,
+                elem_id="space-click-payload",
+                elem_classes="space-hidden-input",
+            )
+            context_payload = gr.Textbox(
+                value="",
+                visible=True,
+                container=False,
+                show_label=False,
+                elem_id="space-context-payload",
+                elem_classes="space-hidden-input",
+            )
+            context_result = gr.Textbox(
+                value="",
+                visible=True,
+                container=False,
+                show_label=False,
+                elem_id="space-context-result",
+                elem_classes="space-hidden-input",
+            )
+
+            def update_dashboard(
+                selected_model: str,
+                selected_view_mode: str,
+                only_wrong: bool,
+                selected_cell: str | None,
+            ):
                 load_errors: list[str] = []
                 entries = load_scores(errors=load_errors)
                 model_choices = _compute_choices(entries)
                 dropdown_value = selected_model if selected_model in model_choices else AUTO_MODEL_LABEL
-                view_mode = selected_view_mode if selected_view_mode in TABLE_VIEW_LABELS else DEFAULT_TABLE_VIEW
-                
+                view_mode = _normalize_table_view(selected_view_mode)
+
                 selection_state = _prepare_selection(entries, dropdown_value)
                 warnings = load_errors + ([style_warning] if style_warning else [])
                 csv_path = _export_selection_csv(selection_state)
-                
+
                 summary_value = _render_summary(
                     all_entries=entries,
                     visible=selection_state.entries,
@@ -2005,10 +2898,19 @@ def _build_dashboard() -> gr.Blocks:
                     view_mode=view_mode,
                     warnings=warnings,
                 )
-                domain_table_values = _build_domain_tables(
+                domain_table_values, interaction_map = _build_domain_tables(
                     selection_state,
                     all_entries=entries,
                     view_mode=view_mode,
+                )
+
+                selected_cell_id = selected_cell if isinstance(selected_cell, str) else None
+                if selected_cell_id and selected_cell_id not in interaction_map:
+                    selected_cell_id = None
+                eval_html, resolved_cell, eval_rows, eval_loader, should_poll = _start_eval_records_load(
+                    cell_id=selected_cell_id,
+                    only_wrong=bool(only_wrong),
+                    interaction_meta=interaction_map,
                 )
 
                 outputs: list[Any] = [
@@ -2018,50 +2920,162 @@ def _build_dashboard() -> gr.Blocks:
                 ]
                 for group in DOMAIN_GROUPS:
                     outputs.append(gr.update(value=domain_table_values.get(group["key"])))
+                outputs.extend(
+                    [
+                        interaction_map,
+                        resolved_cell,
+                        gr.update(value=eval_html),
+                        eval_rows,
+                        eval_loader,
+                        gr.update(interactive=should_poll),
+                    ]
+                )
                 return outputs
+
+            dashboard_outputs: list[Any] = [
+                model_dropdown,
+                download_btn,
+                summary_md,
+                tables["knowledge"],
+                tables["math"],
+                tables["coding"],
+                tables["instruction_following"],
+                tables["function_call"],
+                interaction_state,
+                selected_cell_state,
+                eval_records_html,
+                eval_records_state,
+                eval_loader_state,
+                load_next_page_btn,
+            ]
 
             model_dropdown.change(
                 update_dashboard,
-                inputs=[model_dropdown, table_view],
-                outputs=[c for c in [
-                    model_dropdown,
-                    download_btn,
-                    summary_md,
-                    tables["knowledge"],
-                    tables["math"],
-                    tables["coding"],
-                    tables["instruction_following"],
-                    tables["function_call"],
-                ] if c is not None],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                outputs=dashboard_outputs,
             )
             refresh_btn.click(
                 update_dashboard,
-                inputs=[model_dropdown, table_view],
-                outputs=[c for c in [
-                    model_dropdown,
-                    download_btn,
-                    summary_md,
-                    tables["knowledge"],
-                    tables["math"],
-                    tables["coding"],
-                    tables["instruction_following"],
-                    tables["function_call"],
-                ] if c is not None],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                outputs=dashboard_outputs,
             )
-
             table_view.change(
                 update_dashboard,
-                inputs=[model_dropdown, table_view],
-                outputs=[c for c in [
-                    model_dropdown,
-                    download_btn,
-                    summary_md,
-                    tables["knowledge"],
-                    tables["math"],
-                    tables["coding"],
-                    tables["instruction_following"],
-                    tables["function_call"],
-                ] if c is not None],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                outputs=dashboard_outputs,
+            )
+
+            def on_cell_click(
+                payload: str,
+                only_wrong: bool,
+                interaction_map: dict[str, dict[str, Any]],
+                selected_cell: str | None,
+            ):
+                parsed_cell = _parse_click_payload(payload)
+                if parsed_cell is None:
+                    parsed_cell = selected_cell if isinstance(selected_cell, str) else None
+                eval_html, resolved_cell, eval_rows, eval_loader, should_poll = _start_eval_records_load(
+                    cell_id=parsed_cell,
+                    only_wrong=bool(only_wrong),
+                    interaction_meta=interaction_map if isinstance(interaction_map, dict) else {},
+                )
+                return (
+                    gr.update(value=eval_html),
+                    resolved_cell,
+                    eval_rows,
+                    eval_loader,
+                    gr.update(interactive=should_poll),
+                )
+
+            click_payload.input(
+                on_cell_click,
+                inputs=[click_payload, wrong_only_toggle, interaction_state, selected_cell_state],
+                outputs=[
+                    eval_records_html,
+                    selected_cell_state,
+                    eval_records_state,
+                    eval_loader_state,
+                    load_next_page_btn,
+                ],
+                queue=False,
+            )
+
+            def on_context_click(payload: str, interaction_map: dict[str, dict[str, Any]]):
+                cell_id, _, _ = _parse_context_payload(payload)
+                if not cell_id:
+                    return gr.update()
+                context_text = _resolve_context_text_for_modal(
+                    payload=payload,
+                    interaction_meta=interaction_map if isinstance(interaction_map, dict) else {},
+                )
+                context_event = json.dumps(
+                    {
+                        "text": context_text,
+                        "ts": datetime.now().timestamp(),
+                    },
+                    ensure_ascii=False,
+                )
+                return gr.update(value=context_event)
+
+            context_payload.input(
+                on_context_click,
+                inputs=[context_payload, interaction_state],
+                outputs=[context_result],
+                queue=False,
+            )
+
+            def on_wrong_toggle(
+                only_wrong: bool,
+                interaction_map: dict[str, dict[str, Any]],
+                selected_cell: str | None,
+            ):
+                cell_id = selected_cell if isinstance(selected_cell, str) else None
+                eval_html, resolved_cell, eval_rows, eval_loader, should_poll = _start_eval_records_load(
+                    cell_id=cell_id,
+                    only_wrong=bool(only_wrong),
+                    interaction_meta=interaction_map if isinstance(interaction_map, dict) else {},
+                )
+                return (
+                    gr.update(value=eval_html),
+                    resolved_cell,
+                    eval_rows,
+                    eval_loader,
+                    gr.update(interactive=should_poll),
+                )
+
+            wrong_only_toggle.change(
+                on_wrong_toggle,
+                inputs=[wrong_only_toggle, interaction_state, selected_cell_state],
+                outputs=[
+                    eval_records_html,
+                    selected_cell_state,
+                    eval_records_state,
+                    eval_loader_state,
+                    load_next_page_btn,
+                ],
+                queue=False,
+            )
+
+            def on_load_next_page(
+                loader_state: dict[str, Any],
+                current_rows: list[dict[str, Any]],
+            ):
+                eval_html, merged_rows, next_loader, has_more = _continue_eval_records_load(
+                    loader_state=loader_state if isinstance(loader_state, dict) else _empty_eval_loader_state(),
+                    records=current_rows if isinstance(current_rows, list) else [],
+                )
+                return (
+                    gr.update(value=eval_html),
+                    merged_rows,
+                    next_loader,
+                    gr.update(interactive=has_more),
+                )
+
+            load_next_page_btn.click(
+                on_load_next_page,
+                inputs=[eval_loader_state, eval_records_state],
+                outputs=[eval_records_html, eval_records_state, eval_loader_state, load_next_page_btn],
+                queue=False,
             )
 
             def export_csv(selected_model: str):

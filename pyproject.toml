@@ -37,7 +37,6 @@ dependencies = [
     "cmake>=4.1.2",
     "dotenv>=0.9.9",
     "basedpyright>=1.32.1",
-    "flashinfer-python>=0.5.2",
     "filelock>=3.16.1",
     "evalplus @ git+https://github.com/evalplus/evalplus@c91370f",
     "gradio>=5.50.0",
@@ -74,6 +73,9 @@ include = [
     "src/space/styles/*.css",
     "src/infer/rwkv7/rwkv_vocab_v20230424.txt",
     "src/infer/rwkv7/cuda/*",
+    "src/infer/rapid_sampling/*.cpp",
+    "src/infer/rapid_sampling/*.cu",
+    "src/infer/rapid_sampling/hip/*",
 ]
 exclude = [
     "src/pyvenv.cfg",

@@ -14,8 +14,6 @@ alpha_frequency = 0.01
 alpha_decay = 0.997
 stop_tokens = [0, 261, 24281]
 pad_zero = true
-sample_mode = "normal"
-noise = 0.0
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
@@ -29,7 +27,5 @@ alpha_frequency = 0.0
 alpha_decay = 0.99
 stop_tokens = [0, 2402, 4910]
 pad_zero = true
-sample_mode = "normal"
-noise = 0.0
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

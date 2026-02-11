@@ -5,25 +5,13 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-import os
-from pathlib import Path
 import time
 from typing import Callable, Sequence
-
-if "FLASHINFER_WORKSPACE_BASE" not in os.environ:
-    # flashinfer JIT cache defaults to ~/.cache; some sandboxed environments may have an unwritable HOME.
-    try:
-        home = Path.home()
-        if not (home.exists() and os.access(home, os.W_OK)):
-            os.environ["FLASHINFER_WORKSPACE_BASE"] = "/tmp"
-    except Exception:  # noqa: BLE001
-        os.environ["FLASHINFER_WORKSPACE_BASE"] = "/tmp"
-
-import flashinfer
 
 import torch
 from tqdm import tqdm
 
+from .rapid_sampling_loader import get_rapid_sampling_module
 from .sampling import GenerationOutput, SamplingConfig
 
 
@@ -83,53 +71,6 @@ class _ActiveTask:
     finish_reason: str | None
 
 
-def _torch_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
-    """Lightweight torch fallback for top-k/top-p sampling on CUDA."""
-
-    use_top_k = top_k is not None and 0 < top_k < logits.size(-1)
-    if use_top_k:
-        logits, topk_idx = torch.topk(logits, top_k, dim=-1)
-    else:
-        topk_idx = None
-
-    probs = torch.softmax(logits, dim=-1)
-    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if 0.0 < top_p < 1.0:
-        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-        cum = sorted_probs.cumsum(dim=-1)
-        # keep at least one token even if top_p is extremely small
-        mask = cum > top_p
-        mask[..., 0] = False
-        filtered = sorted_probs.masked_fill(mask, 0.0)
-        filtered_sum = filtered.sum(dim=-1, keepdim=True)
-        needs_fallback = ~torch.isfinite(filtered_sum) | (filtered_sum <= 0)
-        if torch.any(needs_fallback):
-            # fallback to the top candidate so we always have a valid distribution
-            fallback = torch.zeros_like(filtered)
-            fallback[..., 0] = 1.0
-            filtered = torch.where(needs_fallback, fallback, filtered)
-            filtered_sum = filtered.sum(dim=-1, keepdim=True)
-        filtered = filtered / filtered_sum.clamp_min(torch.finfo(filtered.dtype).eps)
-        local_choice = torch.multinomial(filtered, 1).squeeze(-1)
-        local_idx = torch.gather(sorted_idx, -1, local_choice.unsqueeze(-1)).squeeze(-1)
-    else:
-        prob_sum = probs.sum(dim=-1, keepdim=True)
-        needs_fallback = ~torch.isfinite(prob_sum) | (prob_sum <= 0)
-        if torch.any(needs_fallback):
-            # prefer the highest logit in the current view when the distribution is degenerate
-            fallback = torch.zeros_like(probs)
-            fallback.scatter_(-1, torch.argmax(logits, dim=-1, keepdim=True), 1.0)
-            probs = torch.where(needs_fallback, fallback, probs)
-            prob_sum = probs.sum(dim=-1, keepdim=True)
-        probs = probs / prob_sum.clamp_min(torch.finfo(probs.dtype).eps)
-        local_idx = torch.multinomial(probs, 1).squeeze(-1)
-
-    if topk_idx is not None:
-        local_idx = torch.gather(topk_idx, -1, local_idx.unsqueeze(-1)).squeeze(-1)
-    return local_idx
-
-
 def _continuous_batching(
     model: RWKVModelProtocol,
     tokenizer: TokenizerProtocol,
@@ -144,66 +85,41 @@ def _continuous_batching(
         return []
     batch_size = max(1, min(batch_size, len(prompts)))
 
-    sample_mode = (sampling.sample_mode or "normal").strip().lower()
-    if sample_mode not in {"normal", "simple"}:
-        print(f"⚠️ unknown sample_mode={sampling.sample_mode!r}; falling back to 'normal'.")
-        sample_mode = "normal"
-    is_simple = sample_mode == "simple"
-    noise = float(sampling.noise or 0.0)
-    if noise < 0:
-        noise = 0.0
+    vocab_size = _infer_vocab_size(model)
+    device = _infer_device(model)
+    states = _prepare_state_container(model.generate_zero_state(batch_size))
 
-    def _torch_sample(logits_tensor: torch.Tensor, *, force_cpu: bool = False) -> torch.Tensor:
-        if force_cpu and logits_tensor.is_cuda:
-            logits_tensor = logits_tensor.cpu()
-        try:
-            return _torch_top_k_top_p(logits_tensor, sampling.top_k, sampling.top_p)
-        except RuntimeError as exc:
-            if logits_tensor.is_cuda:
-                print(f"⚠️ torch sampling on CUDA failed: {exc}; retrying on CPU.")
-                return _torch_top_k_top_p(logits_tensor.cpu(), sampling.top_k, sampling.top_p)
-            raise
+    rapid_sampler = get_rapid_sampling_module()
+    sampler_states: torch.Tensor | None = None
+    sampler_state_row_width = 0
+    random_seed = int(torch.initial_seed() & 0x7FFFFFFFFFFFFFFF)
+    sampler_states = rapid_sampler.setup_rand(random_seed, batch_size)
+    if not isinstance(sampler_states, torch.Tensor) or sampler_states.ndim != 1:
+        raise RuntimeError("rapid-sampling setup_rand 返回格式异常，期望 1D Tensor")
+    if sampler_states.numel() % batch_size != 0:
+        raise RuntimeError("rapid-sampling 随机状态长度与 batch_size 不匹配")
+    sampler_state_row_width = sampler_states.numel() // batch_size
 
-    def _sanitize_sampled_tokens(
-        sampled_tokens: torch.Tensor | Sequence[int],
-        logits_tensor: torch.Tensor,
-        active_count: int,
-        *,
-        sampled_with_flashinfer: bool,
-    ) -> tuple[torch.Tensor, bool]:
-        # Some flashinfer kernels can sporadically return corrupted token ids (e.g. huge negatives).
-        # Validate sampled ids and resample with torch to keep generation alive.
-        disable_flashinfer = False
-        sampled = torch.as_tensor(sampled_tokens, device=logits_tensor.device)
+    def _sampler_states_view(active_count: int) -> torch.Tensor:
+        if sampler_states is None:
+            raise RuntimeError("rapid-sampling 状态未初始化")
+        if active_count <= 0:
+            raise RuntimeError("active_count 必须大于 0")
+        byte_len = active_count * sampler_state_row_width
+        return sampler_states.narrow(0, 0, byte_len)
+
+    def _validate_sampled_tokens(sampled_tokens: torch.Tensor | Sequence[int], active_count: int) -> torch.Tensor:
+        sampled = torch.as_tensor(sampled_tokens, device=device)
         if sampled.ndim == 0:
             sampled = sampled.unsqueeze(0)
         sampled = sampled.reshape(-1).to(dtype=torch.int64)
-
-        valid_mask = sampled.numel() == active_count
-        if valid_mask:
-            valid_mask = bool(torch.all((sampled >= 0) & (sampled < vocab_size)).item())
-
-        if not valid_mask:
+        if sampled.numel() != active_count:
+            raise RuntimeError(f"rapid-sampling 返回 {sampled.numel()} 个 token，但 active_count={active_count}")
+        invalid = (sampled < 0) | (sampled >= vocab_size)
+        if torch.any(invalid):
             preview = sampled[: min(4, sampled.numel())].tolist()
-            source = "flashinfer" if sampled_with_flashinfer else "sampler"
-            print(f"⚠️ {source} produced invalid token ids {preview}; falling back to torch sampling.")
-            sampled = _torch_sample(logits_tensor, force_cpu=sampled_with_flashinfer and logits_tensor.is_cuda)
-            sampled = sampled.reshape(-1).to(device=logits_tensor.device, dtype=torch.int64)
-            disable_flashinfer = sampled_with_flashinfer
-            if sampled.numel() != active_count:
-                raise RuntimeError(
-                    f"Sampler returned {sampled.numel()} tokens for active_count={active_count}; cannot continue."
-                )
-            invalid = (sampled < 0) | (sampled >= vocab_size)
-            if torch.any(invalid):
-                print("⚠️ torch fallback still produced invalid token ids; forcing greedy fallback for those rows.")
-                greedy = torch.argmax(logits_tensor, dim=-1).to(dtype=torch.int64)
-                sampled = torch.where(invalid, greedy, sampled)
-
-        # Hard safety net to prevent invalid indices from crashing penalty/state updates.
-        sampled = sampled.clamp(0, vocab_size - 1)
-
-        return sampled, disable_flashinfer
+            raise RuntimeError(f"rapid-sampling 返回非法 token id: {preview}")
+        return sampled
 
     encoded = deque()
     for idx, prompt in enumerate(prompts):
@@ -212,29 +128,24 @@ def _continuous_batching(
             tokens = [0] + tokens
         encoded.append((idx, prompt, tokens))
 
-    vocab_size = _infer_vocab_size(model)
-    device = _infer_device(model)
-    states = _prepare_state_container(model.generate_zero_state(batch_size))
-
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())
+    ban_token_ids = [token_id for token_id in ban_tokens if 0 <= token_id < vocab_size]
     no_penalty = set(sampling.no_penalty_token_ids)
 
-    # Frequency/presence penalty tracking can be very expensive for large (batch, vocab).
-    # Avoid allocating these tensors when they are not needed (simple mode / zero penalties).
-    alpha_presence_value = 0.0 if is_simple else float(sampling.alpha_presence)
-    alpha_frequency_value = 0.0 if is_simple else float(sampling.alpha_frequency)
-    alpha_decay_value = 1.0 if is_simple else float(sampling.alpha_decay)
-    use_penalties = (not is_simple) and (alpha_presence_value != 0.0 or alpha_frequency_value != 0.0)
+    sampler_temperature = float(sampling.temperature or 1.0)
+    sampler_top_k = int(sampling.top_k) if sampling.top_k is not None else -1
+    sampler_top_p = float(sampling.top_p) if sampling.top_p is not None else 1.0
 
-    occurrence: torch.Tensor | None = None
-    alpha_presence_vector: torch.Tensor | None = None
-    alpha_presence: torch.Tensor | None = None
-    if use_penalties:
-        # Keep float32 so the post-penalty logits stay float32 (flashinfer expects float32 inputs).
-        occurrence = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
-        alpha_presence_vector = torch.zeros_like(occurrence)
-        alpha_presence = torch.tensor(alpha_presence_value, dtype=torch.float32, device=device)
+    alpha_presence_value = float(sampling.alpha_presence)
+    alpha_frequency_value = float(sampling.alpha_frequency)
+    alpha_decay_value = float(sampling.alpha_decay)
+
+    penalties = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
+    no_penalty_ids: torch.Tensor | None = None
+    valid_no_penalty_ids = sorted(token_id for token_id in no_penalty if 0 <= token_id < vocab_size)
+    if valid_no_penalty_ids:
+        no_penalty_ids = torch.tensor(valid_no_penalty_ids, dtype=torch.int64, device=device)
 
     active_tasks: list[_ActiveTask] = []
     for _ in range(batch_size):
@@ -250,7 +161,6 @@ def _continuous_batching(
     )
 
     outputs: list[GenerationOutput] = []
-    flashinfer_ok = True
     start_time = time.time()
     tokens_processed = 0
     window_start_time = start_time
@@ -258,22 +168,30 @@ def _continuous_batching(
     throughput_ema: float | None = None
 
     def _reset_slot(slot_idx: int) -> None:
-        if occurrence is not None:
-            occurrence[slot_idx, :] = 0
-        if alpha_presence_vector is not None:
-            alpha_presence_vector[slot_idx, :] = 0
+        penalties[slot_idx, :] = 0
         states[0][:, :, slot_idx, :] = 0
         states[1][:, slot_idx, :, :, :] = 0
+        states[2][slot_idx] = 0
+
+    def _swap_sampler_state_rows(dst_idx: int, src_idx: int) -> None:
+        if sampler_states is None:
+            return
+        dst = dst_idx * sampler_state_row_width
+        src = src_idx * sampler_state_row_width
+        if dst == src:
+            return
+        tmp = sampler_states[dst : dst + sampler_state_row_width].clone()
+        sampler_states[dst : dst + sampler_state_row_width] = sampler_states[src : src + sampler_state_row_width]
+        sampler_states[src : src + sampler_state_row_width] = tmp
 
     def _remove_slot(remove_idx: int) -> None:
         last_idx = len(active_tasks) - 1
         if remove_idx != last_idx:
             states[0][:, :, remove_idx, :] = states[0][:, :, last_idx, :]
             states[1][:, remove_idx, :, :, :] = states[1][:, last_idx, :, :, :]
-            if occurrence is not None:
-                occurrence[remove_idx, :] = occurrence[last_idx, :]
-            if alpha_presence_vector is not None:
-                alpha_presence_vector[remove_idx, :] = alpha_presence_vector[last_idx, :]
+            states[2][remove_idx] = states[2][last_idx]
+            penalties[remove_idx, :] = penalties[last_idx, :]
+            _swap_sampler_state_rows(remove_idx, last_idx)
             active_tasks[remove_idx] = active_tasks[last_idx]
         active_tasks.pop()
 
@@ -311,12 +229,6 @@ def _continuous_batching(
                     _reset_slot(idx)
                 else:
                     accomplished.append(idx)
-            else:
-                if not is_simple and new_token not in no_penalty:
-                    if occurrence is not None:
-                        occurrence[idx, new_token] += 1.0
-                    if alpha_presence_vector is not None and alpha_presence is not None:
-                        alpha_presence_vector[idx, new_token] = alpha_presence
 
         if accomplished:
             for remove_idx in sorted(accomplished, reverse=True):
@@ -348,57 +260,28 @@ def _continuous_batching(
         state_view = [
             states[0][:, :, :active_count, :],
             states[1][:, :active_count, :, :, :],
-            states[2],
+            states[2][:active_count],
         ]
-        out = model.forward_batch(next_tokens, state_view)
+        logits = model.forward_batch(next_tokens, state_view).float().contiguous()
 
-        if use_penalties and occurrence is not None:
-            if alpha_decay_value != 1.0:
-                occurrence[:active_count].mul_(alpha_decay_value)
-            if alpha_frequency_value != 0.0:
-                out = out - occurrence[:active_count] * alpha_frequency_value
-            if alpha_presence_value != 0.0 and alpha_presence_vector is not None:
-                out = out - alpha_presence_vector[:active_count]
+        if ban_token_ids:
+            logits[:, ban_token_ids] = -math.inf
 
-        if ban_tokens:
-            out[:, list(ban_tokens)] = -math.inf
-
-        if sampling.temperature != 1.0:
-            temp = sampling.temperature or 1.0
-            out /= temp
-
-        sampled_with_flashinfer = False
-        if is_simple:
-            logits = out
-            if noise:
-                logits = logits + torch.empty_like(logits).uniform_(0.0, noise)
-            new_tokens = torch.argmax(logits, dim=-1)
-        elif flashinfer_ok:
-            logits = out.float().contiguous()
-            sampled_with_flashinfer = True
-            try:
-                new_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-                    logits, sampling.top_k, sampling.top_p
-                )
-            except RuntimeError as exc:
-                print(f"⚠️ flashinfer sampling failed: {exc}; falling back to torch sampling.")
-                flashinfer_ok = False
-                sampled_with_flashinfer = False
-                error_text = str(exc).lower()
-                force_cpu = logits.is_cuda and ("illegal memory access" in error_text or "cuda error" in error_text)
-                new_tokens = _torch_sample(logits, force_cpu=force_cpu)
-        else:
-            logits = out.float().contiguous()
-            new_tokens = _torch_sample(logits)
-
-        sampled_tensor, disable_flashinfer = _sanitize_sampled_tokens(
-            new_tokens,
+        sampler_states_view = _sampler_states_view(active_count)
+        sampled_raw = rapid_sampler.batch_sampling_repetition_temperature_topk_topp(
             logits,
-            active_count,
-            sampled_with_flashinfer=sampled_with_flashinfer,
+            penalties[:active_count],
+            sampler_states_view,
+            alpha_presence_value,
+            alpha_frequency_value,
+            alpha_decay_value,
+            sampler_temperature,
+            sampler_top_k,
+            sampler_top_p,
         )
-        if disable_flashinfer:
-            flashinfer_ok = False
+        if no_penalty_ids is not None:
+            penalties[:active_count, no_penalty_ids] = 0.0
+        sampled_tensor = _validate_sampled_tokens(sampled_raw, active_count)
 
         sampled_list = sampled_tensor.tolist()
         for idx, task in enumerate(active_tasks):

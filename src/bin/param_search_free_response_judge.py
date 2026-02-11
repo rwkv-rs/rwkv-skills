@@ -22,17 +22,17 @@ from src.eval.metrics.free_response import (
     compute_pass_at_k,
     evaluate_free_response,
 )
-from src.eval.param_search.cot_grid import grid_size_by_mode, iter_cot_sampling_grid
+from src.eval.param_search.cot_grid import grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.db.orm import init_orm
-from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
+from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
+from src.db.orm import init_orm
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
@@ -51,7 +51,7 @@ def _load_env_file(path: Path) -> None:
         if "=" not in text:
             continue
         key, value = text.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
 
 
 def _round_float(value: float, digits: int = 2) -> float:
@@ -63,9 +63,7 @@ def _sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     normalized: dict[str, object] = {}
     for key, value in data.items():
         if isinstance(value, tuple):
-            normalized[key] = [
-                _round_float(item) if isinstance(item, float) else item for item in value
-            ]
+            normalized[key] = [_round_float(item) if isinstance(item, float) else item for item in value]
         elif isinstance(value, float):
             normalized[key] = _round_float(value)
         else:
@@ -133,12 +131,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
-    parser.add_argument("--judge-base-url", help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)")
     parser.add_argument(
-        "--scan-mode",
-        choices=("both", "normal", "simple"),
-        default="both",
-        help="Which sampling grid(s) to scan (default: both)",
+        "--judge-base-url",
+        help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
     )
     return parser.parse_args(argv)
 
@@ -150,7 +145,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     db_service = EvalDbService()
 
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
@@ -201,26 +196,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         or os.environ.get("OPENAI_API_KEY")
         or os.environ.get("API_KEY")
     )
-    judge_base_url = args.judge_base_url or os.environ.get("JUDGE_BASE_URL") or os.environ.get("LLM_JUDGE_BASE_URL") or os.environ.get("API_BASE")
+    judge_base_url = (
+        args.judge_base_url
+        or os.environ.get("JUDGE_BASE_URL")
+        or os.environ.get("LLM_JUDGE_BASE_URL")
+        or os.environ.get("API_BASE")
+    )
 
     judge: LLMJudge | None = None
     if judge_model and judge_api_key:
         judge = LLMJudge(LLMJudgeConfig(api_key=judge_api_key, model=judge_model, base_url=judge_base_url))
 
-    sizes = grid_size_by_mode()
-    if args.scan_mode == "both":
-        total = sizes["normal"] + sizes["simple"]
-        print(f"🔍 Param-search grid: normal={sizes['normal']} + simple={sizes['simple']} (total={total})")
-    else:
-        print(f"🔍 Param-search grid: {args.scan_mode}={sizes[args.scan_mode]}")
+    total = grid_size()
+    print(f"🔍 Param-search grid size: {total}")
     print(f"    Dataset: {slug} | Model: {model_name} | Judge: {bool(judge)}")
 
     best_key: str | None = None
     best_score: float | None = None
     best_trial: int | None = None
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, scan_mode=args.scan_mode):
-        print(f"🔍 trial {trial_idx} ({params['sample_mode']}): {slug}")
+    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling):
+        print(f"🔍 trial {trial_idx}: {slug}")
         sampling_payload = {
             "cot": sampling_config_to_dict(trial_cot),
             "final": sampling_config_to_dict(final_sampling),

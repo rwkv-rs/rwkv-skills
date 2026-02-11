@@ -25,11 +25,9 @@ _FLOAT_FIELDS = {
     "alpha_presence",
     "alpha_frequency",
     "alpha_decay",
-    "noise",
 }
 _TUPLE_INT_FIELDS = {"stop_tokens", "ban_tokens", "no_penalty_token_ids"}
 _BOOL_FIELDS = {"pad_zero"}
-_STR_FIELDS = {"sample_mode"}
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
 
@@ -50,7 +48,7 @@ class BenchmarkModelConfig:
 
 
 def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None) -> Path:
-    base,_= split_benchmark_and_split(benchmark_name)
+    base, _ = split_benchmark_and_split(benchmark_name)
     slug = safe_slug(base).lower()
     if model_name:
         model_slug = safe_slug(model_name)
@@ -222,8 +220,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             value = _coerce_int_tuple(raw)
         elif key in _BOOL_FIELDS:
             value = raw if isinstance(raw, bool) else None
-        elif key in _STR_FIELDS:
-            value = str(raw) if isinstance(raw, str) else None
         elif key == "pass_k":
             pass_k = _coerce_k_tuple(raw)
             continue

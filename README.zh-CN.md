@@ -14,7 +14,7 @@
 
 ## 环境要求
 - Python 3.12+，推荐安装 `uv` 以管理依赖。
-- NVIDIA GPU（使用 `flashinfer`、`triton` 等依赖），需要与所选 PyTorch 发行版匹配的 CUDA/ROCm。
+- NVIDIA/AMD GPU（使用 `triton` 与内置 rapid-sampling 内核），需要与所选 PyTorch 发行版匹配的 CUDA/ROCm。
 
 ## 安装
 ```bash
@@ -78,11 +78,8 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 `src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`、`eval_code_livecodebench.py`。
 其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的 free-response benchmark 会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
 采样参数的网格搜索通过 param-search 流程完成：
-- runner job 会把完整网格（先 `normal` 后 `simple`，不截断）每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
-- selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并保留两套互相独立的选参结果：
-  - `normal` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_normal`
-  - `simple` 最优格点 -> 复制/写入到 `results/{completions,eval,scores}`，benchmark 名称追加后缀 `__ps_simple`
-  -（兼容旧逻辑）两种模式里总分最高的格点仍会写入不带后缀的 `{benchmark}` 产物路径。
+- runner job 会把完整网格每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
+- selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并把唯一最佳格点复制/写入到不带后缀的 `{benchmark}` 产物路径。
 
 调度器在评测最新 2.9B 模型时，会自动对 `gsm8k_test` + `hendrycks_math_test` 启用 param-search。
 

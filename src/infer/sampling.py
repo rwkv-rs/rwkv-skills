@@ -22,9 +22,6 @@ class SamplingConfig:
     ban_tokens: tuple[int, ...] | None = None
     pad_zero: bool = True
     no_penalty_token_ids: tuple[int, ...] = DEFAULT_NO_PENALTY_TOKEN_IDS
-    # sampling backend: "normal" (top-k/top-p) or "simple" (greedy(logits + noise))
-    sample_mode: str = "normal"
-    noise: float = 0.0
 
     def clamp(self, max_tokens: int | None) -> "SamplingConfig":
         if not max_tokens or max_tokens <= 0:

@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from sqlalchemy import Integer, case, cast, func, select, update
+from sqlalchemy import Integer, Text, case, cast, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -455,6 +455,67 @@ class EvalDbRepository:
         )
         rows = session.execute(stmt).scalars().all()
         return [self._model_to_dict(row) for row in rows]
+
+    def fetch_eval_with_completions_by_task(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+        only_wrong: bool,
+        limit: int | None = None,
+        offset: int | None = None,
+        include_context: bool = True,
+    ) -> list[dict[str, Any]]:
+        columns: list[Any] = [
+            Completion.sample_index.label("sample_index"),
+            Completion.repeat_index.label("repeat_index"),
+            Eval.is_passed.label("is_passed"),
+            Eval.answer.label("answer"),
+            Eval.ref_answer.label("ref_answer"),
+            Eval.fail_reason.label("fail_reason"),
+            func.left(cast(Completion.context, Text), 80).label("context_preview"),
+        ]
+        if include_context:
+            columns.append(Completion.context.label("context"))
+
+        stmt = (
+            select(*columns)
+            .join(Eval, Eval.completions_id == Completion.completions_id)
+            .where(Completion.task_id == task_id)
+            .order_by(
+                Completion.sample_index.asc(),
+                Completion.repeat_index.asc(),
+                Eval.eval_id.asc(),
+            )
+        )
+        if only_wrong:
+            stmt = stmt.where(Eval.is_passed.is_(False))
+        if offset and offset > 0:
+            stmt = stmt.offset(offset)
+        if limit is not None and limit > 0:
+            stmt = stmt.limit(limit)
+        return list(session.execute(stmt).mappings().all())
+
+    def fetch_eval_context_by_task_sample_repeat(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+        sample_index: int,
+        repeat_index: int,
+    ) -> Any | None:
+        stmt = (
+            select(Completion.context)
+            .join(Eval, Eval.completions_id == Completion.completions_id)
+            .where(
+                Completion.task_id == task_id,
+                Completion.sample_index == sample_index,
+                Completion.repeat_index == repeat_index,
+            )
+            .order_by(Eval.eval_id.desc())
+            .limit(1)
+        )
+        return session.execute(stmt).scalar_one_or_none()
 
     def fetch_scores_rows(self, session: Session, *, task_id: int) -> list[dict[str, Any]]:
         stmt = select(Score).where(Score.task_id == task_id).order_by(Score.created_at.desc())

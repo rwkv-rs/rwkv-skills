@@ -12,7 +12,7 @@ Place per-benchmark TOML files under this folder:
 Supported keys per model table:
 - SamplingConfig fields: max_generate_tokens, temperature, top_k, top_p,
   alpha_presence, alpha_frequency, alpha_decay, stop_tokens, ban_tokens,
-  pad_zero, no_penalty_token_ids, sample_mode, noise
+  pad_zero, no_penalty_token_ids
 - Evaluation fields: pass_k, avg_k, report_pass_k, report_avg_k (free-response only)
 
 Notes:

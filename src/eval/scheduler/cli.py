@@ -126,12 +126,6 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="启用 param-search（默认关闭，仅对最新 2.9b 生效）",
     )
-    parser.add_argument(
-        "--param-search-scan-mode",
-        choices=("both", "normal", "simple"),
-        default="both",
-        help="param-search 扫描模式：both/normal/simple（默认 both，仅在启用 param-search 时生效）",
-    )
 
 
 def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
@@ -204,7 +198,6 @@ def _dispatch_options_from_args(
         only_dataset_slugs=only_dataset_slugs,
         model_name_patterns=model_name_patterns,
         enable_param_search=bool(args.enable_param_search),
-        param_search_scan_mode=str(args.param_search_scan_mode),
         dispatch_poll_seconds=int(args.dispatch_poll_seconds),
         gpu_idle_max_mem=int(args.gpu_idle_max_mem),
         skip_missing_dataset=bool(args.skip_missing_dataset),

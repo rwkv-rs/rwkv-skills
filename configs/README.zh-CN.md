@@ -12,7 +12,7 @@
 每个模型 table 支持的字段：
 - SamplingConfig 字段：max_generate_tokens、temperature、top_k、top_p、
   alpha_presence、alpha_frequency、alpha_decay、stop_tokens、ban_tokens、
-  pad_zero、no_penalty_token_ids、sample_mode、noise
+  pad_zero、no_penalty_token_ids
 - 评测字段：pass_k、avg_k、report_pass_k、report_avg_k（仅 free-response）
 
 备注：

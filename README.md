@@ -14,7 +14,7 @@ An inference & evaluation scaffold for RWKV7, including a continuous-batching in
 
 ## Requirements
 - Python 3.12+. `uv` is recommended for dependency management.
-- NVIDIA GPU (via dependencies like `flashinfer`, `triton`), with CUDA/ROCm matching your chosen PyTorch build.
+- NVIDIA/AMD GPU (via dependencies like `triton` + bundled rapid-sampling kernels), with CUDA/ROCm matching your chosen PyTorch build.
 
 ## Installation
 ```bash
@@ -82,11 +82,8 @@ The default model glob is configured in `src/eval/scheduler/config.py` (it only 
 Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
 
 Sampling-parameter grid search is handled via the param-search workflow:
-- Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}` (full grid: `normal` then `simple`; no truncation).
-- The selector job aggregates `results/param_search/scores/...` across `gsm8k_test` + `hendrycks_math_test` (alias: `math`) and promotes two independent selections:
-  - best `normal` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_normal`
-  - best `simple` grid point -> `results/{completions,eval,scores}` under dataset suffix `__ps_simple`
-  - (backward compatible) the best overall grid point is also promoted to the unsuffixed `{benchmark}` paths.
+- Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`.
+- The selector job aggregates `results/param_search/scores/...` across `gsm8k_test` + `hendrycks_math_test` (alias: `math`) and promotes one best shared grid point into the unsuffixed `{benchmark}` paths.
 
 When evaluating the latest 2.9B model, the scheduler automatically runs param-search on `gsm8k_test` + `hendrycks_math_test`.
 
