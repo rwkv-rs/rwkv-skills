@@ -71,6 +71,7 @@ allow-direct-references = true
 packages = ["src"]
 include = [
     "src/space/styles/*.css",
+    "src/space/assets/**/*",
     "src/infer/rwkv7/rwkv_vocab_v20230424.txt",
     "src/infer/rwkv7/cuda/*",
     "src/infer/rapid_sampling/*.cpp",

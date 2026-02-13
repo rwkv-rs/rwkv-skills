@@ -9,6 +9,7 @@ import html
 import io
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,14 +33,15 @@ from .data import (
     load_scores,
     pick_latest_model,
 )
+from .vocab import token_id_to_display
 
 
 AUTO_MODEL_LABEL = "每档最新（调度策略）"
 TABLE_VIEW_LABELS: dict[str, str] = {
     "benchmark_detail_latest": "明细（最新）",
     "field_avg_latest": "领域均分（最新）",
-    "benchmark_detail_delta": "明细（最新 vs 上一代）",
-    "field_avg_delta": "领域均分（最新 vs 上一代）",
+    "benchmark_detail_delta": "明细（上一代 vs 最新）",
+    "field_avg_delta": "领域均分（上一代 vs 最新）",
 }
 DEFAULT_TABLE_VIEW = "benchmark_detail_latest"
 
@@ -459,6 +461,82 @@ def _load_css() -> tuple[str, str | None]:
         return style_path.read_text(encoding="utf-8"), None
     except Exception as exc:  # noqa: BLE001
         warning = f"未加载样式：读取 {style_path.name} 失败 ({exc})"
+        print(f"[space] {warning}")
+        return "", warning
+
+
+def _load_vendor_css() -> tuple[str, str | None]:
+    """Load vendor CSS for context modal rendering (markdown, code, math).
+
+    Note: Gradio content lives inside a Shadow DOM. CSS must be injected via the
+    Blocks `css=` parameter to apply inside that tree.
+    """
+    vendor_dir = Path(__file__).parent / "assets" / "vendor"
+    if not vendor_dir.exists():
+        warning = f"未找到前端依赖目录：{vendor_dir}"
+        print(f"[space] {warning}")
+        return "", warning
+
+    # KaTeX CSS references fonts/KaTeX_*.woff2. We ship the .woff2 files and rewrite URLs
+    # to Gradio's /file= endpoint.
+    fonts_dir = vendor_dir / "fonts"
+    fonts_url_prefix = f"/file={fonts_dir.as_posix()}/"
+
+    def read_text(name: str) -> str:
+        return (vendor_dir / name).read_text(encoding="utf-8")
+
+    try:
+        katex_css = read_text("katex.min.css")
+        # Drop .woff/.ttf fallbacks to avoid extra 404 requests (we only vendor .woff2).
+        katex_css = re.sub(
+            r',url\(fonts/[^)]+?\.woff\) format\("woff"\),url\(fonts/[^)]+?\.ttf\) format\("truetype"\)',
+            "",
+            katex_css,
+        )
+        katex_css = katex_css.replace("url(fonts/", f"url({fonts_url_prefix}")
+        hljs_css = read_text("github-dark.min.css")
+
+        warning = None
+        if not fonts_dir.exists():
+            warning = f"未找到 KaTeX 字体目录：{fonts_dir}（数学公式可能无法正常显示）"
+            print(f"[space] {warning}")
+
+        css = "\n".join(
+            [
+                "/* Vendor: highlight.js theme */",
+                hljs_css,
+                "/* Vendor: KaTeX */",
+                katex_css,
+            ]
+        )
+        return css, warning
+    except Exception as exc:  # noqa: BLE001
+        warning = f"未加载前端渲染依赖：{exc}"
+        print(f"[space] {warning}")
+        return "", warning
+
+
+def _load_vendor_head() -> tuple[str, str | None]:
+    """Load vendor JS for context modal rendering (markdown, code, math)."""
+    vendor_dir = Path(__file__).parent / "assets" / "vendor"
+    if not vendor_dir.exists():
+        warning = f"未找到前端依赖目录：{vendor_dir}"
+        print(f"[space] {warning}")
+        return "", warning
+
+    def read_js(name: str) -> str:
+        return (vendor_dir / name).read_text(encoding="utf-8")
+
+    try:
+        head_parts = [
+            f"<script id=\"space-vendor-katex-js\">{read_js('katex.min.js')}</script>",
+            f"<script id=\"space-vendor-katex-auto-render\">{read_js('auto-render.min.js')}</script>",
+            f"<script id=\"space-vendor-markdown-it\">{read_js('markdown-it.min.js')}</script>",
+            f"<script id=\"space-vendor-highlight-js\">{read_js('highlight.min.js')}</script>",
+        ]
+        return "\n".join(head_parts), None
+    except Exception as exc:  # noqa: BLE001
+        warning = f"未加载前端渲染依赖：{exc}"
         print(f"[space] {warning}")
         return "", warning
 
@@ -884,10 +962,12 @@ def _score_cell_style(value: float | None, *, mode: str) -> str | None:
             return None
         intensity = min(abs(delta) / 50.0, 1.0)
     else:
-        delta = value
-        if abs(delta) < 1e-6:
+        delta_raw = float(value)
+        if abs(delta_raw) < 1e-6:
             return None
-        intensity = min(abs(delta) / 20.0, 1.0)
+        # Clamp delta intensity to [-10, 10] for consistent colouring.
+        delta = max(min(delta_raw, 10.0), -10.0)
+        intensity = min(abs(delta) / 10.0, 1.0)
 
     base_alpha = 0.06
     alpha = base_alpha + 0.24 * intensity
@@ -1331,8 +1411,8 @@ def _build_field_avg_delta_table(
         prev_label = _model_data_param_label(item.prev_model, include_params=False) if item.prev_model else "—"
         headers.extend(
             [
-                f"{param_label} latest ({latest_label})",
                 f"{param_label} prev ({prev_label})",
+                f"{param_label} latest ({latest_label})",
                 f"{param_label} delta",
             ]
         )
@@ -1346,14 +1426,14 @@ def _build_field_avg_delta_table(
         prev_entries = _entries_for_model_in_domains(model_cache, item.prev_model, domains)
         latest_score = _field_average_score(latest_entries)
         prev_score = _field_average_score(prev_entries)
-        score_values.extend([latest_score, prev_score])
+        score_values.extend([prev_score, latest_score])
         delta_value = None
         if latest_score is not None and prev_score is not None:
             delta_value = _score_to_percent(latest_score) - _score_to_percent(prev_score)
         row.extend(
             [
-                _format_score_1dp(latest_score),
                 _format_score_1dp(prev_score),
+                _format_score_1dp(latest_score),
                 _styled_delta_cell(delta_value),
             ]
         )
@@ -1435,8 +1515,8 @@ def _build_benchmark_detail_delta_table(
         prev_label = _model_data_param_label(item.prev_model, include_params=False) if item.prev_model else "—"
         headers.extend(
             [
-                f"{param_label} latest ({latest_label})",
                 f"{param_label} prev ({prev_label})",
+                f"{param_label} latest ({latest_label})",
                 f"{param_label} delta",
             ]
         )
@@ -1484,14 +1564,35 @@ def _build_benchmark_detail_delta_table(
             if latest_score is not None and prev_score is not None:
                 delta_value = _score_to_percent(latest_score) - _score_to_percent(prev_score)
                 delta_values.append(delta_value)
-            latest_col_idx = len(row)
+            prev_col_idx = len(row)
+            latest_col_idx = prev_col_idx + 1
             row.extend(
                 [
-                    _format_score_1dp(latest_score),
                     _format_score_1dp(prev_score),
+                    _format_score_1dp(latest_score),
                     _styled_delta_cell(delta_value),
                 ]
             )
+            if prev_point is not None and item.prev_model:
+                prev_entry = prev_point.entry
+                row_cell_meta[prev_col_idx] = TableCellMeta(
+                    cell_id=_make_cell_id(
+                        "delta_prev",
+                        row_key[0],
+                        row_key[1],
+                        row_key[2],
+                        item.param,
+                        item.prev_model,
+                    ),
+                    task_id=prev_entry.task_id,
+                    benchmark_name=row_key[0],
+                    eval_method=row_key[1],
+                    k_metric=row_key[2],
+                    column_label=headers[prev_col_idx],
+                    model=prev_entry.model,
+                    tooltip=_tooltip_for_entry(prev_entry),
+                    clickable=prev_entry.task_id is not None,
+                )
             if latest_point is not None:
                 latest_entry = latest_point.entry
                 row_cell_meta[latest_col_idx] = TableCellMeta(
@@ -1511,27 +1612,6 @@ def _build_benchmark_detail_delta_table(
                     model=latest_entry.model,
                     tooltip=_tooltip_for_entry(latest_entry),
                     clickable=latest_entry.task_id is not None,
-                )
-            if prev_point is not None and item.prev_model:
-                prev_entry = prev_point.entry
-                prev_col_idx = latest_col_idx + 1
-                row_cell_meta[prev_col_idx] = TableCellMeta(
-                    cell_id=_make_cell_id(
-                        "delta_prev",
-                        row_key[0],
-                        row_key[1],
-                        row_key[2],
-                        item.param,
-                        item.prev_model,
-                    ),
-                    task_id=prev_entry.task_id,
-                    benchmark_name=row_key[0],
-                    eval_method=row_key[1],
-                    k_metric=row_key[2],
-                    column_label=headers[prev_col_idx],
-                    model=prev_entry.model,
-                    tooltip=_tooltip_for_entry(prev_entry),
-                    clickable=prev_entry.task_id is not None,
                 )
         avg_delta = sum(delta_values) / len(delta_values) if delta_values else float("-inf")
         rows_with_meta.append((avg_delta, _detail_sort_key(row_key), row, row_cell_meta))
@@ -2085,7 +2165,7 @@ def _render_pivot_html(
     if not headers:
         return '<div class="space-table-empty">当前筛选条件下没有数据。</div>'
 
-    header_cells = "".join(f'<th title="{_html(title)}">{_html(title)}</th>' for title in headers)
+    header_cells = "".join(f"<th>{_html(title)}</th>" for title in headers)
     body_rows: list[str] = []
     for row_idx, row in enumerate(rows):
         cells: list[str] = []
@@ -2104,7 +2184,6 @@ def _render_pivot_html(
                 class_names.append("score-cell")
 
             meta = cell_meta.get((row_idx, col_idx)) if cell_meta else None
-            tooltip_text = meta.tooltip if meta and meta.tooltip else str(display_value)
             if meta and meta.tooltip:
                 data_attrs.append(f'data-tooltip="{_html(meta.tooltip)}"')
             if meta:
@@ -2121,7 +2200,7 @@ def _render_pivot_html(
                 inner_html = f'<button type="button" class="space-score-button">{cell_html}</button>'
             else:
                 inner_html = cell_html
-            cells.append(f'<td title="{_html(tooltip_text)}"{class_attr}{style_attr}{data_attr}>{inner_html}</td>')
+            cells.append(f"<td{class_attr}{style_attr}{data_attr}>{inner_html}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     rows_html = "".join(body_rows) if body_rows else '<tr><td colspan="999">当前筛选条件下没有数据。</td></tr>'
@@ -2456,22 +2535,83 @@ def _continue_eval_records_load(
     return html, merged_records, state, bool(state["has_more"])
 
 
-def _resolve_context_text_for_modal(
+def _extract_context_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _build_stop_tokens_mapping(sampling_config: Any) -> dict[str, list[dict[str, Any]]]:
+    mapping: dict[str, list[dict[str, Any]]] = {}
+    if not isinstance(sampling_config, dict):
+        return mapping
+
+    for stage_name, stage_cfg in sampling_config.items():
+        if not isinstance(stage_name, str):
+            continue
+        if not isinstance(stage_cfg, dict):
+            continue
+        stop_tokens = stage_cfg.get("stop_tokens")
+        if not isinstance(stop_tokens, list):
+            continue
+
+        rows: list[dict[str, Any]] = []
+        for token_id in stop_tokens:
+            try:
+                tid = int(token_id)
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                {
+                    "id": tid,
+                    "token": token_id_to_display(tid),
+                }
+            )
+        mapping[stage_name] = rows
+
+    return mapping
+
+
+def _build_context_event_payload(
     *,
     payload: str,
     interaction_meta: dict[str, dict[str, Any]],
-) -> str:
+) -> dict[str, Any]:
+    base_event: dict[str, Any] = {
+        "kind": "eval_context",
+        "ts": datetime.now().timestamp(),
+        "view": "text",
+        "raw_text": "",
+        "context": None,
+        "stop_tokens": {},
+        "errors": [],
+    }
+
     cell_id, sample_index, repeat_index = _parse_context_payload(payload)
     if not cell_id:
-        return ""
+        base_event["errors"].append("未解析到上下文定位信息。")
+        return base_event
 
     meta = interaction_meta.get(cell_id) if isinstance(interaction_meta, dict) else None
     if not isinstance(meta, dict):
-        return "未找到对应分数单元格，请重新点击分数后再试。"
+        base_event["raw_text"] = "未找到对应分数单元格，请重新点击分数后再试。"
+        base_event["errors"].append("missing_cell_meta")
+        return base_event
 
     task_id = meta.get("task_id")
     if not isinstance(task_id, int):
-        return "该分数没有可查询的 task_id。"
+        base_event["raw_text"] = "该分数没有可查询的 task_id。"
+        base_event["errors"].append("missing_task_id")
+        return base_event
 
     try:
         context_value = EvalDbService().get_eval_context_for_space(
@@ -2480,11 +2620,39 @@ def _resolve_context_text_for_modal(
             repeat_index=repeat_index,
         )
     except Exception as exc:  # noqa: BLE001
-        return f"读取 context 失败：{exc}"
+        base_event["raw_text"] = f"读取 context 失败：{exc}"
+        base_event["errors"].append("read_context_failed")
+        return base_event
 
     if context_value is None:
-        return "当前样本没有 context 内容。"
-    return _context_text(context_value)
+        base_event["raw_text"] = "当前样本没有 context 内容。"
+        return base_event
+
+    if isinstance(context_value, str):
+        base_event["raw_text"] = context_value
+    else:
+        try:
+            base_event["raw_text"] = json.dumps(context_value, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            base_event["raw_text"] = str(context_value)
+
+    context_obj = _extract_context_object(context_value)
+    if context_obj is None:
+        return base_event
+    if isinstance(context_value, str):
+        try:
+            base_event["raw_text"] = json.dumps(context_obj, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    stages = context_obj.get("stages")
+    sampling_config = context_obj.get("sampling_config")
+    if isinstance(stages, list) or isinstance(sampling_config, dict):
+        base_event["view"] = "structured"
+        base_event["context"] = context_obj
+        base_event["stop_tokens"] = _build_stop_tokens_mapping(sampling_config)
+
+    return base_event
 
 
 def _compute_choices(entries: list[ScoreEntry]) -> list[str]:
@@ -2499,10 +2667,18 @@ def _initial_payload() -> tuple[list[ScoreEntry], SelectionState, list[str]]:
 
 
 def _build_dashboard() -> gr.Blocks:
-    css, style_warning = _load_css()
+    base_css, style_warning = _load_css()
+    vendor_css, vendor_css_warning = _load_vendor_css()
+    css = base_css + ("\n\n" + vendor_css if vendor_css else "")
+    head, head_warning = _load_vendor_head()
     entries, selection, load_errors = _initial_payload()
     model_choices = _compute_choices(entries)
-    warnings = load_errors + ([style_warning] if style_warning else [])
+    warnings = (
+        load_errors
+        + ([style_warning] if style_warning else [])
+        + ([vendor_css_warning] if vendor_css_warning else [])
+        + ([head_warning] if head_warning else [])
+    )
     initial_view_mode = DEFAULT_TABLE_VIEW
 
     summary = _render_summary(
@@ -2525,8 +2701,14 @@ def _build_dashboard() -> gr.Blocks:
     modal_html = """
 <div id="space-context-modal" class="space-modal" aria-hidden="true">
   <div class="space-modal-content">
-    <button type="button" class="space-modal-close" data-close-modal="1">关闭</button>
-    <pre id="space-context-modal-body" class="space-modal-body"></pre>
+    <div class="space-modal-topbar">
+      <div class="space-modal-title">Context 详情</div>
+      <button type="button" class="space-modal-close" data-close-modal="1">关闭</button>
+    </div>
+    <div class="space-context-layout">
+      <div id="space-context-left" class="space-context-left"></div>
+      <div id="space-context-right" class="space-context-right"></div>
+    </div>
   </div>
 </div>
 """
@@ -2554,6 +2736,96 @@ def _build_dashboard() -> gr.Blocks:
 
         const queryById = (id) => root.querySelector(`#${escapeId(id)}`);
 
+        const clearNode = (node) => {
+            if (!node) {
+                return;
+            }
+            while (node.firstChild) {
+                node.removeChild(node.firstChild);
+            }
+        };
+
+        const toDisplayString = (value) => {
+            if (value === null || value === undefined) {
+                return '';
+            }
+            if (typeof value === 'string') {
+                return value;
+            }
+            if (typeof value === 'number' || typeof value === 'boolean') {
+                return String(value);
+            }
+            try {
+                return JSON.stringify(value);
+            } catch (error) {
+                return String(value);
+            }
+        };
+
+        const ensureMarkdown = () => {
+            if (window.__rwkvSpaceMarkdown) {
+                return window.__rwkvSpaceMarkdown;
+            }
+            if (typeof window.markdownit !== 'function') {
+                window.__rwkvSpaceMarkdown = null;
+                return null;
+            }
+            const md = window.markdownit({
+                html: false,
+                linkify: true,
+                breaks: true,
+                typographer: true,
+            });
+            window.__rwkvSpaceMarkdown = md;
+            return md;
+        };
+
+        const applyHighlight = (container) => {
+            if (!container || !window.hljs) {
+                return;
+            }
+            container.querySelectorAll('pre code').forEach((block) => {
+                try {
+                    window.hljs.highlightElement(block);
+                } catch (error) {
+                    // ignore highlight failures
+                }
+            });
+        };
+
+        const applyMath = (container) => {
+            if (!container || typeof window.renderMathInElement !== 'function') {
+                return;
+            }
+            try {
+                window.renderMathInElement(container, {
+                    delimiters: [
+                        { left: '$$', right: '$$', display: true },
+                        { left: '$', right: '$', display: false },
+                        { left: '\\\\(', right: '\\\\)', display: false },
+                        { left: '\\\\[', right: '\\\\]', display: true },
+                    ],
+                    ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+                });
+            } catch (error) {
+                // ignore math failures
+            }
+        };
+
+        const renderMarkdown = (container, text) => {
+            if (!container) {
+                return;
+            }
+            const md = ensureMarkdown();
+            if (!md) {
+                container.textContent = text || '';
+                return;
+            }
+            container.innerHTML = md.render(text || '');
+            applyHighlight(container);
+            applyMath(container);
+        };
+
         const closeModal = () => {
             const modal = queryById('space-context-modal');
             if (!modal) {
@@ -2563,13 +2835,183 @@ def _build_dashboard() -> gr.Blocks:
             modal.setAttribute('aria-hidden', 'true');
         };
 
-        const openModal = (text) => {
+        const openModalEvent = (evt) => {
             const modal = queryById('space-context-modal');
-            const modalBody = queryById('space-context-modal-body');
-            if (!modal || !modalBody) {
+            const left = queryById('space-context-left');
+            const right = queryById('space-context-right');
+            if (!modal || !left || !right) {
                 return;
             }
-            modalBody.textContent = text || '';
+            clearNode(left);
+            clearNode(right);
+
+            const eventObj = evt && typeof evt === 'object' ? evt : null;
+            const view = eventObj && typeof eventObj.view === 'string' ? eventObj.view : 'text';
+            const rawText = eventObj && typeof eventObj.raw_text === 'string' ? eventObj.raw_text : '';
+
+            const addCard = (parent, title, bodyBuilder) => {
+                const card = document.createElement('div');
+                card.className = 'space-context-card';
+
+                const header = document.createElement('div');
+                header.className = 'space-context-card-header';
+
+                const h = document.createElement('div');
+                h.className = 'space-context-card-title';
+                h.textContent = title || '';
+                header.appendChild(h);
+                card.appendChild(header);
+
+                if (typeof bodyBuilder === 'function') {
+                    bodyBuilder(card);
+                }
+                parent.appendChild(card);
+            };
+
+            const addSectionPre = (parent, label, text) => {
+                const labelEl = document.createElement('div');
+                labelEl.className = 'space-context-label';
+                labelEl.textContent = label || '';
+                parent.appendChild(labelEl);
+
+                const pre = document.createElement('pre');
+                pre.className = 'space-context-pre';
+                pre.textContent = text || '';
+                parent.appendChild(pre);
+            };
+
+            const addSectionMarkdown = (parent, label, text) => {
+                const labelEl = document.createElement('div');
+                labelEl.className = 'space-context-label';
+                labelEl.textContent = label || '';
+                parent.appendChild(labelEl);
+
+                const box = document.createElement('div');
+                box.className = 'space-context-md';
+                renderMarkdown(box, text || '');
+                parent.appendChild(box);
+            };
+
+            const renderRaw = (text) => {
+                addCard(left, 'Raw Context', (card) => {
+                    addSectionPre(card, 'raw_text', text || '');
+                });
+            };
+
+            const renderSampling = (samplingConfig, stopTokens) => {
+                if (!samplingConfig || typeof samplingConfig !== 'object') {
+                    addCard(right, 'sampling_config', (card) => {
+                        addSectionPre(card, 'sampling_config', '—');
+                    });
+                    return;
+                }
+
+                const stageNames = Object.keys(samplingConfig).sort();
+                stageNames.forEach((stageName) => {
+                    const cfg = samplingConfig[stageName];
+                    if (!cfg || typeof cfg !== 'object') {
+                        return;
+                    }
+                    addCard(right, `sampling_config · ${stageName}`, (card) => {
+                        const kv = document.createElement('div');
+                        kv.className = 'space-kv-list';
+
+                        Object.keys(cfg)
+                            .sort()
+                            .forEach((key) => {
+                                if (key === 'stop_tokens') {
+                                    return;
+                                }
+                                const row = document.createElement('div');
+                                row.className = 'space-kv';
+                                const k = document.createElement('div');
+                                k.className = 'space-kv-key';
+                                k.textContent = key;
+                                const v = document.createElement('div');
+                                v.className = 'space-kv-value';
+                                v.textContent = toDisplayString(cfg[key]);
+                                row.appendChild(k);
+                                row.appendChild(v);
+                                kv.appendChild(row);
+                            });
+
+                        card.appendChild(kv);
+
+                        const tokens = stopTokens && typeof stopTokens === 'object' ? stopTokens[stageName] : null;
+                        const rows = Array.isArray(tokens) ? tokens : [];
+                        const label = document.createElement('div');
+                        label.className = 'space-context-label';
+                        label.textContent = 'stop_tokens';
+                        card.appendChild(label);
+
+                        if (!rows.length) {
+                            const empty = document.createElement('div');
+                            empty.className = 'space-stop-empty';
+                            empty.textContent = '—';
+                            card.appendChild(empty);
+                            return;
+                        }
+
+                        const list = document.createElement('div');
+                        list.className = 'space-stop-list';
+                        rows.forEach((item) => {
+                            const line = document.createElement('div');
+                            line.className = 'space-stop-token';
+                            const id = document.createElement('div');
+                            id.className = 'space-stop-id';
+                            id.textContent = String(item && typeof item.id === 'number' ? item.id : item && item.id ? item.id : '');
+                            const tok = document.createElement('div');
+                            tok.className = 'space-stop-text';
+                            tok.textContent = item && typeof item.token === 'string' ? item.token : '';
+                            line.appendChild(id);
+                            line.appendChild(tok);
+                            list.appendChild(line);
+                        });
+                        card.appendChild(list);
+                    });
+                });
+            };
+
+            const errors = eventObj && Array.isArray(eventObj.errors) ? eventObj.errors : [];
+            if (errors.length) {
+                addCard(right, 'errors', (card) => {
+                    addSectionPre(card, 'errors', errors.map((e) => String(e)).join('\\n'));
+                });
+            }
+
+            if (
+                view === 'structured' &&
+                eventObj &&
+                eventObj.context &&
+                typeof eventObj.context === 'object' &&
+                eventObj.context !== null
+            ) {
+                const ctx = eventObj.context;
+                const stages = Array.isArray(ctx.stages) ? ctx.stages : [];
+                const samplingConfig = ctx.sampling_config && typeof ctx.sampling_config === 'object' ? ctx.sampling_config : null;
+                const stopTokens = eventObj.stop_tokens && typeof eventObj.stop_tokens === 'object' ? eventObj.stop_tokens : {};
+
+                if (stages.length) {
+                    stages.forEach((stage, idx) => {
+                        const title = `Stage ${idx + 1}`;
+                        const stopReason =
+                            stage && typeof stage.stop_reason === 'string' && stage.stop_reason ? stage.stop_reason : '';
+                        addCard(left, stopReason ? `${title} · stop_reason: ${stopReason}` : title, (card) => {
+                            const prompt = stage && typeof stage.prompt === 'string' ? stage.prompt : '';
+                            const completion = stage && typeof stage.completion === 'string' ? stage.completion : '';
+                            addSectionPre(card, 'prompt', prompt);
+                            addSectionMarkdown(card, 'completion', completion);
+                        });
+                    });
+                } else {
+                    renderRaw(rawText);
+                }
+
+                renderSampling(samplingConfig, stopTokens);
+            } else {
+                renderRaw(rawText);
+            }
+
             modal.classList.add('open');
             modal.setAttribute('aria-hidden', 'false');
         };
@@ -2597,20 +3039,22 @@ def _build_dashboard() -> gr.Blocks:
             input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
         };
 
-        const parseContextResultText = (rawValue) => {
+        const parseContextEvent = (rawValue) => {
             if (!rawValue) {
-                return '';
+                return { view: 'text', raw_text: '' };
             }
-            let text = rawValue;
             try {
                 const parsed = JSON.parse(rawValue);
-                if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string') {
-                    text = parsed.text;
+                if (parsed && typeof parsed === 'object') {
+                    if (typeof parsed.raw_text !== 'string' && typeof parsed.text === 'string') {
+                        return { ...parsed, raw_text: parsed.text };
+                    }
+                    return parsed;
                 }
             } catch (error) {
                 // Keep raw string payload as fallback.
             }
-            return text;
+            return { view: 'text', raw_text: String(rawValue) };
         };
 
         let contextWatchToken = 0;
@@ -2627,15 +3071,15 @@ def _build_dashboard() -> gr.Blocks:
                 const input = getTextboxInput('space-context-result');
                 const rawValue = input ? (input.value || '') : '';
                 if (rawValue && rawValue !== previousValue) {
-                    openModal(parseContextResultText(rawValue));
+                    openModalEvent(parseContextEvent(rawValue));
                     return;
                 }
 
                 if (Date.now() >= deadline) {
                     if (rawValue) {
-                        openModal(parseContextResultText(rawValue));
+                        openModalEvent(parseContextEvent(rawValue));
                     } else {
-                        openModal('读取完整 context 超时，请重试。');
+                        openModalEvent({ view: 'text', raw_text: '读取完整 context 超时，请重试。' });
                     }
                     return;
                 }
@@ -2645,8 +3089,8 @@ def _build_dashboard() -> gr.Blocks:
 
             poll();
         };
-        window.rwkvSpaceOpenContext = (text) => {
-            openModal(text || '');
+        window.rwkvSpaceOpenContext = (event) => {
+            openModalEvent(event || { view: 'text', raw_text: '' });
         };
 
         window.rwkvSpaceRequestContext = (cellId, sampleIndex, repeatIndex) => {
@@ -2655,7 +3099,7 @@ def _build_dashboard() -> gr.Blocks:
             }
             const contextResultInput = getTextboxInput('space-context-result');
             const previousValue = contextResultInput ? contextResultInput.value : '';
-            openModal('正在加载完整 context...');
+            openModalEvent({ view: 'text', raw_text: '正在加载完整 context...' });
             setTextboxValue(
                 'space-context-payload',
                 JSON.stringify({
@@ -2782,7 +3226,7 @@ def _build_dashboard() -> gr.Blocks:
     """
 
 
-    with gr.Blocks(css=css, theme=gr.themes.Base(), js=js_func) as demo:
+    with gr.Blocks(css=css, head=head, theme=gr.themes.Base(), js=js_func) as demo:
         with gr.Column(elem_classes="space-root"):
 
             gr.HTML(
@@ -3001,21 +3445,11 @@ def _build_dashboard() -> gr.Blocks:
             )
 
             def on_context_click(payload: str, interaction_map: dict[str, dict[str, Any]]):
-                cell_id, _, _ = _parse_context_payload(payload)
-                if not cell_id:
-                    return gr.update()
-                context_text = _resolve_context_text_for_modal(
+                context_event = _build_context_event_payload(
                     payload=payload,
                     interaction_meta=interaction_map if isinstance(interaction_map, dict) else {},
                 )
-                context_event = json.dumps(
-                    {
-                        "text": context_text,
-                        "ts": datetime.now().timestamp(),
-                    },
-                    ensure_ascii=False,
-                )
-                return gr.update(value=context_event)
+                return gr.update(value=json.dumps(context_event, ensure_ascii=False))
 
             context_payload.input(
                 on_context_click,
@@ -3095,7 +3529,10 @@ def _build_dashboard() -> gr.Blocks:
 
 def main() -> None:
     demo = _build_dashboard()
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    # Allow KaTeX font files to be served via Gradio's /file= endpoint.
+    fonts_dir = Path(__file__).parent / "assets" / "vendor" / "fonts"
+    allowed_paths = [str(fonts_dir)] if fonts_dir.exists() else None
+    demo.launch(server_name="0.0.0.0", server_port=7860, allowed_paths=allowed_paths)
 
 
 if __name__ == "__main__":  # pragma: no cover
