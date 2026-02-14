@@ -344,6 +344,18 @@ We override borders/backgrounds under `.space-table-wrapper` with `!important` t
   font-size: 17px;
 }
 
+.space-table-wrapper td.score-cell.delta-pos {
+  color: #22c55e !important;
+}
+
+.space-table-wrapper td.score-cell.delta-neg {
+  color: #ef4444 !important;
+}
+
+.space-table-wrapper td.score-cell.delta-zero {
+  color: #e5e7eb !important;
+}
+
 .space-table-wrapper tbody td {
   background-color: var(--space-row-bg) !important;
 }

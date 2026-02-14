@@ -975,7 +975,8 @@ def _score_cell_style(value: float | None, *, mode: str) -> str | None:
         color = (34, 197, 94)
     else:
         color = (239, 68, 68)
-    return f"background-color: rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
+    # Use an inset overlay so we don't fight with table zebra background rules.
+    return f"box-shadow: inset 0 0 0 9999px rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
 
 
 
@@ -999,7 +1000,7 @@ def _score_cell_style_norm(value: float | None, min_v: float | None, max_v: floa
         color = (34, 197, 94)
     else:
         color = (239, 68, 68)
-    return f"background-color: rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
+    return f"box-shadow: inset 0 0 0 9999px rgba({color[0]}, {color[1]}, {color[2]}, {alpha:.2f});"
 
 def _styled_score_cell(value: float | None) -> tuple[str, str | None]:
     return _format_score_1dp(value), _score_cell_style(value, mode="score")
@@ -2182,6 +2183,15 @@ def _render_pivot_html(
             numeric_value = _parse_display_number(display_value)
             if numeric_value is not None:
                 class_names.append("score-cell")
+                display_text = str(display_value).strip()
+                if display_text.startswith(("+", "-")):
+                    class_names.append("delta-cell")
+                    if numeric_value > 0:
+                        class_names.append("delta-pos")
+                    elif numeric_value < 0:
+                        class_names.append("delta-neg")
+                    else:
+                        class_names.append("delta-zero")
 
             meta = cell_meta.get((row_idx, col_idx)) if cell_meta else None
             if meta and meta.tooltip:
