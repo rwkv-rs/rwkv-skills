@@ -39,7 +39,7 @@ def _format_prompt_no_echo(prompt: str) -> str:
     clean = _compress_newlines(prompt).strip()
     return (
         "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant: <think></think>\n```python"
+        f"{clean}\n\nAssistant:\n```python"
     )
 
 
