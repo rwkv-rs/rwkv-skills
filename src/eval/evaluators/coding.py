@@ -38,7 +38,8 @@ def _format_prompt_no_echo(prompt: str) -> str:
 
     clean = _compress_newlines(prompt).strip()
     return (
-        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation.\n"
+        "Return only Python code in a single fenced block and do not repeat the prompt.\n"
         f"{clean}\n\nAssistant:\n```python"
     )
 
@@ -54,7 +55,11 @@ def _extract_function_signature(code: str | None) -> str | None:
 
 
 def _format_signature_prompt(prompt: str, signature: str ) -> str:
-    prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
+    prompt = (
+        f"{prompt}\n"
+        f"Function signature (must be used exactly): {signature}\n"
+        "Write the full function definition."
+    )
     return _format_prompt_no_echo(prompt)
 
 
