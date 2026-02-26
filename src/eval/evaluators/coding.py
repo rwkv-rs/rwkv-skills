@@ -136,11 +136,12 @@ class CodingPipeline:
 
         is_human_eval_fix = "human_eval_fix" in dataset_path.lower()
 
+        use_fenced_prompt = bool(sampling.stop_suffixes) or is_human_eval_fix
         if probe_only:
             prompts = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
-                prompt_text = _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
+                prompt_text = _format_prompt_no_echo(record.prompt) if use_fenced_prompt else _format_prompt(record.prompt)
                 prompts.append(prompt_text)
             _ = self.engine.generate(
                 prompts,
@@ -154,9 +155,7 @@ class CodingPipeline:
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
             for sample_idx in range(samples_per_task):
-                prompt_text = (
-                    _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
-                )
+                prompt_text = _format_prompt_no_echo(record.prompt) if use_fenced_prompt else _format_prompt(record.prompt)
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         skip_keys = skip_keys or set()
