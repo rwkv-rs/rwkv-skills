@@ -1,3 +1,17 @@
+[code_fenced_default]
+max_generate_tokens = 1024
+temperature = 0.6
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [0, 261, 6884, 21214, 24281]
+stop_suffixes = ["```"]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
 [math_cot_default]
 max_generate_tokens = 4096
 temperature = 0.55
@@ -46,6 +60,7 @@ alpha_presence = 0.25
 alpha_frequency = 0.25
 alpha_decay = 0.996
 stop_tokens = [6884, 21214]
+stop_suffixes = ["```"]
 pad_zero = true
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
