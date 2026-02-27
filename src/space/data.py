@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 from typing import Any, Iterable, Mapping
@@ -208,7 +208,7 @@ def _parse_created_at(raw: Any) -> datetime:
             return parsed.replace(tzinfo=None)
         except ValueError:
             pass
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _parse_int(
