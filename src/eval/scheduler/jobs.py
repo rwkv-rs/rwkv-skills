@@ -140,7 +140,9 @@ LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
         "math_500_test",
         "answer_judge_test",
         "gaokao2023en_test",
+        "comp_math_24_25_test",
         "minerva_math_test",
+        "amc23_test",
     )
 )
 # judge-only 数据集不再调度到 free_response，避免 math_500 反复被 free_response 拉起

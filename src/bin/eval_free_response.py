@@ -289,10 +289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
     avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
     task_details: dict[str, object] = {}
-    metrics_payload = {
-        "exact_accuracy": evaluation.exact_accuracy,
-        "judge_accuracy": evaluation.judge_accuracy,
-    }
+    metrics_payload = {"exact_accuracy": evaluation.exact_accuracy}
+    if evaluation.judge_accuracy is not None:
+        metrics_payload["judge_accuracy"] = evaluation.judge_accuracy
 
     pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:

@@ -48,12 +48,20 @@ class BenchmarkModelConfig:
 
 
 def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None) -> Path:
-    base, _ = split_benchmark_and_split(benchmark_name)
-    slug = safe_slug(base).lower()
+    raw_slug = safe_slug(canonical_slug(benchmark_name)).lower()
     if model_name:
         model_slug = safe_slug(model_name)
-        return CONFIG_ROOT / model_slug / f"{slug}.toml"
-    return CONFIG_ROOT / f"{slug}.toml"
+        direct = CONFIG_ROOT / model_slug / f"{raw_slug}.toml"
+        if direct.exists():
+            return direct
+        base, _ = split_benchmark_and_split(raw_slug)
+        return CONFIG_ROOT / model_slug / f"{safe_slug(base).lower()}.toml"
+
+    direct = CONFIG_ROOT / f"{raw_slug}.toml"
+    if direct.exists():
+        return direct
+    base, _ = split_benchmark_and_split(raw_slug)
+    return CONFIG_ROOT / f"{safe_slug(base).lower()}.toml"
 
 
 def resolve_benchmark_model_config(

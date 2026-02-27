@@ -55,6 +55,27 @@ class SampleRecord:
         return payload
 
 
+def sample_repeat_seed(sample_index: int, repeat_index: int, *, stage: int = 1) -> int:
+    """Build a stable per-sample seed from (sample_index, repeat_index, stage).
+
+    Layout (63-bit, non-negative):
+      [sample_index:31][repeat_index:24][stage:8]
+    """
+
+    sample = int(sample_index)
+    repeat = int(repeat_index)
+    stage_id = int(stage)
+    if sample < 0 or repeat < 0 or stage_id < 0:
+        raise ValueError("sample_index/repeat_index/stage must be non-negative")
+    if sample >= (1 << 31):
+        raise ValueError(f"sample_index 超出可编码范围: {sample}")
+    if repeat >= (1 << 24):
+        raise ValueError(f"repeat_index 超出可编码范围: {repeat}")
+    if stage_id >= (1 << 8):
+        raise ValueError(f"stage 超出可编码范围: {stage_id}")
+    return (sample << 32) | (repeat << 8) | stage_id
+
+
 @dataclass(slots=True)
 class ResumeState:
     next_index: int
@@ -205,6 +226,7 @@ __all__ = [
     "ResumeState",
     "DebugCaptureConfig",
     "DebugCaptureBuffer",
+    "sample_repeat_seed",
     "detect_resume_state",
     "ensure_resume_samples_compatible",
 ]

@@ -16,7 +16,7 @@ from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from .common import SampleRecord, StageRecord
+from .common import SampleRecord, StageRecord, sample_repeat_seed
 
 DEFAULT_BAN_TOKEN = 295
 
@@ -124,6 +124,10 @@ class InstructionFollowingPipeline:
                 batch_size=min(batch_size, len(prompts)),
                 progress_desc="Generating instruction-following responses",
                 on_complete=_on_complete,
+                prompt_seeds=[
+                    sample_repeat_seed(problem_idx, sample_id, stage=1)
+                    for problem_idx, _record, sample_id in chunk
+                ],
             )
         return InstructionFollowingPipelineResult(dataset_name, len(expanded), payloads)
 

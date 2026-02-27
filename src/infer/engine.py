@@ -48,6 +48,7 @@ class InferenceEngine:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        prompt_seeds: Sequence[int] | None = None,
     ) -> list[GenerationOutput]:
         return _continuous_batching(
             self.model,
@@ -58,6 +59,7 @@ class InferenceEngine:
             progress_desc,
             probe_only,
             on_complete,
+            prompt_seeds,
         )
 
 
@@ -80,9 +82,12 @@ def _continuous_batching(
     progress_desc: str,
     probe_only: bool = False,
     on_complete: Callable[[GenerationOutput], None] | None = None,
+    prompt_seeds: Sequence[int] | None = None,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
+    if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
+        raise ValueError("prompt_seeds 长度必须与 prompts 一致")
     batch_size = max(1, min(batch_size, len(prompts)))
 
     vocab_size = _infer_vocab_size(model)
@@ -108,6 +113,19 @@ def _continuous_batching(
         byte_len = active_count * sampler_state_row_width
         return sampler_states.narrow(0, 0, byte_len)
 
+    def _set_sampler_seed(slot_idx: int, seed: int) -> None:
+        if sampler_states is None:
+            raise RuntimeError("rapid-sampling 状态未初始化")
+        normalized = int(seed) & 0x7FFFFFFFFFFFFFFF
+        slot_state = rapid_sampler.setup_rand(normalized, 1)
+        if not isinstance(slot_state, torch.Tensor) or slot_state.ndim != 1:
+            raise RuntimeError("rapid-sampling setup_rand(seed, 1) 返回格式异常")
+        if slot_state.numel() != sampler_state_row_width:
+            raise RuntimeError("rapid-sampling setup_rand(seed, 1) 返回长度异常")
+        start = slot_idx * sampler_state_row_width
+        target = sampler_states.narrow(0, start, sampler_state_row_width)
+        target.copy_(slot_state.to(device=target.device, dtype=target.dtype))
+
     def _validate_sampled_tokens(sampled_tokens: torch.Tensor | Sequence[int], active_count: int) -> torch.Tensor:
         sampled = torch.as_tensor(sampled_tokens, device=device)
         if sampled.ndim == 0:
@@ -126,7 +144,8 @@ def _continuous_batching(
         tokens = tokenizer.encode(prompt)
         if sampling.pad_zero:
             tokens = [0] + tokens
-        encoded.append((idx, prompt, tokens))
+        seed = int(prompt_seeds[idx]) if prompt_seeds is not None else None
+        encoded.append((idx, prompt, tokens, seed))
 
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())
@@ -148,10 +167,12 @@ def _continuous_batching(
         no_penalty_ids = torch.tensor(valid_no_penalty_ids, dtype=torch.int64, device=device)
 
     active_tasks: list[_ActiveTask] = []
-    for _ in range(batch_size):
-        prompt_idx, prompt, tokens = encoded.popleft()
+    for slot_idx in range(batch_size):
+        prompt_idx, prompt, tokens, seed = encoded.popleft()
         pending = deque(tokens)
         active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], None, None))
+        if seed is not None:
+            _set_sampler_seed(slot_idx, seed)
 
     pbar = tqdm(
         total=len(prompts),
@@ -223,10 +244,12 @@ def _continuous_batching(
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
-                    prompt_idx, prompt, tokens = encoded.popleft()
+                    prompt_idx, prompt, tokens, seed = encoded.popleft()
                     pending = deque(tokens)
                     active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], None, None)
                     _reset_slot(idx)
+                    if seed is not None:
+                        _set_sampler_seed(idx, seed)
                 else:
                     accomplished.append(idx)
 

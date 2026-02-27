@@ -14,7 +14,7 @@ from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
-from .common import SampleRecord, StageRecord
+from .common import SampleRecord, StageRecord, sample_repeat_seed
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
@@ -153,6 +153,7 @@ class MultipleChoicePipeline:
         dataset_name: str | None = None,
         sample_limit: int | None = None,
         min_prompt_count: int | None = None,
+        samples_per_task: int = 1,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -163,39 +164,45 @@ class MultipleChoicePipeline:
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         templates = _select_prompt_templates(dataset_name)
         batch_size = max(1, int(batch_size))
-        if min_prompt_count and min_prompt_count > len(records) and records:
-            repeats = (min_prompt_count + len(records) - 1) // len(records)
-            records = (records * repeats)[:min_prompt_count]
         if cot_prompt_template is None:
             cot_prompt_template = templates.cot
         if final_answer_template is None:
             final_answer_template = templates.final
 
-        if probe_only and records:
-            if len(records) >= batch_size:
-                records = records[:batch_size]
-            else:
-                repeat = (batch_size + len(records) - 1) // len(records)
-                records = (records * repeat)[:batch_size]
-
+        repeats = max(1, int(samples_per_task)) if not probe_only else 1
         skip_keys = skip_keys or set()
+        expanded: list[tuple[int, MultipleChoiceRecord, int]] = []
+        for idx, record in enumerate(records):
+            for sample_id in range(repeats):
+                if (idx, sample_id) in skip_keys:
+                    continue
+                expanded.append((idx, record, sample_id))
+
+        if min_prompt_count and min_prompt_count > len(expanded) and expanded:
+            repeat = (min_prompt_count + len(expanded) - 1) // len(expanded)
+            expanded = (expanded * repeat)[:min_prompt_count]
+
+        if probe_only and expanded:
+            if len(expanded) >= batch_size:
+                expanded = expanded[:batch_size]
+            else:
+                repeat = (batch_size + len(expanded) - 1) // len(expanded)
+                expanded = (expanded * repeat)[:batch_size]
+
         if resume_start_index < 0:
             resume_start_index = 0
         if resume_start_index:
-            if resume_start_index >= len(records):
-                return MultipleChoicePipelineResult(dataset_name, len(records), [])
+            if resume_start_index >= len(expanded):
+                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
             remaining_entries = [
-                (idx, record)
-                for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
-                if (idx, 0) not in skip_keys
+                (idx, record, sample_id)
+                for idx, record, sample_id in expanded[resume_start_index:]
             ]
             print(
-                f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(records)}，剩余 {len(remaining_entries)}"
+                f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(expanded)}，剩余 {len(remaining_entries)}"
             )
         else:
-            remaining_entries = [
-                (idx, record) for idx, record in enumerate(records) if (idx, 0) not in skip_keys
-            ]
+            remaining_entries = expanded
         if not remaining_entries:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
@@ -210,7 +217,7 @@ class MultipleChoicePipeline:
                 local_idx = output.prompt_index
                 if local_idx < 0 or local_idx >= len(chunk):
                     return
-                record_idx, record = chunk[local_idx]
+                record_idx, record, sample_id = chunk[local_idx]
                 cot_prompt = prompts[local_idx]
                 cot_stage = StageRecord(
                     prompt=cot_prompt,
@@ -221,7 +228,7 @@ class MultipleChoicePipeline:
                     benchmark_name=benchmark_name,
                     dataset_split=dataset_split,
                     sample_index=record_idx,
-                    repeat_index=0,
+                    repeat_index=sample_id,
                     sampling_config=sampling_config,
                     stages=[cot_stage],
                 ).as_payload()
@@ -246,7 +253,7 @@ class MultipleChoicePipeline:
                     benchmark_name=benchmark_name,
                     dataset_split=dataset_split,
                     sample_index=record_idx,
-                    repeat_index=0,
+                    repeat_index=sample_id,
                     sampling_config=sampling_config,
                     stages=[cot_stage, final_stage],
                 ).as_payload()
@@ -262,10 +269,14 @@ class MultipleChoicePipeline:
                 progress_desc="Generating CoT" if not probe_only else "Probing CoT",
                 probe_only=probe_only,
                 on_complete=None if probe_only else _on_cot_complete,
+                prompt_seeds=[
+                    sample_repeat_seed(record_idx, sample_id, stage=1)
+                    for record_idx, _record, sample_id in chunk
+                ],
             )
             if probe_only:
-                return MultipleChoicePipelineResult(dataset_name, len(records), [])
-        return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
+                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+        return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     # ------------------------------------------------------------------
     # Helpers

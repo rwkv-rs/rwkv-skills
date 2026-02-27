@@ -21,6 +21,7 @@ class MultipleChoiceMetrics:
     accuracy: float
     accuracy_by_subject: dict[str | None, float]
     samples: int
+    rows: list[tuple[int, int, bool]]
     payloads: list[dict]
 
 
@@ -65,9 +66,11 @@ def evaluate_multiple_choice(
     correct = 0
     subject_totals: dict[str | None, tuple[int, int]] = {}
     eval_payloads: list[dict] = []
+    rows_for_at_k: list[tuple[int, int, bool]] = []
 
     for payload in _iter_completions(completions):
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         last_stage = _max_stage_index(payload)
         token_text = str(payload.get(f"completion{last_stage}", ""))
         predicted = _extract_choice_letter(token_text)
@@ -85,6 +88,7 @@ def evaluate_multiple_choice(
         total += 1
         if passed:
             correct += 1
+        rows_for_at_k.append((sample_index, repeat_index, passed))
 
         sub_total, sub_hits = subject_totals.get(subject, (0, 0))
         sub_total += 1
@@ -109,6 +113,7 @@ def evaluate_multiple_choice(
         accuracy=accuracy,
         accuracy_by_subject=accuracy_by_subject,
         samples=total,
+        rows=rows_for_at_k,
         payloads=eval_payloads,
     )
 

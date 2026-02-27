@@ -243,16 +243,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         or os.environ.get("API_BASE")
     )
 
-    judge: LLMJudge | None = None
-    if judge_model and judge_api_key:
-        judge = LLMJudge(
-            LLMJudgeConfig(
-                api_key=judge_api_key,
-                model=judge_model,
-                base_url=judge_base_url,
-                max_workers=args.judge_max_workers,
-            )
+    if not judge_model or not judge_api_key:
+        raise ValueError(
+            "free_response_judge 需要有效的 judge 配置："
+            "请提供 --judge-model/--judge-api-key，或设置 JUDGE_MODEL + JUDGE_API_KEY。"
         )
+    judge = LLMJudge(
+        LLMJudgeConfig(
+            api_key=judge_api_key,
+            model=judge_model,
+            base_url=judge_base_url,
+            max_workers=args.judge_max_workers,
+        )
+    )
 
     writer = CompletionWriteWorker(
         service=service,
@@ -291,10 +294,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k_final)
     avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k_final)
-    metrics_payload = {
-        "exact_accuracy": evaluation.exact_accuracy,
-        "judge_accuracy": evaluation.judge_accuracy,
-    }
+    if evaluation.judge_accuracy is None:
+        raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
+    metrics_payload = {"judge_accuracy": evaluation.judge_accuracy}
     pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:
         pass_payload = pass_metrics_all or {}

@@ -352,6 +352,12 @@ def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
             return _format_metric_value(value)
         return None
 
+    if _is_multi_choice_entry(entry):
+        preferred_k = _preferred_k_metric(metrics)
+        formatted = _format_specific(preferred_k)
+        if formatted is not None:
+            return f"{preferred_k} {formatted}"
+
     if base.startswith("aime"):
         parts: list[str] = []
         for key in ("avg@16", "pass@8"):
@@ -386,6 +392,12 @@ def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float
 
     def _numeric_specific(key: str) -> float | None:
         return _numeric_value(metrics.get(key))
+
+    if _is_multi_choice_entry(entry):
+        preferred_k = _preferred_k_metric(metrics)
+        value = _numeric_specific(preferred_k)
+        if value is not None:
+            return value
 
     if base.startswith("aime"):
         candidates: list[float] = []
@@ -436,16 +448,37 @@ def _is_multi_choice_entry(entry: ScoreEntry) -> bool:
     return job_hint and _numeric_value(entry.metrics.get("accuracy")) is not None
 
 
+def _prefer_llm_judge(entry: ScoreEntry) -> bool:
+    task = (entry.task or "").lower()
+    if "judge" in task:
+        return True
+    return _numeric_value(entry.metrics.get("judge_accuracy")) is not None
+
+
 def _score_for_eval_method(entry: ScoreEntry, method: str, k_metric: str) -> float | None:
     metrics = entry.metrics
     if method == "logits":
+        k_value = _numeric_value(metrics.get(k_metric))
+        if k_value is not None:
+            return k_value
         acc = _numeric_value(metrics.get("accuracy"))
         if acc is not None:
             return acc
         _, fallback = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
         return fallback
     if method == "llm_judge":
-        return _numeric_value(metrics.get("judge_accuracy"))
+        judge_score = _numeric_value(metrics.get("judge_accuracy"))
+        if judge_score is not None:
+            return judge_score
+        k_value = _numeric_value(metrics.get(k_metric))
+        if k_value is not None:
+            return k_value
+        for key in ("exact_accuracy", "instruction_accuracy", "prompt_accuracy", "accuracy"):
+            value = _numeric_value(metrics.get(key))
+            if value is not None:
+                return value
+        _, fallback = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
+        return fallback
 
     # exact_match
     for key in ("exact_accuracy", "instruction_accuracy", "prompt_accuracy"):
@@ -470,9 +503,10 @@ def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float
     if _is_multi_choice_entry(entry):
         methods.append("logits")
     else:
-        if _numeric_value(entry.metrics.get("judge_accuracy")) is not None:
+        if _prefer_llm_judge(entry):
             methods.append("llm_judge")
-        methods.append("exact_match")
+        else:
+            methods.append("exact_match")
 
     rows: list[tuple[str, str, str, float]] = []
     for method in methods:
@@ -486,7 +520,7 @@ def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float
 def _field_primary_score(entry: ScoreEntry) -> float | None:
     if _is_multi_choice_entry(entry):
         return _score_for_eval_method(entry, "logits", _preferred_k_metric(entry.metrics))
-    if _numeric_value(entry.metrics.get("judge_accuracy")) is not None:
+    if _prefer_llm_judge(entry):
         return _score_for_eval_method(entry, "llm_judge", _preferred_k_metric(entry.metrics))
     return _score_for_eval_method(entry, "exact_match", _preferred_k_metric(entry.metrics))
 

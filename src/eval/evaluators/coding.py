@@ -12,7 +12,7 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
-from .common import SampleRecord, StageRecord
+from .common import SampleRecord, StageRecord, sample_repeat_seed
 
 # Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
 DEFAULT_PASS_K = (1,)
@@ -138,16 +138,19 @@ class CodingPipeline:
 
         if probe_only:
             prompts = []
+            probe_seeds: list[int] = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
                 prompt_text = _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
                 prompts.append(prompt_text)
+                probe_seeds.append(sample_repeat_seed(idx % len(records), idx // len(records), stage=1))
             _ = self.engine.generate(
                 prompts,
                 sampling=sampling,
                 batch_size=batch_size,
                 progress_desc="Probing code",
                 probe_only=True,
+                prompt_seeds=probe_seeds,
             )
             return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
@@ -216,6 +219,10 @@ class CodingPipeline:
                     batch_size=max(1, min(batch_size, len(prompts))),
                     progress_desc="Generating code",
                     on_complete=_on_complete,
+                    prompt_seeds=[
+                        sample_repeat_seed(rec_idx, sample_idx, stage=1)
+                        for _prompt_text, _record, rec_idx, sample_idx in chunk
+                    ],
                 )
 
         return CodingPipelineResult(
@@ -251,6 +258,7 @@ class CodingPipeline:
 
         if probe_only:
             prompts = []
+            probe_seeds: list[int] = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
                 raw_code = record.metadata.get("code") if record.metadata else None
@@ -260,12 +268,14 @@ class CodingPipeline:
                 else:
                     prompt_text = _format_prompt_no_echo(record.prompt)
                 prompts.append(prompt_text)
+                probe_seeds.append(sample_repeat_seed(idx % len(records), idx // len(records), stage=1))
             _ = self.engine.generate(
                 prompts,
                 sampling=sampling,
                 batch_size=batch_size,
                 progress_desc="Probing code",
                 probe_only=True,
+                prompt_seeds=probe_seeds,
             )
             return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
@@ -337,6 +347,10 @@ class CodingPipeline:
                     batch_size=max(1, min(batch_size, len(prompts))),
                     progress_desc="Generating code",
                     on_complete=_on_complete,
+                    prompt_seeds=[
+                        sample_repeat_seed(rec_idx, sample_idx, stage=1)
+                        for _prompt_text, _record, rec_idx, sample_idx in chunk
+                    ],
                 )
 
         return CodingPipelineResult(
@@ -373,16 +387,19 @@ class CodingPipeline:
 
         if probe_only:
             prompts = []
+            probe_seeds_stage1: list[int] = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
                 prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
                 prompts.append(prompt_text)
+                probe_seeds_stage1.append(sample_repeat_seed(idx % len(records), idx // len(records), stage=1))
             cot_outputs = self.engine.generate(
                 prompts,
                 sampling=cot_sampling,
                 batch_size=batch_size,
                 progress_desc="Probing CoT",
                 probe_only=True,
+                prompt_seeds=probe_seeds_stage1,
             )
             final_prompts: list[str] = []
             cot_by_idx = {item.prompt_index: item for item in cot_outputs}
@@ -391,12 +408,17 @@ class CodingPipeline:
                 cot_text = cot_seq.text if cot_seq is not None else ""
                 final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_text))
             if final_prompts:
+                probe_seeds_stage2 = [
+                    sample_repeat_seed(idx % len(records), idx // len(records), stage=2)
+                    for idx in range(len(final_prompts))
+                ]
                 _ = self.engine.generate(
                     final_prompts,
                     sampling=final_sampling,
                     batch_size=batch_size,
                     progress_desc="Probing final code",
                     probe_only=True,
+                    prompt_seeds=probe_seeds_stage2,
                 )
             return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
@@ -465,6 +487,10 @@ class CodingPipeline:
                     batch_size=max(1, min(batch_size, len(prompts))),
                     progress_desc="Generating CoT",
                     on_complete=_on_cot_complete,
+                    prompt_seeds=[
+                        sample_repeat_seed(rec_idx, sample_idx, stage=1)
+                        for _prompt_text, _record, rec_idx, sample_idx in chunk
+                    ],
                 )
                 cot_by_idx = {item.prompt_index: item for item in cot_outputs}
 
@@ -510,12 +536,17 @@ class CodingPipeline:
                     payloads.append(payload)
 
                 if final_prompts:
+                    final_prompt_seeds = [
+                        sample_repeat_seed(chunk[local_idx][2], chunk[local_idx][3], stage=2)
+                        for local_idx in final_prompt_indices
+                    ]
                     _ = self.engine.generate(
                         final_prompts,
                         sampling=final_sampling,
                         batch_size=max(1, min(batch_size, len(final_prompts))),
                         progress_desc="Generating final code",
                         on_complete=_on_final_complete,
+                        prompt_seeds=final_prompt_seeds,
                     )
 
         return CodingPipelineResult(

@@ -12,7 +12,7 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
 from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
-from .common import SampleRecord, StageRecord
+from .common import SampleRecord, StageRecord, sample_repeat_seed
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
@@ -99,12 +99,17 @@ class FreeResponsePipeline:
             cot_prompts = [
                 cot_prompt_template.replace("<Q>", record.question) for _, record, _ in remaining_entries
             ]
+            probe_seeds = [
+                sample_repeat_seed(problem_idx, sample_id, stage=1)
+                for problem_idx, _record, sample_id in remaining_entries
+            ]
             _ = self.engine.generate(
                 cot_prompts,
                 sampling=final_sampling,
                 batch_size=batch_size,
                 progress_desc="Generating answers",
                 probe_only=probe_only,
+                prompt_seeds=probe_seeds,
             )
             return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, [])
 
@@ -145,6 +150,10 @@ class FreeResponsePipeline:
                 batch_size=min(batch_size, len(cot_prompts)),
                 progress_desc="Generating CoT",
                 on_complete=_on_cot_complete,
+                prompt_seeds=[
+                    sample_repeat_seed(problem_idx, sample_id, stage=1)
+                    for problem_idx, _record, sample_id in chunk
+                ],
             )
             cot_by_idx = {item.prompt_index: item for item in cot_outputs}
 
@@ -196,6 +205,10 @@ class FreeResponsePipeline:
                 batch_size=min(batch_size, len(final_prompts)),
                 progress_desc="Generating answers",
                 on_complete=_on_final_complete,
+                prompt_seeds=[
+                    sample_repeat_seed(problem_idx, sample_id, stage=2)
+                    for problem_idx, _record, sample_id in chunk
+                ],
             )
         return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, payloads)
 
