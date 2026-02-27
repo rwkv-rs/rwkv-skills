@@ -17,6 +17,22 @@ from .execution import check_correctness
 _MP_ARENA_DIRS_SANITIZED = False
 
 
+def _extract_code(text: str) -> str:
+    """Extract code from fenced block if present, otherwise return as-is."""
+    if not text:
+        return ""
+    if "```" not in text:
+        return text.strip()
+    parts = text.split("```")
+    if len(parts) < 3:
+        return text.strip()
+    block = parts[-2]
+    lines = block.splitlines()
+    if lines and lines[0].strip().lower() in {"python", "py"}:
+        block = "\n".join(lines[1:])
+    return block.strip()
+
+
 def estimate_pass_at_k(
     num_samples: Union[int, List[int], np.ndarray],
     num_correct: Union[List[int], np.ndarray],
@@ -89,7 +105,7 @@ def _evaluate_mbpp_base(
 
         for sample in tqdm.tqdm(stream_jsonl(sample_file), desc="Reading samples"):
             task_id = str(sample["task_id"])
-            completion = sample["completion"]
+            completion = _extract_code(sample["completion"])
             problem = problems[task_id]
             args = (problem, completion, timeout, completion_id[task_id])
             futures.append(executor.submit(check_correctness, *args))
@@ -266,7 +282,8 @@ def _evaluate_mbpp_plus(
     payloads: list[tuple[str, int, dict, str, dict, float]] = []
     for sample in tqdm.tqdm(stream_jsonl(sample_file), desc="Reading samples"):
         task_id = sample["task_id"]
-        completion = sample.get("completion") or sample.get("solution") or ""
+        raw_completion = sample.get("completion") or sample.get("solution") or ""
+        completion = _extract_code(raw_completion)
         if task_id not in problems:
             continue
         problem = problems[task_id]
