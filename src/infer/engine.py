@@ -3,7 +3,7 @@ from __future__ import annotations
 """RWKV 推理引擎，封装连续批量生成、state 管理等逻辑。"""
 
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import math
 import os
@@ -222,7 +222,7 @@ def _continuous_batching(
     window_start_tokens = 0
     throughput_ema: float | None = None
     decode_pool: ThreadPoolExecutor | None = None
-    pending_decodes: list[tuple[object, GenerationOutput, bool]] = []
+    pending_decodes: list[tuple[Future[str], GenerationOutput, bool]] = []
 
     def _get_decode_pool() -> ThreadPoolExecutor:
         nonlocal decode_pool
@@ -235,6 +235,20 @@ def _continuous_batching(
         pool = _get_decode_pool()
         future = pool.submit(_decode_tokens, tokenizer, output.token_ids)
         pending_decodes.append((future, output, call_on_complete))
+
+    def _drain_decodes(*, wait_all: bool) -> None:
+        nonlocal pending_decodes
+        if not pending_decodes:
+            return
+        remaining: list[tuple[Future[str], GenerationOutput, bool]] = []
+        for future, output, call_on_complete in pending_decodes:
+            if not wait_all and not future.done():
+                remaining.append((future, output, call_on_complete))
+                continue
+            output.text = future.result()
+            if call_on_complete and on_complete is not None and not probe_only:
+                on_complete(output)
+        pending_decodes = remaining
 
     def _reset_slot(slot_idx: int) -> None:
         penalties[slot_idx, :] = 0
@@ -321,11 +335,11 @@ def _continuous_batching(
                     text=stop_text,
                     finish_reason=finish_reason,
                 )
-                if on_complete is not None and not probe_only:
-                    if output.text:
+                if output.text:
+                    if on_complete is not None and not probe_only:
                         on_complete(output)
-                    else:
-                        _schedule_decode(output, call_on_complete=True)
+                else:
+                    _schedule_decode(output, call_on_complete=on_complete is not None and not probe_only)
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
@@ -340,6 +354,8 @@ def _continuous_batching(
         if accomplished:
             for remove_idx in sorted(accomplished, reverse=True):
                 _remove_slot(remove_idx)
+
+        _drain_decodes(wait_all=False)
 
         next_tokens: list[list[int]] = []
         active_count = len(active_tasks)
@@ -396,18 +412,9 @@ def _continuous_batching(
 
     pbar.close()
 
-    if pending_decodes:
-        for future, output, call_on_complete in pending_decodes:
-            output.text = future.result()
-            if call_on_complete and on_complete is not None and not probe_only:
-                on_complete(output)
+    _drain_decodes(wait_all=True)
     if decode_pool is not None:
         decode_pool.shutdown(wait=True)
-
-    for output in outputs:
-        if output.text:
-            continue
-        output.text = _decode_tokens(tokenizer, output.token_ids)
 
     outputs.sort(key=lambda item: item.prompt_index)
     return outputs
