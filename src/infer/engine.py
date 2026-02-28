@@ -3,8 +3,10 @@ from __future__ import annotations
 """RWKV 推理引擎，封装连续批量生成、state 管理等逻辑。"""
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import os
 import time
 from typing import Callable, Sequence, NamedTuple
 
@@ -219,6 +221,20 @@ def _continuous_batching(
     window_start_time = start_time
     window_start_tokens = 0
     throughput_ema: float | None = None
+    decode_pool: ThreadPoolExecutor | None = None
+    pending_decodes: list[tuple[object, GenerationOutput, bool]] = []
+
+    def _get_decode_pool() -> ThreadPoolExecutor:
+        nonlocal decode_pool
+        if decode_pool is None:
+            max_workers = min(32, max(2, (os.cpu_count() or 4)))
+            decode_pool = ThreadPoolExecutor(max_workers=max_workers)
+        return decode_pool
+
+    def _schedule_decode(output: GenerationOutput, *, call_on_complete: bool) -> None:
+        pool = _get_decode_pool()
+        future = pool.submit(_decode_tokens, tokenizer, output.token_ids)
+        pending_decodes.append((future, output, call_on_complete))
 
     def _reset_slot(slot_idx: int) -> None:
         penalties[slot_idx, :] = 0
@@ -306,9 +322,10 @@ def _continuous_batching(
                     finish_reason=finish_reason,
                 )
                 if on_complete is not None and not probe_only:
-                    if not output.text:
-                        output.text = _decode_tokens(tokenizer, output.token_ids)
-                    on_complete(output)
+                    if output.text:
+                        on_complete(output)
+                    else:
+                        _schedule_decode(output, call_on_complete=True)
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
@@ -378,6 +395,14 @@ def _continuous_batching(
             task.new_token = int(sampled_list[idx])
 
     pbar.close()
+
+    if pending_decodes:
+        for future, output, call_on_complete in pending_decodes:
+            output.text = future.result()
+            if call_on_complete and on_complete is not None and not probe_only:
+                on_complete(output)
+    if decode_pool is not None:
+        decode_pool.shutdown(wait=True)
 
     for output in outputs:
         if output.text:
