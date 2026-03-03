@@ -3,10 +3,12 @@ from __future__ import annotations
 """RWKV 推理引擎，封装连续批量生成、state 管理等逻辑。"""
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import math
+import os
 import time
-from typing import Callable, Sequence
+from typing import Callable, NamedTuple, Sequence
 
 import torch
 from tqdm import tqdm
@@ -63,6 +65,46 @@ class InferenceEngine:
         )
 
 
+class StopMatch(NamedTuple):
+    index: int
+    len: int
+
+
+class StopSuffixState:
+    def __init__(self, stop_suffixes: Sequence[bytes]) -> None:
+        self.generated_bytes = bytearray()
+        self.stop_suffixes = [suffix for suffix in stop_suffixes if suffix]
+        self.max_stop_suffix_len = max((len(suffix) for suffix in self.stop_suffixes), default=0)
+        self.matched: StopMatch | None = None
+
+    def append_bytes(self, data: bytes) -> None:
+        if not data:
+            return
+        self.generated_bytes.extend(data)
+
+    def match(self) -> StopMatch | None:
+        if not self.stop_suffixes:
+            self.matched = None
+            return None
+        best: StopMatch | None = None
+        output = self.generated_bytes
+        for index, suffix in enumerate(self.stop_suffixes):
+            if not output.endswith(suffix):
+                continue
+            candidate = StopMatch(index=index, len=len(suffix))
+            if best is None:
+                best = candidate
+            else:
+                if candidate.len > best.len or (candidate.len == best.len and candidate.index < best.index):
+                    best = candidate
+        self.matched = best
+        return best
+
+    def trunc_len(self) -> int:
+        matched_len = self.matched.len if self.matched else 0
+        return max(0, len(self.generated_bytes) - matched_len)
+
+
 @dataclass(slots=True)
 class _ActiveTask:
     prompt_index: int
@@ -71,6 +113,7 @@ class _ActiveTask:
     generated_tokens: list[int]
     new_token: int | None
     finish_reason: str | None
+    stop_state: StopSuffixState | None
 
 
 def _continuous_batching(
@@ -148,6 +191,17 @@ def _continuous_batching(
         encoded.append((idx, prompt, tokens, seed))
 
     stop_tokens = set(sampling.stop_tokens)
+    stop_suffixes = tuple(sampling.stop_suffixes or ())
+    suffix_bytes: list[bytes] = [suffix.encode("utf-8") for suffix in stop_suffixes if suffix]
+    if not suffix_bytes and stop_tokens:
+        token_bytes: list[bytes] = []
+        for token_id in stop_tokens:
+            token = _token_id_to_bytes(tokenizer, token_id)
+            if token is None:
+                token_bytes = []
+                break
+            token_bytes.append(token)
+        suffix_bytes = token_bytes
     ban_tokens = tuple(sampling.ban_tokens or ())
     ban_token_ids = [token_id for token_id in ban_tokens if 0 <= token_id < vocab_size]
     no_penalty = set(sampling.no_penalty_token_ids)
@@ -170,7 +224,8 @@ def _continuous_batching(
     for slot_idx in range(batch_size):
         prompt_idx, prompt, tokens, seed = encoded.popleft()
         pending = deque(tokens)
-        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], None, None))
+        stop_state = StopSuffixState(suffix_bytes) if suffix_bytes else None
+        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], None, None, stop_state))
         if seed is not None:
             _set_sampler_seed(slot_idx, seed)
 
@@ -187,6 +242,34 @@ def _continuous_batching(
     window_start_time = start_time
     window_start_tokens = 0
     throughput_ema: float | None = None
+    decode_pool: ThreadPoolExecutor | None = None
+    pending_decodes: list[tuple[Future[str], GenerationOutput, bool]] = []
+
+    def _get_decode_pool() -> ThreadPoolExecutor:
+        nonlocal decode_pool
+        if decode_pool is None:
+            max_workers = min(32, max(2, (os.cpu_count() or 4)))
+            decode_pool = ThreadPoolExecutor(max_workers=max_workers)
+        return decode_pool
+
+    def _schedule_decode(output: GenerationOutput, *, call_on_complete: bool) -> None:
+        pool = _get_decode_pool()
+        future = pool.submit(_decode_tokens, tokenizer, output.token_ids)
+        pending_decodes.append((future, output, call_on_complete))
+
+    def _drain_decodes(*, wait_all: bool) -> None:
+        nonlocal pending_decodes
+        if not pending_decodes:
+            return
+        remaining: list[tuple[Future[str], GenerationOutput, bool]] = []
+        for future, output, call_on_complete in pending_decodes:
+            if not wait_all and not future.done():
+                remaining.append((future, output, call_on_complete))
+                continue
+            output.text = future.result()
+            if call_on_complete and on_complete is not None and not probe_only:
+                on_complete(output)
+        pending_decodes = remaining
 
     def _reset_slot(slot_idx: int) -> None:
         penalties[slot_idx, :] = 0
@@ -219,34 +302,72 @@ def _continuous_batching(
     while active_tasks:
         accomplished: list[int] = []
 
+        max_tokens = sampling.max_generate_tokens if not probe_only else 1
         for idx, task in enumerate(active_tasks):
             if task.pending_tokens:
                 continue
             new_token = task.new_token
             if new_token is None:
                 continue
-            reached_stop = new_token in stop_tokens
-            reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
-            if not reached_stop:
-                task.pending_tokens.append(new_token)
-                task.generated_tokens.append(new_token)
+            reached_stop = False
+            stop_text = ""
+            finish_reason = "max_length"
+
+            reached_length = len(task.generated_tokens) >= max_tokens
+            if not reached_length:
+                if task.stop_state is not None:
+                    token_bytes = _token_id_to_bytes(tokenizer, new_token)
+                    if token_bytes is None and not stop_suffixes:
+                        reached_stop = new_token in stop_tokens
+                        if not reached_stop:
+                            task.pending_tokens.append(new_token)
+                            task.generated_tokens.append(new_token)
+                        finish_reason = "stop_token" if reached_stop else "max_length"
+                    else:
+                        task.generated_tokens.append(new_token)
+                        if token_bytes is not None:
+                            task.stop_state.append_bytes(token_bytes)
+                            match = task.stop_state.match()
+                            if match is not None:
+                                reached_stop = True
+                                trunc_len = task.stop_state.trunc_len()
+                                stop_text = _decode_bytes(task.stop_state.generated_bytes[:trunc_len])
+                        else:
+                            text = _decode_tokens(tokenizer, task.generated_tokens)
+                            match = _match_stop_suffix_text(text, stop_suffixes)
+                            if match is not None:
+                                reached_stop = True
+                                stop_text = text[: max(0, len(text) - match.len)]
+                        if not reached_stop:
+                            task.pending_tokens.append(new_token)
+                        finish_reason = "stop_suffix" if reached_stop else "max_length"
+                else:
+                    reached_stop = new_token in stop_tokens
+                    if not reached_stop:
+                        task.pending_tokens.append(new_token)
+                        task.generated_tokens.append(new_token)
+                    finish_reason = "stop_token" if reached_stop else "max_length"
+
             if reached_stop or reached_length:
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
-                    text="",
-                    finish_reason="stop_token" if reached_stop else "max_length",
+                    text=stop_text,
+                    finish_reason=finish_reason,
                 )
-                if on_complete is not None and not probe_only:
-                    output.text = _decode_tokens(tokenizer, output.token_ids)
-                    on_complete(output)
+                if output.text:
+                    if on_complete is not None and not probe_only:
+                        on_complete(output)
+                else:
+                    _schedule_decode(output, call_on_complete=on_complete is not None and not probe_only)
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
                     prompt_idx, prompt, tokens, seed = encoded.popleft()
                     pending = deque(tokens)
-                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], None, None)
+                    stop_state = StopSuffixState(suffix_bytes) if suffix_bytes else None
+                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], None, None, stop_state)
                     _reset_slot(idx)
                     if seed is not None:
                         _set_sampler_seed(idx, seed)
@@ -256,6 +377,8 @@ def _continuous_batching(
         if accomplished:
             for remove_idx in sorted(accomplished, reverse=True):
                 _remove_slot(remove_idx)
+
+        _drain_decodes(wait_all=False)
 
         next_tokens: list[list[int]] = []
         active_count = len(active_tasks)
@@ -312,10 +435,9 @@ def _continuous_batching(
 
     pbar.close()
 
-    for output in outputs:
-        if output.text:
-            continue
-        output.text = _decode_tokens(tokenizer, output.token_ids)
+    _drain_decodes(wait_all=True)
+    if decode_pool is not None:
+        decode_pool.shutdown(wait=True)
 
     outputs.sort(key=lambda item: item.prompt_index)
     return outputs
@@ -353,6 +475,42 @@ def _prepare_state_container(state):
     if isinstance(state, tuple):
         return list(state)
     raise TypeError("generate_zero_state 必须返回 list 或 tuple")
+
+
+def _token_id_to_bytes(tokenizer: TokenizerProtocol, token_id: int) -> bytes | None:
+    token_map = getattr(tokenizer, "idx2token", None)
+    if isinstance(token_map, dict):
+        token = token_map.get(int(token_id))
+        if isinstance(token, bytes):
+            return token
+        if isinstance(token, str):
+            return token.encode("utf-8")
+    return None
+
+
+def _decode_bytes(data: bytes) -> str:
+    if not data:
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as err:
+        if err.start <= 0:
+            return ""
+        return data[: err.start].decode("utf-8", errors="ignore")
+
+
+def _match_stop_suffix_text(text: str, suffixes: Sequence[str]) -> StopMatch | None:
+    best: StopMatch | None = None
+    for index, suffix in enumerate(suffixes):
+        if not suffix or not text.endswith(suffix):
+            continue
+        candidate = StopMatch(index=index, len=len(suffix))
+        if best is None:
+            best = candidate
+        else:
+            if candidate.len > best.len or (candidate.len == best.len and candidate.index < best.index):
+                best = candidate
+    return best
 
 
 def _decode_tokens(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> str:
