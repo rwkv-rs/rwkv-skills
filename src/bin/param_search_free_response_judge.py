@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.env_config import load_env_file
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import (
@@ -39,19 +40,6 @@ from src.infer.sampling import SamplingConfig
 
 DEFAULT_PASS_K = (1,)
 DEFAULT_AVG_K: tuple[int, ...] = ()
-
-
-def _load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        if "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'").strip('"'))
 
 
 def _round_float(value: float, digits: int = 2) -> float:
@@ -139,7 +127,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _load_env_file(Path(".env"))
+    load_env_file(Path(".env"))
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))

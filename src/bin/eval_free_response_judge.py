@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.env_config import load_env_file
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     LLMJudge,
@@ -32,22 +33,6 @@ from src.infer.model import ModelLoadConfig
 
 DEFAULT_PASS_K = (1,)
 DEFAULT_AVG_K: tuple[int, ...] = ()
-
-
-def _load_env_file(path: Path) -> None:
-    """Lightweight .env loader (key=value, optional quotes, ignores comments)."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        if "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
 
 
 def _count_records(path: str | Path, limit: int | None) -> int:
@@ -147,7 +132,7 @@ def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[s
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    _load_env_file(Path(".env"))
+    load_env_file(Path(".env"))
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))

@@ -208,6 +208,66 @@ def _dispatch_options_from_args(
     )
 
 
+def _resolve_job_list(
+    include: Sequence[str] | None,
+    exclude: Sequence[str] | None,
+    domains: Sequence[str] | None,
+) -> tuple[str, ...]:
+    order = list(JOB_ORDER)
+
+    if domains:
+        allowed_domains = set(domains)
+        order = [job for job in order if JOB_CATALOGUE[job].domain in allowed_domains]
+
+    if include:
+        allowed = {job for job in include}
+        order = [job for job in order if job in allowed]
+    if exclude:
+        blocked = {job for job in exclude}
+        order = [job for job in order if job not in blocked]
+    return tuple(order)
+
+
+def _canonicalize_slugs(
+    parser: argparse.ArgumentParser,
+    slugs: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if not slugs:
+        return tuple()
+    try:
+        return canonicalize_benchmark_list(slugs, known_slugs=_KNOWN_DATASET_SLUGS)
+    except ValueError as exc:  # pragma: no cover - argparse already prints
+        parser.error(str(exc))
+
+
+def _compile_model_patterns(
+    parser: argparse.ArgumentParser,
+    patterns: Sequence[str] | None,
+) -> tuple[re.Pattern[str], ...]:
+    if not patterns:
+        return tuple()
+    compiled: list[re.Pattern[str]] = []
+    for raw in patterns:
+        try:
+            compiled.append(re.compile(raw))
+        except re.error as exc:  # pragma: no cover - argparse already prints
+            parser.error(f"无效的模型正则 {raw!r}: {exc}")
+    return tuple(compiled)
+
+
+def _resolve_job_priority(priority: Sequence[str] | None, available: Sequence[str]) -> tuple[str, ...] | None:
+    if not priority:
+        return None
+    allowed = {job for job in available}
+    ordered: list[str] = []
+    for job in priority:
+        if job in allowed and job not in ordered:
+            ordered.append(job)
+    return tuple(ordered) if ordered else None
+
+
+__all__ = ["build_parser", "main"]
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -277,67 +337,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 1
     return 0
-
-
-def _resolve_job_list(
-    include: Sequence[str] | None,
-    exclude: Sequence[str] | None,
-    domains: Sequence[str] | None,
-) -> tuple[str, ...]:
-    order = list(JOB_ORDER)
-
-    if domains:
-        allowed_domains = set(domains)
-        order = [job for job in order if JOB_CATALOGUE[job].domain in allowed_domains]
-
-    if include:
-        allowed = {job for job in include}
-        order = [job for job in order if job in allowed]
-    if exclude:
-        blocked = {job for job in exclude}
-        order = [job for job in order if job not in blocked]
-    return tuple(order)
-
-
-def _canonicalize_slugs(
-    parser: argparse.ArgumentParser,
-    slugs: Sequence[str] | None,
-) -> tuple[str, ...]:
-    if not slugs:
-        return tuple()
-    try:
-        return canonicalize_benchmark_list(slugs, known_slugs=_KNOWN_DATASET_SLUGS)
-    except ValueError as exc:  # pragma: no cover - argparse already prints
-        parser.error(str(exc))
-
-
-def _compile_model_patterns(
-    parser: argparse.ArgumentParser,
-    patterns: Sequence[str] | None,
-) -> tuple[re.Pattern[str], ...]:
-    if not patterns:
-        return tuple()
-    compiled: list[re.Pattern[str]] = []
-    for raw in patterns:
-        try:
-            compiled.append(re.compile(raw))
-        except re.error as exc:  # pragma: no cover - argparse already prints
-            parser.error(f"无效的模型正则 {raw!r}: {exc}")
-    return tuple(compiled)
-
-
-def _resolve_job_priority(priority: Sequence[str] | None, available: Sequence[str]) -> tuple[str, ...] | None:
-    if not priority:
-        return None
-    allowed = {job for job in available}
-    ordered: list[str] = []
-    for job in priority:
-        if job in allowed and job not in ordered:
-            ordered.append(job)
-    return tuple(ordered) if ordered else None
-
-
-__all__ = ["build_parser", "main"]
 
 
 if __name__ == "__main__":  # pragma: no cover

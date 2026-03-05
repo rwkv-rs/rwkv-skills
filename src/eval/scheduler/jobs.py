@@ -45,6 +45,11 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_fix": "test",
     "human_eval_cn": "test",
     "livecodebench": "test",
+    "tau_bench_retail": "test",
+    "tau_bench_airline": "test",
+    "tau2_bench_retail": "base",
+    "tau2_bench_airline": "base",
+    "tau2_bench_telecom": "base",
 }
 
 
@@ -164,6 +169,11 @@ MBPP_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
 LCB_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
     sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("livecodebench"))
 )
+AGENT_TAU_BENCH_RETAIL_SLUG: Final[str] = canonical_slug("tau_bench_retail_test")
+AGENT_TAU_BENCH_AIRLINE_SLUG: Final[str] = canonical_slug("tau_bench_airline_test")
+AGENT_TAU2_BENCH_RETAIL_SLUG: Final[str] = canonical_slug("tau2_bench_retail_base")
+AGENT_TAU2_BENCH_AIRLINE_SLUG: Final[str] = canonical_slug("tau2_bench_airline_base")
+AGENT_TAU2_BENCH_TELECOM_SLUG: Final[str] = canonical_slug("tau2_bench_telecom_base")
 
 
 JOB_CATALOGUE: dict[str, JobSpec] = {
@@ -266,6 +276,41 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
         probe_samples_per_task=1,  # coding 默认只做 pass@1
+    ),
+    "agent_tau_bench_retail": JobSpec(
+        name="agent_tau_bench_retail",
+        module="src.bin.eval_agent_tau_bench",
+        dataset_slugs=(AGENT_TAU_BENCH_RETAIL_SLUG,),
+        is_cot=False,
+        domain="agent_bench",
+    ),
+    "agent_tau_bench_airline": JobSpec(
+        name="agent_tau_bench_airline",
+        module="src.bin.eval_agent_tau_bench",
+        dataset_slugs=(AGENT_TAU_BENCH_AIRLINE_SLUG,),
+        is_cot=False,
+        domain="agent_bench",
+    ),
+    "agent_tau2_bench_retail": JobSpec(
+        name="agent_tau2_bench_retail",
+        module="src.bin.eval_agent_tau2_bench",
+        dataset_slugs=(AGENT_TAU2_BENCH_RETAIL_SLUG,),
+        is_cot=False,
+        domain="agent_bench",
+    ),
+    "agent_tau2_bench_airline": JobSpec(
+        name="agent_tau2_bench_airline",
+        module="src.bin.eval_agent_tau2_bench",
+        dataset_slugs=(AGENT_TAU2_BENCH_AIRLINE_SLUG,),
+        is_cot=False,
+        domain="agent_bench",
+    ),
+    "agent_tau2_bench_telecom": JobSpec(
+        name="agent_tau2_bench_telecom",
+        module="src.bin.eval_agent_tau2_bench",
+        dataset_slugs=(AGENT_TAU2_BENCH_TELECOM_SLUG,),
+        is_cot=False,
+        domain="agent_bench",
     ),
     "instruction_following": JobSpec(
         name="instruction_following",
