@@ -587,3 +587,147 @@ class EvalDbRepository:
             created_at=created_at,
         )
         session.add(score)
+
+    # ── Session management ────────────────────────────────────────────────────
+
+    def insert_pending_task(
+        self,
+        session: Session,
+        *,
+        config_path: str | None,
+        evaluator: str,
+        is_param_search: bool,
+        created_at: datetime,
+        git_hash: str,
+        model_id: int,
+        benchmark_id: int,
+        session_id: str,
+        session_git_hash: str,
+        log_path: str = "",
+    ) -> int:
+        task = Task(
+            config_path=config_path,
+            evaluator=evaluator,
+            is_param_search=is_param_search,
+            created_at=created_at,
+            status="pending",
+            git_hash=git_hash,
+            model_id=model_id,
+            benchmark_id=benchmark_id,
+            desc=None,
+            sampling_config=None,
+            log_path=log_path,
+            session_id=session_id,
+            session_git_hash=session_git_hash,
+            session_status="pending",
+        )
+        session.add(task)
+        session.flush()
+        return int(task.task_id)
+
+    def update_task_session_status(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+        session_status: str,
+    ) -> None:
+        stmt = update(Task).where(Task.task_id == task_id).values(session_status=session_status)
+        session.execute(stmt)
+
+    def find_pending_task_by_session(
+        self,
+        session: Session,
+        *,
+        session_id: str,
+        benchmark_id: int,
+        model_id: int,
+        is_param_search: bool,
+    ) -> int | None:
+        stmt = (
+            select(Task.task_id)
+            .where(
+                Task.session_id == session_id,
+                Task.benchmark_id == benchmark_id,
+                Task.model_id == model_id,
+                Task.is_param_search == is_param_search,
+                Task.session_status == "pending",
+            )
+            .order_by(Task.created_at.desc())
+            .limit(1)
+        )
+        return session.execute(stmt).scalar_one_or_none()
+
+    def fetch_tasks_by_session(
+        self,
+        session: Session,
+        *,
+        session_id: str,
+        session_statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        stmt = (
+            select(
+                Task.task_id,
+                Task.benchmark_id,
+                Task.model_id,
+                Task.evaluator,
+                Task.is_param_search,
+                Task.status,
+                Task.session_status,
+                Task.session_id,
+                Task.session_git_hash,
+                Task.created_at,
+                Task.log_path,
+                Model.model_name.label("model_name"),
+                Benchmark.benchmark_name.label("benchmark_name"),
+                Benchmark.benchmark_split.label("benchmark_split"),
+            )
+            .join(Model, Model.model_id == Task.model_id)
+            .join(Benchmark, Benchmark.benchmark_id == Task.benchmark_id)
+            .where(Task.session_id == session_id)
+        )
+        if session_statuses:
+            stmt = stmt.where(Task.session_status.in_(session_statuses))
+        stmt = stmt.order_by(Task.task_id.asc())
+        return list(session.execute(stmt).mappings().all())
+
+    def find_latest_incomplete_session(
+        self,
+        session: Session,
+        *,
+        git_hash: str,
+    ) -> str | None:
+        """Find the most recent session_id that has pending/failed tasks with matching git hash."""
+        stmt = (
+            select(Task.session_id)
+            .where(
+                Task.session_id.isnot(None),
+                Task.session_git_hash == git_hash,
+                Task.session_status.in_(["pending", "failed"]),
+            )
+            .order_by(Task.created_at.desc())
+            .limit(1)
+        )
+        return session.execute(stmt).scalar_one_or_none()
+
+    def get_session_git_hash(
+        self,
+        session: Session,
+        *,
+        session_id: str,
+    ) -> str | None:
+        stmt = (
+            select(Task.session_git_hash)
+            .where(Task.session_id == session_id, Task.session_git_hash.isnot(None))
+            .limit(1)
+        )
+        return session.execute(stmt).scalar_one_or_none()
+
+    def count_completions_for_task(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+    ) -> int:
+        stmt = select(func.count()).select_from(Completion).where(Completion.task_id == task_id)
+        return int(session.execute(stmt).scalar_one())

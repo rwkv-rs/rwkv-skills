@@ -12,9 +12,8 @@ from zoneinfo import ZoneInfo
 from src.db.orm import get_session, init_orm, transaction
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices, strict_nonneg_int
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
+from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
-from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags, normalize_model_name
 
 from .eval_db_repo import EvalDbRepository
@@ -137,6 +136,14 @@ class EvalDbService:
             return [cls._sanitize_json_text(item) for item in value]
         return value
 
+    @staticmethod
+    def _missing_benchmark_error(*, dataset: str) -> RuntimeError:
+        return RuntimeError(
+            "benchmark 记录不存在: "
+            f"{dataset}. 请先通过数据集解析流程写入（record_dataset_samples）"
+            "或执行 reconcile_benchmark_num_samples.py。"
+        )
+
     def get_resume_context(
         self,
         *,
@@ -147,7 +154,7 @@ class EvalDbService:
     ) -> ResumeContext:
         """三层级联检索：一次查询获取所有续跑信息。
 
-        Layer 1: 查找/创建 benchmark 和 model
+        Layer 1: 查找 benchmark 和 model
         Layer 2: 查找最新的未完成 task
         Layer 3: 获取已完成的 completion keys（仅 answer 阶段计入 completed）
         """
@@ -172,27 +179,7 @@ class EvalDbService:
                 session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if ctx.benchmark_id is None:
-                resolved_samples = self._resolve_dataset_sample_count(dataset)
-                ctx.benchmark_id = self._repo.insert_benchmark(
-                    session,
-                    benchmark_name=benchmark_name,
-                    benchmark_split=benchmark_split,
-                    url=None,
-                    status="Todo",
-                    num_samples=resolved_samples if resolved_samples is not None else 0,
-                )
-            else:
-                existing = self._parse_num_samples(
-                    self._repo.get_benchmark_num_samples(session, benchmark_id=ctx.benchmark_id)
-                )
-                if not existing:
-                    resolved_samples = self._resolve_dataset_sample_count(dataset)
-                    if resolved_samples is not None and resolved_samples > 0:
-                        self._repo.update_benchmark_num_samples(
-                            session,
-                            benchmark_id=ctx.benchmark_id,
-                            num_samples=resolved_samples,
-                        )
+                raise self._missing_benchmark_error(dataset=dataset)
 
             ctx.model_id = self._repo.get_model_id(
                 session,
@@ -259,6 +246,40 @@ class EvalDbService:
             with get_session() as session:
                 self._repo.update_task_status(session, task_id=ctx.task_id, status="running")
             return str(ctx.task_id)
+        if ctx.benchmark_id is None:
+            raise self._missing_benchmark_error(dataset=dataset)
+        if ctx.model_id is None:
+            raise RuntimeError(f"model 记录不存在: {model}")
+
+        # Check if there's a pre-created pending task from session
+        session_id = os.environ.get("RWKV_SESSION_ID")
+        if session_id:
+            pending_task_id = self.find_pending_task_by_session(
+                session_id=session_id,
+                dataset=dataset,
+                model=model,
+                is_param_search=is_param_search,
+            )
+            if pending_task_id:
+                # Update the pre-created task with runtime info
+                desc = os.environ.get("RWKV_TASK_DESC")
+                log_path = os.environ.get("RWKV_SKILLS_LOG_PATH", "")
+                with get_session() as session:
+                    # Update task fields
+                    from sqlalchemy import update
+                    from src.db.orm import Task
+                    stmt = (
+                        update(Task)
+                        .where(Task.task_id == pending_task_id)
+                        .values(
+                            status="running",
+                            desc=desc,
+                            sampling_config=sampling_config,
+                            log_path=log_path,
+                        )
+                    )
+                    session.execute(stmt)
+                return str(pending_task_id)
 
         benchmark_name, _ = split_benchmark_and_split(dataset)
         model = normalize_model_name(model)
@@ -305,27 +326,7 @@ class EvalDbService:
                 session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
             )
             if benchmark_id is None:
-                resolved_samples = self._resolve_dataset_sample_count(dataset)
-                benchmark_id = self._repo.insert_benchmark(
-                    session,
-                    benchmark_name=benchmark_name,
-                    benchmark_split=benchmark_split,
-                    url=None,
-                    status="Todo",
-                    num_samples=resolved_samples if resolved_samples is not None else 0,
-                )
-            else:
-                existing = self._parse_num_samples(
-                    self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
-                )
-                if not existing:
-                    resolved_samples = self._resolve_dataset_sample_count(dataset)
-                    if resolved_samples is not None and resolved_samples > 0:
-                        self._repo.update_benchmark_num_samples(
-                            session,
-                            benchmark_id=benchmark_id,
-                            num_samples=resolved_samples,
-                        )
+                raise self._missing_benchmark_error(dataset=dataset)
             model = normalize_model_name(model)
             normalized = _normalize_model_identifier(model)
             arch, data_version, num_params = _parse_model_tags(normalized)
@@ -428,6 +429,23 @@ class EvalDbService:
                 benchmark_id=benchmark_id,
                 num_samples=num_samples,
             )
+
+    def expected_completion_count(
+        self,
+        *,
+        dataset: str,
+        sample_limit: int | None,
+        repeats_per_problem: int = 1,
+    ) -> int | None:
+        benchmark_count = self.get_benchmark_num_samples(dataset=dataset)
+        if benchmark_count is None:
+            return None
+        repeats = max(1, int(repeats_per_problem))
+        if sample_limit is None or sample_limit <= 0:
+            effective = benchmark_count
+        else:
+            effective = min(benchmark_count, sample_limit)
+        return effective * repeats
 
     def insert_completion_payload(
         self,
@@ -797,6 +815,157 @@ class EvalDbService:
         with get_session() as session:
             self._repo.update_task_status(session, task_id=int(task_id), status=status)
 
+    def update_task_session_status(self, *, task_id: str, session_status: str) -> None:
+        with get_session() as session:
+            self._repo.update_task_session_status(session, task_id=int(task_id), session_status=session_status)
+
+    # ── Session management ────────────────────────────────────────────────────
+
+    def create_pending_task(
+        self,
+        *,
+        session_id: str,
+        git_hash: str,
+        dataset: str,
+        model: str,
+        job_name: str,
+        is_param_search: bool,
+    ) -> int:
+        """Pre-create a pending task record for a session queue item."""
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
+        normalized = _normalize_model_identifier(model)
+        arch, data_version, num_params = _parse_model_tags(normalized)
+        if not arch or not data_version or not num_params:
+            fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
+            arch = arch or fallback_arch
+            data_version = data_version or fallback_data
+            num_params = num_params or fallback_params
+        arch_version = arch or "unknown"
+        data_version = data_version or "unknown"
+        num_params = num_params or "unknown"
+
+        with get_session() as session:
+            benchmark_id = self._repo.get_benchmark_id(
+                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                raise self._missing_benchmark_error(dataset=dataset)
+
+            model_id = self._repo.get_model_id(
+                session,
+                model_name=model,
+                arch_version=arch_version,
+                data_version=data_version,
+                num_params=num_params,
+            )
+            if model_id is None:
+                model_id = self._repo.insert_model(
+                    session,
+                    model_name=model,
+                    arch_version=arch_version,
+                    data_version=data_version,
+                    num_params=num_params,
+                )
+
+            config_path = config_path_for_benchmark(benchmark_name, model)
+            if config_path.exists():
+                config_path_str = str(config_path)
+            else:
+                fallback_path = config_path_for_benchmark(benchmark_name, None)
+                config_path_str = str(fallback_path) if fallback_path.exists() else None
+
+            task_id = self._repo.insert_pending_task(
+                session,
+                config_path=config_path_str,
+                evaluator=job_name,
+                is_param_search=is_param_search,
+                created_at=self._now_cn(),
+                git_hash=git_hash,
+                model_id=model_id,
+                benchmark_id=benchmark_id,
+                session_id=session_id,
+                session_git_hash=git_hash,
+            )
+        return task_id
+
+    def find_pending_task_by_session(
+        self,
+        *,
+        session_id: str,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+    ) -> int | None:
+        """Find a pending task_id for a given session + benchmark + model."""
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
+        normalized = _normalize_model_identifier(model)
+        arch, data_version, num_params = _parse_model_tags(normalized)
+        if not arch or not data_version or not num_params:
+            fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
+            arch = arch or fallback_arch
+            data_version = data_version or fallback_data
+            num_params = num_params or fallback_params
+        arch_version = arch or "unknown"
+        data_version = data_version or "unknown"
+        num_params = num_params or "unknown"
+
+        with get_session() as session:
+            benchmark_id = self._repo.get_benchmark_id(
+                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                return None
+            model_id = self._repo.get_model_id(
+                session,
+                model_name=model,
+                arch_version=arch_version,
+                data_version=data_version,
+                num_params=num_params,
+            )
+            if model_id is None:
+                return None
+            return self._repo.find_pending_task_by_session(
+                session,
+                session_id=session_id,
+                benchmark_id=benchmark_id,
+                model_id=model_id,
+                is_param_search=is_param_search,
+            )
+
+    def get_session_tasks(
+        self,
+        *,
+        session_id: str,
+        session_statuses: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        with get_session() as session:
+            rows = self._repo.fetch_tasks_by_session(
+                session,
+                session_id=session_id,
+                session_statuses=session_statuses,
+            )
+        result = []
+        for row in rows:
+            d = dict(row)
+            # Count completions for tasks that have been started
+            if d.get("task_id") and d.get("session_status") in ("running", "completed", "failed"):
+                with get_session() as s:
+                    d["completion_count"] = self._repo.count_completions_for_task(s, task_id=int(d["task_id"]))
+            else:
+                d["completion_count"] = 0
+            result.append(d)
+        return result
+
+    def find_latest_incomplete_session(self, *, git_hash: str) -> str | None:
+        with get_session() as session:
+            return self._repo.find_latest_incomplete_session(session, git_hash=git_hash)
+
+    def get_session_git_hash(self, *, session_id: str) -> str | None:
+        with get_session() as session:
+            return self._repo.get_session_git_hash(session, session_id=session_id)
+
     @staticmethod
     def _build_completion_context(payload: dict[str, Any]) -> dict[str, Any]:
         stages: list[dict[str, Any]] = []
@@ -841,21 +1010,6 @@ class EvalDbService:
         except (TypeError, ValueError):
             return None
         return parsed if parsed > 0 else None
-
-    @classmethod
-    def _resolve_dataset_sample_count(cls, dataset: str) -> int | None:
-        path = find_dataset_file(dataset, DATASET_ROOTS)
-        if path is None or not path.exists():
-            return None
-        try:
-            count = 0
-            with path.open("r", encoding="utf-8") as fh:
-                for line in fh:
-                    if line.strip():
-                        count += 1
-        except OSError:
-            return None
-        return count if count > 0 else None
 
     @staticmethod
     def _resolve_git_sha() -> str:

@@ -69,26 +69,6 @@ def _parse_created_at(raw: Any, *, fallback: datetime) -> datetime:
     return fallback
 
 
-def _parse_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(float(text))
-        except ValueError:
-            return None
-    return None
-
-
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -206,10 +186,6 @@ def main(argv: list[str] | None = None) -> int:
         log_path = _resolve_log_path(payload)
         task_name = payload.get("task") if isinstance(payload.get("task"), str) else "score_migration"
 
-        samples = _parse_int(payload.get("samples"))
-        problems = _parse_int(payload.get("problems"))
-        num_samples = samples if samples is not None and samples > 0 else problems
-
         cache_key = (dataset, model, False)
         if not args.allow_duplicates:
             existing = existing_cache.get(cache_key)
@@ -233,20 +209,22 @@ def main(argv: list[str] | None = None) -> int:
                 existing_cache.setdefault(cache_key, set()).add((is_cot, created_at))
             continue
 
-        if num_samples is not None and num_samples > 0:
-            service.ensure_benchmark_num_samples(dataset=dataset, num_samples=num_samples)
-
         os.environ["RWKV_SKILLS_LOG_PATH"] = log_path
         os.environ.setdefault("RWKV_TASK_DESC", "score_migration")
 
-        task_id = service.get_or_create_task(
-            job_name=task_name,
-            job_id=None,
-            dataset=dataset,
-            model=model,
-            is_param_search=False,
-            allow_resume=False,
-        )
+        try:
+            task_id = service.get_or_create_task(
+                job_name=task_name,
+                job_id=None,
+                dataset=dataset,
+                model=model,
+                is_param_search=False,
+                allow_resume=False,
+            )
+        except RuntimeError as exc:
+            stats.errors += 1
+            print(f"WARN: failed to create task for {dataset}: {exc}")
+            continue
 
         payload["dataset"] = dataset
         payload["model"] = model

@@ -19,7 +19,7 @@ TABLE_VIEW_LABELS: dict[str, str] = {
     "benchmark_detail_delta": "明细（上一代 vs 最新）",
     "field_avg_delta": "领域均分（上一代 vs 最新）",
 }
-DEFAULT_TABLE_VIEW = "benchmark_detail_latest"
+DEFAULT_TABLE_VIEW = "benchmark_detail_delta"
 
 
 def _normalize_table_view(raw_value: Any) -> str:
@@ -262,3 +262,10 @@ class TableCellMeta:
             "tooltip": self.tooltip,
             "clickable": self.clickable,
         }
+
+
+@dataclass(slots=True)
+class SortState:
+    """Table sorting state"""
+    column_index: int | None = None
+    ascending: bool = False

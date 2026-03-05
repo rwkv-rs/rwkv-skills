@@ -21,6 +21,7 @@ from .constants import (
     DetailPoint,
     ParamLineage,
     SelectionState,
+    SortState,
     TableCellMeta,
     _normalize_table_view,
 )
@@ -71,7 +72,7 @@ def _col_display_name(header_name: str) -> str:
     Fixed meta columns are returned unchanged.
     """
     name = str(header_name).strip()
-    if name in {"benchmark_name", "num_samples", "eval_method", "k_metric", "field_name", "metric_rule"}:
+    if name in {"benchmark_name", "samples", "eval_method", "k_metric", "field_name", "metric_rule"}:
         return name
 
     # Extract version from parentheses
@@ -350,7 +351,7 @@ def _build_benchmark_detail_latest_table(
     model_cache: dict[str, list[ScoreEntry]],
     domains: set[str],
 ) -> tuple[list[str], list[list[Any]], dict[tuple[int, int], TableCellMeta]]:
-    headers = ["benchmark_name", "num_samples", "eval_method", "k_metric"] + [
+    headers = ["benchmark_name", "samples", "eval_method", "k_metric"] + [
         f"{_format_param(item.param).lower()} · {_model_data_param_label(item.latest_model, include_params=False)}"
         for item in lineages
     ]
@@ -417,7 +418,7 @@ def _build_benchmark_detail_delta_table(
     model_cache: dict[str, list[ScoreEntry]],
     domains: set[str],
 ) -> tuple[list[str], list[list[Any]], dict[tuple[int, int], TableCellMeta]]:
-    headers = ["benchmark_name", "num_samples", "eval_method", "k_metric"]
+    headers = ["benchmark_name", "samples", "eval_method", "k_metric"]
     for item in lineages:
         param_label = _format_param(item.param).lower()
         latest_label = _model_data_param_label(item.latest_model, include_params=False)
@@ -614,6 +615,7 @@ def _build_domain_tables(
     *,
     all_entries: list[ScoreEntry],
     view_mode: str,
+    sort_state: SortState | None = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
     mode = _normalize_table_view(view_mode)
     source_entries = all_entries if all_entries else selection.entries
@@ -626,7 +628,10 @@ def _build_domain_tables(
             lineages=lineages,
             model_cache=model_cache,
         )
-        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
+        # Apply sorting if specified
+        if sort_state and sort_state.column_index is not None:
+            rows, _ = _sort_table_by_column(headers, rows, None, sort_state.column_index, sort_state.ascending)
+        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}", sort_state=sort_state)
         return {group["key"]: table_html for group in DOMAIN_GROUPS}, interaction_meta
 
     if mode == "field_avg_delta":
@@ -634,7 +639,10 @@ def _build_domain_tables(
             lineages=lineages,
             model_cache=model_cache,
         )
-        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}")
+        # Apply sorting if specified
+        if sort_state and sort_state.column_index is not None:
+            rows, _ = _sort_table_by_column(headers, rows, None, sort_state.column_index, sort_state.ascending)
+        table_html = _render_pivot_html(headers, rows, title=f"全领域 · {TABLE_VIEW_LABELS[mode]}", sort_state=sort_state)
         return {group["key"]: table_html for group in DOMAIN_GROUPS}, interaction_meta
 
     tables: dict[str, str] = {}
@@ -653,8 +661,16 @@ def _build_domain_tables(
                 domains=domains,
             )
 
+        # Apply sorting if specified
+        if sort_state and sort_state.column_index is not None:
+            rows, cell_meta = _sort_table_by_column(
+                headers, rows, cell_meta,
+                sort_state.column_index,
+                sort_state.ascending
+            )
+
         title = f"{group['title']} · {TABLE_VIEW_LABELS[mode]}"
-        tables[group["key"]] = _render_pivot_html(headers, rows, title=title, cell_meta=cell_meta)
+        tables[group["key"]] = _render_pivot_html(headers, rows, title=title, cell_meta=cell_meta, sort_state=sort_state)
         for meta in cell_meta.values():
             interaction_meta[meta.cell_id] = meta.as_dict()
 
@@ -739,9 +755,95 @@ def _header_cell_classes(col_idx: int, header_name: str) -> list[str]:
     name = header_name.strip().lower()
     if col_idx == 0:
         classes.append("col-name")
-    if name in {"eval_method", "k_metric", "num_samples"}:
+    if name in {"eval_method", "k_metric", "samples"}:
         classes.append("col-meta")
     return classes
+
+
+def _sort_table_by_column(
+    headers: list[str],
+    rows: list[list[Any]],
+    cell_meta: dict[tuple[int, int], TableCellMeta] | None,
+    column_index: int,
+    ascending: bool,
+) -> tuple[list[list[Any]], dict[tuple[int, int], TableCellMeta] | None]:
+    """
+    Sort table by specified column
+
+    Args:
+        headers: Column headers
+        rows: Row data
+        cell_meta: Cell metadata dictionary
+        column_index: Column index to sort by
+        ascending: True=ascending, False=descending
+
+    Returns:
+        Sorted (rows, cell_meta)
+    """
+    if column_index < 0 or column_index >= len(headers):
+        return rows, cell_meta
+
+    # Determine if column is numeric by checking first non-empty cell
+    is_numeric_column = False
+    for row in rows:
+        if column_index < len(row):
+            cell = row[column_index]
+            cell_value = cell[0] if isinstance(cell, tuple) else cell
+            cell_str = str(cell_value).replace('%', '').replace('+', '').strip()
+            if cell_str not in ['N/A', '—', '-', '']:
+                try:
+                    float(cell_str)
+                    is_numeric_column = True
+                except (ValueError, AttributeError):
+                    is_numeric_column = False
+                break
+
+    # Extract sort key function
+    def sort_key(row_with_index: tuple[int, list[Any]]) -> tuple[float, int] | tuple[str, int]:
+        original_index, row = row_with_index
+        if column_index >= len(row):
+            return (float('inf'), original_index) if is_numeric_column else ('', original_index)
+
+        cell = row[column_index]
+        # Handle tuple format (value, css_class)
+        if isinstance(cell, tuple):
+            cell_value = cell[0]
+        else:
+            cell_value = cell
+
+        if is_numeric_column:
+            # Numeric sorting
+            try:
+                cell_str = str(cell_value).replace('%', '').replace('+', '').strip()
+                if cell_str in ['N/A', '—', '-', '']:
+                    return (float('inf'), original_index)
+                return (float(cell_str), original_index)
+            except (ValueError, AttributeError):
+                return (float('inf'), original_index)
+        else:
+            # String sorting
+            return (str(cell_value).lower(), original_index)
+
+    # Sort with index (for stability)
+    indexed_rows = list(enumerate(rows))
+    sorted_indexed_rows = sorted(indexed_rows, key=sort_key, reverse=not ascending)
+
+    # Build new row list and metadata mapping
+    sorted_rows = [row for _, row in sorted_indexed_rows]
+
+    # Remap cell_meta (row indices changed)
+    if cell_meta is None:
+        return sorted_rows, None
+
+    new_cell_meta: dict[tuple[int, int], TableCellMeta] = {}
+    for new_row_idx, (old_row_idx, _) in enumerate(sorted_indexed_rows):
+        for col_idx in range(len(headers)):
+            old_key = (old_row_idx, col_idx)
+            if old_key in cell_meta:
+                new_key = (new_row_idx, col_idx)
+                new_cell_meta[new_key] = cell_meta[old_key]
+
+    return sorted_rows, new_cell_meta
 
 
 def _render_pivot_html(
@@ -750,6 +852,7 @@ def _render_pivot_html(
     *,
     title: str = "明细",
     cell_meta: dict[tuple[int, int], TableCellMeta] | None = None,
+    sort_state: SortState | None = None,
 ) -> str:
     """Render a pivot table with two-row thead and CSS-class-based cell styling."""
     if not headers:
@@ -759,9 +862,25 @@ def _render_pivot_html(
     col_header_cells: list[str] = []
     for col_idx, header_name in enumerate(headers):
         class_names = _header_cell_classes(col_idx, str(header_name))
+
+        # Determine if column is sortable (all columns are sortable)
+        header_str = str(header_name).strip().lower()
+        is_sortable = True  # Allow sorting on all columns including benchmark_name and metadata
+
+        # Add sort indicator
+        sort_indicator = ""
+        if sort_state and sort_state.column_index == col_idx:
+            sort_indicator = " ▲" if sort_state.ascending else " ▼"
+            class_names.append("sorted")
+
+        if is_sortable:
+            class_names.append("sortable")
+
+        # Add data attribute for JavaScript
+        data_attr = f' data-col-index="{col_idx}"' if is_sortable else ""
         class_attr = f' class="{" ".join(class_names)}"' if class_names else ""
         display_name = _col_display_name(str(header_name))
-        col_header_cells.append(f"<th{class_attr}>{_html(display_name)}</th>")
+        col_header_cells.append(f"<th{class_attr}{data_attr}>{_html(display_name)}{sort_indicator}</th>")
 
     body_rows: list[str] = []
     for row_idx, row in enumerate(rows):

@@ -26,11 +26,8 @@ def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = Non
     if not slug:
         return
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     service = EvalDbService()
-    existing = service.get_benchmark_num_samples(dataset=slug)
-    if existing is not None and existing > 0:
-        return
     try:
         samples = count_jsonl_records(dataset_path)
     except OSError as exc:

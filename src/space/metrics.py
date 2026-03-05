@@ -322,8 +322,8 @@ def _styled_score_cell_norm(value: float | None, min_v: float | None, max_v: flo
 def _styled_delta_cell(delta_value: float | None) -> tuple[str, str]:
     """Return ``(formatted_text, css_class)`` for a delta cell.
 
-    css_class is one of ``"cell-delta-pos"``, ``"cell-delta-neg"``, or
-    ``"cell-na"``.
+    css_class is one of ``"cell-delta-pos"``, ``"cell-delta-neg"``,
+    ``"cell-delta-zero"``, or ``"cell-na"``.
     """
     text = _format_delta_value(delta_value)
     if delta_value is None:
@@ -332,7 +332,7 @@ def _styled_delta_cell(delta_value: float | None) -> tuple[str, str]:
         return text, "cell-delta-pos"
     if delta_value < -1e-6:
         return text, "cell-delta-neg"
-    return text, "cell-na"
+    return text, "cell-delta-zero"
 
 
 # ---------------------------------------------------------------------------

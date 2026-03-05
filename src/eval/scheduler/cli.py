@@ -15,6 +15,8 @@ from .actions import (
     action_dispatch,
     action_logs,
     action_queue,
+    action_resume,
+    action_session_status,
     action_status,
     action_stop,
 )
@@ -46,8 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_job_filters(dispatch_parser)
     _add_dispatch_options(dispatch_parser)
 
+    resume_parser = sub.add_parser("resume", help="续跑未完成的调度会话")
+    resume_parser.add_argument("--session-id", help="指定会话 ID（不指定则自动检测最新未完成会话）")
+    _add_job_filters(resume_parser)
+    _add_dispatch_options(resume_parser)
+
     status_parser = sub.add_parser("status", help="查看正在运行的任务")
     status_parser.add_argument("--pid-dir", default=str(DEFAULT_PID_DIR), help="PID 文件目录")
+    status_parser.add_argument("--session-id", help="查看指定会话的任务状态")
 
     stop_parser = sub.add_parser("stop", help="停止任务")
     stop_parser.add_argument("--pid-dir", default=str(DEFAULT_PID_DIR), help="PID 文件目录")
@@ -213,12 +221,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     command = args.command
 
+    # session-status and resume don't need job_list validation
+    if command == "status" and getattr(args, "session_id", None):
+        action_session_status(StatusOptions(pid_dir=Path(args.pid_dir)), session_id=args.session_id)
+        return 0
+
     job_list = _resolve_job_list(
         getattr(args, "only_jobs", None),
         getattr(args, "skip_jobs", None),
         getattr(args, "domains", None),
     )
-    if not job_list:
+    if not job_list and command not in ("status", "stop", "logs"):
         print("⚠️ 未剩余可调度的 job，请检查 --domains / --only-jobs / --skip-jobs 参数设置")
         return 1
     job_priority = _resolve_job_priority(getattr(args, "job_order", None), job_list)
@@ -259,6 +272,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_select=model_select,
         )
         action_dispatch(opts)
+    elif command == "resume":
+        opts = _dispatch_options_from_args(
+            args,
+            job_list=job_list,
+            job_priority=job_priority,
+            model_globs=model_globs,
+            skip_dataset_slugs=skip_dataset_slugs,
+            only_dataset_slugs=only_dataset_slugs,
+            model_name_patterns=model_name_patterns,
+            min_param_b=min_param_b,
+            max_param_b=max_param_b,
+            model_select=model_select,
+        )
+        action_resume(opts, session_id=getattr(args, "session_id", None))
     elif command == "status":
         action_status(StatusOptions(pid_dir=Path(args.pid_dir)))
     elif command == "stop":

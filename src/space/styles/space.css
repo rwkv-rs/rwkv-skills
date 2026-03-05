@@ -86,7 +86,7 @@ gradio-app,
 .space-root > .space-header {
   background: var(--bg-primary);
   text-align: center;
-  padding: 44px 40px 28px;
+  padding: 44px 16px 28px;
 }
 
 .space-root > .space-header h1 {
@@ -119,7 +119,7 @@ gradio-app,
 
 .space-controls-card,
 .space-section-card {
-  padding: 40px 40px 48px;
+  padding: 24px 16px 32px;
 }
 
 .space-controls-card {
@@ -173,7 +173,7 @@ gradio-app,
 .space-footer {
   background: var(--bg-primary);
   text-align: center;
-  padding: 24px 40px;
+  padding: 24px 16px;
   color: var(--text-muted);
   font-size: 0.85rem;
   font-weight: 400;
@@ -226,7 +226,7 @@ gradio-app,
   background: var(--bg-section-a) !important;
   border: 0 !important;
   margin: 0 !important;
-  padding: 0 40px;
+  padding: 0 16px;
 }
 
 .tab-nav {
@@ -279,12 +279,12 @@ gradio-app,
 }
 
 .space-eval-toggle-row {
-  padding: 16px 40px;
+  padding: 16px;
   position: relative;
 }
 
 .space-eval-pagination-row {
-  padding: 0 40px 32px;
+  padding: 0 16px 32px;
 }
 
 .space-eval-toggle-row > .block,
@@ -366,8 +366,8 @@ gradio-app,
 .space-table-wrapper {
   width: 100%;
   overflow-x: auto;
-  margin: 0 -40px;
-  padding: 0 40px;
+  margin: 0 -16px;
+  padding: 0 16px;
 }
 
 .space-table-wrapper table {
@@ -533,6 +533,11 @@ gradio-app,
   color: #fca5a5 !important;
 }
 
+.bench-table td.cell-delta-zero {
+  background: #1c1c2e !important;
+  color: #ffffff !important;
+}
+
 .bench-table tbody tr:hover td {
   background: #1a1a2a !important;
 }
@@ -543,6 +548,10 @@ gradio-app,
 
 .bench-table tbody tr:hover td.cell-delta-neg {
   background: #7f1d1d !important;
+}
+
+.bench-table tbody tr:hover td.cell-delta-zero {
+  background: #1c1c2e !important;
 }
 
 .space-clickable-score {
@@ -568,10 +577,32 @@ gradio-app,
   color: var(--accent-cyan);
 }
 
+/* Sortable column header styles */
+.col-row th.sortable {
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.2s ease;
+}
+
+.col-row th.sortable:hover {
+  background-color: #2a2a3a;
+}
+
+/* Current sorted column highlight */
+.col-row th.sorted {
+  background-color: #2a2a3a;
+  font-weight: 600;
+  color: #22d3ee;
+}
+
+.col-row th.sorted:hover {
+  background-color: #3a3a4a;
+}
+
 .eval-table {
   width: 100%;
   border-collapse: collapse;
-  table-layout: auto;
+  table-layout: fixed;
 }
 
 .eval-table th,
@@ -602,10 +633,10 @@ gradio-app,
   background: #1a1a28;
 }
 
-/* # column (col 1) */
+/* # column (col 1) - 5% */
 .eval-table tbody td:nth-child(1),
 .eval-table thead th:nth-child(1) {
-  width: 1%;
+  width: 5%;
   white-space: nowrap;
   text-align: center;
   color: var(--text-muted);
@@ -613,12 +644,17 @@ gradio-app,
   font-weight: 700;
 }
 
-/* model_output (col 2) */
+/* model_output (col 2) - 25% */
 .eval-table tbody td:nth-child(2),
 .eval-table thead th:nth-child(2) {
-  width: 1%;
-  white-space: nowrap;
-  text-align: center;
+  width: 25%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+  vertical-align: top;
+  overflow: hidden;
+  max-height: 6.6rem;
+  line-height: 1.5;
 }
 
 .eval-table tbody td:nth-child(2) {
@@ -627,34 +663,37 @@ gradio-app,
   font-weight: 600;
 }
 
-/* is_passed (col 3) */
+/* ref_answer (col 3) - 25% */
 .eval-table tbody td:nth-child(3),
 .eval-table thead th:nth-child(3) {
-  width: 1%;
-  white-space: nowrap;
-  text-align: center;
+  width: 25%;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+  vertical-align: top;
+  overflow: hidden;
+  max-height: 6.6rem;
+  line-height: 1.5;
 }
 
-/* ref_answer (col 4) */
-.eval-table tbody td:nth-child(4),
-.eval-table thead th:nth-child(4) {
-  width: 1%;
-  white-space: nowrap;
-  text-align: center;
-}
-
-.eval-table tbody td:nth-child(4) {
+.eval-table tbody td:nth-child(3) {
   font-family: var(--font-mono);
   font-size: 0.88rem;
   font-weight: 600;
 }
 
-/* llm_reason (col 5) - 25%~50% of table width */
+/* is_passed (col 4) - 8% */
+.eval-table tbody td:nth-child(4),
+.eval-table thead th:nth-child(4) {
+  width: 8%;
+  white-space: nowrap;
+  text-align: center;
+}
+
+/* fail_reason (col 5) - 20% */
 .eval-table tbody td:nth-child(5),
 .eval-table thead th:nth-child(5) {
-  width: 30%;
-  min-width: 180px;
-  max-width: 45%;
+  width: 20%;
   white-space: normal;
   word-break: break-word;
   vertical-align: top;
@@ -665,9 +704,10 @@ gradio-app,
   font-size: 0.88rem;
 }
 
-/* context (col 6) - fill remaining width */
+/* context (col 6) - 17% */
 .eval-table tbody td:nth-child(6),
 .eval-table thead th:nth-child(6) {
+  width: 17%;
   white-space: normal;
   word-break: break-word;
   vertical-align: top;
@@ -1053,7 +1093,7 @@ gradio-app,
 
 @media (max-width: 768px) {
   .space-root > .space-header {
-    padding: 32px 20px 24px;
+    padding: 28px 12px 20px;
   }
 
   .space-root > .space-header h1 {
@@ -1062,25 +1102,30 @@ gradio-app,
 
   .space-controls-card,
   .space-section-card {
-    padding: 28px 16px 36px;
+    padding: 16px 8px 24px;
   }
 
   .tabs {
-    padding: 0 16px;
+    padding: 0;
   }
 
   .table-wrap,
   .space-table-wrapper {
-    margin: 0 -16px;
-    padding: 0 16px;
+    margin: 0 -8px;
+    padding: 0 8px;
+    width: calc(100% + 16px);
   }
 
   .space-eval-toggle-row {
-    padding: 16px;
+    padding: 12px 8px;
   }
 
   .space-eval-pagination-row {
-    padding: 0 16px 28px;
+    padding: 0 8px 20px;
+  }
+
+  .space-footer {
+    padding: 16px 8px;
   }
 }
 

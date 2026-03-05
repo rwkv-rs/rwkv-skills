@@ -236,7 +236,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     min_prompt_count: int | None = None
     target_batch = max(1, args.batch_size)
     problem_count = min(len(records), sample_limit) if sample_limit else len(records)
-    expected_count = problem_count * samples_per_task
+    expected_count = service.expected_completion_count(
+        dataset=str(slug),
+        sample_limit=sample_limit,
+        repeats_per_problem=samples_per_task,
+    )
+    if expected_count is None:
+        expected_count = problem_count * samples_per_task
     try:
         result = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
@@ -255,6 +261,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             actual = service.count_completions(task_id=task_id, status="answer")
             status = "completed" if actual == expected_count else "failed"
             service.update_task_status(task_id=task_id, status=status)
+            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+            if session_task_id:
+                try:
+                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
+                except Exception:
+                    pass
         raise
 
     writer.close()
@@ -265,7 +277,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     pass_metrics_all = compute_pass_at_k(metrics.rows, pass_k)
     avg_metrics_all = compute_avg_at_k(metrics.rows, avg_k)
-    metrics_payload = {"accuracy": metrics.accuracy}
+    # When explicit k-metrics are requested, treat them as the primary score output
+    # and avoid writing legacy `accuracy` into score.metrics.
+    has_explicit_k_metrics = bool(report_pass_k) or bool(report_avg_k)
+    metrics_payload: dict[str, float] = {}
+    if not has_explicit_k_metrics:
+        metrics_payload["accuracy"] = metrics.accuracy
     pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:
         pass_payload = pass_metrics_all or {}
@@ -297,6 +314,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload=score_payload,
         task_id=task_id,
     )
+    # Update session status on success
+    session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+    if session_task_id:
+        try:
+            service.update_task_session_status(task_id=session_task_id, session_status="completed")
+        except Exception:
+            pass
     export_version_results(
         service,
         task_id=task_id,

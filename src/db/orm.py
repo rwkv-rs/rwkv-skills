@@ -192,6 +192,11 @@ class Task(Base):
     sampling_config: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, nullable=True)
     log_path: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # Session fields for version management and resume
+    session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    session_git_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    session_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, server_default=text("'pending'"))
+
     # Relationships
     model: Mapped["Model"] = relationship("Model", back_populates="tasks", lazy="joined")
     benchmark: Mapped["Benchmark"] = relationship("Benchmark", back_populates="tasks", lazy="joined")
@@ -201,6 +206,8 @@ class Task(Base):
     __table_args__ = (
         Index("idx_task_model", "model_id"),
         Index("idx_task_benchmark", "benchmark_id"),
+        Index("idx_task_session", "session_id"),
+        Index("idx_task_session_git_hash", "session_git_hash"),
     )
 
 

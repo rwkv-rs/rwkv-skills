@@ -178,10 +178,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     sample_limit: int | None = args.max_samples
     generate_pass_k = (1,) if args.probe_only else pass_k_final
     samples_per_task = max(_max_k(pass_k_final), _max_k(avg_k_final), 1)
-    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     service = EvalDbService()
+    expected_count = service.expected_completion_count(
+        dataset=str(slug),
+        sample_limit=args.max_samples,
+        repeats_per_problem=samples_per_task,
+    )
+    if expected_count is None:
+        expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
     force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
     # 三层级联检索：一次查询获取所有续跑信息
@@ -281,6 +287,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             actual = service.count_completions(task_id=task_id, status="answer")
             status = "completed" if actual == expected_count else "failed"
             service.update_task_status(task_id=task_id, status=status)
+            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+            if session_task_id:
+                try:
+                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
+                except Exception:
+                    pass
         raise
     writer.close()
     completions_payloads = service.list_completion_payloads(
@@ -330,6 +342,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload=score_payload,
         task_id=task_id,
     )
+    # Update session status on success
+    session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+    if session_task_id:
+        try:
+            service.update_task_session_status(task_id=session_task_id, session_status="completed")
+        except Exception:
+            pass
     export_version_results(
         service,
         task_id=task_id,

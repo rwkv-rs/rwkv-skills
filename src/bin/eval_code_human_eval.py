@@ -110,7 +110,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_queue=args.db_write_queue,
     )
     records = JsonlCodeGenerationLoader(str(dataset_path)).load()
-    expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * max(1, max(pass_k))
+    repeats = max(1, max(pass_k))
+    expected_count = service.expected_completion_count(
+        dataset=str(slug),
+        sample_limit=sample_limit,
+        repeats_per_problem=repeats,
+    )
+    if expected_count is None:
+        expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * repeats
     try:
         result = pipeline.run_human_eval(
             dataset_path=str(dataset_path),
@@ -131,6 +138,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             actual = service.count_completions(task_id=task_id)
             status = "completed" if actual == expected_count else "failed"
             service.update_task_status(task_id=task_id, status=status)
+            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+            if session_task_id:
+                try:
+                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
+                except Exception:
+                    pass
         raise
     if args.probe_only:
         writer.close()
@@ -167,6 +180,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             payload=score_payload,
             task_id=task_id,
         )
+        # Update session status on success
+        session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+        if session_task_id:
+            try:
+                service.update_task_session_status(task_id=session_task_id, session_status="completed")
+            except Exception:
+                pass
         export_version_results(
             service,
             task_id=task_id,

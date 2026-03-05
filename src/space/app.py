@@ -14,6 +14,7 @@ from .constants import (
     DEFAULT_TABLE_VIEW,
     DOMAIN_GROUPS,
     EVAL_FETCH_ROWS,
+    SortState,
     _normalize_table_view,
 )
 from .assets import _load_css, _load_vendor_css, _load_vendor_head
@@ -64,10 +65,12 @@ def _build_dashboard() -> gr.Blocks:
         view_mode=initial_view_mode,
         warnings=warnings,
     )
+    initial_sort_state = SortState(column_index=0, ascending=True)  # Default: sort by benchmark_name ascending
     domain_tables, interaction_meta = _build_domain_tables(
         selection,
         all_entries=entries,
         view_mode=initial_view_mode,
+        sort_state=initial_sort_state,
     )
     initial_eval_html = _render_eval_records_html(meta=None, records=[], only_wrong=False)
     initial_eval_rows: list[dict[str, Any]] = []
@@ -598,6 +601,64 @@ def _build_dashboard() -> gr.Blocks:
 
         root.addEventListener('scroll', hideTooltip, true);
         window.addEventListener('scroll', hideTooltip, true);
+
+        // Column sorting event listeners
+        const attachSortListeners = () => {
+            const tables = root.querySelectorAll('.bench-table');
+            tables.forEach(table => {
+                const headers = table.querySelectorAll('.col-row th.sortable');
+                headers.forEach(header => {
+                    // Remove old listeners by cloning
+                    const newHeader = header.cloneNode(true);
+                    header.parentNode.replaceChild(newHeader, header);
+                });
+
+                // Reattach listeners
+                const newHeaders = table.querySelectorAll('.col-row th.sortable');
+                newHeaders.forEach(header => {
+                    header.addEventListener('click', function() {
+                        const colIndex = this.getAttribute('data-col-index');
+                        const isSorted = this.classList.contains('sorted');
+                        const isAscending = this.textContent.includes('▲');
+
+                        // Determine new sort direction
+                        const newAscending = isSorted ? !isAscending : false;
+
+                        // Update hidden inputs to trigger Gradio event
+                        setTextboxValue('space-sort-column', colIndex);
+                        setTextboxValue('space-sort-ascending', newAscending ? 'true' : 'false');
+                    });
+                });
+            });
+        };
+
+        // Attach listeners on initial load
+        setTimeout(attachSortListeners, 200);
+
+        // Re-attach listeners when tables update (observe DOM changes)
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                if (mutation.type === 'childList') {
+                    const addedNodes = Array.from(mutation.addedNodes);
+                    const hasTable = addedNodes.some(node =>
+                        node.nodeType === 1 && (
+                            node.classList?.contains('bench-table') ||
+                            node.querySelector?.('.bench-table')
+                        )
+                    );
+                    if (hasTable) {
+                        setTimeout(attachSortListeners, 100);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Observe the main content area for table updates
+        const contentArea = root.querySelector('.space-root');
+        if (contentArea) {
+            observer.observe(contentArea, { childList: true, subtree: true });
+        }
     }
     """
 
@@ -642,7 +703,26 @@ def _build_dashboard() -> gr.Blocks:
             selected_cell_state = gr.State(None)
             eval_records_state = gr.State(initial_eval_rows)
             eval_loader_state = gr.State(initial_eval_loader)
+            sort_state = gr.State(SortState(column_index=0, ascending=True))  # Default: sort by benchmark_name ascending
             tables: dict[str, gr.HTML] = {}
+
+            # Hidden textboxes for sort event handling
+            sort_column_input = gr.Textbox(
+                value="",
+                visible=True,
+                container=False,
+                show_label=False,
+                elem_id="space-sort-column",
+                elem_classes="space-hidden-input",
+            )
+            sort_ascending_input = gr.Textbox(
+                value="",
+                visible=True,
+                container=False,
+                show_label=False,
+                elem_id="space-sort-ascending",
+                elem_classes="space-hidden-input",
+            )
 
             with gr.Tabs(elem_classes="tabs"):
                 for group in DOMAIN_GROUPS:
@@ -705,6 +785,7 @@ def _build_dashboard() -> gr.Blocks:
                 selected_view_mode: str,
                 only_wrong: bool,
                 selected_cell: str | None,
+                current_sort_state: SortState,
             ):
                 load_errors: list[str] = []
                 entries = load_scores(errors=load_errors)
@@ -732,6 +813,7 @@ def _build_dashboard() -> gr.Blocks:
                     selection_state,
                     all_entries=entries,
                     view_mode=view_mode,
+                    sort_state=current_sort_state,
                 )
 
                 selected_cell_id = selected_cell if isinstance(selected_cell, str) else None
@@ -758,6 +840,7 @@ def _build_dashboard() -> gr.Blocks:
                         eval_rows,
                         eval_loader,
                         gr.update(interactive=should_poll),
+                        current_sort_state,  # Return the sort state
                     ]
                 )
                 return outputs
@@ -777,21 +860,22 @@ def _build_dashboard() -> gr.Blocks:
                 eval_records_state,
                 eval_loader_state,
                 load_next_page_btn,
+                sort_state,
             ]
 
             model_dropdown.change(
                 update_dashboard,
-                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state, sort_state],
                 outputs=dashboard_outputs,
             )
             refresh_btn.click(
                 update_dashboard,
-                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state, sort_state],
                 outputs=dashboard_outputs,
             )
             table_view.change(
                 update_dashboard,
-                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state],
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state, sort_state],
                 outputs=dashboard_outputs,
             )
 
@@ -907,6 +991,46 @@ def _build_dashboard() -> gr.Blocks:
                 export_csv,
                 inputs=[model_dropdown],
                 outputs=download_btn,
+                queue=False,
+            )
+
+            def handle_sort(
+                column_str: str,
+                ascending_str: str,
+                selected_model: str,
+                selected_view_mode: str,
+                only_wrong: bool,
+                selected_cell: str | None,
+            ):
+                """Handle column sort request"""
+                try:
+                    column_index = int(column_str) if column_str else None
+                    ascending = ascending_str.lower() == "true" if ascending_str else False
+                except (ValueError, AttributeError):
+                    column_index = None
+                    ascending = False
+
+                if column_index is None:
+                    # Invalid sort request, fall back to default
+                    return update_dashboard(selected_model, selected_view_mode, only_wrong, selected_cell, SortState(column_index=0, ascending=True))
+
+                # Create new sort state
+                new_sort_state = SortState(column_index=column_index, ascending=ascending)
+
+                # Rebuild tables with sorting
+                return update_dashboard(selected_model, selected_view_mode, only_wrong, selected_cell, new_sort_state)
+
+            sort_column_input.change(
+                handle_sort,
+                inputs=[
+                    sort_column_input,
+                    sort_ascending_input,
+                    model_dropdown,
+                    table_view,
+                    wrong_only_toggle,
+                    selected_cell_state,
+                ],
+                outputs=dashboard_outputs,
                 queue=False,
             )
 

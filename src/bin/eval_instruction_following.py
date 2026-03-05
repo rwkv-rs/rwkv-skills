@@ -101,7 +101,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_avg_k = _report_avg_k(slug, avg_k_final)
     samples_per_prompt = max(_max_k(avg_k_final), 1)
     records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
-    expected_count = (min(len(records), args.max_samples) if args.max_samples else len(records)) * samples_per_prompt
 
     sampling = resolve_sampling_config(
         slug,
@@ -115,8 +114,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     ban_tokens = tuple(args.ban_token) if args.ban_token else None
 
     init_orm(DEFAULT_DB_CONFIG)
-    
+
     service = EvalDbService()
+    expected_count = service.expected_completion_count(
+        dataset=str(slug),
+        sample_limit=args.max_samples,
+        repeats_per_problem=samples_per_prompt,
+    )
+    if expected_count is None:
+        expected_count = (min(len(records), args.max_samples) if args.max_samples else len(records)) * samples_per_prompt
     force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
     # 三层级联检索：一次查询获取所有续跑信息
@@ -163,6 +169,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             actual = service.count_completions(task_id=task_id)
             status = "completed" if actual == expected_count else "failed"
             service.update_task_status(task_id=task_id, status=status)
+            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+            if session_task_id:
+                try:
+                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
+                except Exception:
+                    pass
         raise
     writer.close()
     completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
@@ -195,6 +207,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload=score_payload,
         task_id=task_id,
     )
+    # Update session status on success
+    session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+    if session_task_id:
+        try:
+            service.update_task_session_status(task_id=session_task_id, session_status="completed")
+        except Exception:
+            pass
     export_version_results(
         service,
         task_id=task_id,

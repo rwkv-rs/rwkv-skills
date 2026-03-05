@@ -154,7 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     pass_k = tuple(args.pass_k) if args.pass_k else DEFAULT_PASS_K
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
-    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+    expected_count = db_service.expected_completion_count(
+        dataset=str(slug),
+        sample_limit=args.max_samples,
+        repeats_per_problem=samples_per_task,
+    )
+    if expected_count is None:
+        expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
 
     cot_sampling = resolve_sampling_config(
         slug,

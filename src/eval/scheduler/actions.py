@@ -3,6 +3,7 @@ from __future__ import annotations
 """User-facing actions backed by the scheduler library."""
 
 import os
+import random
 import re
 import sys
 import time
@@ -40,6 +41,13 @@ from .state import (
 from src.eval.benchmark_config import config_path_for_benchmark
 
 
+def _generate_session_id() -> str:
+    """Generate a unique session ID: timestamp_random."""
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    suffix = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=4))
+    return f"{timestamp}_{suffix}"
+
+
 @dataclass(slots=True)
 class QueueOptions:
     log_dir: Path
@@ -66,6 +74,8 @@ class DispatchOptions(QueueOptions):
     batch_cache_path: Path | None = None
     overwrite: bool = False
     disable_checker: bool = False
+    # For resume: precise (dataset_slug, model_name, job_name) whitelist
+    only_job_triples: frozenset[tuple[str, str, str]] | None = None
 
 
 @dataclass(slots=True)
@@ -125,6 +135,66 @@ def action_dispatch(opts: DispatchOptions) -> None:
     batch_cache = opts.batch_cache_path or (opts.log_dir / "batch_cache.json")
     batch_profiler = BatchProfiler(batch_cache)
     job_priority = _job_priority_map(opts.job_priority)
+
+    # Create session for this dispatch run
+    session_id = _generate_session_id()
+    # Pre-create pending tasks for session tracking
+    from src.db.orm import init_orm
+    from src.db.eval_db_service import EvalDbService, _get_cached_git_sha
+    from .config import DEFAULT_DB_CONFIG
+
+    init_orm(DEFAULT_DB_CONFIG)
+    service = EvalDbService()
+    git_hash = _get_cached_git_sha()
+    print(f"📋 Session ID: {session_id}")
+    print(f"📋 Git Hash: {git_hash}")
+
+    # Build initial queue to pre-create tasks
+    completed, score_records = scan_completed_jobs(opts.log_dir)
+    failed = {record.key for record in score_records.values() if getattr(record, "missing_artifacts", False)}
+    running_entries = load_running(opts.pid_dir)
+    overwrite_mode = opts.overwrite
+    completed_for_queue = set() if overwrite_mode else set(completed)
+
+    initial_queue = build_queue(
+        model_globs=opts.model_globs,
+        job_order=opts.job_order,
+        completed=completed_for_queue,
+        failed=failed,
+        running=running_entries.keys(),
+        skip_dataset_slugs=opts.skip_dataset_slugs,
+        only_dataset_slugs=opts.only_dataset_slugs,
+        model_select=opts.model_select,
+        min_param_b=opts.min_param_b,
+        max_param_b=opts.max_param_b,
+        enable_param_search=opts.enable_param_search,
+        model_name_patterns=opts.model_name_patterns,
+    )
+
+    # If resume mode: filter to exact (dataset_slug, model_name, job_name) triples
+    if opts.only_job_triples:
+        initial_queue = [
+            item for item in initial_queue
+            if (item.dataset_slug, item.model_path.stem, item.job_name) in opts.only_job_triples
+        ]
+
+    # Pre-create pending task records for session tracking
+    task_id_map: dict[str, int] = {}  # job_id -> task_id
+    for item in initial_queue:
+        try:
+            task_id = service.create_pending_task(
+                session_id=session_id,
+                git_hash=git_hash,
+                dataset=item.dataset_slug,
+                model=item.model_path.stem,
+                job_name=item.job_name,
+                is_param_search=False,
+            )
+            task_id_map[item.job_id] = task_id
+        except Exception as e:
+            print(f"⚠️  Failed to pre-create task for {item.job_id}: {e}")
+
+    print(f"📋 Pre-created {len(task_id_map)} pending tasks for session {session_id}")
 
     FAILURE_MONITOR.reset()
     pending_since: dict[str, float] = {}
@@ -209,6 +279,13 @@ def action_dispatch(opts: DispatchOptions) -> None:
         )
         question_counts = derive_question_counts(completed_records)
         queue = sort_queue_items(queue, question_counts=question_counts, job_priority=job_priority)
+
+        # If resume mode: filter to exact (dataset_slug, model_name, job_name) triples
+        if opts.only_job_triples:
+            queue = [
+                item for item in queue
+                if (item.dataset_slug, item.model_path.stem, item.job_name) in opts.only_job_triples
+            ]
 
         for position, item in enumerate(queue):
             if item.job_id not in pending_since:
@@ -327,8 +404,18 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RUN_LOG_DIR": str(opts.log_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
                     "RWKV_SCHEDULER_OVERWRITE": "1" if opts.overwrite else "0",
+                    "RWKV_SESSION_ID": session_id,
                 }
             )
+            # Pass session task_id if pre-created
+            session_task_id = task_id_map.get(item.job_id)
+            if session_task_id is not None:
+                env["RWKV_SESSION_TASK_ID"] = str(session_task_id)
+                # Update session_status to running
+                try:
+                    service.update_task_session_status(task_id=str(session_task_id), session_status="running")
+                except Exception:
+                    pass
             if opts.disable_checker:
                 env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
@@ -685,6 +772,172 @@ def _write_stdout(text: str) -> bool:
     return sys.stdout.write(text) >= 0
 
 
+def action_resume(opts: DispatchOptions, *, session_id: str | None = None) -> None:
+    """Resume an incomplete session."""
+    from src.db.orm import init_orm
+    from src.db.eval_db_service import EvalDbService, _get_cached_git_sha
+    from .config import DEFAULT_DB_CONFIG
+
+    init_orm(DEFAULT_DB_CONFIG)
+    service = EvalDbService()
+
+    # Find session to resume
+    if session_id is None:
+        git_hash = _get_cached_git_sha()
+        session_id = service.find_latest_incomplete_session(git_hash=git_hash)
+        if session_id is None:
+            print(f"❌ No incomplete session found with current git hash: {git_hash}")
+            return
+        print(f"📋 Auto-detected session: {session_id}")
+    else:
+        print(f"📋 Resuming session: {session_id}")
+
+    # Validate git hash
+    session_git_hash = service.get_session_git_hash(session_id=session_id)
+    current_git_hash = _get_cached_git_sha()
+    if session_git_hash != current_git_hash:
+        if session_id is None:
+            print(f"❌ Session git hash mismatch: session={session_git_hash}, current={current_git_hash}")
+            return
+        else:
+            print(f"⚠️  Git hash mismatch: session={session_git_hash}, current={current_git_hash}")
+
+    # Get incomplete tasks
+    incomplete_tasks = service.get_session_tasks(
+        session_id=session_id,
+        session_statuses=["pending", "failed"],
+    )
+
+    if not incomplete_tasks:
+        print("✅ All tasks in session are completed")
+        return
+
+    print(f"📋 Found {len(incomplete_tasks)} incomplete tasks")
+
+    # Extract unique datasets, models, and jobs from incomplete tasks
+    # Store as (dataset, model, job) tuples for precise filtering
+    incomplete_triples = set()
+    for task in incomplete_tasks:
+        status_icon = "○" if task.get("session_status") == "pending" else "✗"
+        dataset = task.get("benchmark_name", "")
+        split = task.get("benchmark_split", "")
+        dataset_label = f"{dataset}_{split}" if split else dataset
+        model = task.get("model_name", "")
+        job = task.get("evaluator", "")
+        print(f"  {status_icon} {dataset_label} | {model} | {job}")
+
+        # Store as tuple for precise matching
+        if dataset and model and job:
+            dataset_slug = f"{dataset}_{split}" if split else dataset
+            incomplete_triples.add((dataset_slug, model, job))
+
+    if not incomplete_triples:
+        print("⚠️  No valid incomplete tasks found")
+        return
+
+    # Extract unique values for filtering
+    incomplete_datasets = {triple[0] for triple in incomplete_triples}
+    incomplete_models = {triple[1] for triple in incomplete_triples}
+    incomplete_jobs = {triple[2] for triple in incomplete_triples}
+
+    # Override opts to only run incomplete tasks
+    import re
+    # Create regex patterns that match the incomplete model names exactly
+    model_patterns = [re.compile(f"^{re.escape(model)}\\.pth$") for model in incomplete_models]
+
+    # Filter job_order to only include incomplete jobs
+    filtered_job_order = tuple(job for job in opts.job_order if job in incomplete_jobs)
+
+    opts = DispatchOptions(
+        log_dir=opts.log_dir,
+        pid_dir=opts.pid_dir,
+        run_log_dir=opts.run_log_dir,
+        job_order=filtered_job_order,
+        job_priority=opts.job_priority,
+        model_globs=opts.model_globs,
+        model_select=opts.model_select,
+        min_param_b=opts.min_param_b,
+        max_param_b=opts.max_param_b,
+        skip_dataset_slugs=opts.skip_dataset_slugs,
+        only_dataset_slugs=tuple(incomplete_datasets),
+        enable_param_search=opts.enable_param_search,
+        model_name_patterns=tuple(model_patterns),
+        dispatch_poll_seconds=opts.dispatch_poll_seconds,
+        gpu_idle_max_mem=opts.gpu_idle_max_mem,
+        skip_missing_dataset=opts.skip_missing_dataset,
+        clean_param_swap=opts.clean_param_swap,
+        batch_cache_path=opts.batch_cache_path,
+        overwrite=True,  # Force overwrite to ignore existing scores
+        disable_checker=opts.disable_checker,
+        only_job_triples=frozenset(incomplete_triples),  # Precise filtering
+    )
+
+    print(f"\n🚀 Starting resume dispatch (filtered to {len(incomplete_datasets)} datasets, {len(incomplete_models)} models, {len(incomplete_jobs)} jobs)...")
+    print(f"   Exact matches: {len(incomplete_triples)} (dataset, model, job) combinations")
+    action_dispatch(opts)
+
+
+def action_session_status(opts: StatusOptions, *, session_id: str) -> None:
+    """Show status of a specific session."""
+    from src.db.orm import init_orm
+    from src.db.eval_db_service import EvalDbService
+    from .config import DEFAULT_DB_CONFIG
+
+    init_orm(DEFAULT_DB_CONFIG)
+    service = EvalDbService()
+    session_git_hash = service.get_session_git_hash(session_id=session_id)
+    if session_git_hash is None:
+        print(f"❌ Session not found: {session_id}")
+        return
+
+    tasks = service.get_session_tasks(session_id=session_id)
+    if not tasks:
+        print(f"❌ No tasks found for session: {session_id}")
+        return
+
+    print(f"Session: {session_id}")
+    print(f"Git Hash: {session_git_hash}")
+    print(f"Created: {tasks[0].get('created_at', 'unknown')}")
+    print()
+
+    # Count by status
+    status_counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0}
+    for task in tasks:
+        status = task.get("session_status", "pending")
+        status_counts[status] = status_counts.get(status, 0) + 1
+
+    print(f"Tasks: {len(tasks)} total")
+    print(f"  ✓ Completed: {status_counts['completed']}")
+    print(f"  ⏳ Running: {status_counts['running']}")
+    print(f"  ✗ Failed: {status_counts['failed']}")
+    print(f"  ○ Pending: {status_counts['pending']}")
+    print()
+
+    # Show task details
+    print("Task Details:")
+    for task in tasks:
+        status = task.get("session_status", "pending")
+        status_icon = {
+            "completed": "✓",
+            "running": "⏳",
+            "failed": "✗",
+            "pending": "○",
+        }.get(status, "?")
+
+        dataset = task.get("benchmark_name", "")
+        split = task.get("benchmark_split", "")
+        dataset_label = f"{dataset}_{split}" if split else dataset
+        model = task.get("model_name", "")
+        task_id = task.get("task_id", "")
+        completion_count = task.get("completion_count", 0)
+
+        extra = ""
+        if completion_count > 0:
+            extra = f" ({completion_count} samples)"
+
+        print(f"  {status_icon} task_id={task_id:<6} {dataset_label:<30} {model:<30}{extra}")
+
+
 __all__ = [
     "DispatchOptions",
     "QueueOptions",
@@ -696,5 +949,7 @@ __all__ = [
     "action_status",
     "action_stop",
     "action_logs",
+    "action_resume",
+    "action_session_status",
     "MODEL_SELECT_CHOICES",
 ]
