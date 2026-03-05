@@ -22,23 +22,15 @@ from typing import Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import build_context_from_completions, strict_nonneg_int
 from src.eval.metrics.code_generation.human_eval import evaluate_functional_correctness
 from src.eval.metrics.code_generation.mbpp import evaluate_mbpp
 
 
-def _iter_jsonl(path: str | Path) -> Iterable[dict]:
-    with Path(path).open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
-
-
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
     if isinstance(source, (str, Path)):
-        yield from _iter_jsonl(source)
+        yield from iter_jsonl(source)
         return
     yield from source
 

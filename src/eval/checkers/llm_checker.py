@@ -9,7 +9,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import orjson
 import jsonschema
@@ -18,6 +18,7 @@ from openai import OpenAI, OpenAIError
 
 from src.eval.env_config import load_env_file
 from src.eval.results.layout import check_details_path
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import strict_nonneg_int
 from src.eval.scheduler.config import REPO_ROOT
 
@@ -124,21 +125,12 @@ def _env_flag(name: str) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "n", "off"}
 
 
-def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield orjson.loads(line)
-
-
 def _load_existing_keys(path: Path) -> set[tuple[str, int, int]]:
     """Return {(dataset_split, sample_index, repeat_index)} already written."""
     if not path.exists():
         return set()
     keys: set[tuple[str, int, int]] = set()
-    for row in _iter_jsonl(path):
+    for row in iter_jsonl(path, loads=orjson.loads):
         split = str(row.get("dataset_split", ""))
         sample_index = strict_nonneg_int(row.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(row.get("repeat_index"), "repeat_index")
@@ -396,7 +388,7 @@ def run_llm_checker(
     failed_rows: list[dict[str, Any]] = []
     benchmark_name: str | None = None
 
-    for row in _iter_jsonl(eval_path):
+    for row in iter_jsonl(eval_path, loads=orjson.loads):
         if benchmark_name is None:
             benchmark_name = str(row.get("benchmark_name", "") or "")
         if bool(row.get("is_passed", False)):

@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from src.eval.agent_bench.deps import ensure_modules_available
+
 
 @dataclass(slots=True)
 class NLAssertionResult:
@@ -134,6 +136,7 @@ def _extract_json_object(text: str) -> Any | None:
 
 
 def _import_litellm_completion():
+    ensure_modules_available(("litellm",), context="tau2-bench NL assertion judge")
     try:
         from litellm import completion
     except Exception as exc:  # pragma: no cover - dependency is optional during unit tests

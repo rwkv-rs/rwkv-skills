@@ -5,7 +5,7 @@ from typing import Any, Mapping
 
 from src.eval.agent_bench.runtime import EpisodeResult
 from src.eval.evaluators.common import SampleRecord, StageRecord
-from src.eval.results.schema import make_eval_payload, strict_nonneg_int
+from src.eval.results.schema import make_eval_payload
 
 
 def episode_to_completion_payload(
@@ -92,21 +92,7 @@ def _extract_agent_result(payload: dict[str, Any]) -> dict[str, Any]:
         "error": None,
     }
 
-
-def completion_rows_for_pass_k(payloads: list[dict[str, Any]]) -> list[tuple[int, int, bool]]:
-    rows: list[tuple[int, int, bool]] = []
-    for payload in payloads:
-        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
-        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
-        result = _extract_agent_result(payload)
-        reward = float(result.get("reward", 0.0))
-        passed = bool(result.get("is_passed", reward >= (1.0 - 1e-6)))
-        rows.append((sample_index, repeat_index, passed))
-    return rows
-
-
 __all__ = [
     "episode_to_completion_payload",
     "completion_to_eval_payload",
-    "completion_rows_for_pass_k",
 ]

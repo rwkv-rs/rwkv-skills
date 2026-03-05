@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Free-form QA evaluation over canonical `results/completions` JSONL."""
 
-import json
 import re
 import time
 import unicodedata
@@ -17,6 +16,7 @@ from openai import OpenAI
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -97,18 +97,9 @@ def resolve_reference_answer(record: FreeAnswerRecord) -> str:
     return record.answer
 
 
-def _iter_jsonl(path: str | Path) -> Iterable[dict]:
-    with Path(path).open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
-
-
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
     if isinstance(source, (str, Path)):
-        yield from _iter_jsonl(source)
+        yield from iter_jsonl(source)
         return
     yield from source
 

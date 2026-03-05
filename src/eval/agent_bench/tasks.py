@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+from src.eval.agent_bench.deps import (
+    ensure_tau_v1_task_dependencies,
+    ensure_tau_v2_task_dependencies,
+    import_module_with_auto_install,
+    run_with_auto_install,
+)
 
 ROOT = Path(__file__).resolve().parent
 TAU_V1_VENDOR_ROOT = ROOT / "data" / "tau_v1"
@@ -24,12 +30,14 @@ class ManifestTask:
 
 
 def ensure_tau_v1_vendor_path() -> Path:
+    ensure_tau_v1_task_dependencies()
     if str(TAU_V1_VENDOR_ROOT) not in sys.path:
         sys.path.insert(0, str(TAU_V1_VENDOR_ROOT))
     return TAU_V1_VENDOR_ROOT
 
 
 def ensure_tau_v2_vendor_path() -> Path:
+    ensure_tau_v2_task_dependencies()
     if str(TAU_V2_VENDOR_ROOT) not in sys.path:
         sys.path.insert(0, str(TAU_V2_VENDOR_ROOT))
     # tau2 expects DATA_DIR/tau2/...; DATA_DIR is TAU2_DATA_DIR when set.
@@ -125,12 +133,7 @@ def _tau_v1_task_source(domain: str, split: str) -> tuple[str, str]:
 def load_tau_v1_tasks(*, domain: str, split: str = "test") -> list[dict[str, Any]]:
     ensure_tau_v1_vendor_path()
     module_name, attr_name = _tau_v1_task_source(domain, split)
-    try:
-        module = importlib.import_module(module_name)
-    except Exception as exc:
-        raise RuntimeError(
-            "failed to import tau v1 task definitions; ensure dependencies (e.g. pydantic) are installed"
-        ) from exc
+    module = import_module_with_auto_install(module_name, context=f"tau-bench task module: {module_name}")
     tasks = getattr(module, attr_name)
     rows: list[dict[str, Any]] = []
     for idx, task in enumerate(tasks):
@@ -163,14 +166,13 @@ def _tau2_env_module(domain: str) -> str:
 
 def load_tau_v2_tasks(*, domain: str, split: str = "base") -> list[dict[str, Any]]:
     ensure_tau_v2_vendor_path()
-    try:
-        module = importlib.import_module(_tau2_env_module(domain))
-    except Exception as exc:
-        raise RuntimeError(
-            "failed to import tau2 task definitions; ensure dependencies (e.g. pydantic) are installed"
-        ) from exc
+    module_name = _tau2_env_module(domain)
+    module = import_module_with_auto_install(module_name, context=f"tau2-bench task module: {module_name}")
     get_tasks = getattr(module, "get_tasks")
-    tasks = get_tasks(split)
+    tasks = run_with_auto_install(
+        lambda: get_tasks(split),
+        context=f"tau2-bench task loading: domain={domain}, split={split}",
+    )
     rows: list[dict[str, Any]] = []
     for idx, task in enumerate(tasks):
         task_payload = _model_dump_any(task)

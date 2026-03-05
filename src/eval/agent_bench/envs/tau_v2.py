@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from src.eval.agent_bench.deps import (
+    ensure_tau_v2_runtime_dependencies,
+    import_module_with_auto_install,
+)
 from src.eval.agent_bench.judge import NLAssertionJudge
 from src.eval.agent_bench.tasks import ensure_tau_v2_vendor_path
 
@@ -20,27 +24,33 @@ class TauV2Env:
 
     def __init__(self, *, domain: str, judge: NLAssertionJudge | None = None) -> None:
         ensure_tau_v2_vendor_path()
+        ensure_tau_v2_runtime_dependencies()
         self.domain = domain
         self.judge = judge
 
         if domain == "retail":
-            from tau2.domains.retail.environment import get_environment  # type: ignore
-
-            self._environment_constructor: Callable[[], Any] = get_environment
+            self._environment_constructor = _tau2_attr(
+                "tau2.domains.retail.environment",
+                "get_environment",
+                context="tau2 retail env import",
+            )
         elif domain == "airline":
-            from tau2.domains.airline.environment import get_environment  # type: ignore
-
-            self._environment_constructor = get_environment
+            self._environment_constructor = _tau2_attr(
+                "tau2.domains.airline.environment",
+                "get_environment",
+                context="tau2 airline env import",
+            )
         elif domain == "telecom":
-            from tau2.domains.telecom.environment import get_environment_manual_policy  # type: ignore
-
-            self._environment_constructor = get_environment_manual_policy
+            self._environment_constructor = _tau2_attr(
+                "tau2.domains.telecom.environment",
+                "get_environment_manual_policy",
+                context="tau2 telecom env import",
+            )
         else:
             raise ValueError(f"Unsupported tau2 domain: {domain}")
 
     def load_task(self, payload: dict[str, Any]) -> Any:
-        from tau2.data_model.tasks import Task  # type: ignore
-
+        Task = _tau2_attr("tau2.data_model.tasks", "Task", context="tau2 Task model import")
         return Task.model_validate(payload)
 
     def create_environment(self) -> Any:
@@ -68,8 +78,11 @@ class TauV2Env:
 
     @staticmethod
     def default_assistant_greeting() -> Any:
-        from tau2.data_model.message import AssistantMessage  # type: ignore
-
+        AssistantMessage = _tau2_attr(
+            "tau2.data_model.message",
+            "AssistantMessage",
+            context="tau2 AssistantMessage import",
+        )
         return AssistantMessage(role="assistant", content="Hi! How can I help you today?")
 
     @staticmethod
@@ -82,8 +95,11 @@ class TauV2Env:
     @staticmethod
     def user_stop_signal(message: Any) -> bool:
         try:
-            from tau2.user.user_simulator import UserSimulator  # type: ignore
-
+            UserSimulator = _tau2_attr(
+                "tau2.user.user_simulator",
+                "UserSimulator",
+                context="tau2 UserSimulator import",
+            )
             return bool(UserSimulator.is_stop(message))
         except Exception:
             content = getattr(message, "content", "")
@@ -97,20 +113,21 @@ class TauV2Env:
 
     @staticmethod
     def build_user_message(content: str) -> Any:
-        from tau2.data_model.message import UserMessage  # type: ignore
-
+        UserMessage = _tau2_attr("tau2.data_model.message", "UserMessage", context="tau2 UserMessage import")
         return UserMessage(role="user", content=content)
 
     @staticmethod
     def build_assistant_message(*, content: str | None, tool_calls: list[Any] | None = None) -> Any:
-        from tau2.data_model.message import AssistantMessage  # type: ignore
-
+        AssistantMessage = _tau2_attr(
+            "tau2.data_model.message",
+            "AssistantMessage",
+            context="tau2 AssistantMessage import",
+        )
         return AssistantMessage(role="assistant", content=content, tool_calls=tool_calls)
 
     @staticmethod
     def build_tool_call(*, tool_call_id: str, name: str, arguments: dict[str, Any]) -> Any:
-        from tau2.data_model.message import ToolCall  # type: ignore
-
+        ToolCall = _tau2_attr("tau2.data_model.message", "ToolCall", context="tau2 ToolCall import")
         return ToolCall(
             id=tool_call_id,
             name=name,
@@ -201,10 +218,22 @@ class TauV2Env:
                 details={"termination_reason": termination_reason, "note": "no evaluation criteria"},
             )
 
-        from tau2.data_model.tasks import RewardType  # type: ignore
-        from tau2.evaluator.evaluator_action import ActionEvaluator  # type: ignore
-        from tau2.evaluator.evaluator_communicate import CommunicateEvaluator  # type: ignore
-        from tau2.evaluator.evaluator_env import EnvironmentEvaluator  # type: ignore
+        RewardType = _tau2_attr("tau2.data_model.tasks", "RewardType", context="tau2 RewardType import")
+        ActionEvaluator = _tau2_attr(
+            "tau2.evaluator.evaluator_action",
+            "ActionEvaluator",
+            context="tau2 ActionEvaluator import",
+        )
+        CommunicateEvaluator = _tau2_attr(
+            "tau2.evaluator.evaluator_communicate",
+            "CommunicateEvaluator",
+            context="tau2 CommunicateEvaluator import",
+        )
+        EnvironmentEvaluator = _tau2_attr(
+            "tau2.evaluator.evaluator_env",
+            "EnvironmentEvaluator",
+            context="tau2 EnvironmentEvaluator import",
+        )
 
         env_reward = EnvironmentEvaluator.calculate_reward(
             environment_constructor=self._environment_constructor,
@@ -254,8 +283,13 @@ class TauV2Env:
         )
 
     def _evaluate_nl_assertions(self, *, task: Any, trajectory: list[Any]) -> Any:
-        from tau2.data_model.simulation import NLAssertionCheck, RewardInfo  # type: ignore
-        from tau2.data_model.tasks import RewardType  # type: ignore
+        NLAssertionCheck = _tau2_attr(
+            "tau2.data_model.simulation",
+            "NLAssertionCheck",
+            context="tau2 NLAssertionCheck import",
+        )
+        RewardInfo = _tau2_attr("tau2.data_model.simulation", "RewardInfo", context="tau2 RewardInfo import")
+        RewardType = _tau2_attr("tau2.data_model.tasks", "RewardType", context="tau2 RewardType import")
 
         criteria = getattr(task, "evaluation_criteria", None)
         nl_assertions = getattr(criteria, "nl_assertions", None) if criteria is not None else None
@@ -268,8 +302,11 @@ class TauV2Env:
             )
 
         if self.judge is None:
-            from tau2.evaluator.evaluator_nl_assertions import NLAssertionsEvaluator  # type: ignore
-
+            NLAssertionsEvaluator = _tau2_attr(
+                "tau2.evaluator.evaluator_nl_assertions",
+                "NLAssertionsEvaluator",
+                context="tau2 NLAssertionsEvaluator import",
+            )
             return NLAssertionsEvaluator.calculate_reward(task=task, full_trajectory=trajectory)
 
         judged = self.judge.evaluate(list(nl_assertions), trajectory)
@@ -316,6 +353,11 @@ def _reward_breakdown_dict(reward_info: Any) -> dict[str, float]:
     for key, value in breakdown.items():
         output[str(key)] = float(value)
     return output
+
+
+def _tau2_attr(module_name: str, attr_name: str, *, context: str) -> Any:
+    module = import_module_with_auto_install(module_name, context=context)
+    return getattr(module, attr_name)
 
 
 __all__ = [

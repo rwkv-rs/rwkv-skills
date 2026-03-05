@@ -23,7 +23,6 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
-from src.db.export_results import export_version_results
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.infer.model import ModelLoadConfig
 
@@ -324,10 +323,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     service.record_score_payload(
         payload=score_payload,
-        task_id=task_id,
-    )
-    export_version_results(
-        service,
         task_id=task_id,
     )
     print(f"✅ CoT free-form done: {result.sample_count} samples")

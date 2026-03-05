@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.eval.agent_bench.chat_bridge import RWKVChatBridge
+from src.eval.agent_bench.deps import import_module_with_auto_install
 from src.eval.agent_bench.envs.tau_v1 import TauV1Env
 from src.eval.agent_bench.envs.tau_v2 import TauV2Env
 from src.eval.env_config import OpenAIModelConfig
@@ -144,8 +145,13 @@ def run_tau_v2_episode(
     if strategy == "human":
         user = HumanUser()
     elif strategy == "llm":
-        from tau2.user.user_simulator import UserSimulator  # type: ignore
-        from tau2.user.base import is_valid_user_history_message  # type: ignore
+        user_module = import_module_with_auto_install(
+            "tau2.user.user_simulator",
+            context="tau2 user simulator import",
+        )
+        base_module = import_module_with_auto_install("tau2.user.base", context="tau2 user base import")
+        UserSimulator = getattr(user_module, "UserSimulator")
+        is_valid_user_history_message = getattr(base_module, "is_valid_user_history_message")
 
         user = UserSimulator(
             instructions=getattr(task.user_scenario, "instructions", ""),

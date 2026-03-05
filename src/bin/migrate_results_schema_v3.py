@@ -18,13 +18,13 @@ Notes:
 """
 
 import argparse
-import json
 import re
 from pathlib import Path
 from typing import Any, Iterable
 
 import orjson
 
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import (
     build_context_from_completions,
     dataset_slug_parts,
@@ -34,15 +34,6 @@ from src.eval.results.schema import (
 
 
 _LETTER_RE = re.compile(r"^[A-Z]$")
-
-
-def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
 
 
 def _write_jsonl_atomic(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -189,7 +180,7 @@ def _convert_completions_record(
 def migrate_completions_file(in_path: Path, out_path: Path) -> None:
     stem = strip_artifact_suffix(in_path.stem)
     benchmark_name, dataset_split = dataset_slug_parts(stem)
-    legacy_payloads = list(_iter_jsonl(in_path))
+    legacy_payloads = list(iter_jsonl(in_path))
     repeats = _infer_repeats_from_legacy(legacy_payloads)
 
     def rows():
@@ -262,7 +253,7 @@ def _infer_pass_fail(legacy: dict[str, Any]) -> tuple[bool, str]:
 def migrate_eval_file(in_path: Path, out_path: Path, *, completions_path: Path, legacy_completions_path: Path) -> None:
     # Build context map from migrated completions.
     context_map: dict[tuple[int, int], tuple[str, str, str]] = {}
-    for payload in _iter_jsonl(completions_path):
+    for payload in iter_jsonl(completions_path):
         sample_index = payload.get("sample_index")
         repeat_index = payload.get("repeat_index")
         if not isinstance(sample_index, int) or not isinstance(repeat_index, int):
@@ -276,11 +267,11 @@ def migrate_eval_file(in_path: Path, out_path: Path, *, completions_path: Path, 
             build_context_from_completions(payload),
         )
 
-    legacy_eval = list(_iter_jsonl(in_path))
+    legacy_eval = list(iter_jsonl(in_path))
 
     # Special mapping for legacy IFEval: (sample_key, sample_id) -> problem_index
     key_map: dict[tuple[int, int], int] = {}
-    legacy_comp_payloads = list(_iter_jsonl(legacy_completions_path)) if legacy_completions_path.exists() else []
+    legacy_comp_payloads = list(iter_jsonl(legacy_completions_path)) if legacy_completions_path.exists() else []
     for payload in legacy_comp_payloads:
         key = payload.get("key")
         sample_id = payload.get("sample_id")
@@ -375,4 +366,3 @@ def main() -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-

@@ -3,13 +3,13 @@ from __future__ import annotations
 """Multiple-choice evaluation over canonical `results/completions` JSONL."""
 
 from dataclasses import dataclass
-import json
 import re
 from pathlib import Path
 from typing import Iterable
 
 
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -25,18 +25,9 @@ class MultipleChoiceMetrics:
     payloads: list[dict]
 
 
-def _iter_jsonl(path: str | Path) -> Iterable[dict]:
-    with Path(path).open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
-
-
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
     if isinstance(source, (str, Path)):
-        yield from _iter_jsonl(source)
+        yield from iter_jsonl(source)
         return
     yield from source
 

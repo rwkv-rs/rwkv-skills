@@ -7,12 +7,11 @@ from pathlib import Path
 import os
 import sys
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from src.eval.env_config import load_env_file
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+load_env_file(REPO_ROOT / ".env")
 RESULTS_ROOT = Path(os.environ.get("RUN_RESULTS_DIR", REPO_ROOT / "results"))
 
 

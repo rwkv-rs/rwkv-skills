@@ -12,6 +12,7 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.orm import init_orm
 from src.eval.agent_bench.chat_bridge import RWKVChatBridge
+from src.eval.agent_bench.deps import ensure_tau_v1_runtime_dependencies
 from src.eval.env_config import (
     apply_openai_env,
     load_env_file,
@@ -87,6 +88,7 @@ def _normalize_pass_k(raw: Sequence[int] | None, *, num_trials: int) -> tuple[in
 def main(argv: Sequence[str] | None = None) -> int:
     load_env_file(Path(".env"))
     args = parse_args(argv)
+    ensure_tau_v1_runtime_dependencies()
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     dataset_slug = infer_dataset_slug_from_path(str(dataset_path))
     domain = infer_domain_from_slug(dataset_slug)

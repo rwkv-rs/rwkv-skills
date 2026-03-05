@@ -27,6 +27,7 @@ from src.eval.datasets.data_loader.instruction_following import JsonlInstruction
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.free_response import resolve_reference_answer as resolve_free_response_reference_answer
 from src.eval.metrics.instruction_following import instructions_registry
+from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import strip_artifact_suffix, strict_nonneg_int
 from src.eval.scheduler.config import DEFAULT_COMPLETION_DIR, DEFAULT_EVAL_RESULT_DIR
 from src.eval.scheduler.datasets import find_dataset_file
@@ -62,15 +63,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Do not write changes; only print what would be updated.",
     )
     return parser.parse_args(argv)
-
-
-def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line)
 
 
 def _write_jsonl_atomic(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -193,7 +185,7 @@ def _build_instruction_ref_answer(record) -> str:
 def _extract_answers_from_completions(job_name: str, completions_path: Path) -> dict[tuple[int, int], str]:
     """Return {(sample_index, repeat_index): answer}."""
     answers: dict[tuple[int, int], str] = {}
-    for payload in _iter_jsonl(completions_path):
+    for payload in iter_jsonl(completions_path):
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         last_stage = _max_stage_index(payload)
@@ -270,7 +262,7 @@ def backfill_eval_file(eval_path: Path, *, prepare_missing: bool, overwrite: boo
 
     def rows():
         nonlocal total, updated, missing_answer, missing_ref
-        for row in _iter_jsonl(eval_path):
+        for row in iter_jsonl(eval_path):
             total += 1
             has_fields = "answer" in row and "ref_answer" in row
             if has_fields and not overwrite:

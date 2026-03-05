@@ -18,7 +18,6 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.job_env import ensure_job_id
 from src.db.eval_db_service import EvalDbService
-from src.db.export_results import export_version_results
 from src.db.orm import init_orm
 
 
@@ -116,10 +115,6 @@ def _promote_score(
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
     service.record_score_payload(
         payload=score_payload,
-        task_id=task_id,
-    )
-    export_version_results(
-        service,
         task_id=task_id,
     )
 

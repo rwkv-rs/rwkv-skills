@@ -32,7 +32,6 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.job_env import ensure_job_id
 from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
-from src.db.export_results import export_version_results
 from src.db.orm import init_orm
 from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
@@ -290,10 +289,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
         db_service.record_score_payload(
             payload=payload,
-            task_id=task_id,
-        )
-        export_version_results(
-            db_service,
             task_id=task_id,
         )
 

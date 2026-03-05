@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from src.eval.agent_bench.deps import (
+    ensure_tau_v1_runtime_dependencies,
+    import_module_with_auto_install,
+)
 from src.eval.agent_bench.tasks import ensure_tau_v1_vendor_path
 
 
@@ -33,7 +37,9 @@ class TauV1Env:
         task_split: str,
     ) -> None:
         ensure_tau_v1_vendor_path()
-        from tau_bench.envs import get_env  # type: ignore
+        ensure_tau_v1_runtime_dependencies()
+        envs_module = import_module_with_auto_install("tau_bench.envs", context="tau-bench runtime import")
+        get_env = getattr(envs_module, "get_env")
 
         self.domain = domain
         self._env = get_env(
@@ -44,7 +50,8 @@ class TauV1Env:
             task_split=task_split,
         )
 
-        from tau_bench.types import RESPOND_ACTION_NAME  # type: ignore
+        types_module = import_module_with_auto_install("tau_bench.types", context="tau-bench runtime types import")
+        RESPOND_ACTION_NAME = getattr(types_module, "RESPOND_ACTION_NAME")
 
         self.respond_action_name = RESPOND_ACTION_NAME
 
@@ -72,7 +79,8 @@ class TauV1Env:
         return self._step(name=self.respond_action_name, kwargs={"content": content})
 
     def _step(self, *, name: str, kwargs: dict[str, Any]) -> TauV1Step:
-        from tau_bench.types import Action  # type: ignore
+        types_module = import_module_with_auto_install("tau_bench.types", context="tau-bench action import")
+        Action = getattr(types_module, "Action")
 
         action = Action(name=name, kwargs=kwargs)
         response = self._env.step(action)

@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 @dataclass(slots=True)
 class OpenAIModelConfig:
@@ -13,19 +15,10 @@ class OpenAIModelConfig:
 
 
 def load_env_file(path: Path | str = ".env") -> None:
-    target = Path(path)
+    target = Path(path).expanduser()
     if not target.exists():
         return
-    for line in target.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
-            continue
-        if "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"").strip("'")
-        os.environ.setdefault(key, value)
+    load_dotenv(dotenv_path=target, override=False, encoding="utf-8")
 
 
 def resolve_required_user_model_config() -> OpenAIModelConfig:
