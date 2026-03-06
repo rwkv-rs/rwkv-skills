@@ -4,10 +4,12 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Literal, Sequence
 
 from src.infer.engine import InferenceEngine
 from src.infer.sampling import SamplingConfig
+
+PromptProfile = Literal["tau_v1", "tau_v2", "legacy"]
 
 
 @dataclass(slots=True)
@@ -35,10 +37,12 @@ class RWKVChatBridge:
         *,
         engine: InferenceEngine,
         default_sampling: SamplingConfig,
+        prompt_profile: PromptProfile = "tau_v1",
         extra_system_instruction: str | None = None,
     ) -> None:
         self._engine = engine
         self._default_sampling = default_sampling
+        self._prompt_profile = prompt_profile
         self._extra_system_instruction = (extra_system_instruction or "").strip()
 
     def chat(
@@ -48,8 +52,15 @@ class RWKVChatBridge:
         *,
         sampling: SamplingConfig | None = None,
         tool_choice: str | None = None,
+        prompt_profile: PromptProfile | None = None,
     ) -> ChatResult:
-        prompt = self._render_prompt(messages, tools_schema=tools_schema or (), tool_choice=tool_choice)
+        profile = prompt_profile or self._prompt_profile
+        prompt = self._render_prompt(
+            messages,
+            tools_schema=tools_schema or (),
+            tool_choice=tool_choice,
+            profile=profile,
+        )
         outputs = self._engine.generate(
             [prompt],
             sampling=sampling or self._default_sampling,
@@ -86,7 +97,130 @@ class RWKVChatBridge:
         *,
         tools_schema: Sequence[dict[str, Any]],
         tool_choice: str | None,
+        profile: PromptProfile,
     ) -> str:
+        if profile == "tau_v1":
+            return self._render_tau_v1(messages, tools_schema=tools_schema, tool_choice=tool_choice)
+        if profile == "tau_v2":
+            return self._render_tau_v2(messages, tools_schema=tools_schema, tool_choice=tool_choice)
+        return self._render_legacy(messages, tools_schema=tools_schema, tool_choice=tool_choice)
+
+    def _render_tau_v1(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools_schema: Sequence[dict[str, Any]],
+        tool_choice: str | None,
+    ) -> str:
+        """Render prompt in tau-bench v1 style: system is domain policy/wiki."""
+        lines: list[str] = []
+
+        # Extract system message (domain policy)
+        system_content = _extract_system_content(messages)
+        if system_content:
+            lines.append(system_content)
+            lines.append("")
+
+        # Tool calling guidance (minimal, since RWKV needs format hints)
+        lines.append("When you need to call a tool, output JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}")
+        lines.append("When you want to respond to the user, just write your response directly.")
+        if tool_choice == "required":
+            lines.append("A tool call is required for this turn.")
+        elif tool_choice == "none":
+            lines.append("Do not call any tools for this turn.")
+
+        # Available tools
+        if tools_schema:
+            lines.append("")
+            lines.append("Available tools:")
+            for tool in tools_schema:
+                lines.append(_serialize_tool(tool))
+
+        # Extra instruction if provided
+        if self._extra_system_instruction:
+            lines.append("")
+            lines.append(self._extra_system_instruction)
+
+        # Conversation (skip system message)
+        lines.append("")
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+            lines.append(_format_message_tau_v1(message))
+
+        lines.append("")
+        lines.append("Assistant:")
+        return "\n".join(lines)
+
+    def _render_tau_v2(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools_schema: Sequence[dict[str, Any]],
+        tool_choice: str | None,
+    ) -> str:
+        """Render prompt in tau2-bench style: <instructions> + <policy> structure."""
+        lines: list[str] = []
+
+        # Extract system message (domain policy)
+        system_content = _extract_system_content(messages)
+
+        # Instructions block
+        instruction_text = (
+            "You are a customer service agent that helps the user according to the <policy> provided below.\n"
+            "In each turn you can either:\n"
+            "- Send a message to the user.\n"
+            "- Make a tool call as JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}\n"
+            "You cannot do both at the same time."
+        )
+        if tool_choice == "required":
+            instruction_text += "\nA tool call is required for this turn."
+        elif tool_choice == "none":
+            instruction_text += "\nDo not call any tools for this turn."
+
+        lines.append("<instructions>")
+        lines.append(instruction_text)
+        lines.append("</instructions>")
+
+        # Policy block
+        lines.append("<policy>")
+        lines.append(system_content if system_content else "Follow standard customer service guidelines.")
+        lines.append("</policy>")
+
+        # Available tools
+        if tools_schema:
+            lines.append("")
+            lines.append("<tools>")
+            for tool in tools_schema:
+                lines.append(_serialize_tool(tool))
+            lines.append("</tools>")
+
+        # Extra instruction if provided
+        if self._extra_system_instruction:
+            lines.append("")
+            lines.append(self._extra_system_instruction)
+
+        # Conversation (skip system message)
+        lines.append("")
+        lines.append("<conversation>")
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+            lines.append(_format_message_tau_v2(message))
+        lines.append("</conversation>")
+
+        lines.append("")
+        lines.append("Assistant:")
+        return "\n".join(lines)
+
+    def _render_legacy(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools_schema: Sequence[dict[str, Any]],
+        tool_choice: str | None,
+    ) -> str:
+        """Legacy prompt format (original strict JSON protocol)."""
         lines: list[str] = []
         lines.append("You are an AI support agent. You must follow tool definitions exactly.")
         if self._extra_system_instruction:
@@ -115,6 +249,52 @@ class RWKVChatBridge:
         lines.append("")
         lines.append("Now output one JSON object only.")
         return "\n".join(lines)
+
+
+def _extract_system_content(messages: Sequence[dict[str, Any]]) -> str:
+    """Extract system message content from messages."""
+    for message in messages:
+        if message.get("role") == "system":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+    return ""
+
+
+def _format_message_tau_v1(message: dict[str, Any]) -> str:
+    """Format a single message for tau_v1 style."""
+    role = str(message.get("role", "assistant"))
+    content = message.get("content")
+
+    if role == "user":
+        return f"User: {content or ''}"
+    if role == "assistant":
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            return f"Assistant: [tool_call] {json.dumps(tool_calls, ensure_ascii=False)}"
+        return f"Assistant: {content or ''}"
+    if role == "tool":
+        tool_name = message.get("name", "unknown")
+        return f"Tool ({tool_name}): {content or ''}"
+    return f"{role}: {content or ''}"
+
+
+def _format_message_tau_v2(message: dict[str, Any]) -> str:
+    """Format a single message for tau_v2 style."""
+    role = str(message.get("role", "assistant"))
+    content = message.get("content")
+
+    if role == "user":
+        return f"<user>{content or ''}</user>"
+    if role == "assistant":
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            return f"<assistant><tool_call>{json.dumps(tool_calls, ensure_ascii=False)}</tool_call></assistant>"
+        return f"<assistant>{content or ''}</assistant>"
+    if role == "tool":
+        tool_name = message.get("name", "unknown")
+        return f"<tool name=\"{tool_name}\">{content or ''}</tool>"
+    return f"<{role}>{content or ''}</{role}>"
 
 
 def _serialize_message(message: dict[str, Any]) -> str:
@@ -332,6 +512,7 @@ def _parse_function_call_fallback(text: str, *, tool_names: set[str]) -> ParsedT
 
 
 __all__ = [
+    "PromptProfile",
     "ParsedToolCall",
     "ChatResult",
     "RWKVChatBridge",

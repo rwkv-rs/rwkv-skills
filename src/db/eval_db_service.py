@@ -488,7 +488,11 @@ class EvalDbService:
         created_at = self._now_cn()
         task_id_int = int(task_id)
         with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(session, task_id=task_id_int)
+            mapping = self._repo.fetch_completion_id_map(
+                session,
+                task_id=task_id_int,
+                status="answer",
+            )
             existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
                 session,
                 task_id=task_id_int,
@@ -682,6 +686,24 @@ class EvalDbService:
                         payload[f"prompt{idx}"] = stage.get("prompt")
                         payload[f"completion{idx}"] = stage.get("completion")
                         payload[f"stop_reason{idx}"] = stage.get("stop_reason")
+                agent_result = context.get("agent_result")
+                if isinstance(agent_result, dict):
+                    payload["agent_result"] = agent_result
+                agent_info = context.get("agent_info")
+                if isinstance(agent_info, dict):
+                    payload["agent_info"] = agent_info
+                agent_trace = context.get("agent_trace")
+                if isinstance(agent_trace, list):
+                    payload["agent_trace"] = agent_trace
+                task_name = context.get("task_id")
+                if isinstance(task_name, str):
+                    payload["task_id"] = task_name
+                domain = context.get("domain")
+                if isinstance(domain, str):
+                    payload["domain"] = domain
+                instruction = context.get("instruction")
+                if isinstance(instruction, str):
+                    payload["instruction"] = instruction
             payloads.append(payload)
         return payloads
 
@@ -812,6 +834,10 @@ class EvalDbService:
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
+        for key in ("agent_result", "agent_info", "agent_trace", "task_id", "domain", "instruction"):
+            value = payload.get(key)
+            if value is not None:
+                context[key] = value
         sanitized = EvalDbService._sanitize_json_text(context)
         return sanitized if isinstance(sanitized, dict) else {}
 

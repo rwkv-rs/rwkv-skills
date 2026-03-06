@@ -74,6 +74,11 @@ def _extract_agent_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = payload.get("agent_result")
     if isinstance(result, dict):
         return result
+    context = payload.get("context")
+    if isinstance(context, dict):
+        context_result = context.get("agent_result")
+        if isinstance(context_result, dict):
+            return context_result
 
     answer = payload.get("answer")
     if isinstance(answer, str):

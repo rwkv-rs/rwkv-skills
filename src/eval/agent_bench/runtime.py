@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.eval.agent_bench.chat_bridge import RWKVChatBridge
+from src.eval.agent_bench.chat_bridge import PromptProfile, RWKVChatBridge
 from src.eval.agent_bench.deps import import_module_with_auto_install
 from src.eval.agent_bench.envs.tau_v1 import TauV1Env
 from src.eval.agent_bench.envs.tau_v2 import TauV2Env
@@ -42,6 +42,7 @@ def run_tau_v1_episode(
     task_index: int,
     max_steps: int,
     sampling: SamplingConfig | None = None,
+    prompt_profile: PromptProfile = "tau_v1",
 ) -> EpisodeResult:
     reset = env.reset(task_index=task_index)
     messages: list[dict[str, Any]] = [
@@ -58,6 +59,7 @@ def run_tau_v1_episode(
             env.tools_schema,
             sampling=sampling,
             tool_choice="auto",
+            prompt_profile=prompt_profile,
         )
         stages.append(
             StageRecord(
@@ -132,6 +134,7 @@ def run_tau_v2_episode(
     max_errors: int = 10,
     user_temperature: float = 0.0,
     sampling: SamplingConfig | None = None,
+    prompt_profile: PromptProfile = "tau_v2",
 ) -> EpisodeResult:
     task = runtime_env.load_task(task_payload)
     environment = runtime_env.create_environment()
@@ -197,6 +200,7 @@ def run_tau_v2_episode(
             runtime_env.tools_schema(environment),
             sampling=sampling,
             tool_choice="auto",
+            prompt_profile=prompt_profile,
         )
         stages.append(
             StageRecord(

@@ -4,6 +4,8 @@ import importlib
 import importlib.util
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -124,7 +126,7 @@ def _pip_install(*, requirements: list[str], context: str) -> None:
         f"[agent_bench] Auto-installing missing dependencies for {context}: {', '.join(unique_requirements)}",
         flush=True,
     )
-    cmd = [
+    pip_cmd = [
         sys.executable,
         "-m",
         "pip",
@@ -132,14 +134,75 @@ def _pip_install(*, requirements: list[str], context: str) -> None:
         "--disable-pip-version-check",
         *unique_requirements,
     ]
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as exc:
-        joined = " ".join(cmd)
-        raise RuntimeError(
-            f"Failed to auto-install dependencies for {context}. "
-            f"Please run: {joined}"
-        ) from exc
+
+    tried: list[tuple[str, list[str], str]] = []
+
+    ok, detail = _run_install_command(pip_cmd)
+    if ok:
+        return
+    tried.append(("pip", pip_cmd, detail))
+
+    if _looks_like_missing_module(detail, "pip"):
+        ensurepip_cmd = [sys.executable, "-m", "ensurepip", "--upgrade"]
+        ok, detail = _run_install_command(ensurepip_cmd)
+        if ok:
+            ok, detail = _run_install_command(pip_cmd)
+            if ok:
+                return
+            tried.append(("pip-after-ensurepip", pip_cmd, detail))
+        else:
+            tried.append(("ensurepip", ensurepip_cmd, detail))
+
+    uv_path = shutil.which("uv")
+    if uv_path:
+        uv_cmd = [
+            uv_path,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            *unique_requirements,
+        ]
+        ok, detail = _run_install_command(uv_cmd)
+        if ok:
+            return
+        tried.append(("uv-pip", uv_cmd, detail))
+
+    hint_lines = "\n".join(f"- {_shell_join(cmd)}" for _, cmd, _ in tried)
+    last_detail = tried[-1][2] if tried else "unknown install failure"
+    raise RuntimeError(
+        f"Failed to auto-install dependencies for {context}.\n"
+        f"Tried commands:\n{hint_lines}\n"
+        f"Last error: {last_detail}"
+    )
+
+
+def _run_install_command(command: list[str]) -> tuple[bool, str]:
+    proc = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode == 0:
+        return True, ""
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    detail = "\n".join(part for part in (stdout, stderr) if part).strip()
+    if not detail:
+        detail = f"exit code {proc.returncode}"
+    return False, detail
+
+
+def _looks_like_missing_module(detail: str, module_name: str) -> bool:
+    text = detail.lower()
+    needle = f"no module named {module_name.lower()}"
+    return needle in text
+
+
+def _shell_join(command: list[str]) -> str:
+    return shlex.join(command)
 
 
 def _resolve_requirement_from_module(module_name: str) -> str:

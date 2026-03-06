@@ -350,12 +350,15 @@ class EvalDbRepository:
         session: Session,
         *,
         task_id: int,
+        status: str | None = None,
     ) -> dict[tuple[int, int], int]:
         stmt = select(
             Completion.completions_id,
             Completion.sample_index,
             Completion.repeat_index,
         ).where(Completion.task_id == task_id)
+        if status:
+            stmt = stmt.where(Completion.status == status)
         rows = session.execute(stmt).all()
         mapping: dict[tuple[int, int], int] = {}
         for completions_id, sample_index, repeat_index in rows:
