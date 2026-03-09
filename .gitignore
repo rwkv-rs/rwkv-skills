@@ -12,6 +12,10 @@ wheels/
 /results
 /results_old
 .env
-/data
+data/
 /results.7z
 config_backup
+
+
+tau_bench/
+tau2_bench/

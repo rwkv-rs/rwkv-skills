@@ -15,6 +15,13 @@ from typing import Callable, TypeVar
 _AUTO_INSTALL_ENV = "RWKV_AGENT_BENCH_AUTO_INSTALL_DEPS"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _PYPROJECT_PATH = _REPO_ROOT / "pyproject.toml"
+_AGENT_BENCH_ROOT = Path(__file__).resolve().parent
+_TAU_V1_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v1"
+_TAU_V2_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v2"
+_TAU_V2_DATA_ROOT = _TAU_V2_VENDOR_ROOT / "data"
+_TAU_V1_LOCAL_ROOT = _REPO_ROOT / "tau-bench"
+_TAU_V2_LOCAL_ROOT = _REPO_ROOT / "tau2-bench" / "src"
+_TAU_V2_LOCAL_DATA_ROOT = _REPO_ROOT / "tau2-bench" / "data"
 
 # module name -> distribution name
 _MODULE_TO_DIST: dict[str, str] = {
@@ -75,10 +82,11 @@ def run_with_auto_install(operation: Callable[[], _T], *, context: str, max_roun
             missing = _normalize_missing_module(exc.name)
             if not missing:
                 raise
-            if missing.startswith("tau2") or missing.startswith("tau_bench"):
-                raise
             if missing in installed_missing:
                 raise
+            if _ensure_agent_bench_vendor_module(missing):
+                installed_missing.add(missing)
+                continue
             ensure_modules_available((missing,), context=context)
             installed_missing.add(missing)
     return operation()
@@ -86,6 +94,13 @@ def run_with_auto_install(operation: Callable[[], _T], *, context: str, max_roun
 
 def ensure_modules_available(modules: tuple[str, ...] | list[str], *, context: str) -> None:
     missing = [name for name in modules if not _module_available(name)]
+    if not missing:
+        return
+    unresolved: list[str] = []
+    for name in missing:
+        if not _ensure_agent_bench_vendor_module(name):
+            unresolved.append(name)
+    missing = unresolved
     if not missing:
         return
     if not _auto_install_enabled():
@@ -199,6 +214,37 @@ def _looks_like_missing_module(detail: str, module_name: str) -> bool:
     text = detail.lower()
     needle = f"no module named {module_name.lower()}"
     return needle in text
+
+
+def _ensure_agent_bench_vendor_module(module_name: str) -> bool:
+    normalized = _normalize_missing_module(module_name)
+    if normalized == "tau_bench":
+        return _add_first_existing_path((_TAU_V1_VENDOR_ROOT, _TAU_V1_LOCAL_ROOT))
+    if normalized == "tau2":
+        ok = _add_first_existing_path((_TAU_V2_VENDOR_ROOT, _TAU_V2_LOCAL_ROOT))
+        if ok:
+            data_root = _first_existing_path((_TAU_V2_DATA_ROOT, _TAU_V2_LOCAL_DATA_ROOT))
+            if data_root is not None:
+                os.environ.setdefault("TAU2_DATA_DIR", str(data_root))
+        return ok
+    return False
+
+
+def _add_first_existing_path(candidates: tuple[Path, ...]) -> bool:
+    path = _first_existing_path(candidates)
+    if path is None:
+        return False
+    text = str(path)
+    if text not in sys.path:
+        sys.path.insert(0, text)
+    return True
+
+
+def _first_existing_path(candidates: tuple[Path, ...]) -> Path | None:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _shell_join(command: list[str]) -> str:

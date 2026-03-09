@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
@@ -90,6 +91,17 @@ def _normalize_pass_k(raw: Sequence[int] | None, *, num_trials: int) -> tuple[in
     return tuple(range(1, max(1, int(num_trials)) + 1))
 
 
+def _ingest_current_eval_payloads(
+    service: EvalDbService,
+    *,
+    task_id: str,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
+    eval_payloads = [completion_to_eval_payload(item) for item in completions_payloads]
+    service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+    return completions_payloads, eval_payloads
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     load_env_file(Path(".env"))
     args = parse_args(argv)
@@ -156,6 +168,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_id=task_id,
         max_queue=args.db_write_queue,
     )
+    should_exit = {"active": False}
+    original_signal_handlers: dict[signal.Signals, object] = {}
+
+    def _restore_signal_handlers() -> None:
+        for sig, handler in original_signal_handlers.items():
+            signal.signal(sig, handler)
+        original_signal_handlers.clear()
+
+    def _flush_partial_eval(signame: str) -> None:
+        try:
+            _ingest_current_eval_payloads(service, task_id=task_id)
+        except Exception as exc:
+            print(f"⚠️ Failed to ingest partial tau2-bench eval rows during {signame}: {exc}")
+
+    def _handle_termination(signum: int, _frame: object) -> None:
+        if should_exit["active"]:
+            raise SystemExit(128 + signum)
+        should_exit["active"] = True
+        signame = signal.Signals(signum).name
+        print(f"⚠️ Received {signame}; draining tau2-bench completions before exit...")
+        try:
+            writer.close(timeout_s=30.0)
+        except Exception as exc:
+            print(f"⚠️ Failed to close completion writer during {signame}: {exc}")
+        _flush_partial_eval(signame)
+        try:
+            service.update_task_status(task_id=task_id, status="failed")
+        except Exception as exc:
+            print(f"⚠️ Failed to mark task {task_id} failed after {signame}: {exc}")
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        original_signal_handlers[sig] = signal.getsignal(sig)
+        signal.signal(sig, _handle_termination)
 
     try:
         for sample_index, record in enumerate(manifest):
@@ -190,20 +236,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload["domain"] = record.domain
                 payload["instruction"] = record.instruction
                 writer.enqueue(payload)
+        writer.close(timeout_s=30.0)
     except BaseException:
         try:
-            writer.close()
+            writer.close(timeout_s=30.0)
         finally:
+            _flush_partial_eval("exception")
             actual = service.count_completions(task_id=task_id, status="answer")
-            status = "completed" if actual == expected_count else "failed"
+            status = "failed" if should_exit["active"] else ("completed" if actual == expected_count else "failed")
             service.update_task_status(task_id=task_id, status=status)
         raise
+    finally:
+        _restore_signal_handlers()
 
-    writer.close()
-
-    completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
-    eval_payloads = [completion_to_eval_payload(item) for item in completions_payloads]
-    service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+    completions_payloads, eval_payloads = _ingest_current_eval_payloads(service, task_id=task_id)
 
     metrics = compute_agent_metrics(
         eval_payloads,

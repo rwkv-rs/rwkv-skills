@@ -60,6 +60,9 @@ def completion_to_eval_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "cost": float(result.get("cost", 0.0)),
         "error": result.get("error"),
     }
+    agent_info = payload.get("agent_info")
+    if isinstance(agent_info, dict) and agent_info:
+        answer_payload["details"] = agent_info
     fail_reason = "" if passed else "reward_below_threshold"
     return make_eval_payload(
         payload,
