@@ -25,7 +25,7 @@ from src.eval.agent_bench.envs import TauV2Env
 from src.eval.agent_bench.judge import NLAssertionJudge
 from src.eval.agent_bench.metrics import compute_agent_metrics
 from src.eval.agent_bench.payloads import completion_to_eval_payload, episode_to_completion_payload
-from src.eval.agent_bench.runtime import run_tau_v2_episode
+from src.eval.agent_bench.runtime import run_tau_v2_episodes
 from src.eval.agent_bench.tasks import infer_domain_from_slug, load_manifest
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.results.payloads import make_score_payload
@@ -52,6 +52,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model", help="Override judge model name")
     parser.add_argument("--max-turns", type=int, default=80, help="Maximum agent turns per episode")
     parser.add_argument("--max-errors", type=int, default=10, help="Maximum tool errors in one episode")
+    parser.add_argument("--batch-size", type=int, default=1, help="Max concurrent agent episodes / RWKV batch size")
+    parser.add_argument("--probe-only", action="store_true", help="Run a minimal batch-sizing probe")
     parser.add_argument("--max-samples", type=int, help="Limit number of tasks for quick runs")
     parser.add_argument("--num-trials", type=int, default=1, help="Number of repeats per task")
     parser.add_argument("--pass-k", type=int, action="append", help="pass@k values to report")
@@ -111,9 +113,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     domain = infer_domain_from_slug(dataset_slug)
     benchmark_name, dataset_split = split_benchmark_and_split(dataset_slug)
     num_trials = max(1, int(args.num_trials))
+    batch_size = max(1, int(args.batch_size))
     pass_k = _normalize_pass_k(args.pass_k, num_trials=num_trials)
+    if args.user_strategy == "human" and batch_size > 1:
+        raise ValueError("human user_strategy 不支持 batch_size > 1")
+    effective_max_samples = args.max_samples
+    if args.probe_only and (effective_max_samples is None or effective_max_samples <= 0 or effective_max_samples > batch_size):
+        effective_max_samples = batch_size
 
-    manifest = load_manifest(dataset_path, max_samples=args.max_samples)
+    manifest = load_manifest(dataset_path, max_samples=effective_max_samples)
     expected_count = len(manifest) * num_trials
 
     model_name = Path(args.model_path).stem
@@ -204,6 +212,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         signal.signal(sig, _handle_termination)
 
     try:
+        pending_requests: list[tuple[int, int, object]] = []
+        task_payloads: list[dict[str, object]] = []
         for sample_index, record in enumerate(manifest):
             task_payload = record.payload.get("task")
             if not isinstance(task_payload, dict):
@@ -213,29 +223,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 key = (sample_index, repeat_index)
                 if key in skip_keys:
                     continue
+                pending_requests.append((sample_index, repeat_index, record))
+                task_payloads.append(task_payload)
 
-                episode = run_tau_v2_episode(
-                    bridge=bridge,
-                    runtime_env=runtime_env,
-                    task_payload=task_payload,
-                    user_strategy=args.user_strategy,
-                    user_model=user_model,
-                    max_steps=args.max_turns,
-                    max_errors=args.max_errors,
-                    sampling=sampling,
-                )
-                payload = episode_to_completion_payload(
-                    episode,
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=sample_index,
-                    repeat_index=repeat_index,
-                    sampling_config=sampling_payload,
-                )
-                payload["task_id"] = record.task_id
-                payload["domain"] = record.domain
-                payload["instruction"] = record.instruction
-                writer.enqueue(payload)
+        def _enqueue_episode(request_index: int, episode) -> None:
+            sample_index, repeat_index, record = pending_requests[request_index]
+            payload = episode_to_completion_payload(
+                episode,
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=sample_index,
+                repeat_index=repeat_index,
+                sampling_config=sampling_payload,
+            )
+            payload["task_id"] = record.task_id
+            payload["domain"] = record.domain
+            payload["instruction"] = record.instruction
+            writer.enqueue(payload)
+
+        run_tau_v2_episodes(
+            bridge=bridge,
+            runtime_env=runtime_env,
+            task_payloads=task_payloads,
+            user_strategy=args.user_strategy,
+            user_model=user_model,
+            max_steps=args.max_turns,
+            max_errors=args.max_errors,
+            max_concurrency=batch_size,
+            sampling=sampling,
+            on_complete=_enqueue_episode,
+        )
         writer.close(timeout_s=30.0)
     except BaseException:
         try:

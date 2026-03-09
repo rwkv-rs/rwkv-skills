@@ -283,6 +283,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=(AGENT_TAU_BENCH_RETAIL_SLUG,),
         is_cot=False,
         domain="agent_bench",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
     ),
     "agent_tau_bench_airline": JobSpec(
         name="agent_tau_bench_airline",
@@ -290,6 +293,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=(AGENT_TAU_BENCH_AIRLINE_SLUG,),
         is_cot=False,
         domain="agent_bench",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
     ),
     "agent_tau2_bench_retail": JobSpec(
         name="agent_tau2_bench_retail",
@@ -297,6 +303,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=(AGENT_TAU2_BENCH_RETAIL_SLUG,),
         is_cot=False,
         domain="agent_bench",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
     ),
     "agent_tau2_bench_airline": JobSpec(
         name="agent_tau2_bench_airline",
@@ -304,6 +313,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=(AGENT_TAU2_BENCH_AIRLINE_SLUG,),
         is_cot=False,
         domain="agent_bench",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
     ),
     "agent_tau2_bench_telecom": JobSpec(
         name="agent_tau2_bench_telecom",
@@ -311,6 +323,9 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=(AGENT_TAU2_BENCH_TELECOM_SLUG,),
         is_cot=False,
         domain="agent_bench",
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
     ),
     "instruction_following": JobSpec(
         name="instruction_following",

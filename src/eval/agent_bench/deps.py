@@ -19,9 +19,6 @@ _AGENT_BENCH_ROOT = Path(__file__).resolve().parent
 _TAU_V1_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v1"
 _TAU_V2_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v2"
 _TAU_V2_DATA_ROOT = _TAU_V2_VENDOR_ROOT / "data"
-_TAU_V1_LOCAL_ROOT = _REPO_ROOT / "tau-bench"
-_TAU_V2_LOCAL_ROOT = _REPO_ROOT / "tau2-bench" / "src"
-_TAU_V2_LOCAL_DATA_ROOT = _REPO_ROOT / "tau2-bench" / "data"
 
 # module name -> distribution name
 _MODULE_TO_DIST: dict[str, str] = {
@@ -219,11 +216,11 @@ def _looks_like_missing_module(detail: str, module_name: str) -> bool:
 def _ensure_agent_bench_vendor_module(module_name: str) -> bool:
     normalized = _normalize_missing_module(module_name)
     if normalized == "tau_bench":
-        return _add_first_existing_path((_TAU_V1_VENDOR_ROOT, _TAU_V1_LOCAL_ROOT))
+        return _add_first_existing_path((_TAU_V1_VENDOR_ROOT,))
     if normalized == "tau2":
-        ok = _add_first_existing_path((_TAU_V2_VENDOR_ROOT, _TAU_V2_LOCAL_ROOT))
+        ok = _add_first_existing_path((_TAU_V2_VENDOR_ROOT,))
         if ok:
-            data_root = _first_existing_path((_TAU_V2_DATA_ROOT, _TAU_V2_LOCAL_DATA_ROOT))
+            data_root = _first_existing_path((_TAU_V2_DATA_ROOT,))
             if data_root is not None:
                 os.environ.setdefault("TAU2_DATA_DIR", str(data_root))
         return ok

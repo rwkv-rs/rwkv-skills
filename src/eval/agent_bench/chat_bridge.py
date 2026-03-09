@@ -54,42 +54,80 @@ class RWKVChatBridge:
         tool_choice: str | None = None,
         prompt_profile: PromptProfile | None = None,
     ) -> ChatResult:
-        profile = prompt_profile or self._prompt_profile
-        prompt = self._render_prompt(
-            messages,
-            tools_schema=tools_schema or (),
+        return self.chat_many(
+            [messages],
+            [tools_schema or ()],
+            sampling=sampling,
             tool_choice=tool_choice,
-            profile=profile,
-        )
+            prompt_profile=prompt_profile,
+        )[0]
+
+    def chat_many(
+        self,
+        message_batches: Sequence[Sequence[dict[str, Any]]],
+        tools_schemas: Sequence[Sequence[dict[str, Any]] | None] | None = None,
+        *,
+        sampling: SamplingConfig | None = None,
+        tool_choice: str | None = None,
+        prompt_profile: PromptProfile | None = None,
+    ) -> list[ChatResult]:
+        if not message_batches:
+            return []
+        if tools_schemas is None:
+            tools_schemas = [()] * len(message_batches)
+        if len(tools_schemas) != len(message_batches):
+            raise ValueError("tools_schemas 长度必须与 message_batches 一致")
+
+        profile = prompt_profile or self._prompt_profile
+        prompts = [
+            self._render_prompt(
+                messages,
+                tools_schema=tools_schema or (),
+                tool_choice=tool_choice,
+                profile=profile,
+            )
+            for messages, tools_schema in zip(message_batches, tools_schemas)
+        ]
         outputs = self._engine.generate(
-            [prompt],
+            prompts,
             sampling=sampling or self._default_sampling,
-            batch_size=1,
+            batch_size=len(prompts),
             progress_desc="AgentBench",
         )
-        if not outputs:
-            return ChatResult(
-                content="",
-                tool_calls=[],
-                finish_reason="error",
-                parse_error="rwkv_generate_empty",
-                raw_text="",
-                prompt=prompt,
+
+        by_index = {int(output.prompt_index): output for output in outputs}
+        results: list[ChatResult] = []
+        for idx, (prompt, tools_schema) in enumerate(zip(prompts, tools_schemas)):
+            output = by_index.get(idx)
+            if output is None:
+                results.append(
+                    ChatResult(
+                        content="",
+                        tool_calls=[],
+                        finish_reason="error",
+                        parse_error="rwkv_generate_missing_output",
+                        raw_text="",
+                        prompt=prompt,
+                    )
+                )
+                continue
+
+            raw_text = (output.text or "").strip()
+            tool_calls, content, parse_error = _parse_generation(
+                raw_text,
+                tool_names=_extract_tool_names(tools_schema or ()),
             )
-        output = outputs[0]
-        raw_text = (output.text or "").strip()
-        tool_calls, content, parse_error = _parse_generation(
-            raw_text,
-            tool_names=_extract_tool_names(tools_schema or ()),
-        )
-        return ChatResult(
-            content=content,
-            tool_calls=tool_calls,
-            finish_reason=output.finish_reason,
-            parse_error=parse_error,
-            raw_text=raw_text,
-            prompt=prompt,
-        )
+            results.append(
+                ChatResult(
+                    content=content,
+                    tool_calls=tool_calls,
+                    finish_reason=output.finish_reason,
+                    parse_error=parse_error,
+                    raw_text=raw_text,
+                    prompt=prompt,
+                )
+            )
+        return results
 
     def _render_prompt(
         self,
