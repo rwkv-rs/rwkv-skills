@@ -211,7 +211,7 @@ class MultipleChoicePipeline:
         chunk_size = max(1, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            prompts = [self._format_prompt(record, cot_prompt_template) for _, record in chunk]
+            prompts = [self._format_prompt(record, cot_prompt_template) for _, record, _ in chunk]
 
             def _on_cot_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
