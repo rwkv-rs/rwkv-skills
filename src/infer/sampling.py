@@ -18,6 +18,7 @@ class SamplingConfig:
     alpha_presence: float = 0.5
     alpha_frequency: float = 0.5
     alpha_decay: float = 0.99
+    stop_suffixes: tuple[str, ...] = ()
     stop_tokens: tuple[int, ...] = (0, 261, 24281)
     ban_tokens: tuple[int, ...] | None = None
     pad_zero: bool = True

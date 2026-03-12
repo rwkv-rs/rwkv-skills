@@ -27,6 +27,7 @@ _FLOAT_FIELDS = {
     "alpha_decay",
 }
 _TUPLE_INT_FIELDS = {"stop_tokens", "ban_tokens", "no_penalty_token_ids"}
+_TUPLE_STR_FIELDS = {"stop_suffixes"}
 _BOOL_FIELDS = {"pad_zero"}
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
@@ -226,6 +227,8 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             value = _coerce_float(raw)
         elif key in _TUPLE_INT_FIELDS:
             value = _coerce_int_tuple(raw)
+        elif key in _TUPLE_STR_FIELDS:
+            value = _coerce_str_tuple(raw)
         elif key in _BOOL_FIELDS:
             value = raw if isinstance(raw, bool) else None
         elif key == "pass_k":
@@ -292,6 +295,21 @@ def _coerce_int_tuple(value: Any) -> tuple[int, ...] | None:
                 items.append(int(item))
             else:
                 return None
+        return tuple(items)
+    return None
+
+
+def _coerce_str_tuple(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        items: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                return None
+            items.append(item)
         return tuple(items)
     return None
 
