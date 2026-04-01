@@ -38,29 +38,31 @@ def _parse_click_payload(payload: str) -> str | None:
     return None
 
 
-def _parse_context_payload(payload: str) -> tuple[str | None, int | None, int | None]:
+def _parse_context_payload(payload: str) -> tuple[str | None, int | None, int | None, int | None]:
     if not payload:
-        return None, None, None
+        return None, None, None, None
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError:
-        return None, None, None
+        return None, None, None, None
     if not isinstance(parsed, dict):
-        return None, None, None
+        return None, None, None, None
 
     cell_id = parsed.get("cell_id")
     sample_index = parsed.get("sample_index")
     repeat_index = parsed.get("repeat_index")
+    pass_index = parsed.get("pass_index", 0)
     if not isinstance(cell_id, str) or not cell_id.strip():
-        return None, None, None
+        return None, None, None, None
     try:
         sample = int(sample_index)
         repeat = int(repeat_index)
+        passed = int(pass_index)
     except (TypeError, ValueError):
-        return None, None, None
-    if sample < 0 or repeat < 0:
-        return None, None, None
-    return cell_id.strip(), sample, repeat
+        return None, None, None, None
+    if sample < 0 or repeat < 0 or passed < 0:
+        return None, None, None, None
+    return cell_id.strip(), sample, repeat, passed
 
 
 def _context_text(value: Any) -> str:
@@ -146,6 +148,10 @@ def _render_eval_records_html(
             repeat_index = int(row.get("repeat_index", 0))
         except (TypeError, ValueError):
             repeat_index = 0
+        try:
+            pass_index = int(row.get("pass_index", 0))
+        except (TypeError, ValueError):
+            pass_index = 0
 
         preview_source = str(row.get("context_preview") or "")
         if not preview_source and "context" in row:
@@ -157,7 +163,8 @@ def _render_eval_records_html(
                 f'<button type="button" class="space-context-open" '
                 f'data-context-cell-id="{_html(meta_cell_id)}" '
                 f'data-sample-index="{sample_index}" '
-                f'data-repeat-index="{repeat_index}">'
+                f'data-repeat-index="{repeat_index}" '
+                f'data-pass-index="{pass_index}">'
                 f'{_html(preview)}</button>'
             )
         else:
@@ -169,7 +176,7 @@ def _render_eval_records_html(
 
         cells = "".join(
             [
-                f"<td>{_html(sample_index)}/{_html(repeat_index)}</td>",
+                f"<td>{_html(sample_index)}/{_html(repeat_index)}/{_html(pass_index)}</td>",
                 f"<td>{_html(row.get('answer') or '')}</td>",
                 f"<td>{_html(row.get('ref_answer') or '')}</td>",
                 f'<td class="{pass_class}">{pass_text}</td>',
@@ -372,7 +379,7 @@ def _build_context_event_payload(
         "errors": [],
     }
 
-    cell_id, sample_index, repeat_index = _parse_context_payload(payload)
+    cell_id, sample_index, repeat_index, pass_index = _parse_context_payload(payload)
     if not cell_id:
         base_event["errors"].append("未解析到上下文定位信息。")
         return base_event
@@ -394,6 +401,7 @@ def _build_context_event_payload(
             task_id=str(task_id),
             sample_index=sample_index,
             repeat_index=repeat_index,
+            pass_index=pass_index,
         )
     except Exception as exc:  # noqa: BLE001
         base_event["raw_text"] = f"读取 context 失败：{exc}"

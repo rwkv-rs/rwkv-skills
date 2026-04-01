@@ -1,44 +1,20 @@
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
-from typing import List
-from collections.abc import Iterable
+from typing import Any
 
-from ..data_utils import dataset_cache_dir, download_file, write_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
+from src.eval.datasets.runtime import UrlDownloadFile, UrlFilesJsonlDatasetSpec, read_jsonl_items
 
 GSM8K_URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/{split}.jsonl"
 
 
 def _parse_answer(answer: str) -> str:
     *_, final = answer.split("####")
-    final = final.strip()
-    final = final.replace(",", "")
+    final = final.strip().replace(",", "")
     match = re.search(r"([-+]?[0-9]*\.?[0-9]+)", final)
     return match.group(1) if match else final
-
-
-def _iter_records(root: Path, split: str, fixes: dict[str, str | int]) -> Iterable[dict]:
-    url_split = "test" if split == "test" else "train"
-    data_dir = dataset_cache_dir(root, "gsm8k")
-    source_path = data_dir / f"{url_split}.jsonl"
-    download_file(GSM8K_URL.format(split=url_split), source_path)
-
-    with source_path.open("r", encoding="utf-8") as handle:
-        for row in handle:
-            payload = json.loads(row)
-            question = payload["question"].strip()
-            answer = fixes.get(question)
-            if answer is None:
-                answer = _parse_answer(payload["answer"])
-            yield {
-                "question": question,
-                "answer": str(answer),
-                "subject": "gsm8k",
-                "reference_solution": payload["answer"],
-            }
 
 
 _FIXES = {
@@ -46,10 +22,31 @@ _FIXES = {
 }
 
 
-@FREE_ANSWER_REGISTRY.register("gsm8k")
-def prepare_gsm8k(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "gsm8k"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(output_root, split, _FIXES))
-    return [target]
+def _map_record(payload: dict[str, Any]) -> dict[str, Any]:
+    question = str(payload["question"]).strip()
+    answer = _FIXES.get(question)
+    if answer is None:
+        answer = _parse_answer(str(payload["answer"]))
+    return {
+        "question": question,
+        "answer": str(answer),
+        "subject": "gsm8k",
+        "reference_solution": payload["answer"],
+    }
+
+
+@FREE_ANSWER_REGISTRY.register_spec("gsm8k")
+def prepare_gsm8k_spec(output_root: Path, split: str = "test") -> UrlFilesJsonlDatasetSpec:
+    url_split = "test" if split == "test" else "train"
+
+    def _load(source_root: Path) -> list[dict[str, Any]]:
+        return read_jsonl_items(source_root / f"{url_split}.jsonl", parse_item=_map_record)
+
+    return UrlFilesJsonlDatasetSpec(
+        "gsm8k",
+        output_root,
+        split,
+        files=(UrlDownloadFile(Path(f"{url_split}.jsonl"), GSM8K_URL.format(split=url_split)),),
+        load_downloaded_records=_load,
+        required_fields=("question", "answer"),
+    )

@@ -14,6 +14,7 @@ from src.db.eval_db_service import EvalDbService
 from src.db.orm import init_orm
 from src.eval.agent_bench.chat_bridge import RWKVChatBridge
 from src.eval.agent_bench.deps import ensure_tau_v2_runtime_dependencies
+from src.eval.evaluating import prepare_task_execution, run_checker_for_task
 from src.eval.env_config import (
     OpenAIModelConfig,
     apply_openai_env,
@@ -98,7 +99,7 @@ def _ingest_current_eval_payloads(
     *,
     task_id: str,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
+    completions_payloads = service.list_completion_payloads(task_id=task_id, status="Completed")
     eval_payloads = [completion_to_eval_payload(item) for item in completions_payloads]
     service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
     return completions_payloads, eval_payloads
@@ -147,26 +148,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     init_orm(DEFAULT_DB_CONFIG)
     service = EvalDbService()
-    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
-    ctx = service.get_resume_context(
-        dataset=str(dataset_slug),
-        model=model_name,
-        is_param_search=False,
-        force_new_task=force_new_task,
-    )
-
     sampling_payload = {
         "stage1": sampling_config_to_dict(sampling),
     }
-    task_id = service.create_task_from_context(
-        ctx=ctx,
-        job_name="eval_agent_tau2_bench",
+    task_state = prepare_task_execution(
+        service=service,
         dataset=str(dataset_slug),
         model=model_name,
         is_param_search=False,
+        job_name="eval_agent_tau2_bench",
         sampling_config=sampling_payload,
     )
-    skip_keys = ctx.completed_keys
+    task_id = task_state.task_id
+    skip_keys = task_state.skip_keys
 
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
@@ -220,7 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise ValueError(f"manifest row missing task object: sample_index={sample_index}")
 
             for repeat_index in range(num_trials):
-                key = (sample_index, repeat_index)
+                key = (sample_index, repeat_index, 0)
                 if key in skip_keys:
                     continue
                 pending_requests.append((sample_index, repeat_index, record))
@@ -259,7 +253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             writer.close(timeout_s=30.0)
         finally:
             _flush_partial_eval("exception")
-            actual = service.count_completions(task_id=task_id, status="answer")
+            actual = service.count_completions(task_id=task_id, status="Completed")
             status = "failed" if should_exit["active"] else ("completed" if actual == expected_count else "failed")
             service.update_task_status(task_id=task_id, status=status)
         raise
@@ -267,6 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _restore_signal_handlers()
 
     completions_payloads, eval_payloads = _ingest_current_eval_payloads(service, task_id=task_id)
+    run_checker_for_task(service=service, task_id=task_id, model_name=model_name)
 
     metrics = compute_agent_metrics(
         eval_payloads,

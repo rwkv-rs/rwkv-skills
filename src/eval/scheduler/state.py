@@ -62,15 +62,15 @@ def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, Com
             continue
         model_name = normalize_model_name(model_name)
         detected_is_cot = bool(raw.get("cot"))
-        job_name = detect_job_from_dataset(dataset_slug, detected_is_cot)
-        key_is_cot = detected_is_cot
+        job_name, key_is_cot = _infer_job_from_task_field(
+            Path("<db>"),
+            raw,
+            dataset_slug,
+            detected_is_cot,
+        )
         if not job_name:
-            job_name, key_is_cot = _infer_job_from_task_field(
-                Path("<db>"),
-                raw,
-                dataset_slug,
-                detected_is_cot,
-            )
+            job_name = detect_job_from_dataset(dataset_slug, detected_is_cot)
+            key_is_cot = detected_is_cot
         if not job_name:
             _warn_job_detection(
                 Path("<db>"),

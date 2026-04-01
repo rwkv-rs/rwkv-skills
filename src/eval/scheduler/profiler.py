@@ -205,6 +205,8 @@ class BatchProfiler:
         if question_count and job.probe_samples_per_task > 1:
             # 估算实际生成样本量（题目数 * 每题样本数），避免对少样本数据集从过小的 batch 起 probe
             question_count *= max(1, job.probe_samples_per_task)
+        if getattr(job, "probe_question_floor", 0) and question_count is not None:
+            question_count = max(question_count, int(job.probe_question_floor))
         candidates = self._select_probe_candidates(
             base_candidates,
             question_count=question_count,
@@ -220,6 +222,7 @@ class BatchProfiler:
             cached_value = max_allowed_batch
             entry = {
                 "batch": cached_value,
+                "last_error": None,
                 "last_probe": time.time(),
             }
             model_cache[gpu] = entry
@@ -257,6 +260,9 @@ class BatchProfiler:
         print(f"🔍 Probing batch size for {job_id} on cuda:{gpu} (candidates: {joined})")
 
         for candidate in candidates:
+            # `_persist_cache()` replaces `self._cache`, so reacquire nested maps each round.
+            job_cache = self._cache.setdefault(job.name, {})
+            model_cache = job_cache.setdefault(model_slug, {})
             command = list(self.command_prefix) + [job.module]
             command.extend(
                 [
@@ -301,6 +307,7 @@ class BatchProfiler:
             if proc.returncode == 0:
                 entry = {
                     "batch": candidate,
+                    "last_error": None,
                     "last_probe": time.time(),
                 }
                 model_cache[gpu] = entry

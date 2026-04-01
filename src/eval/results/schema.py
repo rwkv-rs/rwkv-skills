@@ -91,11 +91,15 @@ def make_eval_payload(
     repeat_index = strict_nonneg_int(
         completions_payload.get("repeat_index"), "repeat_index"
     )
+    pass_index = strict_nonneg_int(
+        completions_payload.get("pass_index", 0), "pass_index"
+    )
     return {
         "benchmark_name": str(completions_payload.get("benchmark_name", "")),
         "dataset_split": str(completions_payload.get("dataset_split", "")),
         "sample_index": sample_index,
         "repeat_index": repeat_index,
+        "pass_index": pass_index,
         "context": build_context_from_completions(completions_payload),
         "answer": "" if answer is None else str(answer),
         "ref_answer": "" if ref_answer is None else str(ref_answer),

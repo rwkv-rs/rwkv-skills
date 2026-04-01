@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Dataset sample counting + DB recording helpers."""
 
+import json
 from pathlib import Path
 
 from src.db.orm import init_orm
@@ -20,6 +21,24 @@ def count_jsonl_records(path: Path) -> int:
     return count
 
 
+def _manifest_path_for_dataset(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".manifest.json")
+
+
+def load_dataset_manifest_count(path: Path) -> int | None:
+    manifest_path = _manifest_path_for_dataset(path)
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = payload.get("row_count")
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
 def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = None) -> None:
     """Persist dataset sample count into benchmark table."""
     slug = canonical_slug(dataset_slug or infer_dataset_slug_from_path(str(dataset_path)))
@@ -32,7 +51,7 @@ def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = Non
     if existing is not None and existing > 0:
         return
     try:
-        samples = count_jsonl_records(dataset_path)
+        samples = load_dataset_manifest_count(dataset_path) or count_jsonl_records(dataset_path)
     except OSError as exc:
         print(f"⚠️  无法统计数据集样本数: {dataset_path} ({exc})")
         return
@@ -42,4 +61,4 @@ def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = Non
     service.ensure_benchmark_num_samples(dataset=slug, num_samples=samples)
 
 
-__all__ = ["count_jsonl_records", "record_dataset_samples"]
+__all__ = ["count_jsonl_records", "load_dataset_manifest_count", "record_dataset_samples"]

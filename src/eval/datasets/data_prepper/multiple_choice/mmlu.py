@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
-from collections.abc import Iterable
+from typing import Any
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
-
-from ..data_utils import configure_hf_home, write_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import HfParquetJsonlDatasetSpec
 
 _SUBCATEGORIES: dict[str, str] = {
     "abstract_algebra": "math",
@@ -73,36 +67,35 @@ _SUBCATEGORIES: dict[str, str] = {
 }
 
 
-def _iter_records(split: str) -> Iterable[dict]:
-    configure_hf_home()
-    if load_dataset is None:  # pragma: no cover - dependency missing
-        raise ModuleNotFoundError(
-            "需要安装 `datasets` 才能准备 mmlu 数据集，请运行 `pip install datasets`"
-        )
-    dataset = load_dataset("cais/mmlu", "all", split=split)
-    for row in dataset:
-        question = row["question"].strip()
-        choices = [choice.strip() for choice in row["choices"]]
-        answer_idx = int(row["answer"])
-        if not (0 <= answer_idx < len(choices)):
-            raise ValueError(f"Invalid answer index {answer_idx} for question {row}")
-        subject = row.get("subject", "")
-        subset = _SUBCATEGORIES.get(subject, "unknown")
-        payload: dict[str, object] = {
-            "question": question,
-            "answer": chr(ord("A") + answer_idx),
-            "subject": subject,
-            "subset": subset,
-        }
-        for idx, choice in enumerate(choices):
-            payload[chr(ord("A") + idx)] = choice
-        yield payload
+def _parse_row(row: dict[str, Any]) -> dict[str, Any]:
+    question = str(row["question"]).strip()
+    choices = [str(choice).strip() for choice in row["choices"]]
+    answer_idx = int(row["answer"])
+    if not (0 <= answer_idx < len(choices)):
+        raise ValueError(f"Invalid answer index {answer_idx} for question {question}")
+
+    subject = str(row.get("subject") or "")
+    payload: dict[str, Any] = {
+        "question": question,
+        "answer": chr(ord("A") + answer_idx),
+        "subject": subject,
+        "subset": _SUBCATEGORIES.get(subject, "unknown"),
+    }
+    for idx, choice in enumerate(choices):
+        payload[chr(ord("A") + idx)] = choice
+    return payload
 
 
-@MULTIPLE_CHOICE_REGISTRY.register("mmlu")
-def prepare_mmlu(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "mmlu"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split))
-    return [target]
+@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu")
+def prepare_mmlu_spec(output_root: Path, split: str = "test") -> HfParquetJsonlDatasetSpec:
+    return HfParquetJsonlDatasetSpec(
+        "mmlu",
+        output_root,
+        split,
+        dataset_id="cais/mmlu",
+        config="all",
+        source_splits=(split,),
+        parse_row=_parse_row,
+        required_fields=("question", "answer"),
+        tasks=8,
+    )

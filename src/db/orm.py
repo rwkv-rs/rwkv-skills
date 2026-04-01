@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     text,
 )
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 _ENGINE: Engine | None = None
 _SESSION_FACTORY: sessionmaker[Session] | None = None
 _INITIALIZED = False
+_RECOVERY_APPLIED = False
 
 
 def _build_db_url(config: DBConfig, dbname: str | None = None) -> str:
@@ -44,39 +46,57 @@ def _build_db_url(config: DBConfig, dbname: str | None = None) -> str:
     )
 
 
-def _ensure_database_exists(config: DBConfig) -> None:
-    """Connect to 'postgres' db and create target database if it doesn't exist."""
-    admin_engine = create_engine(
-        _build_db_url(config, dbname="postgres"),
-        isolation_level="AUTOCOMMIT",
-    )
-    with admin_engine.connect() as conn:
-        result = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :dbname"),
-            {"dbname": config.dbname},
-        )
-        if result.fetchone() is None:
-            conn.execute(text(f'CREATE DATABASE "{config.dbname}"'))
-    admin_engine.dispose()
+def _engine_connect_args(config: DBConfig) -> dict[str, str]:
+    sslmode = str(getattr(config, "sslmode", "") or "").strip()
+    return {"sslmode": sslmode} if sslmode else {}
 
 
 def init_orm(config: DBConfig | None = None) -> None:
     """Initialize ORM engine and session factory.
 
     Can be called multiple times safely - only initializes once.
+    Caller must provision the target PostgreSQL database and schema first.
     If config is None, uses DEFAULT_DB_CONFIG.
     """
-    global _ENGINE, _SESSION_FACTORY, _INITIALIZED
+    global _ENGINE, _SESSION_FACTORY, _INITIALIZED, _RECOVERY_APPLIED
     if _INITIALIZED:
         return
     if config is None:
         from src.eval.scheduler.config import DEFAULT_DB_CONFIG
         config = DEFAULT_DB_CONFIG
-    _ensure_database_exists(config)
-    _ENGINE = create_engine(_build_db_url(config), pool_pre_ping=True, future=True)
+    _ENGINE = create_engine(
+        _build_db_url(config),
+        pool_pre_ping=True,
+        future=True,
+        connect_args=_engine_connect_args(config),
+    )
     _SESSION_FACTORY = sessionmaker(bind=_ENGINE, expire_on_commit=False, class_=Session)
-    Base.metadata.create_all(_ENGINE)
+    if getattr(config, "startup_recovery", False) and not _RECOVERY_APPLIED:
+        _recover_running_tasks(_ENGINE)
+        _RECOVERY_APPLIED = True
     _INITIALIZED = True
+
+
+def _recover_running_tasks(engine: Engine) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE task
+                SET status = 'Failed'
+                WHERE status IN ('running', 'Running')
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE completions
+                SET status = 'Failed'
+                WHERE status IN ('running', 'Running')
+                """
+            )
+        )
 
 
 def is_initialized() -> bool:
@@ -152,6 +172,7 @@ class Benchmark(Base):
             "status IN ('Todo', 'Buggy', 'Low', 'DataSynthesizing', 'Completed')",
             name="chk_benchmark_status",
         ),
+        UniqueConstraint("benchmark_name", "benchmark_split", name="uq_benchmark_name_split"),
     )
 
 
@@ -167,6 +188,16 @@ class Model(Base):
     # Relationships
     tasks: Mapped[list["Task"]] = relationship("Task", back_populates="model", lazy="select")
 
+    __table_args__ = (
+        UniqueConstraint(
+            "arch_version",
+            "data_version",
+            "num_params",
+            "model_name",
+            name="uq_model_identity",
+        ),
+    )
+
 
 class Task(Base):
     __tablename__ = "task"
@@ -175,6 +206,7 @@ class Task(Base):
     config_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     evaluator: Mapped[str] = mapped_column(String(255), nullable=False)
     is_param_search: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    is_tmp: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
     status: Mapped[str] = mapped_column(String(255), nullable=False)
     git_hash: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -201,6 +233,10 @@ class Task(Base):
     __table_args__ = (
         Index("idx_task_model", "model_id"),
         Index("idx_task_benchmark", "benchmark_id"),
+        Index("idx_task_is_tmp_created_at", "is_tmp", "created_at"),
+        Index("idx_task_status_created_at", "status", "created_at"),
+        Index("idx_task_identity_lookup", "model_id", "benchmark_id", "evaluator", "git_hash", "config_path"),
+        CheckConstraint("status IN ('Running', 'Completed', 'Failed')", name="chk_task_status"),
     )
 
 
@@ -215,19 +251,24 @@ class Completion(Base):
     )
     context: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False)
     sample_index: Mapped[int] = mapped_column(Integer, nullable=False)
-    repeat_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    avg_repeat_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    pass_index: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
     status: Mapped[str] = mapped_column(String(255), nullable=False)
 
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="completions", lazy="select")
     evals: Mapped[list["Eval"]] = relationship("Eval", back_populates="completion", lazy="select")
+    checker: Mapped["Checker | None"] = relationship("Checker", back_populates="completion", lazy="select")
 
     __table_args__ = (
         Index("idx_completions_task", "task_id"),
-        Index("uq_completions_sample", "task_id", "sample_index", "repeat_index", unique=True),
+        Index("idx_completions_task_status", "task_id", "status"),
+        Index("uq_completions_sample", "task_id", "sample_index", "avg_repeat_index", "pass_index", unique=True),
         CheckConstraint("sample_index >= 0", name="chk_completions_sample_index"),
-        CheckConstraint("repeat_index >= 0", name="chk_completions_repeat_index"),
+        CheckConstraint("avg_repeat_index >= 0", name="chk_completions_avg_repeat_index"),
+        CheckConstraint("pass_index >= 0", name="chk_completions_pass_index"),
+        CheckConstraint("status IN ('Running', 'Completed', 'Failed')", name="chk_completions_status"),
     )
 
 
@@ -249,7 +290,38 @@ class Eval(Base):
     # Relationships
     completion: Mapped["Completion"] = relationship("Completion", back_populates="evals", lazy="select")
 
-    __table_args__ = (Index("idx_eval_completion", "completions_id"),)
+    __table_args__ = (
+        Index("idx_eval_completion", "completions_id"),
+        UniqueConstraint("completions_id", name="uq_eval_completion"),
+    )
+
+
+class Checker(Base):
+    __tablename__ = "checker"
+
+    checker_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    completions_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("completions.completions_id", ondelete="RESTRICT", onupdate="RESTRICT"),
+        nullable=False,
+    )
+    answer_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    instruction_following_error: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    world_knowledge_error: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    math_error: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasoning_logic_error: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    thought_contains_correct_answer: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    needs_human_review: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
+
+    completion: Mapped["Completion"] = relationship("Completion", back_populates="checker", lazy="select")
+
+    __table_args__ = (
+        Index("idx_checker_completion", "completions_id"),
+        Index("idx_checker_needs_human_review", "needs_human_review"),
+        UniqueConstraint("completions_id", name="uq_checker_completion"),
+    )
 
 
 class Score(Base):
@@ -261,19 +333,24 @@ class Score(Base):
         ForeignKey("task.task_id", ondelete="RESTRICT", onupdate="RESTRICT"),
         nullable=False,
     )
-    is_cot: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    cot_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     metrics: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
 
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="scores", lazy="select")
 
-    __table_args__ = (Index("idx_scores_task", "task_id"),)
+    __table_args__ = (
+        Index("idx_scores_task", "task_id"),
+        UniqueConstraint("task_id", name="uq_scores_task"),
+        CheckConstraint("cot_mode IN ('NoCoT', 'FakeCoT', 'CoT')", name="chk_scores_cot_mode"),
+    )
 
 
 __all__ = [
     "Base",
     "Benchmark",
+    "Checker",
     "Completion",
     "Eval",
     "Model",

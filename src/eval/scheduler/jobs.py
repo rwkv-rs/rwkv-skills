@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable, Sequence
 
+from src.eval.benchmark_registry import resolve_benchmark_metadata
 from src.eval.datasets.data_prepper.data_manager import (
     available_code_generation_datasets,
     available_free_answer_datasets,
@@ -13,6 +14,7 @@ from src.eval.datasets.data_prepper.data_manager import (
     available_multiple_choice_datasets,
     prepare_dataset,
 )
+from src.eval.runner_registry import ALL_RUNNERS, RunnerGroup, RunnerSpec as RegisteredRunnerSpec
 
 from .dataset_utils import (
     DATASET_SLUG_ALIASES,
@@ -20,37 +22,6 @@ from .dataset_utils import (
     make_dataset_slug,
     safe_slug,
 )
-
-
-MULTICHOICE_DEFAULT_SPLITS: dict[str, str] = {
-    "gpqa": "main",
-    "ceval": "test",
-}
-MATH_DEFAULT_SPLITS: dict[str, str] = {
-    "hle": "all",
-    "simpleqa": "verified",
-}
-SPECIAL_DEFAULT_SPLITS: dict[str, str] = {
-    "flores200": "devtest",
-    "ifeval": "test",
-    "arena-hard": "test",
-    "ifbench": "test",
-    "wmt24pp": "test",
-}
-CODE_DEFAULT_SPLITS: dict[str, str] = {
-    "mbpp": "test",
-    "human_eval": "test",
-    "mbpp_plus": "test",
-    "human_eval_plus": "test",
-    "human_eval_fix": "test",
-    "human_eval_cn": "test",
-    "livecodebench": "test",
-    "tau_bench_retail": "test",
-    "tau_bench_airline": "test",
-    "tau2_bench_retail": "base",
-    "tau2_bench_airline": "base",
-    "tau2_bench_telecom": "base",
-}
 
 
 @dataclass(frozen=True)
@@ -66,6 +37,7 @@ class JobSpec:
     dataset_slugs: tuple[str, ...]
     is_cot: bool
     domain: str
+    runner_group: RunnerGroup | None = None
     extra_args: tuple[str, ...] = ()
     batch_flag: str | None = None
     probe_flag: str | None = None
@@ -74,6 +46,9 @@ class JobSpec:
     probe_extra_args: tuple[str, ...] = ()
     # 用于探测 batch size 时估算实际样本量（例如 pass@k>1 时每题会展开多条样本）
     probe_samples_per_task: int = 1
+    # 某些 benchmark 会自动扩展到固定样本量（例如 avg@k 补到 5000 次尝试），
+    # probe 时至少按这个规模挑选候选 batch，避免小数据集只能探到过小 batch。
+    probe_question_floor: int = 0
 
     @property
     def id_prefix(self) -> str:
@@ -86,8 +61,10 @@ def _build_dataset_catalogues() -> tuple[
     tuple[str, ...],
     tuple[str, ...],
     tuple[str, ...],
+    dict[str, tuple[str, ...]],
 ]:
     specs: dict[str, DatasetPrepSpec] = {}
+    job_dataset_slugs: dict[str, list[str]] = {}
 
     def register(name: str, split: str) -> str:
         slug = make_dataset_slug(name, split)
@@ -95,27 +72,20 @@ def _build_dataset_catalogues() -> tuple[
             specs[slug] = DatasetPrepSpec(name, split)
         return slug
 
-    multi_choice_slugs: list[str] = []
-    for dataset in available_multiple_choice_datasets():
-        split = MULTICHOICE_DEFAULT_SPLITS.get(dataset, "test")
-        multi_choice_slugs.append(register(dataset, split))
+    def collect(datasets: Iterable[str]) -> list[str]:
+        family_slugs: list[str] = []
+        for dataset in datasets:
+            metadata = resolve_benchmark_metadata(dataset)
+            slug = register(dataset, metadata.default_split)
+            family_slugs.append(slug)
+            for job_name in metadata.scheduler_jobs:
+                job_dataset_slugs.setdefault(job_name, []).append(slug)
+        return family_slugs
 
-    multi_choice_slugs.append(canonical_slug("ceval_exam_test"))
-
-    math_slugs: list[str] = []
-    for dataset in available_free_answer_datasets():
-        split = MATH_DEFAULT_SPLITS.get(dataset, "test")
-        math_slugs.append(register(dataset, split))
-
-    special_slugs: list[str] = []
-    for dataset in available_instruction_following_datasets():
-        split = SPECIAL_DEFAULT_SPLITS.get(dataset, "test")
-        special_slugs.append(register(dataset, split))
-
-    code_slugs: list[str] = []
-    for dataset in available_code_generation_datasets():
-        split = CODE_DEFAULT_SPLITS.get(dataset, "test")
-        code_slugs.append(register(dataset, split))
+    multi_choice_slugs = collect(available_multiple_choice_datasets())
+    math_slugs = collect(available_free_answer_datasets())
+    special_slugs = collect(available_instruction_following_datasets())
+    code_slugs = collect(available_code_generation_datasets())
 
     for alias, target in DATASET_SLUG_ALIASES.items():
         canonical = canonical_slug(target)
@@ -127,7 +97,11 @@ def _build_dataset_catalogues() -> tuple[
     math_tuple = tuple(sorted({canonical_slug(s) for s in math_slugs}))
     special_tuple = tuple(sorted({canonical_slug(s) for s in special_slugs}))
     code_tuple = tuple(sorted({canonical_slug(s) for s in code_slugs}))
-    return specs, multi_choice_tuple, math_tuple, special_tuple, code_tuple
+    job_tuples = {
+        job_name: tuple(sorted({canonical_slug(slug) for slug in slugs}))
+        for job_name, slugs in job_dataset_slugs.items()
+    }
+    return specs, multi_choice_tuple, math_tuple, special_tuple, code_tuple, job_tuples
 
 
 (
@@ -136,208 +110,93 @@ def _build_dataset_catalogues() -> tuple[
     MATH_DATASET_SLUGS,
     SPECIAL_DATASET_SLUGS,
     CODE_DATASET_SLUGS,
+    _JOB_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
 
-LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
-    canonical_slug(slug)
-    for slug in (
-        "gsm8k_test",
-        "math_500_test",
-        "answer_judge_test",
-        "gaokao2023en_test",
-        "comp_math_24_25_test",
-        "minerva_math_test",
-        "amc23_test",
-    )
-)
+def _job_dataset_slugs(job_name: str) -> tuple[str, ...]:
+    return _JOB_DATASET_SLUGS.get(job_name, ())
+
+
+LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("free_response_judge")
 # judge-only 数据集不再调度到 free_response，避免 math_500 反复被 free_response 拉起
 MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
-    slug for slug in MATH_DATASET_SLUGS if slug not in LLM_JUDGE_DATASET_SLUGS
+    _job_dataset_slugs("free_response") or (slug for slug in MATH_DATASET_SLUGS if slug not in LLM_JUDGE_DATASET_SLUGS)
 )
 
-ifeval_related = [slug for slug in SPECIAL_DATASET_SLUGS if slug.startswith("ifeval")]
-if not ifeval_related:
-    ifeval_related = [canonical_slug("ifeval_test")]
-INSTRUCTION_FOLLOWING_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(sorted(set(ifeval_related)))
-
-HUMAN_EVAL_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
-    sorted(slug for slug in CODE_DATASET_SLUGS if "human_eval" in slug)
+INSTRUCTION_FOLLOWING_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    sorted(set(_job_dataset_slugs("instruction_following") or SPECIAL_DATASET_SLUGS or (canonical_slug("ifeval_test"),)))
 )
+
+HUMAN_EVAL_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_human_eval")
 MBPP_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
-    sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("mbpp"))
+    sorted(
+        set(_job_dataset_slugs("code_mbpp"))
+        | set(_job_dataset_slugs("code_mbpp_fake_cot"))
+        | set(_job_dataset_slugs("code_mbpp_cot"))
+    )
 )
-LCB_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
-    sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("livecodebench"))
-)
-AGENT_TAU_BENCH_RETAIL_SLUG: Final[str] = canonical_slug("tau_bench_retail_test")
-AGENT_TAU_BENCH_AIRLINE_SLUG: Final[str] = canonical_slug("tau_bench_airline_test")
-AGENT_TAU2_BENCH_RETAIL_SLUG: Final[str] = canonical_slug("tau2_bench_retail_base")
-AGENT_TAU2_BENCH_AIRLINE_SLUG: Final[str] = canonical_slug("tau2_bench_airline_base")
-AGENT_TAU2_BENCH_TELECOM_SLUG: Final[str] = canonical_slug("tau2_bench_telecom_base")
+LCB_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_livecodebench")
+FUNCTION_BROWSECOMP_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_browsecomp")
+FUNCTION_MCP_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_mcp_bench")
+FUNCTION_TAU_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau_bench")
+FUNCTION_TAU2_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau2_bench")
 
 
-JOB_CATALOGUE: dict[str, JobSpec] = {
-    "multi_choice_plain": JobSpec(
-        name="multi_choice_plain",
-        module="src.bin.eval_multi_choice",
-        dataset_slugs=MULTICHOICE_DATASET_SLUGS,
-        is_cot=False,
-        domain="multi_choice",
-    ),
-    "multi_choice_cot": JobSpec(
-        name="multi_choice_cot",
-        module="src.bin.eval_multi_choice_cot",
-        dataset_slugs=MULTICHOICE_DATASET_SLUGS,
-        is_cot=True,
-        domain="multi_choice",
-        extra_args=("--no-param-search",),
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "free_response": JobSpec(
-        name="free_response",
-        module="src.bin.eval_free_response",
-        dataset_slugs=MATH_DATASET_SLUGS_FOR_FREE_RESPONSE,
-        is_cot=True,
-        domain="free_response",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-        # 高难数学默认 pass@k 较大，按 256 倍展开估算样本量，避免 batch 探测过小
-        probe_samples_per_task=256,
-    ),
-    "free_response_judge": JobSpec(
-        name="free_response_judge",
-        module="src.bin.eval_free_response_judge",
-        dataset_slugs=LLM_JUDGE_DATASET_SLUGS,
-        is_cot=True,
-        domain="free_response",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "param_search_free_response": JobSpec(
-        name="param_search_free_response",
-        module="src.bin.param_search_free_response",
-        dataset_slugs=(canonical_slug("math_500_test"),),
-        is_cot=True,
-        domain="param_search",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "param_search_free_response_judge": JobSpec(
-        name="param_search_free_response_judge",
-        module="src.bin.param_search_free_response_judge",
-        dataset_slugs=(canonical_slug("gsm8k_test"),),
-        is_cot=True,
-        domain="param_search",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "param_search_select": JobSpec(
-        name="param_search_select",
-        module="src.bin.param_search_select",
-        dataset_slugs=(canonical_slug("gsm8k_test"),),
-        is_cot=True,
-        domain="param_search",
-    ),
-    "code_human_eval": JobSpec(
-        name="code_human_eval",
-        module="src.bin.eval_code_human_eval",
-        dataset_slugs=HUMAN_EVAL_CODE_SLUGS or (canonical_slug("human_eval_test"),),
-        is_cot=False,
-        domain="code",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
-    ),
-    "code_mbpp": JobSpec(
-        name="code_mbpp",
-        module="src.bin.eval_code_mbpp",
-        dataset_slugs=MBPP_CODE_SLUGS or (canonical_slug("mbpp_test"),),
-        is_cot=False,
-        domain="code",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
-    ),
-    "code_livecodebench": JobSpec(
-        name="code_livecodebench",
-        module="src.bin.eval_code_livecodebench",
-        dataset_slugs=LCB_CODE_SLUGS or (canonical_slug("livecodebench_test"),),
-        is_cot=True,
-        domain="code",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
-    ),
-    "agent_tau_bench_retail": JobSpec(
-        name="agent_tau_bench_retail",
-        module="src.bin.eval_agent_tau_bench",
-        dataset_slugs=(AGENT_TAU_BENCH_RETAIL_SLUG,),
-        is_cot=False,
-        domain="agent_bench",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "agent_tau_bench_airline": JobSpec(
-        name="agent_tau_bench_airline",
-        module="src.bin.eval_agent_tau_bench",
-        dataset_slugs=(AGENT_TAU_BENCH_AIRLINE_SLUG,),
-        is_cot=False,
-        domain="agent_bench",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "agent_tau2_bench_retail": JobSpec(
-        name="agent_tau2_bench_retail",
-        module="src.bin.eval_agent_tau2_bench",
-        dataset_slugs=(AGENT_TAU2_BENCH_RETAIL_SLUG,),
-        is_cot=False,
-        domain="agent_bench",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "agent_tau2_bench_airline": JobSpec(
-        name="agent_tau2_bench_airline",
-        module="src.bin.eval_agent_tau2_bench",
-        dataset_slugs=(AGENT_TAU2_BENCH_AIRLINE_SLUG,),
-        is_cot=False,
-        domain="agent_bench",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "agent_tau2_bench_telecom": JobSpec(
-        name="agent_tau2_bench_telecom",
-        module="src.bin.eval_agent_tau2_bench",
-        dataset_slugs=(AGENT_TAU2_BENCH_TELECOM_SLUG,),
-        is_cot=False,
-        domain="agent_bench",
-        batch_flag="--batch-size",
-        probe_flag="--probe-only",
-        probe_dataset_required=True,
-    ),
-    "instruction_following": JobSpec(
-        name="instruction_following",
-        module="src.bin.eval_instruction_following",
-        dataset_slugs=INSTRUCTION_FOLLOWING_DATASET_SLUGS,
-        is_cot=False,
-        domain="instruction_following",
-        extra_args=("--no-param-search",),
-    ),
-}
+def _dataset_slugs_for_runner(runner: RegisteredRunnerSpec) -> tuple[str, ...]:
+    if runner.name == "multi_choice_plain":
+        return MULTICHOICE_DATASET_SLUGS
+    if runner.name == "multi_choice_fake_cot":
+        return MULTICHOICE_DATASET_SLUGS
+    if runner.name == "multi_choice_cot":
+        return MULTICHOICE_DATASET_SLUGS
+    if runner.name == "free_response":
+        return MATH_DATASET_SLUGS_FOR_FREE_RESPONSE
+    if runner.name == "free_response_judge":
+        return LLM_JUDGE_DATASET_SLUGS
+    if runner.name == "instruction_following":
+        return INSTRUCTION_FOLLOWING_DATASET_SLUGS
+    if runner.name == "code_human_eval":
+        return HUMAN_EVAL_CODE_SLUGS or runner.fallback_dataset_slugs
+    if runner.name in {"code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot"}:
+        return MBPP_CODE_SLUGS or runner.fallback_dataset_slugs
+    if runner.name == "code_livecodebench":
+        return LCB_CODE_SLUGS or runner.fallback_dataset_slugs
+    if runner.name == "function_browsecomp":
+        return FUNCTION_BROWSECOMP_SLUGS or runner.fallback_dataset_slugs
+    if runner.name == "function_mcp_bench":
+        return FUNCTION_MCP_BENCH_SLUGS or runner.fallback_dataset_slugs
+    if runner.name == "function_tau_bench":
+        return FUNCTION_TAU_BENCH_SLUGS or runner.fallback_dataset_slugs
+    if runner.name == "function_tau2_bench":
+        return FUNCTION_TAU2_BENCH_SLUGS or runner.fallback_dataset_slugs
+    return _job_dataset_slugs(runner.name) or runner.fallback_dataset_slugs
 
-JOB_ORDER: tuple[str, ...] = tuple(JOB_CATALOGUE.keys())
+
+def _build_job_catalogue() -> dict[str, JobSpec]:
+    catalogue: dict[str, JobSpec] = {}
+    for runner in ALL_RUNNERS:
+        catalogue[runner.name] = JobSpec(
+            name=runner.name,
+            module=runner.module,
+            dataset_slugs=_dataset_slugs_for_runner(runner),
+            is_cot=runner.is_cot,
+            domain=runner.scheduler_domain,
+            runner_group=runner.group,
+            extra_args=runner.extra_args,
+            batch_flag=runner.batch_flag,
+            probe_flag=runner.probe_flag,
+            probe_max_generate_flag=runner.probe_max_generate_flag,
+            probe_dataset_required=runner.probe_dataset_required,
+            probe_extra_args=runner.probe_extra_args,
+            probe_samples_per_task=runner.probe_samples_per_task,
+            probe_question_floor=runner.probe_question_floor,
+        )
+    return catalogue
+
+
+JOB_CATALOGUE: dict[str, JobSpec] = _build_job_catalogue()
+
+JOB_ORDER: tuple[str, ...] = tuple(runner.name for runner in ALL_RUNNERS)
 
 
 def detect_job_from_dataset(dataset_slug: str, is_cot: bool) -> str | None:

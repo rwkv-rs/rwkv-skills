@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
+from typing import Any
 
-from ..data_utils import download_file, write_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import INSTRUCTION_FOLLOWING_REGISTRY
+from src.eval.datasets.runtime import UrlDownloadFile, UrlFilesJsonlDatasetSpec, read_jsonl_items
 
 IFEVAL_URL = (
     "https://raw.githubusercontent.com/google-research/google-research/"
@@ -12,29 +12,28 @@ IFEVAL_URL = (
 )
 
 
-@INSTRUCTION_FOLLOWING_REGISTRY("ifeval")
-def prepare_ifeval(output_root: Path, split: str = "test") -> list[Path]:
+def _map_record(payload: dict[str, Any]) -> dict[str, Any]:
+    record = dict(payload)
+    record["question"] = record.get("prompt", "")
+    return record
+
+
+@INSTRUCTION_FOLLOWING_REGISTRY.register_spec("ifeval")
+def prepare_ifeval_spec(output_root: Path, split: str = "test") -> UrlFilesJsonlDatasetSpec:
     if split != "test":
         raise ValueError("IFEval 数据集仅提供 test split")
 
-    dataset_dir = (output_root / "ifeval").expanduser().resolve()
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = dataset_dir / "input_data.jsonl"
+    def _load(source_root: Path) -> list[dict[str, Any]]:
+        return read_jsonl_items(source_root / "input_data.jsonl", parse_item=_map_record)
 
-    download_file(IFEVAL_URL, raw_path)
-
-    records = []
-    with raw_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            payload["question"] = payload.get("prompt", "")
-            records.append(payload)
-
-    target = dataset_dir / "test.jsonl"
-    write_jsonl(target, records)
-    return [target]
+    return UrlFilesJsonlDatasetSpec(
+        "ifeval",
+        output_root,
+        split,
+        files=(UrlDownloadFile(Path("input_data.jsonl"), IFEVAL_URL),),
+        load_downloaded_records=_load,
+        required_fields=("prompt", "question"),
+    )
 
 
-__all__ = ["prepare_ifeval"]
+__all__ = ["prepare_ifeval_spec"]

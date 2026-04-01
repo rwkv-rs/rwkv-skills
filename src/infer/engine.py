@@ -291,6 +291,8 @@ def _continuous_batching(
             logits[:, ban_token_ids] = -math.inf
 
         sampler_states_view = _sampler_states_view(active_count)
+        if no_penalty_ids is not None:
+            penalties[:active_count, no_penalty_ids] = 0.0
         sampled_raw = rapid_sampler.batch_sampling_repetition_temperature_topk_topp(
             logits,
             penalties[:active_count],
@@ -302,8 +304,6 @@ def _continuous_batching(
             sampler_top_k,
             sampler_top_p,
         )
-        if no_penalty_ids is not None:
-            penalties[:active_count, no_penalty_ids] = 0.0
         sampled_tensor = _validate_sampled_tokens(sampled_raw, active_count)
 
         sampled_list = sampled_tensor.tolist()

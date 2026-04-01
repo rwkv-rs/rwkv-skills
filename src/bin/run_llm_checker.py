@@ -6,13 +6,18 @@ Typical usage:
   python -m src.bin.run_llm_checker                # scan default results/eval
   python -m src.bin.run_llm_checker results/eval/<model_name>
   python -m src.bin.run_llm_checker results/eval/<model_name>/<bench>_results.jsonl
+  python -m src.bin.run_llm_checker --task-id 1234
 """
 
 import argparse
 from pathlib import Path
 from typing import Sequence
 
+from src.db.eval_db_service import EvalDbService
+from src.db.orm import init_orm
+from src.eval.evaluating import run_checker_for_task
 from src.eval.checkers.llm_checker import run_llm_checker
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.config import DEFAULT_EVAL_RESULT_DIR
 
 
@@ -46,6 +51,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Limit number of eval files processed (after sorting).",
     )
+    parser.add_argument(
+        "--task-id",
+        help="Run checker directly against DB eval rows for a task_id instead of scanning eval JSONL files.",
+    )
     return parser.parse_args(argv)
 
 
@@ -74,6 +83,22 @@ def _infer_model_name(eval_path: Path, *, eval_root: Path, forced: str | None) -
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.task_id:
+        init_orm(DEFAULT_DB_CONFIG)
+        service = EvalDbService()
+        bundle = service.get_task_bundle(task_id=str(args.task_id))
+        if not isinstance(bundle, dict):
+            print(f"⚠️  task_id={args.task_id} not found")
+            return 1
+        model = bundle.get("model") if isinstance(bundle.get("model"), dict) else {}
+        model_name = str(model.get("model_name") or args.model_name or "").strip()
+        if not model_name:
+            print(f"⚠️  task_id={args.task_id} missing model_name")
+            return 1
+        inserted = run_checker_for_task(service=service, task_id=str(args.task_id), model_name=model_name)
+        print(f"🧩 checker rows inserted: {inserted}")
+        return 0
+
     eval_root = Path(args.eval_root).expanduser()
     eval_files = [p for p in _iter_eval_files(list(args.targets)) if p.name.endswith(_RESULTS_SUFFIX)]
     eval_files = sorted({p.expanduser() for p in eval_files})

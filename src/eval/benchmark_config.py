@@ -37,9 +37,9 @@ class BenchmarkModelConfig:
     sampling_overrides: dict[str, object]
     # Optional evaluation-level overrides (e.g. free-response pass@k / avg@k).
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[int, ...] | None = None
+    avg_k: tuple[float, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[float, ...] | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -215,9 +215,9 @@ def _normalize_model_key(value: str) -> str:
 def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     sampling_overrides: dict[str, object] = {}
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[int, ...] | None = None
+    avg_k: tuple[float, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[float, ...] | None = None
 
     for key, raw in table.items():
         if key in _INT_FIELDS:
@@ -232,13 +232,13 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             pass_k = _coerce_k_tuple(raw)
             continue
         elif key == "avg_k":
-            avg_k = _coerce_k_tuple(raw)
+            avg_k = _coerce_avg_k_tuple(raw)
             continue
         elif key == "report_pass_k":
             report_pass_k = _coerce_k_tuple(raw)
             continue
         elif key == "report_avg_k":
-            report_avg_k = _coerce_k_tuple(raw)
+            report_avg_k = _coerce_avg_k_tuple(raw)
             continue
         else:
             continue
@@ -307,6 +307,25 @@ def _coerce_k_tuple(value: Any) -> tuple[int, ...] | None:
     if raw is None:
         return None
     filtered = sorted({int(item) for item in raw if int(item) > 0})
+    return tuple(filtered)
+
+
+def _coerce_avg_k_tuple(value: Any) -> tuple[float, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    values: list[float] = []
+    if isinstance(value, (int, float)):
+        values = [float(value)]
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                return None
+            values.append(float(item))
+    else:
+        return None
+    filtered = sorted({float(item) for item in values if float(item) > 0.0})
     return tuple(filtered)
 
 

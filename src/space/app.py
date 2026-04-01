@@ -469,7 +469,7 @@ def _build_dashboard() -> gr.Blocks:
             openModalEvent(event || { view: 'text', raw_text: '' });
         };
 
-        window.rwkvSpaceRequestContext = (cellId, sampleIndex, repeatIndex) => {
+        window.rwkvSpaceRequestContext = (cellId, sampleIndex, repeatIndex, passIndex) => {
             if (!cellId) {
                 return;
             }
@@ -482,6 +482,7 @@ def _build_dashboard() -> gr.Blocks:
                     cell_id: cellId,
                     sample_index: Number(sampleIndex),
                     repeat_index: Number(repeatIndex),
+                    pass_index: Number(passIndex),
                     ts: Date.now(),
                 }),
             );
@@ -550,8 +551,9 @@ def _build_dashboard() -> gr.Blocks:
                 const cellId = contextButton.getAttribute('data-context-cell-id');
                 const sampleIndex = contextButton.getAttribute('data-sample-index');
                 const repeatIndex = contextButton.getAttribute('data-repeat-index');
+                const passIndex = contextButton.getAttribute('data-pass-index');
                 if (cellId) {
-                    window.rwkvSpaceRequestContext(cellId, sampleIndex, repeatIndex);
+                    window.rwkvSpaceRequestContext(cellId, sampleIndex, repeatIndex, passIndex);
                 }
                 return;
             }

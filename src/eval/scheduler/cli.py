@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.benchmark_registry import ALL_BENCHMARKS, BenchmarkField
+from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
+
 from .actions import (
     DispatchOptions,
     LogsOptions,
@@ -32,6 +35,9 @@ from .models import MODEL_SELECT_CHOICES
 _KNOWN_DATASET_SLUGS: tuple[str, ...] = tuple(
     sorted({canonical_slug(slug) for spec in JOB_CATALOGUE.values() for slug in spec.dataset_slugs})
 )
+_KNOWN_BENCHMARK_NAMES: tuple[str, ...] = tuple(sorted(item.name for item in ALL_BENCHMARKS))
+_BENCHMARK_FIELD_CHOICES: tuple[str, ...] = tuple(field.value for field in BenchmarkField)
+_RUN_MODE_CHOICES: tuple[str, ...] = tuple(mode.value for mode in RunMode)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -112,6 +118,18 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
             help=f"按任务域筛选 job，例如 --domains {'/'.join(domain_choices)}",
         )
     parser.add_argument(
+        "--benchmark-fields",
+        nargs="+",
+        choices=_BENCHMARK_FIELD_CHOICES,
+        help="按 benchmark 领域筛选，语义对齐 rwkv-rs 的 benchmark_field",
+    )
+    parser.add_argument(
+        "--extra-benchmarks",
+        nargs="+",
+        choices=_KNOWN_BENCHMARK_NAMES,
+        help="额外包含的 benchmark，语义对齐 rwkv-rs 的 extra_benchmark_name",
+    )
+    parser.add_argument(
         "--only-datasets",
         nargs="+",
         help="仅运行指定 benchmark（使用数据集名称即可，如 aime24 或 gpqa）",
@@ -132,6 +150,12 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     """Add dispatch-related options (also used by `queue` for dry-run parity)."""
 
     parser.add_argument("--run-log-dir", default=str(DEFAULT_RUN_LOG_DIR), help="运行日志目录")
+    parser.add_argument(
+        "--run-mode",
+        choices=_RUN_MODE_CHOICES,
+        default=RunMode.AUTO.value,
+        help="任务执行语义：auto/new/resume/rerun；strict 模式对齐 rwkv-rs，默认 auto 保持当前兼容行为",
+    )
     parser.add_argument(
         "--dispatch-poll-seconds",
         type=int,
@@ -161,12 +185,12 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="忽略已存在分数并强制重跑（写入新版本，不删除历史记录）",
+        help="兼容旧接口，相当于 --run-mode rerun",
     )
     parser.add_argument(
         "--disable-checker",
         action="store_true",
-        help="关闭 LLM wrong-answer checker（不运行 run_llm_checker）",
+        help="关闭 LLM wrong-answer checker（不写 checker 表，也不跑离线 checker）",
     )
 
 
@@ -182,6 +206,7 @@ def _dispatch_options_from_args(
     min_param_b: float | None,
     max_param_b: float | None,
     model_select: str,
+    run_mode: RunMode,
 ) -> DispatchOptions:
     batch_cache = Path(args.batch_cache) if getattr(args, "batch_cache", None) else None
     return DispatchOptions(
@@ -198,12 +223,12 @@ def _dispatch_options_from_args(
         only_dataset_slugs=only_dataset_slugs,
         model_name_patterns=model_name_patterns,
         enable_param_search=bool(args.enable_param_search),
+        run_mode=run_mode,
         dispatch_poll_seconds=int(args.dispatch_poll_seconds),
         gpu_idle_max_mem=int(args.gpu_idle_max_mem),
         skip_missing_dataset=bool(args.skip_missing_dataset),
         clean_param_swap=bool(args.clean_param_swap),
         batch_cache_path=batch_cache,
-        overwrite=bool(args.overwrite),
         disable_checker=bool(args.disable_checker),
     )
 
@@ -266,6 +291,48 @@ def _resolve_job_priority(priority: Sequence[str] | None, available: Sequence[st
     return tuple(ordered) if ordered else None
 
 
+def _parse_benchmark_fields(values: Sequence[str] | None) -> tuple[BenchmarkField, ...]:
+    if not values:
+        return tuple()
+    return tuple(BenchmarkField(value) for value in values)
+
+
+def _collect_selected_dataset_slugs(
+    parser: argparse.ArgumentParser,
+    *,
+    benchmark_fields: Sequence[BenchmarkField],
+    extra_benchmarks: Sequence[str] | None,
+    only_datasets: Sequence[str] | None,
+) -> tuple[str, ...]:
+    selected: set[str] = set()
+    if benchmark_fields or extra_benchmarks:
+        try:
+            selected.update(
+                collect_benchmark_dataset_slugs(
+                    fields=benchmark_fields,
+                    extra_benchmark_names=tuple(extra_benchmarks or ()),
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    selected.update(_canonicalize_slugs(parser, only_datasets))
+    return tuple(sorted(selected))
+
+
+def _resolve_run_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> RunMode:
+    explicit = getattr(args, "run_mode", RunMode.AUTO.value)
+    overwrite = bool(getattr(args, "overwrite", False))
+    if overwrite and explicit not in (RunMode.AUTO.value, RunMode.RERUN.value):
+        parser.error("--overwrite 只能与 --run-mode auto/rerun 搭配使用")
+    if overwrite:
+        return RunMode.RERUN
+    try:
+        return RunMode.parse(explicit)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 __all__ = ["build_parser", "main"]
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -285,11 +352,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     model_globs = tuple(getattr(args, "models", list(DEFAULT_MODEL_GLOBS)))
     skip_dataset_slugs = _canonicalize_slugs(parser, getattr(args, "skip_datasets", None))
-    only_dataset_slugs = _canonicalize_slugs(parser, getattr(args, "only_datasets", None))
+    benchmark_fields = _parse_benchmark_fields(getattr(args, "benchmark_fields", None))
+    only_dataset_slugs = _collect_selected_dataset_slugs(
+        parser,
+        benchmark_fields=benchmark_fields,
+        extra_benchmarks=getattr(args, "extra_benchmarks", None),
+        only_datasets=getattr(args, "only_datasets", None),
+    )
     model_name_patterns = _compile_model_patterns(parser, getattr(args, "model_regex", None))
     min_param_b = getattr(args, "min_param_b", None)
     max_param_b = getattr(args, "max_param_b", None)
     model_select = getattr(args, "model_select", "all")
+    run_mode = _resolve_run_mode(parser, args)
 
     if command == "queue":
         opts = _dispatch_options_from_args(
@@ -303,6 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_param_b=min_param_b,
             max_param_b=max_param_b,
             model_select=model_select,
+            run_mode=run_mode,
         )
         action_queue(opts)
     elif command == "dispatch":
@@ -317,6 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_param_b=min_param_b,
             max_param_b=max_param_b,
             model_select=model_select,
+            run_mode=run_mode,
         )
         action_dispatch(opts)
     elif command == "status":

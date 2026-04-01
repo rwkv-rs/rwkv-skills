@@ -236,15 +236,21 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
         return "coding系列"
     if job == "instruction_following":
         return "instruction following系列"
+    if job in {"function_browsecomp", "function_mcp_bench", "function_tau_bench", "function_tau2_bench"}:
+        return "function_call系列"
     if job in {"free_response", "free_response_judge"}:
         return "math reasoning系列"
-    if job in {"multi_choice_plain", "multi_choice_cot"}:
+    if job in {"multi_choice_plain", "multi_choice_fake_cot", "multi_choice_cot"}:
         return "multi-choice系列"
     if task:
         if "code" in task:
             return "coding系列"
         if "instruction" in task:
             return "instruction following系列"
+        if "function" in task or "browsecomp" in task or "mcp" in task:
+            return "function_call系列"
+        if "multi_choice" in task:
+            return "multi-choice系列"
     return "其他"
 
 

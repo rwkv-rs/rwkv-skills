@@ -93,15 +93,36 @@ class DBConfig:
     user: str = "postgres"
     password: str = ""
     dbname: str = "rwkv-eval"
+    sslmode: str = "prefer"
+    startup_recovery: bool = False
+
+
+def _env_first(*names: str, default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def _env_bool(*names: str, default: bool) -> bool:
+    raw = _env_first(*names, default="1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _load_db_config() -> DBConfig:
     return DBConfig(
-        host=os.environ.get("PG_HOST", "localhost"),
-        port=int(os.environ.get("PG_PORT", "5432")),
-        user=os.environ.get("PG_USER", "postgres"),
-        password=os.environ.get("PG_PASSWORD", ""),
-        dbname=os.environ.get("PG_DBNAME", "rwkv-eval"),
+        host=_env_first("RWKV_EVAL_SPACE_DB_HOST", "PG_HOST", default="localhost"),
+        port=int(_env_first("RWKV_EVAL_SPACE_DB_PORT", "PG_PORT", default="5432")),
+        user=_env_first("RWKV_EVAL_SPACE_DB_USERNAME", "PG_USER", default="postgres"),
+        password=_env_first("RWKV_EVAL_SPACE_DB_PASSWORD", "PG_PASSWORD", default=""),
+        dbname=_env_first("RWKV_EVAL_SPACE_DB_DATABASE_NAME", "PG_DBNAME", default="rwkv-eval"),
+        sslmode=_env_first("RWKV_EVAL_SPACE_DB_SSLMODE", "PG_SSLMODE", default="prefer"),
+        startup_recovery=_env_bool(
+            "RWKV_EVAL_STARTUP_RECOVERY",
+            "RUN_STARTUP_RECOVERY",
+            default=False,
+        ),
     )
 
 DEFAULT_DB_CONFIG = _load_db_config()

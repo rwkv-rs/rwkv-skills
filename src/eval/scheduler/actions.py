@@ -38,6 +38,7 @@ from .state import (
     write_pid_file,
 )
 from src.eval.benchmark_config import config_path_for_benchmark
+from src.eval.evaluating import RunMode
 
 
 @dataclass(slots=True)
@@ -54,6 +55,7 @@ class QueueOptions:
     only_dataset_slugs: tuple[str, ...] = ()
     model_name_patterns: tuple[re.Pattern[str], ...] = ()
     enable_param_search: bool = False
+    run_mode: RunMode = RunMode.AUTO
 
 
 @dataclass(slots=True)
@@ -64,7 +66,6 @@ class DispatchOptions(QueueOptions):
     skip_missing_dataset: bool = False
     clean_param_swap: bool = False
     batch_cache_path: Path | None = None
-    overwrite: bool = False
     disable_checker: bool = False
 
 
@@ -95,8 +96,7 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
     }
     running_entries = load_running(opts.pid_dir)
     job_priority_map = _job_priority_map(opts.job_priority)
-    overwrite_mode = bool(getattr(opts, "overwrite", False))
-    completed_for_queue = set() if overwrite_mode else set(completed)
+    completed_for_queue = set() if opts.run_mode is RunMode.RERUN else set(completed)
     pending = build_queue(
         model_globs=opts.model_globs,
         job_order=opts.job_order,
@@ -187,7 +187,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
         previous_running = set(running_entries.keys())
 
         cooldown_jobs = {job_id for job_id, until in cooldown_until.items() if until > now}
-        if opts.overwrite:
+        if opts.run_mode is RunMode.RERUN:
             completed_for_queue = set(session_completed)
         else:
             completed_for_queue = set(completed)
@@ -326,7 +326,8 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RWKV_TASK_DESC": f"job={item.job_name}, dataset={dataset_slug}",
                     "RUN_LOG_DIR": str(opts.log_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
-                    "RWKV_SCHEDULER_OVERWRITE": "1" if opts.overwrite else "0",
+                    "RWKV_EVAL_RUN_MODE": opts.run_mode.value,
+                    "RWKV_SCHEDULER_OVERWRITE": "1" if opts.run_mode is RunMode.RERUN else "0",
                 }
             )
             if opts.disable_checker:
@@ -346,7 +347,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
             )
 
             extra_args = item.extra_args
-            if opts.overwrite and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
+            if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
                 extra_args = extra_args + ("--overwrite",)
 
             command = build_command(

@@ -46,12 +46,44 @@ def _normalize_subject_label(text: str) -> str:
     return text.replace("_", " ").strip().lower()
 
 
-def _method_tag(is_cot: bool) -> str:
+def _method_tag(is_cot: bool, *, cot_mode: str | None = None) -> str:
+    normalized = str(cot_mode or "").strip().lower()
+    if normalized == "fake_cot":
+        return "fake_cot"
+    if normalized in {"no_cot", "nocot"}:
+        return "nocot"
+    if normalized == "cot":
+        return "cot"
     return "cot" if is_cot else "nocot"
 
 
+def _entry_cot_mode(entry: ScoreEntry) -> str | None:
+    if entry.task_details:
+        mode = entry.task_details.get("cot_mode")
+        if isinstance(mode, str) and mode.strip():
+            return mode
+    mode = entry.extra.get("cot_mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode
+    sampling_config = entry.extra.get("sampling_config")
+    if isinstance(sampling_config, dict):
+        nested = sampling_config.get("cot_mode")
+        if isinstance(nested, str) and nested.strip():
+            return nested
+    task = (entry.task or "").strip().lower()
+    if "fake_cot" in task:
+        return "fake_cot"
+    if task.endswith("_plain"):
+        return "no_cot"
+    return "cot" if entry.cot else "no_cot"
+
+
+def _entry_method_tag(entry: ScoreEntry) -> str:
+    return _method_tag(entry.cot, cot_mode=_entry_cot_mode(entry))
+
+
 def _benchmark_name(entry: ScoreEntry) -> str:
-    return f"{_dataset_base(entry.dataset)}_{_method_tag(entry.cot)}"
+    return f"{_dataset_base(entry.dataset)}_{_entry_method_tag(entry)}"
 
 
 def _format_param(token: str | None) -> str:
@@ -109,24 +141,24 @@ def _parse_pass_suffix(key: str) -> int | None:
         return None
 
 
-def _parse_k_metric(key: str) -> tuple[str, int] | None:
+def _parse_k_metric(key: str) -> tuple[str, float] | None:
     token = str(key).strip().lower()
     if token.startswith("pass@"):
         try:
-            return "pass", int(token.split("@", 1)[1])
+            return "pass", float(int(token.split("@", 1)[1]))
         except ValueError:
             return None
     if token.startswith("avg@"):
         try:
-            return "avg", int(token.split("@", 1)[1])
+            return "avg", float(token.split("@", 1)[1])
         except ValueError:
             return None
     return None
 
 
 def _preferred_k_metric(metrics: dict[str, Any]) -> str:
-    avg_candidates: list[tuple[int, str]] = []
-    pass_candidates: list[tuple[int, str]] = []
+    avg_candidates: list[tuple[float, str]] = []
+    pass_candidates: list[tuple[float, str]] = []
     for key, value in metrics.items():
         parsed = _parse_k_metric(str(key))
         if parsed is None or _numeric_value(value) is None:
@@ -530,7 +562,7 @@ def _detail_sort_key(row_key: tuple[str, str, str]) -> tuple[Any, ...]:
     method_rank = {"llm_judge": 0, "exact_match": 1, "logits": 2}.get(method, 9)
     parsed = _parse_k_metric(k_metric)
     if parsed is None:
-        k_rank = (9, 0)
+        k_rank = (9, 0.0)
     else:
         kind, k = parsed
         kind_rank = 0 if kind == "avg" else 1

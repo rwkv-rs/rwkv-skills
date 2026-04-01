@@ -53,8 +53,8 @@ class TauV2Env:
         Task = _tau2_attr("tau2.data_model.tasks", "Task", context="tau2 Task model import")
         return Task.model_validate(payload)
 
-    def create_environment(self) -> Any:
-        return self._environment_constructor()
+    def create_environment(self, *, solo_mode: bool = False) -> Any:
+        return self._environment_constructor(solo_mode=solo_mode)
 
     def apply_initial_state(self, *, environment: Any, task: Any) -> list[Any]:
         initial_state = getattr(task, "initial_state", None)
@@ -126,13 +126,19 @@ class TauV2Env:
         return AssistantMessage(role="assistant", content=content, tool_calls=tool_calls)
 
     @staticmethod
-    def build_tool_call(*, tool_call_id: str, name: str, arguments: dict[str, Any]) -> Any:
+    def build_tool_call(
+        *,
+        tool_call_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        requestor: str = "assistant",
+    ) -> Any:
         ToolCall = _tau2_attr("tau2.data_model.message", "ToolCall", context="tau2 ToolCall import")
         return ToolCall(
             id=tool_call_id,
             name=name,
             arguments=arguments,
-            requestor="assistant",
+            requestor=requestor,
         )
 
     def call_tool(self, *, environment: Any, tool_call: Any) -> Any:
@@ -184,6 +190,14 @@ class TauV2Env:
     @staticmethod
     def tools_schema(environment: Any) -> list[dict[str, Any]]:
         return [tool.openai_schema for tool in environment.get_tools()]
+
+    @staticmethod
+    def user_tools_schema(environment: Any) -> list[dict[str, Any]]:
+        try:
+            tools = environment.get_user_tools()
+        except Exception:
+            return []
+        return [tool.openai_schema for tool in tools]
 
     @staticmethod
     def system_prompt(environment: Any) -> str:

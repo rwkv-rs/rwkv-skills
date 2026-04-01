@@ -38,6 +38,7 @@ class SampleRecord:
     sample_index: int
     repeat_index: int
     stages: list[StageRecord]
+    pass_index: int = 0
     sampling_config: dict = field(default_factory=dict)
 
     def as_payload(self) -> dict:
@@ -46,6 +47,7 @@ class SampleRecord:
             "dataset_split": self.dataset_split,
             "sample_index": int(self.sample_index),
             "repeat_index": int(self.repeat_index),
+            "pass_index": int(self.pass_index),
             "sampling_config": self.sampling_config or {},
         }
         for idx, stage in enumerate(self.stages, start=1):
@@ -55,8 +57,14 @@ class SampleRecord:
         return payload
 
 
-def sample_repeat_seed(sample_index: int, repeat_index: int, *, stage: int = 1) -> int:
-    """Build a stable per-sample seed from (sample_index, repeat_index, stage).
+def sample_repeat_seed(
+    sample_index: int,
+    repeat_index: int,
+    *,
+    pass_index: int = 0,
+    stage: int = 1,
+) -> int:
+    """Build a stable per-attempt seed from (sample_index, repeat_index, pass_index, stage).
 
     Layout (63-bit, non-negative):
       [sample_index:31][repeat_index:24][stage:8]
@@ -64,16 +72,27 @@ def sample_repeat_seed(sample_index: int, repeat_index: int, *, stage: int = 1) 
 
     sample = int(sample_index)
     repeat = int(repeat_index)
+    passed = int(pass_index)
     stage_id = int(stage)
-    if sample < 0 or repeat < 0 or stage_id < 0:
-        raise ValueError("sample_index/repeat_index/stage must be non-negative")
+    if sample < 0 or repeat < 0 or passed < 0 or stage_id < 0:
+        raise ValueError("sample_index/repeat_index/pass_index/stage must be non-negative")
     if sample >= (1 << 31):
         raise ValueError(f"sample_index 超出可编码范围: {sample}")
     if repeat >= (1 << 24):
         raise ValueError(f"repeat_index 超出可编码范围: {repeat}")
+    if passed >= (1 << 16):
+        raise ValueError(f"pass_index 超出可编码范围: {passed}")
     if stage_id >= (1 << 8):
         raise ValueError(f"stage 超出可编码范围: {stage_id}")
-    return (sample << 32) | (repeat << 8) | stage_id
+    base_seed = (sample << 32) | (repeat << 8) | stage_id
+    if passed == 0:
+        return base_seed
+    # Preserve historical seeds for pass_index=0 while ensuring extra passes
+    # of the same (sample, repeat) receive stable distinct seeds.
+    return (
+        base_seed
+        ^ (((passed + 1) * 0x9E3779B97F4A7C15) & 0x7FFFFFFFFFFFFFFF)
+    ) & 0x7FFFFFFFFFFFFFFF
 
 
 @dataclass(slots=True)

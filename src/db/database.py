@@ -1,4 +1,4 @@
-"""Database initialization - thin wrapper around orm.init_orm for backwards compatibility."""
+"""Database initialization wrapper around orm.init_orm."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ __all__ = ["init_db", "is_initialized"]
 def init_db(config: DBConfig | None = None) -> None:
     """Initialize the database connection.
 
-    This is the preferred entry point for database initialization.
+    Database and schema must already exist.
     Delegates to orm.init_orm().
     """
     init_orm(config)

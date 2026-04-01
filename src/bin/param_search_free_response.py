@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
-from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
-from src.eval.evaluators.free_response import FreeResponsePipeline
+from src.eval.evaluating import run_checker_for_task
+from src.eval.maths.common import count_free_answer_records, filter_avg_metrics, filter_pass_metrics
+from src.eval.maths.pipeline import FreeResponsePipeline
 from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
 from src.eval.param_search.cot_grid import COT_GRID, grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
@@ -48,36 +49,8 @@ def _sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     return normalized
 
 
-def _filter_metrics_by_k(metric_map: dict[str, float] | None, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
-    if not metric_map or not ks:
-        return {}
-    allowed = {int(k) for k in ks if int(k) > 0}
-    filtered: dict[str, float] = {}
-    for key, value in metric_map.items():
-        if not key.startswith(prefix):
-            continue
-        suffix_text = key[len(prefix) :]
-        if not suffix_text.isdigit():
-            continue
-        suffix = int(suffix_text)
-        if suffix in allowed:
-            filtered[key] = value
-    return filtered
-
-
 def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
-
-
-def _count_records(path: str | Path, limit: int | None) -> int:
-    loader = JsonlFreeAnswerLoader(str(path))
-    count = 0
-    for _ in loader:
-        count += 1
-        if limit and count >= limit:
-            break
-    return count
-
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search (free-response, exact-match)")
@@ -142,7 +115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     pass_k = tuple(args.pass_k) if args.pass_k else DEFAULT_PASS_K
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
-    expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+    expected_count = count_free_answer_records(dataset_path, args.max_samples) * samples_per_task
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -222,12 +195,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 writer.close()
             finally:
-                actual = db_service.count_completions(task_id=task_id, status="answer")
+                actual = db_service.count_completions(task_id=task_id, status="Completed")
                 status = "completed" if actual == expected_count else "failed"
                 db_service.update_task_status(task_id=task_id, status=status)
             raise
         writer.close()
-        completions_payloads = db_service.list_completion_payloads(task_id=task_id, status="answer")
+        completions_payloads = db_service.list_completion_payloads(task_id=task_id, status="Completed")
         evaluation = evaluate_free_response(
             completions_payloads,
             dataset_path=str(dataset_path),
@@ -239,10 +212,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "exact_accuracy": float(evaluation.exact_accuracy),
             "judge_accuracy": evaluation.judge_accuracy,
         }
-        pass_payload = _filter_metrics_by_k(pass_metrics_all, pass_k, "pass@") or (pass_metrics_all or {})
+        pass_payload = filter_pass_metrics(pass_metrics_all, pass_k) or (pass_metrics_all or {})
         if pass_payload:
             metrics_payload.update(pass_payload)
-        avg_payload = _filter_metrics_by_k(avg_metrics_all, avg_k, "avg@") or (avg_metrics_all or {})
+        avg_payload = filter_avg_metrics(avg_metrics_all, avg_k) or (avg_metrics_all or {})
         if avg_payload:
             metrics_payload.update(avg_payload)
 
@@ -270,6 +243,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_details=task_details,
         )
         db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
+        run_checker_for_task(service=db_service, task_id=task_id, model_name=model_name)
         db_service.record_score_payload(
             payload=payload,
             task_id=task_id,

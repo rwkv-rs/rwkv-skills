@@ -34,6 +34,7 @@ from .prepper_registry import (
     INSTRUCTION_FOLLOWING_REGISTRY,
     MULTIPLE_CHOICE_REGISTRY,
 )
+from src.eval.datasets.runtime import LegacyPreparerDatasetSpec, ensure_dataset_materialized
 
 _FAMILY_MODULES = (
     "multiple_choice",
@@ -96,19 +97,33 @@ def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[P
     """
     _ensure_registries()
     key = name.lower()
-    preparer = (
-        MULTIPLE_CHOICE_REGISTRY.get(key)
-        or FREE_ANSWER_REGISTRY.get(key)
-        or INSTRUCTION_FOLLOWING_REGISTRY.get(key)
-        or CODE_GENERATION_REGISTRY.get(key)
+    registries = (
+        MULTIPLE_CHOICE_REGISTRY,
+        FREE_ANSWER_REGISTRY,
+        INSTRUCTION_FOLLOWING_REGISTRY,
+        CODE_GENERATION_REGISTRY,
     )
-    if preparer is None:
-        raise ValueError(f"未知的 NeMo benchmark 数据集: {name}")
+    spec_factory = None
+    preparer: DatasetPreparer | None = None
+    for registry in registries:
+        spec_factory = registry.get_spec_factory(key)
+        if spec_factory is not None:
+            break
+        preparer = registry.get(key)
+        if preparer is not None:
+            break
+    if spec_factory is None and preparer is None:
+        raise ValueError(f"未知的 benchmark 数据集: {name}")
 
     output_root = output_root.expanduser().resolve()
     start = time.perf_counter()
     try:
-        paths = preparer(output_root, split)
+        if spec_factory is not None:
+            spec = spec_factory(output_root, split)
+        else:
+            assert preparer is not None
+            spec = LegacyPreparerDatasetSpec(key, output_root, split, preparer=preparer)
+        paths = ensure_dataset_materialized(spec)
     except Exception as exc:
         if perf_logger.enabled:
             perf_logger.log(

@@ -30,11 +30,11 @@ from .metrics import (
     _cell_numeric_value,
     _dataset_base,
     _detail_sort_key,
+    _entry_method_tag,
     _field_average_score,
     _format_param,
     _map_subject_to_subdomain,
     _max_percent,
-    _method_tag,
     _metric_score,
     _numeric_value,
     _parse_display_number,
@@ -106,7 +106,7 @@ def _render_summary(
         )
 
     normalized_view = _normalize_table_view(view_mode)
-    benchmark_count = len({(_dataset_base(entry.dataset), _method_tag(entry.cot)) for entry in visible})
+    benchmark_count = len({(_dataset_base(entry.dataset), _entry_method_tag(entry)) for entry in visible})
     lines = [
         f"- 数据源：PostgreSQL (`{db_host}:{db_port}/{db_name}`)",
         "- 数据范围：仅正式评测（已过滤 param-search）",
@@ -136,7 +136,7 @@ def _build_pivot_table(selection: SelectionState, entries: Iterable[ScoreEntry] 
 
     for entry in target_entries:
         base = _dataset_base(entry.dataset)
-        method = _method_tag(entry.cot)
+        method = _entry_method_tag(entry)
         row_key = (base, method)
         meta = row_meta.get(row_key)
         if meta is None:

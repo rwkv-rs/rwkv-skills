@@ -10,6 +10,8 @@ These utilities operate over canonical evaluator outputs keyed by:
 from collections import defaultdict
 from typing import Iterable, Sequence
 
+from src.eval.execution_plan import avg_k_metric_key
+
 
 def estimate_pass_at_k(total: int, correct: int, k: int) -> float:
     if total - correct < k:
@@ -54,7 +56,7 @@ def compute_pass_at_k(
 
 def compute_avg_at_k(
     rows: Iterable[tuple[int, int, bool]],
-    ks: Sequence[int],
+    ks: Sequence[float | int],
 ) -> dict[str, float]:
     seen: set[tuple[int, int]] = set()
     grouped: dict[int, list[tuple[int, bool]]] = defaultdict(list)
@@ -67,20 +69,37 @@ def compute_avg_at_k(
 
     metrics: dict[str, float] = {}
     for k in ks:
-        k = int(k)
-        if k <= 0:
+        numeric_k = float(k)
+        if numeric_k <= 0:
+            continue
+        metric_key = avg_k_metric_key(numeric_k)
+        if numeric_k < 1.0:
+            correct = 0
+            total = 0
+            for entries in grouped.values():
+                ordered = sorted(entries, key=lambda pair: pair[0])
+                if not ordered:
+                    continue
+                correct += sum(1 for _, flag in ordered if flag)
+                total += len(ordered)
+            if total > 0:
+                metrics[metric_key] = correct / total
+            continue
+
+        k_int = int(round(numeric_k))
+        if abs(numeric_k - k_int) > 1e-9 or k_int <= 0:
             continue
         correct = 0
         total = 0
         for entries in grouped.values():
             ordered = sorted(entries, key=lambda pair: pair[0])
-            if len(ordered) < k:
+            if len(ordered) < k_int:
                 continue
-            selected = ordered[:k]
+            selected = ordered[:k_int]
             correct += sum(1 for _, flag in selected if flag)
-            total += k
+            total += k_int
         if total > 0:
-            metrics[f"avg@{k}"] = correct / total
+            metrics[metric_key] = correct / total
     return metrics
 
 
