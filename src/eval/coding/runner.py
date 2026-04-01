@@ -33,7 +33,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="JSONL dataset path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
-    parser.add_argument("--max-samples", type=int, help="Compatibility flag for quick runs")
+    parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--max-tokens", type=int, help="Clamp generation length")
     parser.add_argument("--temperature", type=float, help="Override sampling temperature")
     parser.add_argument("--top-k", type=int, help="Override sampling top-k")
@@ -44,7 +44,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--probe-only",
         action="store_true",
-        help="Scheduler compatibility flag: run a single-batch probe and skip scoring",
+        help="Run a single-batch probe and skip scoring",
     )
     parser.add_argument(
         "--benchmark-kind",
@@ -56,12 +56,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--cot-mode",
         choices=[mode.value for mode in CoTMode],
         help="Prompt mode for MBPP benchmarks; human_eval/livecodebench use fixed modes",
-    )
-    parser.add_argument(
-        "--pass-k",
-        type=int,
-        action="append",
-        help="Compatibility flag for legacy callers.",
     )
     return parser.parse_args(argv)
 
@@ -179,6 +173,8 @@ def _sampling_payload(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
     from src.eval.coding.pipeline import CodingPipeline
     from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
     from src.eval.evaluating import prepare_task_execution, run_checker_for_task
@@ -194,7 +190,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.db.orm import init_orm
     from src.infer.model import ModelLoadConfig
 
-    args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     benchmark_kind = _resolve_benchmark_kind(slug, CodingBenchmarkKind(args.benchmark_kind))
@@ -417,3 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = ["CodingBenchmarkKind", "main", "parse_args"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -28,7 +28,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="JSONL dataset path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
-    parser.add_argument("--max-samples", type=int, help="Compatibility flag for quick runs")
+    parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
     parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
     parser.add_argument("--db-write-queue", type=int, help="DB completion write queue max size")
@@ -46,19 +46,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--probe-only",
         action="store_true",
-        help="Scheduler compatibility flag: run a single-sample probe and skip scoring",
-    )
-    parser.add_argument(
-        "--pass-k",
-        type=int,
-        action="append",
-        help="Compatibility flag for legacy callers.",
-    )
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="Compatibility flag for legacy callers.",
+        help="Run a single-sample probe and skip scoring",
     )
     parser.add_argument(
         "--judge-mode",
@@ -100,6 +88,8 @@ def _close_writer_and_mark_failed(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
     from src.eval.env_config import load_env_file
     from src.eval.evaluating import prepare_task_execution, run_checker_for_task
     from src.eval.execution_plan import build_attempt_keys, build_auto_avg_k_execution_plan, plan_attempt_count
@@ -116,7 +106,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.infer.model import ModelLoadConfig
 
     load_env_file(Path(".env"))
-    args = parse_args(argv)
     judge_mode = JudgeMode(args.judge_mode)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
@@ -304,3 +293,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = ["main", "parse_args"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

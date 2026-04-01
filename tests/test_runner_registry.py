@@ -41,7 +41,7 @@ def test_knowledge_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.KNOWLEDGE]
     }
-    assert knowledge_modules == {"src.bin.knowledge_runner"}
+    assert knowledge_modules == {"src.eval.knowledge.runner"}
 
 
 def test_maths_runners_share_unified_module() -> None:
@@ -49,7 +49,7 @@ def test_maths_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.MATHS]
     }
-    assert maths_modules == {"src.bin.maths_runner"}
+    assert maths_modules == {"src.eval.maths.runner"}
 
 
 def test_coding_runners_share_unified_module() -> None:
@@ -57,7 +57,7 @@ def test_coding_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.CODING]
     }
-    assert coding_modules == {"src.bin.coding_runner"}
+    assert coding_modules == {"src.eval.coding.runner"}
 
 
 def test_instruction_following_runners_share_unified_module() -> None:
@@ -65,7 +65,7 @@ def test_instruction_following_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.INSTRUCTION_FOLLOWING]
     }
-    assert modules == {"src.bin.instruction_following_runner"}
+    assert modules == {"src.eval.instruction_following.runner"}
 
 
 def test_function_calling_runners_share_unified_module() -> None:
@@ -73,4 +73,4 @@ def test_function_calling_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]
     }
-    assert modules == {"src.bin.function_calling_runner"}
+    assert modules == {"src.eval.function_calling.runner"}

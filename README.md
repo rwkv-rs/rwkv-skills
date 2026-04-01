@@ -76,10 +76,10 @@ By default the evaluator scripts run the LLM wrong-answer checker when configure
 
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
 
-The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler entry scripts are provided:
-`src/bin/eval_multi_choice.py`, `eval_multi_choice_cot.py`, `eval_free_response.py`, `eval_free_response_judge.py`, `eval_instruction_following.py`, `eval_code_human_eval.py`, `eval_code_mbpp.py`, `eval_code_livecodebench.py`.
+The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler jobs now dispatch directly to the field runners:
+`src.eval.knowledge.runner`, `src.eval.maths.runner`, `src.eval.coding.runner`, `src.eval.instruction_following.runner`, `src.eval.function_calling.runner`.
 
-Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
+Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `src.eval.maths.runner --judge-mode llm`; other free-response tasks use `src.eval.maths.runner --judge-mode exact`.
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`.
@@ -91,41 +91,44 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("human_eval", Path("data"))` downloads the official `HumanEval.jsonl.gz` and writes `data/human_eval/test.jsonl`.
 - Run via CLI:
   ```bash
-  python -m src.bin.eval_code_human_eval \
+  python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/human_eval/test.jsonl \
+    --benchmark-kind human_eval \
+    --cot-mode no_cot \
     --batch-size 128 \
-    --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
     --eval-timeout 3
   ```
-  Samples are written under `results/completions`, and the official unit tests are executed automatically to produce pass@k (number of generations equals the maximum k).
+  Samples are written to the evaluation database, and the official unit tests are executed automatically to produce `pass@1` plus the scheduler's derived `avg@k`.
 
 ## MBPP code generation evaluation
 - Dataset prep: `prepare_dataset("mbpp", Path("data"))` uses the EvalPlus variant MBPP+ and converts 4-space indentation in prompts into tabs.
 - Run via CLI:
   ```bash
-  python -m src.bin.eval_code_mbpp \
+  python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/mbpp/test.jsonl \
+    --benchmark-kind mbpp \
+    --cot-mode no_cot \
     --batch-size 128 \
-    --pass-k 1 --pass-k 2 --pass-k 4 --pass-k 8 --pass-k 16 \
     --eval-timeout 3
   ```
-  Multiple samples are generated and executed against EvalPlus test cases to output pass@k (number of generations equals the maximum k).
+  Multiple samples are generated and executed against EvalPlus test cases to report `pass@1` plus the scheduler's derived `avg@k`.
 
 ## LiveCodeBench code generation evaluation
 - Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_v6 (lite) split and writes `data/livecodebench/test.jsonl` (override with `RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG`).
 - Run via CLI:
   ```bash
-  python -m src.bin.eval_code_livecodebench \
+  python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
+    --benchmark-kind livecodebench \
+    --cot-mode cot \
     --batch-size 64 \
-    --pass-k 1 --pass-k 5 \
     --eval-timeout 6 \
     --eval-workers 12
   ```
-  LiveCodeBench uses the extracted code blocks for execution and reports pass@k (number of generations equals the maximum k).
+  LiveCodeBench uses the extracted code blocks for execution and reports `pass@1` plus the scheduler's derived `avg@k`.
 
 ## Known gaps / TODO
 - Other code benchmarks (BigCodeBench, etc.) are not supported yet.

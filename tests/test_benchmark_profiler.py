@@ -11,7 +11,7 @@ import src.eval.scheduler.profiler as profiler_module
 def _job_spec() -> JobSpec:
     return JobSpec(
         name="free_response",
-        module="src.bin.eval_free_response",
+        module="src.eval.maths.runner",
         dataset_slugs=("math_500_test",),
         is_cot=True,
         domain="free_response",

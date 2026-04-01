@@ -22,7 +22,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="JSONL dataset path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation/scoring")
-    parser.add_argument("--max-samples", type=int, help="Compatibility flag for quick runs")
+    parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
@@ -34,24 +34,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--probe-only",
         action="store_true",
-        help="Scheduler compatibility flag: run a single-batch CoT probe and skip scoring",
-    )
-    parser.add_argument(
-        "--no-param-search",
-        action="store_true",
-        help="Compatibility flag (no-op).",
-    )
-    parser.add_argument(
-        "--pass-k",
-        type=int,
-        action="append",
-        help="Compatibility flag for legacy callers.",
-    )
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="Compatibility flag for legacy callers.",
+        help="Run a single-batch CoT probe and skip scoring",
     )
     return parser.parse_args(argv)
 
@@ -95,6 +78,8 @@ def _task_sampling_config(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
     from src.eval.benchmark_config import resolve_sampling_config
     from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
     from src.eval.evaluating import prepare_task_execution, run_checker_for_task
@@ -110,7 +95,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.db.orm import init_orm
     from src.infer.model import ModelLoadConfig
 
-    args = parse_args(argv)
     cot_mode = CoTMode(args.cot_mode)
     if args.probe_only and cot_mode is not CoTMode.COT:
         raise ValueError("--probe-only is only supported with --cot-mode cot")
@@ -236,3 +220,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = ["main", "parse_args"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

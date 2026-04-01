@@ -18,30 +18,30 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["free_response"].runner_group is RunnerGroup.MATHS
     assert JOB_CATALOGUE["code_mbpp"].runner_group is RunnerGroup.CODING
     assert JOB_CATALOGUE["function_mcp_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
-    assert JOB_CATALOGUE["multi_choice_plain"].module == "src.bin.knowledge_runner"
-    assert JOB_CATALOGUE["multi_choice_fake_cot"].module == "src.bin.knowledge_runner"
-    assert JOB_CATALOGUE["multi_choice_cot"].module == "src.bin.knowledge_runner"
-    assert JOB_CATALOGUE["free_response"].module == "src.bin.maths_runner"
-    assert JOB_CATALOGUE["free_response_judge"].module == "src.bin.maths_runner"
-    assert JOB_CATALOGUE["code_human_eval"].module == "src.bin.coding_runner"
-    assert JOB_CATALOGUE["code_mbpp"].module == "src.bin.coding_runner"
-    assert JOB_CATALOGUE["code_mbpp_fake_cot"].module == "src.bin.coding_runner"
-    assert JOB_CATALOGUE["code_mbpp_cot"].module == "src.bin.coding_runner"
-    assert JOB_CATALOGUE["code_livecodebench"].module == "src.bin.coding_runner"
-    assert JOB_CATALOGUE["instruction_following"].module == "src.bin.instruction_following_runner"
-    assert JOB_CATALOGUE["function_browsecomp"].module == "src.bin.function_calling_runner"
-    assert JOB_CATALOGUE["function_mcp_bench"].module == "src.bin.function_calling_runner"
-    assert JOB_CATALOGUE["function_tau_bench"].module == "src.bin.function_calling_runner"
-    assert JOB_CATALOGUE["function_tau2_bench"].module == "src.bin.function_calling_runner"
+    assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.knowledge.runner"
+    assert JOB_CATALOGUE["multi_choice_fake_cot"].module == "src.eval.knowledge.runner"
+    assert JOB_CATALOGUE["multi_choice_cot"].module == "src.eval.knowledge.runner"
+    assert JOB_CATALOGUE["free_response"].module == "src.eval.maths.runner"
+    assert JOB_CATALOGUE["free_response_judge"].module == "src.eval.maths.runner"
+    assert JOB_CATALOGUE["code_human_eval"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_mbpp_fake_cot"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_mbpp_cot"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["instruction_following"].module == "src.eval.instruction_following.runner"
+    assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["multi_choice_plain"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["multi_choice_fake_cot"].extra_args == ("--cot-mode", "fake_cot")
-    assert JOB_CATALOGUE["multi_choice_cot"].extra_args == ("--cot-mode", "cot", "--no-param-search")
+    assert JOB_CATALOGUE["multi_choice_cot"].extra_args == ("--cot-mode", "cot")
     assert JOB_CATALOGUE["free_response"].extra_args == ("--judge-mode", "exact")
     assert JOB_CATALOGUE["free_response_judge"].extra_args == ("--judge-mode", "llm")
     assert JOB_CATALOGUE["code_mbpp"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["code_mbpp_fake_cot"].extra_args == ("--cot-mode", "fake_cot")
     assert JOB_CATALOGUE["code_mbpp_cot"].extra_args == ("--cot-mode", "cot")
-    assert JOB_CATALOGUE["instruction_following"].extra_args == ("--no-param-search",)
+    assert JOB_CATALOGUE["instruction_following"].extra_args == ()
 
 
 def test_instruction_following_matrix_includes_all_supported_datasets() -> None:

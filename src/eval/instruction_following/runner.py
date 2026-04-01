@@ -73,11 +73,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
-        "--no-param-search",
-        action="store_true",
-        help="Compatibility flag (no-op).",
-    )
-    parser.add_argument(
         "--avg-k",
         type=float,
         action="append",
@@ -87,10 +82,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
     from src.eval.instruction_following.pipeline import InstructionFollowingPipeline
     from src.infer.model import ModelLoadConfig
 
-    args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     dataset_records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
