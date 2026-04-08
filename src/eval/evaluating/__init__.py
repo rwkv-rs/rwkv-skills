@@ -6,12 +6,21 @@ from .benchmark import (
     resolve_registered_benchmark_name,
 )
 from .checker import run_checker_for_task
+from .contracts import ResultEnvelope, RunContext, TaskSpec
+from .runtime import TaskRunController, TaskRunSignalGuard, TaskRunState, attempt_tuple
 from .task_persistence import RunMode, TaskExecutionState, current_run_mode, prepare_task_execution
 
 __all__ = [
+    "ResultEnvelope",
     "RunMode",
+    "RunContext",
     "SelectedBenchmark",
+    "TaskRunController",
+    "TaskRunSignalGuard",
+    "TaskRunState",
     "TaskExecutionState",
+    "TaskSpec",
+    "attempt_tuple",
     "benchmark_dataset_slug",
     "collect_benchmark_dataset_slugs",
     "collect_benchmarks",

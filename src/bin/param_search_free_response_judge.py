@@ -10,6 +10,7 @@ import json
 import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
@@ -30,10 +31,18 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.job_env import ensure_job_id
 from src.db.async_writer import CompletionWriteWorker
+from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
-from src.infer.model import ModelLoadConfig
+from src.infer.backend import (
+    add_inference_backend_arguments,
+    build_inference_backend_from_args,
+    resolve_backend_model_name,
+    validate_inference_backend_args,
+)
 from src.infer.sampling import SamplingConfig
+
+if TYPE_CHECKING:
+    from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
 DEFAULT_PASS_K = (1,)
@@ -60,11 +69,11 @@ def _sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
 def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
 
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search (judge-style free-response)")
-    parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", required=True, help="JSONL dataset path")
-    parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
+    add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
@@ -96,18 +105,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    run_context: "RunContext | None" = None,
+    task_spec: "TaskSpec | None" = None,
+) -> int:
+    del task_spec
     load_env_file(Path(".env"))
     args = parse_args(argv)
+    validate_inference_backend_args(args)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    model_name = Path(args.model_path).stem
-    init_orm(DEFAULT_DB_CONFIG)
+    model_name = resolve_backend_model_name(args)
+    init_db(DEFAULT_DB_CONFIG)
 
     db_service = EvalDbService()
 
-    config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
-    pipeline = FreeResponsePipeline(config)
+    pipeline = FreeResponsePipeline(build_inference_backend_from_args(args))
 
     pass_k = tuple(args.pass_k) if args.pass_k else DEFAULT_PASS_K
     avg_k = tuple(args.avg_k) if args.avg_k else DEFAULT_AVG_K
@@ -162,6 +177,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_score: float | None = None
     best_trial: int | None = None
 
+    job_name = run_context.job_name if run_context is not None else "param_search_free_response_judge"
+
     for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling):
         print(f"🔍 trial {trial_idx}: {slug}")
         sampling_payload = {
@@ -169,8 +186,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "final": sampling_config_to_dict(final_sampling),
         }
         task_id = db_service.get_or_create_task(
-            job_name="param_search_free_response_judge",
-            job_id=ensure_job_id("param_search_free_response_judge"),
+            job_name=job_name,
+            job_id=ensure_job_id(job_name),
             dataset=str(slug),
             model=model_name,
             is_param_search=True,

@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Sequence
 
-from src.infer.engine import InferenceEngine
+from src.infer.backend import InferenceBackend
 from src.infer.sampling import SamplingConfig
 
 PromptProfile = Literal["tau_v1", "tau_v2", "legacy"]
@@ -35,7 +35,7 @@ class RWKVChatBridge:
     def __init__(
         self,
         *,
-        engine: InferenceEngine,
+        engine: InferenceBackend,
         default_sampling: SamplingConfig,
         prompt_profile: PromptProfile = "tau_v1",
         extra_system_instruction: str | None = None,

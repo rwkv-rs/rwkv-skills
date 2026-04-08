@@ -8,19 +8,17 @@ all selected languages + all MMLU subjects.
 
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Any
+from collections.abc import Iterable, Mapping
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
-
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from .mmlu import _SUBCATEGORIES as _MMLU_SUBCATEGORIES
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import MaterializingDatasetSpec
 
 
 _DATASET_ID = "giuliolovisotto/openai_multilingual_mmlu"
+_REQUIRED_FIELDS = ("question", "answer", "A", "B", "C", "D")
 
 # Default to the 14 non-English languages in OpenAI multilingual MMLU.
 _DEFAULT_LANGUAGE_SPLITS: tuple[str, ...] = (
@@ -49,18 +47,23 @@ def _parse_language_splits() -> tuple[str, ...]:
     return tuple(part for part in parts if part)
 
 
-def _iter_records(split: str) -> Iterable[dict]:
+def _load_mmmlu_dataset_by_subject(subject: str) -> Mapping[str, Iterable[Mapping[str, Any]]]:
+    configure_hf_home()
+    try:
+        from datasets import load_dataset  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
+        raise ModuleNotFoundError("需要安装 `datasets` 才能准备 mmmlu 数据集，请运行 `pip install datasets`") from exc
+    return load_dataset(_DATASET_ID, subject)
+
+
+def _iter_records(split: str) -> Iterable[dict[str, Any]]:
     if split != "test":
         raise ValueError("mmmlu 目前仅提供 test split")
-    if load_dataset is None:  # pragma: no cover - dependency missing
-        raise ModuleNotFoundError("需要安装 `datasets` 才能准备 mmmlu 数据集，请运行 `pip install datasets`")
-
-    configure_hf_home()
     language_splits = _parse_language_splits()
     subjects = tuple(sorted(_MMLU_SUBCATEGORIES.keys()))
 
     for subject in subjects:
-        dataset_by_lang = load_dataset(_DATASET_ID, subject)
+        dataset_by_lang = _load_mmmlu_dataset_by_subject(subject)
         for language in language_splits:
             if language not in dataset_by_lang:
                 raise KeyError(
@@ -89,13 +92,23 @@ def _iter_records(split: str) -> Iterable[dict]:
                 }
 
 
-@MULTIPLE_CHOICE_REGISTRY.register("mmmlu")
-def prepare_mmmlu(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "mmmlu"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split))
-    return [target]
+class MmmluDatasetSpec(MaterializingDatasetSpec):
+    def __init__(self, output_root: Path, split: str) -> None:
+        super().__init__("mmmlu", output_root, split, required_fields=_REQUIRED_FIELDS, source_kind="hf_load_dataset")
+
+    def download(self) -> None:
+        return None
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        return list(_iter_records(self.split))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        return {"dataset_id": _DATASET_ID, "source_split": self.split, "languages": list(_parse_language_splits())}
 
 
-__all__ = ["prepare_mmmlu"]
+@MULTIPLE_CHOICE_REGISTRY.register_spec("mmmlu")
+def prepare_mmmlu_spec(output_root: Path, split: str = "test") -> MmmluDatasetSpec:
+    return MmmluDatasetSpec(output_root, split)
+
+
+__all__ = ["prepare_mmmlu_spec"]

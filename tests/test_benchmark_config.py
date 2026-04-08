@@ -5,7 +5,9 @@ from src.eval.benchmark_config import (
     resolve_benchmark_model_config,
     resolve_sampling_config,
 )
+from src.eval.results.schema import sampling_config_to_dict
 from src.infer.sampling import SamplingConfig
+from src.eval import benchmark_config
 
 
 def test_config_path_for_benchmark_strips_split_suffix() -> None:
@@ -54,3 +56,42 @@ def test_resolve_sampling_config_supports_fallback_templates() -> None:
     assert config.temperature == 0.6
     assert config.top_p == 0.6
     assert config.stop_tokens == (0, 261, 6884, 21214, 24281)
+
+
+def test_parse_table_accepts_rwkv_rs_sampling_aliases() -> None:
+    config = benchmark_config._parse_table(  # type: ignore[attr-defined]
+        {
+            "max_new_tokens": 512,
+            "presence_penalty": 0.7,
+            "repetition_penalty": 0.2,
+            "penalty_decay": 0.95,
+        }
+    )
+
+    assert config.sampling_overrides == {
+        "max_generate_tokens": 512,
+        "alpha_presence": 0.7,
+        "alpha_frequency": 0.2,
+        "alpha_decay": 0.95,
+    }
+
+
+def test_sampling_config_to_dict_uses_rwkv_rs_field_names() -> None:
+    payload = sampling_config_to_dict(
+        SamplingConfig(
+            max_generate_tokens=256,
+            temperature=0.5,
+            top_k=50,
+            top_p=0.3,
+            alpha_presence=1.0,
+            alpha_frequency=0.1,
+            alpha_decay=0.99,
+        )
+    )
+
+    assert payload["max_new_tokens"] == 256
+    assert payload["presence_penalty"] == 1.0
+    assert payload["repetition_penalty"] == 0.1
+    assert payload["penalty_decay"] == 0.99
+    assert "max_generate_tokens" not in payload
+    assert "alpha_presence" not in payload

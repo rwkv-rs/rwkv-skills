@@ -5,15 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
 
+from src.eval.benchmark_registry import CoTMode
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.execution_plan import AttemptKey
+from src.eval.prompt_builders import (
+    FINAL_ANSWER_PLACEHOLDER,
+    build_maths_expected_context,
+    normalize_subject,
+    prompt_for_cot,
+    prompt_for_marker,
+)
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
-from src.infer.sampling import SamplingConfig
+from src.infer.backend import InferenceBackend
+from src.infer.sampling import GenerationOutput, SamplingConfig
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
@@ -32,10 +39,8 @@ class FreeResponsePipelineResult:
 
 
 class FreeResponsePipeline:
-    def __init__(self, model_config: ModelLoadConfig) -> None:
-        self.model, self.tokenizer = load_rwkv_model(model_config)
-        self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
+    def __init__(self, backend: InferenceBackend) -> None:
+        self.backend = backend
 
     def run(
         self,
@@ -112,10 +117,25 @@ class FreeResponsePipeline:
             )
         else:
             remaining_entries = expanded
+        use_legacy_templates = (
+            cot_prompt_template != DEFAULT_COT_PROMPT
+            or final_answer_template != DEFAULT_FINAL_PROMPT
+        )
         if probe_only:
-            cot_prompts = [
-                cot_prompt_template.replace("<Q>", record.question) for _key, record in remaining_entries
-            ]
+            if use_legacy_templates:
+                cot_prompts = [
+                    cot_prompt_template.replace("<Q>", record.question) for _key, record in remaining_entries
+                ]
+            else:
+                expected_contexts = [
+                    build_maths_expected_context(
+                        subject=normalize_subject(record.subject, "maths"),
+                        question=record.question,
+                        cot_mode=CoTMode.COT,
+                    )
+                    for _key, record in remaining_entries
+                ]
+                cot_prompts = [prompt_for_cot(context) for context in expected_contexts]
             probe_seeds = [
                 sample_repeat_seed(
                     key.sample_index,
@@ -125,7 +145,7 @@ class FreeResponsePipeline:
                 )
                 for key, _record in remaining_entries
             ]
-            _ = self.engine.generate(
+            _ = self.backend.generate(
                 cot_prompts,
                 sampling=final_sampling,
                 batch_size=batch_size,
@@ -140,9 +160,21 @@ class FreeResponsePipeline:
         chunk_size = max(1, int(batch_size))
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            cot_prompts = [
-                cot_prompt_template.replace("<Q>", record.question) for _key, record in chunk
-            ]
+            if use_legacy_templates:
+                cot_prompts = [
+                    cot_prompt_template.replace("<Q>", record.question) for _key, record in chunk
+                ]
+                expected_contexts: list[str] | None = None
+            else:
+                expected_contexts = [
+                    build_maths_expected_context(
+                        subject=normalize_subject(record.subject, "maths"),
+                        question=record.question,
+                        cot_mode=CoTMode.COT,
+                    )
+                    for _key, record in chunk
+                ]
+                cot_prompts = [prompt_for_cot(context) for context in expected_contexts]
 
             def _on_cot_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
@@ -167,7 +199,7 @@ class FreeResponsePipeline:
                 if on_record is not None:
                     on_record(payload)
 
-            cot_outputs = self.engine.generate(
+            cot_outputs = self.backend.generate(
                 cot_prompts,
                 sampling=cot_sampling,
                 batch_size=min(batch_size, len(cot_prompts)),
@@ -189,7 +221,14 @@ class FreeResponsePipeline:
             for local_idx in range(len(chunk)):
                 cot_seq = cot_by_idx.get(local_idx)
                 cot_text = cot_seq.text if cot_seq else ""
-                prompt = final_answer_template.replace("<Q>", cot_prompts[local_idx]).replace("<COT>", cot_text)
+                if use_legacy_templates:
+                    prompt = final_answer_template.replace("<Q>", cot_prompts[local_idx]).replace("<COT>", cot_text)
+                else:
+                    prompt = prompt_for_marker(
+                        expected_contexts[local_idx],
+                        FINAL_ANSWER_PLACEHOLDER,
+                        completions_of_cot=cot_text,
+                    )
                 final_prompts.append(prompt)
 
             def _on_final_complete(output: GenerationOutput) -> None:
@@ -228,7 +267,7 @@ class FreeResponsePipeline:
                     on_record(payload)
                 payloads.append(payload)
 
-            _ = self.engine.generate(
+            _ = self.backend.generate(
                 final_prompts,
                 sampling=final_sampling,
                 batch_size=min(batch_size, len(final_prompts)),

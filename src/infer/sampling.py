@@ -28,6 +28,50 @@ class SamplingConfig:
             return self
         return replace(self, max_generate_tokens=max(1, min(self.max_generate_tokens, max_tokens)))
 
+    @property
+    def max_new_tokens(self) -> int:
+        return int(self.max_generate_tokens)
+
+    @property
+    def presence_penalty(self) -> float:
+        return float(self.alpha_presence)
+
+    @property
+    def repetition_penalty(self) -> float:
+        return float(self.alpha_frequency)
+
+    @property
+    def penalty_decay(self) -> float:
+        return float(self.alpha_decay)
+
+    def penalties_enabled(self) -> bool:
+        return self.presence_penalty != 0.0 or self.repetition_penalty != 0.0
+
+    def checked(self, vocab_size: int) -> "SamplingConfig":
+        top_k = int(self.top_k)
+        top_p = float(self.top_p)
+        temperature = float(self.temperature)
+        if temperature <= 0.0:
+            temperature = 0.001
+        else:
+            temperature = min(temperature, 1000.0)
+
+        if not (0 <= top_k <= int(vocab_size)):
+            top_k = int(vocab_size)
+        if not (0.0 <= top_p <= 1.0):
+            top_p = 1.0
+        if top_p == 0.0:
+            top_k = 1
+            top_p = 1.0
+
+        return replace(
+            self,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_generate_tokens=max(1, int(self.max_generate_tokens)),
+        )
+
 
 @dataclass(slots=True)
 class GenerationOutput:

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
 from collections.abc import Iterator
 
-from ..data_utils import dataset_cache_dir, download_file, write_jsonl
+from ..data_utils import dataset_cache_dir, download_file
 from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
 
 DATA_URL = "https://raw.githubusercontent.com/protagolabs/odyssey-math/main/final-odyssey-math-with-levels.jsonl"
 
@@ -39,10 +39,10 @@ def _normalize_answer(answer: str) -> str:
     return answer.replace("$", "").strip()
 
 
-def _records(split: str) -> Iterator[dict]:
+def _records(split: str, context: DatasetPrepareContext) -> Iterator[dict]:
     if split != "test":
         raise ValueError("math-odyssey 仅提供 test split")
-    cache_dir = dataset_cache_dir(Path("data"), "math_odyssey")
+    cache_dir = dataset_cache_dir(context.data_root, "math_odyssey")
     source_path = cache_dir / "math_odyssey.jsonl"
     download_file(DATA_URL, source_path)
 
@@ -62,10 +62,6 @@ def _records(split: str) -> Iterator[dict]:
             }
 
 
-@FREE_ANSWER_REGISTRY.register("math-odyssey")
-def prepare_math_odyssey(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "math-odyssey"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _records(split))
-    return [target]
+@FREE_ANSWER_REGISTRY.register_spec("math_odyssey")
+def prepare_math_odyssey_spec(output_root: Path, split: str = "test") -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec("math-odyssey", output_root, split, load_rows=_records, source_kind="url_download")

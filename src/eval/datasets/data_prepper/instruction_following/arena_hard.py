@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
 from collections.abc import Iterable
 
-from ..data_utils import dataset_cache_dir, download_file, read_jsonl, write_jsonl
+from ..data_utils import dataset_cache_dir, download_file, read_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import INSTRUCTION_FOLLOWING_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
 
 QUESTIONS_URL = "https://raw.githubusercontent.com/lm-sys/arena-hard-auto/main/data/arena-hard-v0.1/question.jsonl"
 BASELINE_URL = (
@@ -36,11 +36,11 @@ def _load_baseline(path: Path) -> dict[str, str]:
     return answers
 
 
-def _iter_records(split: str) -> Iterable[dict]:
+def _iter_records(split: str, context: DatasetPrepareContext) -> Iterable[dict]:
     if split != "test":
         raise ValueError("arena-hard 仅提供 test split")
 
-    cache_dir = dataset_cache_dir(Path("data"), "arena_hard")
+    cache_dir = dataset_cache_dir(context.data_root, "arena_hard")
     questions_path = cache_dir / "question.jsonl"
     baseline_path = cache_dir / "gpt-4-0314.jsonl"
     download_file(QUESTIONS_URL, questions_path)
@@ -57,13 +57,9 @@ def _iter_records(split: str) -> Iterable[dict]:
         yield record
 
 
-@INSTRUCTION_FOLLOWING_REGISTRY.register("arena-hard")
-def prepare_arena_hard(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "arena-hard"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split))
-    return [target]
+@INSTRUCTION_FOLLOWING_REGISTRY.register_spec("arena_hard")
+def prepare_arena_hard_spec(output_root: Path, split: str = "test") -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec("arena-hard", output_root, split, load_rows=_iter_records, source_kind="url_download")
 
 
-__all__ = ["prepare_arena_hard"]
+__all__ = ["prepare_arena_hard_spec"]

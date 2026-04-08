@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .domains import (
+    CODING_DOMAINS,
+    FUNCTION_CALL_DOMAINS,
+    INSTRUCTION_FOLLOWING_DOMAINS,
+    KNOWLEDGE_GROUP_DOMAINS,
+    MATH_DOMAINS,
+)
 from .data import ScoreEntry
 
 
@@ -65,31 +72,31 @@ DOMAIN_GROUPS = (
     {
         "key": "knowledge",
         "label": "Knowledge",
-        "domains": {"mmlu系列", "multi-choice系列", "其他"},
+        "domains": KNOWLEDGE_GROUP_DOMAINS,
         "title": "知识类（MMLU / Multi-choice）",
     },
     {
         "key": "math",
         "label": "Math",
-        "domains": {"math reasoning系列"},
+        "domains": MATH_DOMAINS,
         "title": "数学推理（AIME / Math-500 等）",
     },
     {
         "key": "coding",
         "label": "Coding",
-        "domains": {"coding系列"},
+        "domains": CODING_DOMAINS,
         "title": "代码",
     },
     {
         "key": "instruction_following",
         "label": "Instruction Following",
-        "domains": {"instruction following系列"},
+        "domains": INSTRUCTION_FOLLOWING_DOMAINS,
         "title": "指令遵循（IFEval 等）",
     },
     {
         "key": "function_call",
         "label": "Function Call",
-        "domains": {"function_call系列", "function_call"},
+        "domains": FUNCTION_CALL_DOMAINS,
         "title": "函数调用",
     },
 )

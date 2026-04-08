@@ -15,6 +15,11 @@ from .constants import (
     INSTRUCTION_DOMAIN_ORDER,
     SelectionState,
 )
+from .domains import (
+    is_coding_domain,
+    is_instruction_following_domain,
+    is_knowledge_group_domain,
+)
 from .metrics import (
     _dataset_base,
     _normalize_subject_label,
@@ -56,7 +61,7 @@ def _update_chart_layout(fig: go.Figure) -> None:
 
 
 def _build_knowledge_bar(selection: SelectionState) -> go.Figure | None:
-    entries = [entry for entry in selection.entries if entry.domain in {"mmlu系列", "multi-choice系列", "其他"}]
+    entries = [entry for entry in selection.entries if is_knowledge_group_domain(entry.domain)]
     if not entries:
         return None
 
@@ -215,7 +220,7 @@ def _build_aime_plot(selection: SelectionState) -> go.Figure | None:
 
 
 def _build_instruction_bar(selection: SelectionState) -> go.Figure | None:
-    entries = [entry for entry in selection.entries if entry.domain == "instruction following系列"]
+    entries = [entry for entry in selection.entries if is_instruction_following_domain(entry.domain)]
     if not entries:
         return None
 
@@ -278,7 +283,7 @@ def _build_instruction_bar(selection: SelectionState) -> go.Figure | None:
 
 
 def _build_coding_bar(selection: SelectionState) -> go.Figure | None:
-    entries = [entry for entry in selection.entries if entry.domain == "coding系列"]
+    entries = [entry for entry in selection.entries if is_coding_domain(entry.domain)]
     if not entries:
         return None
 
@@ -336,7 +341,7 @@ def _truncate(text: str, limit: int = 900) -> str:
 
 
 def _load_coding_example(selection: SelectionState) -> str | None:
-    entries = [entry for entry in selection.entries if entry.domain == "coding系列"]
+    entries = [entry for entry in selection.entries if is_coding_domain(entry.domain)]
     if not entries:
         return CODING_FALLBACK_SAMPLE
 

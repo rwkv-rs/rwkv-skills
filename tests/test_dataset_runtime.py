@@ -2,16 +2,27 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from src.eval.datasets.data_prepper.data_manager import prepare_dataset
 from src.eval.datasets.data_prepper.data_utils import write_jsonl
-from src.eval.datasets.data_prepper.prepper_registry import DatasetRegistry
+from src.eval.datasets.data_prepper.data_manager import _ensure_registries
+from src.eval.datasets.data_prepper.prepper_registry import (
+    CODE_GENERATION_REGISTRY,
+    DatasetRegistry,
+    FREE_ANSWER_REGISTRY,
+    FUNCTION_CALLING_REGISTRY,
+    INSTRUCTION_FOLLOWING_REGISTRY,
+    MULTIPLE_CHOICE_REGISTRY,
+)
 from src.eval.datasets.runtime import (
     LegacyPreparerDatasetSpec,
     StaticRowsDatasetSpec,
+    CallableRowsDatasetSpec,
     collect_files_with_extension,
     ensure_dataset_materialized,
     read_csv_items,
@@ -97,3 +108,81 @@ def test_dataset_registry_supports_spec_factories() -> None:
     assert registry.names() == ("demo",)
     assert registry.get("demo") is None
     assert registry.get_spec_factory("demo") is _factory
+
+
+def test_dataset_registry_can_wrap_legacy_preparer_as_spec_factory(tmp_path: Path) -> None:
+    registry = DatasetRegistry("runtime_test")
+
+    @registry.register_legacy_spec("legacy")
+    def _prepare(output_root: Path, split: str) -> list[Path]:
+        path = output_root / "legacy" / f"{split}.jsonl"
+        write_jsonl(path, [{"question": "q", "answer": "a"}])
+        return [path]
+
+    factory = registry.get_spec_factory("legacy")
+
+    assert registry.get("legacy") is None
+    assert factory is not None
+    spec = factory(tmp_path, "test")
+    paths = ensure_dataset_materialized(spec)
+    assert paths == [tmp_path / "legacy" / "test.jsonl"]
+
+
+def test_callable_rows_spec_receives_runtime_context_and_env_overrides(tmp_path: Path) -> None:
+    seen: dict[str, str] = {}
+
+    def _load_rows(split: str, context) -> list[dict[str, object]]:
+        seen["split"] = split
+        seen["data_root"] = str(context.data_root)
+        seen["hf_home"] = os.environ["RWKV_SKILLS_HF_HOME"]
+        seen["datasets_cache"] = os.environ["HF_DATASETS_CACHE"]
+        return [{"id": 1}]
+
+    spec = CallableRowsDatasetSpec("runtime_ctx", tmp_path, "test", load_rows=_load_rows)
+
+    paths = ensure_dataset_materialized(spec)
+
+    assert paths == [tmp_path / "runtime_ctx" / "test.jsonl"]
+    assert seen["split"] == "test"
+    assert seen["data_root"] == str(tmp_path.resolve())
+    assert seen["hf_home"] == str((tmp_path / "cache" / "hf_cache").resolve())
+    assert seen["datasets_cache"] == str((tmp_path / "cache" / "hf_cache" / "datasets").resolve())
+
+
+def test_prepare_dataset_routes_ifbench_cache_into_output_root(tmp_path: Path, monkeypatch) -> None:
+    def _fake_download(_url: str, target_path: Path) -> Path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(json.dumps({"prompt": "Follow this", "key": "7"}) + "\n", encoding="utf-8")
+        return target_path
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.instruction_following.ifbench.download_file",
+        _fake_download,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("ifbench", output_root, "test")
+
+    assert paths == [output_root / "ifbench" / "test.jsonl"]
+    assert (output_root / "cache" / "ifbench" / "IFBench_test.jsonl").exists()
+    assert read_jsonl_items(paths[0]) == [{"prompt": "Follow this", "question": "Follow this", "key": 7}]
+
+
+def test_benchmark_family_registries_are_now_spec_only(tmp_path: Path) -> None:
+    _ensure_registries()
+
+    registries = (
+        MULTIPLE_CHOICE_REGISTRY,
+        FREE_ANSWER_REGISTRY,
+        INSTRUCTION_FOLLOWING_REGISTRY,
+        CODE_GENERATION_REGISTRY,
+        FUNCTION_CALLING_REGISTRY,
+    )
+
+    assert all(not getattr(registry, "_preparers") for registry in registries)
+    assert all(
+        registry.get_spec_factory(name)(tmp_path, "test").source_kind != "legacy_prepper"
+        for registry in registries
+        for name in registry.names()
+        if registry.get_spec_factory(name) is not None
+    )

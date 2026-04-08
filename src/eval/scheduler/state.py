@@ -13,8 +13,6 @@ from .dataset_utils import safe_slug
 from .models import normalize_model_name
 from .jobs import JOB_CATALOGUE, detect_job_from_dataset
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.db.orm import init_orm
-from src.db.eval_db_service import EvalDbService
 
 
 @dataclass(frozen=True)
@@ -47,11 +45,14 @@ class RunningEntry:
 _JOB_DETECTION_ALERTS: set[tuple[Path, str]] = set()
 
 
-def scan_completed_jobs(log_dir: Path) -> tuple[set[CompletedKey], dict[str, CompletedRecord]]:
+def scan_completed_jobs() -> tuple[set[CompletedKey], dict[str, CompletedRecord]]:
     completed: set[CompletedKey] = set()
     records: dict[str, CompletedRecord] = {}
-    init_orm(DEFAULT_DB_CONFIG)
-    
+    from src.db.database import init_db
+    from src.db.eval_db_service import EvalDbService
+
+    init_db(DEFAULT_DB_CONFIG)
+
     service = EvalDbService()
     for raw in service.list_latest_scores():
         if not isinstance(raw, Mapping):

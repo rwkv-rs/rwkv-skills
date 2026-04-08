@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
 from collections.abc import Iterable, Sequence
 
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from src.eval.datasets.data_prepper.prepper_registry import INSTRUCTION_FOLLOWING_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec
 
 DATASET_ID = "openlanguagedata/flores_plus"
 DEFAULT_SOURCE_LANGUAGES: Sequence[str] = ("en", "de", "es", "fr", "it", "ja")
@@ -75,26 +75,45 @@ def _generate_rows(
                 }
 
 
-@INSTRUCTION_FOLLOWING_REGISTRY.register("flores200")
-def prepare_flores200(
-    output_root: Path,
-    split: str = "devtest",
+def _records(
+    split: str,
     *,
     source_languages: Sequence[str] = DEFAULT_SOURCE_LANGUAGES,
     target_languages: Sequence[str] = DEFAULT_TARGET_LANGUAGES,
-) -> list[Path]:
+) -> Iterable[dict]:
     if split not in {"dev", "devtest"}:
         raise ValueError("flores200 仅支持 dev 或 devtest split")
 
     all_languages = _normalize_languages(source_languages, target_languages)
     datasets = {lang: _load_language_data(lang, split) for lang in all_languages}
-
-    dataset_dir = output_root / "flores200"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-
-    write_jsonl(target, _generate_rows(datasets, source_languages, target_languages))
-    return [target]
+    return _generate_rows(datasets, source_languages, target_languages)
 
 
-__all__ = ["prepare_flores200"]
+@INSTRUCTION_FOLLOWING_REGISTRY.register_spec("flores200")
+def prepare_flores200_spec(
+    output_root: Path,
+    split: str = "devtest",
+    *,
+    source_languages: Sequence[str] = DEFAULT_SOURCE_LANGUAGES,
+    target_languages: Sequence[str] = DEFAULT_TARGET_LANGUAGES,
+) -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec(
+        "flores200",
+        output_root,
+        split,
+        load_rows=lambda resolved_split, _src=tuple(source_languages), _tgt=tuple(target_languages): _records(
+            resolved_split,
+            source_languages=_src,
+            target_languages=_tgt,
+        ),
+        source_kind="hf_load_dataset",
+        manifest_extra_factory=lambda resolved_split, _src=tuple(source_languages), _tgt=tuple(target_languages): {
+            "dataset_id": DATASET_ID,
+            "source_split": resolved_split,
+            "source_languages": list(_src),
+            "target_languages": list(_tgt),
+        },
+    )
+
+
+__all__ = ["prepare_flores200_spec"]

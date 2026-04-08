@@ -1,28 +1,32 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
-from collections.abc import Iterable
+from typing import Any
+from collections.abc import Iterable, Mapping
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
-
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import MaterializingDatasetSpec
 
+_DATASET_ID = "TIGER-Lab/MMLU-Pro"
+_ALLOWED_SPLITS = {"validation", "test"}
+_REQUIRED_FIELDS = ("question", "answer", "A", "B", "C", "D")
 
-def _iter_records(split: str) -> Iterable[dict]:
-    if split not in {"validation", "test"}:
+def _load_mmlu_pro_rows(split: str) -> Iterable[Mapping[str, Any]]:
+    if split not in _ALLOWED_SPLITS:
         raise ValueError("mmlu-pro 仅支持 validation 与 test split")
     configure_hf_home()
-    if load_dataset is None:  # pragma: no cover - dependency missing
+    try:
+        from datasets import load_dataset  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise ModuleNotFoundError(
             "需要安装 `datasets` 才能准备 mmlu-pro 数据集，请运行 `pip install datasets`"
-        )
-    dataset = load_dataset("TIGER-Lab/MMLU-Pro", split=split)
-    for row in dataset:
+        ) from exc
+    return load_dataset(_DATASET_ID, split=split)
+
+
+def _iter_records(split: str) -> Iterable[dict[str, Any]]:
+    for row in _load_mmlu_pro_rows(split):
         category = row.get("category", "").replace(" ", "_")
         choices = [choice.strip() for choice in row.get("options", [])]
         answer_letter = str(row.get("answer", "")).strip().upper()
@@ -43,10 +47,23 @@ def _iter_records(split: str) -> Iterable[dict]:
         yield payload
 
 
-@MULTIPLE_CHOICE_REGISTRY.register("mmlu-pro")
-def prepare_mmlu_pro(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "mmlu-pro"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split))
-    return [target]
+class MmluProDatasetSpec(MaterializingDatasetSpec):
+    def __init__(self, output_root: Path, split: str) -> None:
+        super().__init__("mmlu-pro", output_root, split, required_fields=_REQUIRED_FIELDS, source_kind="hf_load_dataset")
+
+    def download(self) -> None:
+        return None
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        return list(_iter_records(self.split))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        return {"dataset_id": _DATASET_ID, "source_split": self.split}
+
+
+@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_pro")
+def prepare_mmlu_pro_spec(output_root: Path, split: str = "test") -> MmluProDatasetSpec:
+    return MmluProDatasetSpec(output_root, split)
+
+
+__all__ = ["prepare_mmlu_pro_spec"]

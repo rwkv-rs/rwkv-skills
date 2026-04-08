@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
-from collections.abc import Iterable
+from typing import Any
+from collections.abc import Iterable, Mapping
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
-
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import MaterializingDatasetSpec
 
 _SUBCATEGORIES: dict[str, str] = {
     "abstract_algebra": "math",
@@ -71,20 +67,25 @@ _SUBCATEGORIES: dict[str, str] = {
     "virology": "health",
     "world_religions": "philosophy",
 }
+_DATASET_ID = "edinburgh-dawg/mmlu-redux-2.0"
+_REQUIRED_FIELDS = ("question", "answer")
 
-
-def _iter_records(split: str) -> Iterable[dict]:
-    if split != "test":
-        raise ValueError("mmlu-redux 仅提供 test split")
+def _load_mmlu_redux_rows(category: str) -> Iterable[Mapping[str, Any]]:
     configure_hf_home()
-    if load_dataset is None:  # pragma: no cover - dependency missing
+    try:
+        from datasets import load_dataset  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise ModuleNotFoundError(
             "需要安装 `datasets` 才能准备 mmlu-redux 数据集，请运行 `pip install datasets`"
-        )
+        ) from exc
+    return load_dataset(_DATASET_ID, name=category, split="test")
+
+def _iter_records(split: str) -> Iterable[dict[str, Any]]:
+    if split != "test":
+        raise ValueError("mmlu-redux 仅提供 test split")
     for category in _SUBCATEGORIES:
-        dataset = load_dataset("edinburgh-dawg/mmlu-redux-2.0", name=category, split="test")
         subset = _SUBCATEGORIES[category]
-        for row in dataset:
+        for row in _load_mmlu_redux_rows(category):
             error_type = row.get("error_type")
             if error_type == "ok":
                 answer_letter = chr(ord("A") + int(row["answer"]))
@@ -107,10 +108,23 @@ def _iter_records(split: str) -> Iterable[dict]:
             yield payload
 
 
-@MULTIPLE_CHOICE_REGISTRY.register("mmlu-redux")
-def prepare_mmlu_redux(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "mmlu-redux"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split))
-    return [target]
+class MmluReduxDatasetSpec(MaterializingDatasetSpec):
+    def __init__(self, output_root: Path, split: str) -> None:
+        super().__init__("mmlu-redux", output_root, split, required_fields=_REQUIRED_FIELDS, source_kind="hf_load_dataset")
+
+    def download(self) -> None:
+        return None
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        return list(_iter_records(self.split))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        return {"dataset_id": _DATASET_ID, "source_split": "test"}
+
+
+@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_redux")
+def prepare_mmlu_redux_spec(output_root: Path, split: str = "test") -> MmluReduxDatasetSpec:
+    return MmluReduxDatasetSpec(output_root, split)
+
+
+__all__ = ["prepare_mmlu_redux_spec"]

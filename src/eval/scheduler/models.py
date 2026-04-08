@@ -229,9 +229,84 @@ def filter_model_paths(
     raise ValueError(f"未知的模型选择策略: {strategy!r}")
 
 
+def filter_model_names(
+    model_names: Sequence[str],
+    strategy: str,
+    min_param_b: float | None,
+    max_param_b: float | None,
+) -> list[str]:
+    entries: list[tuple[float | None, str, str, str | None, str | None]] = []
+    for raw_name in model_names:
+        model_name = str(raw_name).strip()
+        if not model_name:
+            continue
+        normalized = _normalize_model_identifier(model_name)
+        arch, data_version, num_token = _parse_model_tags(normalized)
+        params_val = _extract_param_count(normalized)
+        if min_param_b is not None and params_val is not None and params_val < min_param_b:
+            continue
+        if max_param_b is not None and (params_val is None or params_val > max_param_b):
+            continue
+        entries.append((params_val, normalized, model_name, data_version, num_token))
+
+    if strategy == "all":
+        return [model_name for _, _, model_name, *_ in entries]
+
+    if strategy == "param-extrema":
+        grouped: dict[float | None, list[tuple[str, str]]] = {}
+        for params_val, normalized, model_name, *_ in entries:
+            grouped.setdefault(params_val, []).append((normalized, model_name))
+
+        selected: set[str] = set()
+        for params_val, models in grouped.items():
+            model_map: dict[str, str] = {}
+            for normalized, model_name in models:
+                model_map.setdefault(normalized, model_name)
+            if params_val is None or len(model_map) <= 2:
+                selected.update(model_map.values())
+                continue
+            ordered_models = sorted(model_map.keys(), key=_model_version_sort_key)
+            keep = {ordered_models[0], ordered_models[-1]}
+            for normalized_name in keep:
+                selected.add(model_map[normalized_name])
+        return [model_name for _, _, model_name, *_ in entries if model_name in selected]
+
+    if strategy == "latest-data":
+        selected: set[str] = set()
+        fallback: list[str] = []
+        groups: dict[tuple[str, str], list[tuple[str | None, str, str]]] = {}
+        for _, normalized, model_name, data_version, num_token in entries:
+            if num_token in NUM_PARAM_SKIP:
+                continue
+            arch, _, _ = _parse_model_tags(normalized)
+            if arch is None or data_version is None or num_token is None:
+                fallback.append(model_name)
+                continue
+            groups.setdefault((arch, num_token), []).append((data_version, normalized, model_name))
+
+        for (arch, num_token), items in groups.items():
+            items_sorted = sorted(
+                items,
+                key=lambda x: (
+                    _rank(ARCH_ORDER, arch) or 0,
+                    _rank(NUM_PARAM_ORDER, num_token) or 0,
+                    _rank(DATA_VERSION_ORDER, x[0]) or -1,
+                    _model_version_sort_key(x[1]),
+                ),
+            )
+            best = items_sorted[-1]
+            selected.add(best[2])
+
+        selected.update(fallback)
+        return [model_name for _, _, model_name, *_ in entries if model_name in selected]
+
+    raise ValueError(f"未知的模型选择策略: {strategy!r}")
+
+
 __all__ = [
     "expand_model_paths",
     "filter_model_paths",
+    "filter_model_names",
     "MODEL_SELECT_CHOICES",
     "normalize_model_name",
 ]

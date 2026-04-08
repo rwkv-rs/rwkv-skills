@@ -5,8 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARKS_BY_FIELD, BenchmarkField, BenchmarkMetadata
-from src.eval.scheduler.dataset_utils import canonical_slug, make_dataset_slug, split_benchmark_and_split
+from src.eval.benchmark_registry import (
+    ALL_BENCHMARKS,
+    BENCHMARKS_BY_FIELD,
+    BenchmarkField,
+    BenchmarkMetadata,
+    expand_benchmark_alias,
+)
+from src.eval.scheduler.dataset_utils import make_dataset_slug
 
 
 _BENCHMARKS_BY_NAME: dict[str, BenchmarkMetadata] = {item.name: item for item in ALL_BENCHMARKS}
@@ -27,19 +33,15 @@ class SelectedBenchmark:
 
 
 def resolve_registered_benchmark_name(raw_name: str) -> str:
-    slug = canonical_slug(raw_name)
-    if slug in _BENCHMARKS_BY_NAME:
-        return slug
-
-    benchmark_name, _ = split_benchmark_and_split(slug)
-    if benchmark_name in _BENCHMARKS_BY_NAME:
-        return benchmark_name
+    resolved = expand_benchmark_alias(raw_name)
+    if len(resolved) == 1:
+        return resolved[0]
 
     raise ValueError(f"unknown benchmark name: {raw_name}")
 
 
 def benchmark_dataset_slug(metadata: BenchmarkMetadata) -> str:
-    return make_dataset_slug(metadata.name, metadata.default_split)
+    return make_dataset_slug(metadata.dataset, metadata.default_split)
 
 
 def collect_benchmarks(
@@ -57,12 +59,15 @@ def collect_benchmarks(
             )
 
     for raw_name in extra_benchmark_names or ():
-        resolved_name = resolve_registered_benchmark_name(raw_name)
-        metadata = _BENCHMARKS_BY_NAME[resolved_name]
-        selected[metadata.name] = SelectedBenchmark(
-            metadata=metadata,
-            dataset_slug=benchmark_dataset_slug(metadata),
-        )
+        resolved_names = expand_benchmark_alias(raw_name)
+        if not resolved_names:
+            raise ValueError(f"unknown benchmark name: {raw_name}")
+        for resolved_name in resolved_names:
+            metadata = _BENCHMARKS_BY_NAME[resolved_name]
+            selected[metadata.name] = SelectedBenchmark(
+                metadata=metadata,
+                dataset_slug=benchmark_dataset_slug(metadata),
+            )
 
     if not selected and not fields and not extra_benchmark_names:
         for metadata in ALL_BENCHMARKS:

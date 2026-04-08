@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 try:  # pragma: no cover - avoid heavy deps in tests
-    from src.server.perf_logging import perf_logger  # type: ignore
+    from src.server.perf_logging import perf_logger  # pyright: ignore[reportMissingImports]
 except Exception:  # pragma: no cover
     class _NoopPerfLogger:
         enabled = False
@@ -31,6 +31,7 @@ from .prepper_registry import (
     CODE_GENERATION_REGISTRY,
     DatasetPreparer,
     FREE_ANSWER_REGISTRY,
+    FUNCTION_CALLING_REGISTRY,
     INSTRUCTION_FOLLOWING_REGISTRY,
     MULTIPLE_CHOICE_REGISTRY,
 )
@@ -41,10 +42,11 @@ _FAMILY_MODULES = (
     "free_answer",
     "instruction_following",
     "code_generation",
+    "function_calling",
 )
 _CORE_PACKAGE = __name__.rsplit(".", 1)[0]
 _PACKAGE_ROOT = Path(__file__).resolve().parent
-_REGISTRIES_INITIALIZED = False
+_registries_initialized = False
 
 
 def _import_family_modules(family: str) -> None:
@@ -57,12 +59,12 @@ def _import_family_modules(family: str) -> None:
 
 
 def _ensure_registries() -> None:
-    global _REGISTRIES_INITIALIZED
-    if _REGISTRIES_INITIALIZED:
+    global _registries_initialized
+    if _registries_initialized:
         return
     for family in _FAMILY_MODULES:
         _import_family_modules(family)
-    _REGISTRIES_INITIALIZED = True
+    _registries_initialized = True
 
 
 def available_multiple_choice_datasets() -> Iterable[str]:
@@ -89,6 +91,12 @@ def available_code_generation_datasets() -> Iterable[str]:
     return CODE_GENERATION_REGISTRY.names()
 
 
+def available_function_calling_datasets() -> Iterable[str]:
+    """列出 BrowseComp / MCP-Bench / tau-bench 等 function-calling 数据集。"""
+    _ensure_registries()
+    return FUNCTION_CALLING_REGISTRY.names()
+
+
 def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[Path]:
     """执行指定数据集的准备函数，确保输出路径在 repo/data 下规范化。
 
@@ -102,6 +110,7 @@ def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[P
         FREE_ANSWER_REGISTRY,
         INSTRUCTION_FOLLOWING_REGISTRY,
         CODE_GENERATION_REGISTRY,
+        FUNCTION_CALLING_REGISTRY,
     )
     spec_factory = None
     preparer: DatasetPreparer | None = None
@@ -154,6 +163,7 @@ __all__ = [
     "available_free_answer_datasets",
     "available_instruction_following_datasets",
     "available_code_generation_datasets",
+    "available_function_calling_datasets",
     "prepare_dataset",
     "common",
 ]

@@ -45,6 +45,20 @@ class DatasetRegistry:
 
         return decorator
 
+    def register_legacy_spec(self, dataset_name: str) -> Callable[[DatasetPreparer], DatasetPreparer]:
+        def decorator(preparer: DatasetPreparer) -> DatasetPreparer:
+            key = self._ensure_available(dataset_name)
+
+            def factory(output_root: Path, split: str) -> "DatasetSpec":
+                from src.eval.datasets.runtime import LegacyPreparerDatasetSpec
+
+                return LegacyPreparerDatasetSpec(key, output_root, split, preparer=preparer)
+
+            self._spec_factories[key] = factory
+            return preparer
+
+        return decorator
+
     def get(self, dataset_name: str) -> DatasetPreparer | None:
         return self._preparers.get(dataset_name.lower())
 
@@ -62,6 +76,7 @@ MULTIPLE_CHOICE_REGISTRY = DatasetRegistry("multiple_choice")
 FREE_ANSWER_REGISTRY = DatasetRegistry("free_answer")
 INSTRUCTION_FOLLOWING_REGISTRY = DatasetRegistry("instruction_following")
 CODE_GENERATION_REGISTRY = DatasetRegistry("code_generation")
+FUNCTION_CALLING_REGISTRY = DatasetRegistry("function_calling")
 
 __all__ = [
     "DatasetRegistry",
@@ -71,4 +86,5 @@ __all__ = [
     "FREE_ANSWER_REGISTRY",
     "INSTRUCTION_FOLLOWING_REGISTRY",
     "CODE_GENERATION_REGISTRY",
+    "FUNCTION_CALLING_REGISTRY",
 ]

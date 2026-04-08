@@ -142,6 +142,7 @@ def evaluate_livecodebench_dataset(
     timeout: float = 6.0,
 ) -> tuple[dict[str, float], list[dict]]:
     pass_k_values = tuple(int(val) for val in pass_k)
+    completion_rows = list(_iter_completions(completions))
     dataset_records = list(JsonlCodeGenerationLoader(str(dataset_path)).load())
     sample_map: dict[int, dict] = {}
     ref_map: dict[int, str] = {}
@@ -159,7 +160,7 @@ def evaluate_livecodebench_dataset(
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = []
-        for payload in tqdm.tqdm(_iter_completions(completions), desc="Reading completions"):
+        for payload in tqdm.tqdm(completion_rows, desc="Reading completions"):
             sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
             repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
             last_stage = _max_stage_index(payload)
@@ -222,7 +223,7 @@ def evaluate_livecodebench_dataset(
             pass_at_k[key] = estimate_pass_at_k(totals[mask], corrects[mask], int(val)).mean()
 
     eval_payloads: list[dict] = []
-    for payload in _iter_completions(completions):
+    for payload in completion_rows:
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         last_stage = _max_stage_index(payload)

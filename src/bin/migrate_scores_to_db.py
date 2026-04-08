@@ -11,8 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
+from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 
@@ -168,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: no JSON files found under {scores_dir}")
         return 1
 
-    init_orm(DEFAULT_DB_CONFIG)
+    init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
 
     existing_cache: dict[tuple[str, str, bool], set[tuple[bool, datetime]]] = {}

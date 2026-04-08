@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import importlib
+import sys
+
 from src.eval.runner_registry import RunnerGroup
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import (
+    CODE_DATASET_SLUGS,
+    DATASET_PREP_SPECS,
     INSTRUCTION_FOLLOWING_DATASET_SLUGS,
     JOB_CATALOGUE,
     detect_job_from_dataset,
@@ -52,9 +57,30 @@ def test_instruction_following_matrix_includes_all_supported_datasets() -> None:
 
 
 def test_scheduler_matrix_uses_metadata_default_splits() -> None:
+    assert canonical_slug("include_test") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("gpqa_main") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
+    assert canonical_slug("gpqa_extended") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
+    assert canonical_slug("gpqa_diamond") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("simpleqa_verified") in JOB_CATALOGUE["free_response"].dataset_slugs
+    assert canonical_slug("polymath_all") in JOB_CATALOGUE["free_response"].dataset_slugs
     assert canonical_slug("gsm8k_test") in JOB_CATALOGUE["free_response_judge"].dataset_slugs
+
+
+def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
+    gpqa_spec = DATASET_PREP_SPECS[canonical_slug("gpqa_diamond")]
+    include_spec = DATASET_PREP_SPECS[canonical_slug("include_test")]
+    polymath_spec = DATASET_PREP_SPECS[canonical_slug("polymath_all")]
+    tau2_spec = DATASET_PREP_SPECS[canonical_slug("tau2_bench_airline_base")]
+
+    assert gpqa_spec.dataset == "gpqa"
+    assert gpqa_spec.split == "diamond"
+    assert include_spec.dataset == "include"
+    assert include_spec.split == "test"
+    assert polymath_spec.dataset == "polymath"
+    assert polymath_spec.split == "all"
+    assert tau2_spec.dataset == "tau2_bench_airline"
+    assert tau2_spec.split == "base"
+    assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
 
 
 def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
@@ -82,3 +108,15 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
     assert detect_job_from_dataset(canonical_slug("tau_bench_retail_test"), is_cot=True) == "function_tau_bench"
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"
+
+
+def test_jobs_module_does_not_eagerly_import_data_manager() -> None:
+    module_name = "src.eval.scheduler.jobs"
+    data_manager_name = "src.eval.datasets.data_prepper.data_manager"
+
+    sys.modules.pop(module_name, None)
+    sys.modules.pop(data_manager_name, None)
+
+    importlib.import_module(module_name)
+
+    assert data_manager_name not in sys.modules

@@ -10,15 +10,19 @@ corresponding scores into non-param-search records for the original datasets.
 import argparse
 import json
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any, Sequence
 
+from src.db.database import init_db
 from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.job_env import ensure_job_id
 from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
+from src.infer.backend import add_inference_backend_arguments, resolve_backend_model_name, validate_inference_backend_args
+
+if TYPE_CHECKING:
+    from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
 DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
@@ -47,9 +51,8 @@ def _param_key_from_payload(payload: dict[str, Any]) -> str | None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV param-search selector/promoter")
-    parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
+    add_inference_backend_arguments(parser)
     parser.add_argument("--dataset", help="Ignored (scheduler compatibility)")
-    parser.add_argument("--device", help="Ignored (scheduler compatibility)")
     parser.add_argument(
         "--benchmarks",
         nargs="+",
@@ -84,6 +87,7 @@ def _promote_score(
     dest_dataset: str,
     model_name: str,
     overwrite: bool,
+    job_name: str,
 ) -> None:
     if _should_skip_promotion(service, dataset=dest_dataset, model_name=model_name, overwrite=overwrite):
         return
@@ -104,8 +108,8 @@ def _promote_score(
         task_details=task_details,
     )
     task_id = service.get_or_create_task(
-        job_name="param_search_select",
-        job_id=ensure_job_id("param_search_select"),
+        job_name=job_name,
+        job_id=ensure_job_id(job_name),
         dataset=str(dest_dataset),
         model=model_name,
         is_param_search=False,
@@ -119,12 +123,20 @@ def _promote_score(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    run_context: "RunContext | None" = None,
+    task_spec: "TaskSpec | None" = None,
+) -> int:
+    del task_spec
     args = parse_args(argv)
-    init_orm(DEFAULT_DB_CONFIG)
+    validate_inference_backend_args(args)
+    init_db(DEFAULT_DB_CONFIG)
 
     service = EvalDbService()
-    model_name = Path(args.model_path).stem
+    job_name = run_context.job_name if run_context is not None else "param_search_select"
+    model_name = resolve_backend_model_name(args)
     benchmarks = tuple(canonical_slug(b) for b in args.benchmarks if b)
     if len(benchmarks) < 2:
         print("❌ 需要至少 2 个 benchmark 才能进行综合选参。")
@@ -194,6 +206,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dest_dataset=bench,
             model_name=model_name,
             overwrite=bool(args.overwrite),
+            job_name=job_name,
         )
 
     return 0

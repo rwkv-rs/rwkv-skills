@@ -34,13 +34,23 @@ def ensure_directory(path: Path) -> Path:
     return path
 
 
+def _resolve_data_root(root: Path) -> Path:
+    candidate = root.expanduser()
+    configured = os.environ.get("RWKV_SKILLS_DATA_ROOT")
+    if configured and not candidate.is_absolute():
+        raw = candidate.as_posix().rstrip("/")
+        if raw in {"data", "./data"}:
+            return Path(configured).expanduser().resolve()
+    return candidate.resolve()
+
+
 def dataset_cache_dir(root: Path, dataset_name: str) -> Path:
-    cache_root = ensure_directory(root / "cache")
+    cache_root = ensure_directory(_resolve_data_root(root) / "cache")
     return ensure_directory(cache_root / dataset_name)
 
 
 def dataset_output_dir(root: Path, dataset_name: str, split: str) -> Path:
-    return ensure_directory(root / dataset_name / split)
+    return ensure_directory(_resolve_data_root(root) / dataset_name / split)
 
 
 def _hash_file(path: Path, algorithm: str = "sha256") -> str:
@@ -184,7 +194,13 @@ def cleanup_directory(path: Path) -> None:
 
 def configure_hf_home(root: Path | None = None) -> Path:
     default_root = Path(os.environ.get("RWKV_SKILLS_HF_HOME", "data/hf_cache"))
-    cache_root = ensure_directory((root or default_root).expanduser().resolve())
+    selected_root = root or default_root
+    if root is not None and not root.is_absolute():
+        raw = root.as_posix().rstrip("/")
+        configured = os.environ.get("RWKV_SKILLS_HF_HOME")
+        if configured and raw in {"data/hf_cache", "./data/hf_cache"}:
+            selected_root = Path(configured)
+    cache_root = ensure_directory(selected_root.expanduser().resolve())
     os.environ.setdefault("HF_HOME", str(cache_root))
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(cache_root / "hub"))
     os.environ.setdefault("HF_DATASETS_CACHE", str(cache_root / "datasets"))
@@ -225,11 +241,12 @@ def extract_answer_from_solution(text: str, *, regex: str | None = r"The final a
     return None
 
 
-def load_qwen_dataset(dataset: str, split: str = "test") -> list[dict]:
+def load_qwen_dataset(dataset: str, split: str = "test", *, data_root: Path | None = None) -> list[dict]:
     url = (
         "https://raw.githubusercontent.com/QwenLM/Qwen2.5-Math/refs/heads/main/evaluation/data/{dataset}/{split}.jsonl"
     )
-    cache_root = dataset_cache_dir(Path("data"), "qwen_math")
+    root = data_root or Path(os.environ.get("RWKV_SKILLS_DATA_ROOT") or "data")
+    cache_root = dataset_cache_dir(root, "qwen_math")
     target_dir = ensure_directory(cache_root / dataset)
     raw_path = target_dir / f"original_{split}.jsonl"
 

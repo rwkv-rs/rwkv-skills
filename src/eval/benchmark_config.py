@@ -28,6 +28,12 @@ _FLOAT_FIELDS = {
 }
 _TUPLE_INT_FIELDS = {"stop_tokens", "ban_tokens", "no_penalty_token_ids"}
 _BOOL_FIELDS = {"pad_zero"}
+_INT_FIELD_ALIASES = {"max_new_tokens": "max_generate_tokens"}
+_FLOAT_FIELD_ALIASES = {
+    "presence_penalty": "alpha_presence",
+    "repetition_penalty": "alpha_frequency",
+    "penalty_decay": "alpha_decay",
+}
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
 
@@ -220,13 +226,14 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     report_avg_k: tuple[float, ...] | None = None
 
     for key, raw in table.items():
-        if key in _INT_FIELDS:
+        normalized_key = _INT_FIELD_ALIASES.get(key, _FLOAT_FIELD_ALIASES.get(key, key))
+        if normalized_key in _INT_FIELDS:
             value = _coerce_int(raw)
-        elif key in _FLOAT_FIELDS:
+        elif normalized_key in _FLOAT_FIELDS:
             value = _coerce_float(raw)
-        elif key in _TUPLE_INT_FIELDS:
+        elif normalized_key in _TUPLE_INT_FIELDS:
             value = _coerce_int_tuple(raw)
-        elif key in _BOOL_FIELDS:
+        elif normalized_key in _BOOL_FIELDS:
             value = raw if isinstance(raw, bool) else None
         elif key == "pass_k":
             pass_k = _coerce_k_tuple(raw)
@@ -243,7 +250,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         else:
             continue
         if value is not None:
-            sampling_overrides[key] = value
+            sampling_overrides[normalized_key] = value
 
     return BenchmarkModelConfig(
         sampling_overrides=sampling_overrides,

@@ -13,8 +13,8 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
+from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
 from src.eval.evaluating import run_checker_for_task
 from src.eval.checkers.llm_checker import run_llm_checker
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -84,7 +84,7 @@ def _infer_model_name(eval_path: Path, *, eval_root: Path, forced: str | None) -
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.task_id:
-        init_orm(DEFAULT_DB_CONFIG)
+        init_db(DEFAULT_DB_CONFIG)
         service = EvalDbService()
         bundle = service.get_task_bundle(task_id=str(args.task_id))
         if not isinstance(bundle, dict):

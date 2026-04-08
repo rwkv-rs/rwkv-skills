@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Dict, List
-from collections.abc import Iterable
+from typing import Any
+from collections.abc import Iterable, Mapping
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
-
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import MaterializingDatasetSpec
 
+_DATASET_ID = "m-a-p/SuperGPQA"
+_DEFAULT_SEED = 42
+_REQUIRED_FIELDS = ("question", "answer", "A", "B", "C", "D")
 
 def _norm(text: str | None) -> str:
     if text is None:
@@ -20,20 +19,25 @@ def _norm(text: str | None) -> str:
     return " ".join(text.strip().split())
 
 
-def _iter_records(split: str, seed: int) -> Iterable[dict]:
+def _load_supergpqa_rows(split: str) -> Iterable[Mapping[str, Any]]:
     configure_hf_home()
-    if load_dataset is None:  # pragma: no cover - dependency missing
+    try:
+        from datasets import load_dataset  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise ModuleNotFoundError(
             "需要安装 `datasets` 才能准备 supergpqa 数据集，请运行 `pip install datasets`"
-        )
-    dataset = load_dataset("m-a-p/SuperGPQA")["train"]
+        ) from exc
+    dataset = load_dataset(_DATASET_ID)["train"]
     if split == "science":
-        dataset = dataset.filter(lambda entry: entry.get("discipline") == "Science")
+        return dataset.filter(lambda entry: entry.get("discipline") == "Science")
     elif split != "test":
         raise ValueError("supergpqa 支持 split: test 或 science")
+    return dataset
 
+
+def _iter_records(split: str, seed: int) -> Iterable[dict[str, Any]]:
     rng = random.Random(seed)
-    for row in dataset:
+    for row in _load_supergpqa_rows(split):
         choices = [_norm(option) for option in row.get("options", [])]
         if len(choices) < 4:
             raise ValueError("SuperGPQA 至少需要四个选项")
@@ -63,10 +67,24 @@ def _iter_records(split: str, seed: int) -> Iterable[dict]:
         yield payload
 
 
-@MULTIPLE_CHOICE_REGISTRY.register("supergpqa")
-def prepare_supergpqa(output_root: Path, split: str = "test", seed: int = 42) -> list[Path]:
-    dataset_dir = output_root / "supergpqa"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _iter_records(split, seed))
-    return [target]
+class SuperGpqaDatasetSpec(MaterializingDatasetSpec):
+    def __init__(self, output_root: Path, split: str, *, seed: int = _DEFAULT_SEED) -> None:
+        super().__init__("supergpqa", output_root, split, required_fields=_REQUIRED_FIELDS, source_kind="hf_load_dataset")
+        self._seed = seed
+
+    def download(self) -> None:
+        return None
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        return list(_iter_records(self.split, self._seed))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        return {"dataset_id": _DATASET_ID, "source_split": self.split, "seed": self._seed}
+
+
+@MULTIPLE_CHOICE_REGISTRY.register_spec("supergpqa")
+def prepare_supergpqa_spec(output_root: Path, split: str = "test") -> SuperGpqaDatasetSpec:
+    return SuperGpqaDatasetSpec(output_root, split)
+
+
+__all__ = ["prepare_supergpqa_spec"]

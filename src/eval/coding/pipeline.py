@@ -9,121 +9,23 @@ from src.eval.benchmark_registry import CoTMode
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.execution_plan import AttemptKey
+from src.eval.prompt_builders import (
+    CODE_COMPLETION_PLACEHOLDER,
+    build_human_eval_expected_context,
+    build_livecodebench_expected_context,
+    build_mbpp_expected_context,
+    extract_function_signature,
+    prompt_for_cot,
+    prompt_for_marker,
+)
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
-from src.infer.sampling import SamplingConfig
+from src.infer.backend import InferenceBackend
+from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 
 # Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
 DEFAULT_PASS_K = (1,)
-
-
-def _compress_newlines(text: str) -> str:
-    lines = [line for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
-
-
-def _format_prompt(prompt: str) -> str:
-    """Match the rwkv_mmlu HumanEval prompt: duplicate code after Assistant."""
-
-    clean = _compress_newlines(prompt).strip()
-    return (
-        "User:You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant:{clean}"
-    )
-
-
-def _format_prompt_no_echo(prompt: str) -> str:
-    """Variant without echoing prompt after Assistant (used for bug-fix style prompts)."""
-
-    clean = _compress_newlines(prompt).strip()
-    return (
-        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant: <think></think>\n```python"
-    )
-
-
-def _extract_function_signature(code: str | None) -> str | None:
-    if not code:
-        return None
-    for line in code.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("def ") and stripped.endswith(":"):
-            return stripped
-    return None
-
-
-def _format_signature_prompt(prompt: str, signature: str ) -> str:
-    prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
-    return _format_prompt_no_echo(prompt)
-
-
-def _format_mbpp_user_prompt(prompt: str, signature: str | None) -> str:
-    body = (
-        f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
-        if signature
-        else prompt
-    )
-    body = _compress_newlines(body).strip()
-    return (
-        "User: You are a top-level code master.\n"
-        f"{body}\n"
-        "Output only the full Python function definition without any additional text or explanation.\n\n"
-        "Assistant: "
-    )
-
-
-def _format_mbpp_prompt(prompt: str, signature: str | None, cot_mode: CoTMode) -> str:
-    user_prompt = _format_mbpp_user_prompt(prompt, signature)
-    if cot_mode is CoTMode.NO_COT:
-        return f"{user_prompt}```python\n"
-    if cot_mode is CoTMode.FAKE_COT:
-        return f"{user_prompt}<think>\n</think>\n```python\n"
-    return f"{user_prompt}<think>"
-
-
-def _format_mbpp_final_prompt(cot_prompt: str, cot_completion: str) -> str:
-    return f"{cot_prompt}{cot_completion}</think>\n```python\n"
-
-
-_LCB_SYSTEM_MESSAGE = (
-    "You are an expert Python programmer. You will be given a question "
-    "(problem specification) and will generate a correct Python program "
-    "that matches the specification and passes all tests."
-)
-_LCB_FORMAT_WITH_STARTER = "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
-_LCB_FORMAT_WITHOUT_STARTER = (
-    "Read the inputs from stdin solve the problem and write the answer to stdout "
-    "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
-    "Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT."
-)
-
-
-def _format_lcb_body(question: str, starter_code: str | None) -> str:
-    clean = (question or "").strip()
-    body = f"### Question:\n{clean}\n\n"
-    if starter_code and starter_code.strip():
-        body += f"### Format: {_LCB_FORMAT_WITH_STARTER}\n"
-        body += f"```python\n{starter_code}\n```\n\n"
-    else:
-        body += f"### Format: {_LCB_FORMAT_WITHOUT_STARTER}\n"
-        body += "```python\n# YOUR CODE HERE\n```\n\n"
-    body += "### Answer: (use the provided format with backticks)\n\n"
-    return body
-
-
-_LCB_FINAL_ANSWER_PREFIX = "\nTherefore, the correct code is ```python\n"
-
-
-def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
-    body = _format_lcb_body(question, starter_code)
-    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think"
-
-
-def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
-    return f"{cot_prompt}{cot_completion}{_LCB_FINAL_ANSWER_PREFIX}"
 
 
 @dataclass(slots=True)
@@ -161,11 +63,30 @@ def _expand_attempt_entries(
     return expanded
 
 
+def _build_human_eval_prompt(prompt: str, *, echo_prompt: bool) -> str:
+    expected_context = build_human_eval_expected_context(
+        prompt,
+        assistant_code_prefix=prompt if echo_prompt else None,
+        cot_mode=CoTMode.NO_COT,
+    )
+    return prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
+
+
+def _build_mbpp_context(prompt: str, signature: str | None, cot_mode: CoTMode) -> str:
+    return build_mbpp_expected_context(prompt, signature=signature, cot_mode=cot_mode)
+
+
+def _build_livecodebench_context(prompt: str, starter_code: str | None) -> str:
+    return build_livecodebench_expected_context(
+        prompt,
+        starter_code=starter_code,
+        cot_mode=CoTMode.COT,
+    )
+
+
 class CodingPipeline:
-    def __init__(self, model_config: ModelLoadConfig) -> None:
-        self.model, self.tokenizer = load_rwkv_model(model_config)
-        self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
+    def __init__(self, backend: InferenceBackend) -> None:
+        self.backend = backend
 
     def run_human_eval(
         self,
@@ -205,10 +126,10 @@ class CodingPipeline:
             probe_seeds: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
-                prompt_text = _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
+                prompt_text = _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix)
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
-            _ = self.engine.generate(
+            _ = self.backend.generate(
                 prompts,
                 sampling=sampling,
                 batch_size=batch_size,
@@ -236,7 +157,7 @@ class CodingPipeline:
             )
         entries = [
             (
-                _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt),
+                _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix),
                 record,
                 key,
             )
@@ -277,7 +198,7 @@ class CodingPipeline:
                         on_record(payload)
                     payloads.append(payload)
 
-                _ = self.engine.generate(
+                _ = self.backend.generate(
                     prompts,
                     sampling=sampling,
                     batch_size=max(1, min(batch_size, len(prompts))),
@@ -334,17 +255,24 @@ class CodingPipeline:
             return CodingPipelineResult(dataset_name, 0, 0, [])
 
         if probe_only:
+            expected_contexts = []
             prompts = []
             probe_seeds: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
                 raw_code = record.metadata.get("code") if record.metadata else None
-                signature = _extract_function_signature(raw_code)
-                prompt_text = _format_mbpp_prompt(record.prompt, signature, cot_mode)
+                signature = extract_function_signature(raw_code)
+                expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
+                prompt_text = (
+                    prompt_for_cot(expected_context)
+                    if cot_mode is CoTMode.COT
+                    else prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
+                )
+                expected_contexts.append(expected_context)
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
             if cot_mode is CoTMode.COT:
-                cot_outputs = self.engine.generate(
+                cot_outputs = self.backend.generate(
                     prompts,
                     sampling=sampling,
                     batch_size=batch_size,
@@ -354,21 +282,31 @@ class CodingPipeline:
                 )
                 cot_by_idx = {item.prompt_index: item for item in cot_outputs}
                 final_prompts = []
-                for local_idx, prompt_text in enumerate(prompts):
+                for local_idx, expected_context in enumerate(expected_contexts):
                     cot_seq = cot_by_idx.get(local_idx)
                     cot_text = cot_seq.text if cot_seq is not None else ""
-                    final_prompts.append(_format_mbpp_final_prompt(prompt_text, cot_text))
+                    final_prompts.append(
+                        prompt_for_marker(
+                            expected_context,
+                            CODE_COMPLETION_PLACEHOLDER,
+                            completions_of_cot=cot_text,
+                        )
+                    )
                 if final_prompts:
-                    _ = self.engine.generate(
+                    final_prompt_seeds = [
+                        sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=2)
+                        for idx in range(len(final_prompts))
+                    ]
+                    _ = self.backend.generate(
                         final_prompts,
                         sampling=sampling,
                         batch_size=batch_size,
                         progress_desc="Probing final code",
                         probe_only=True,
-                        prompt_seeds=probe_seeds,
+                        prompt_seeds=final_prompt_seeds,
                     )
             else:
-                _ = self.engine.generate(
+                _ = self.backend.generate(
                     prompts,
                     sampling=sampling,
                     batch_size=batch_size,
@@ -397,9 +335,14 @@ class CodingPipeline:
         entries = []
         for key, record in expanded:
             raw_code = record.metadata.get("code") if record.metadata else None
-            signature = _extract_function_signature(raw_code)
-            prompt_text = _format_mbpp_prompt(record.prompt, signature, cot_mode)
-            entries.append((prompt_text, record, key))
+            signature = extract_function_signature(raw_code)
+            expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
+            prompt_text = (
+                prompt_for_cot(expected_context)
+                if cot_mode is CoTMode.COT
+                else prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
+            )
+            entries.append((expected_context, prompt_text, record, key))
         skipped = total_expected - len(entries)
         if skipped > 0:
             print(f"⏩ MBPP 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
@@ -412,13 +355,13 @@ class CodingPipeline:
             chunk_size = max(1, int(batch_size))
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
-                prompts = [entry[0] for entry in chunk]
+                prompts = [entry[1] for entry in chunk]
                 if cot_mode is CoTMode.COT:
                     def _on_cot_complete(output: GenerationOutput) -> None:
                         local_idx = output.prompt_index
                         if local_idx < 0 or local_idx >= len(chunk):
                             return
-                        prompt_text, _record, key = chunk[local_idx]
+                        _expected_context, prompt_text, _record, key = chunk[local_idx]
                         cot_stage = StageRecord(
                             prompt=prompt_text,
                             completion=output.text,
@@ -437,7 +380,7 @@ class CodingPipeline:
                         if on_record is not None:
                             on_record(payload)
 
-                    cot_outputs = self.engine.generate(
+                    cot_outputs = self.backend.generate(
                         prompts,
                         sampling=sampling,
                         batch_size=max(1, min(batch_size, len(prompts))),
@@ -450,27 +393,37 @@ class CodingPipeline:
                                 pass_index=key.pass_index,
                                 stage=1,
                             )
-                            for _prompt_text, _record, key in chunk
+                            for _expected_context, _prompt_text, _record, key in chunk
                         ],
                     )
                     cot_by_idx = {item.prompt_index: item for item in cot_outputs}
                     final_prompts: list[str] = []
                     final_prompt_indices: list[int] = []
-                    for local_idx, (prompt_text, _record, _key) in enumerate(chunk):
+                    for local_idx, (expected_context, _prompt_text, _record, _key) in enumerate(chunk):
                         cot_seq = cot_by_idx.get(local_idx)
                         if cot_seq is None:
                             continue
-                        final_prompts.append(_format_mbpp_final_prompt(prompt_text, cot_seq.text))
+                        final_prompts.append(
+                            prompt_for_marker(
+                                expected_context,
+                                CODE_COMPLETION_PLACEHOLDER,
+                                completions_of_cot=cot_seq.text,
+                            )
+                        )
                         final_prompt_indices.append(local_idx)
 
                     def _on_final_complete(output: GenerationOutput) -> None:
                         local_idx = final_prompt_indices[output.prompt_index]
-                        prompt_text, _record, key = chunk[local_idx]
+                        expected_context, prompt_text, _record, key = chunk[local_idx]
                         cot_seq = cot_by_idx.get(local_idx)
                         if cot_seq is None:
                             return
                         prior_context = f"{prompt_text}{cot_seq.text}"
-                        final_prompt = _format_mbpp_final_prompt(prompt_text, cot_seq.text)
+                        final_prompt = prompt_for_marker(
+                            expected_context,
+                            CODE_COMPLETION_PLACEHOLDER,
+                            completions_of_cot=cot_seq.text,
+                        )
                         delta_prompt = prompt_delta(final_prompt, prior_context)
                         cot_stage = StageRecord(
                             prompt=prompt_text,
@@ -497,7 +450,7 @@ class CodingPipeline:
                         payloads.append(payload)
 
                     if final_prompts:
-                        _ = self.engine.generate(
+                        _ = self.backend.generate(
                             final_prompts,
                             sampling=sampling,
                             batch_size=max(1, min(batch_size, len(final_prompts))),
@@ -505,9 +458,9 @@ class CodingPipeline:
                             on_complete=_on_final_complete,
                             prompt_seeds=[
                                 sample_repeat_seed(
-                                    chunk[local_idx][2].sample_index,
-                                    chunk[local_idx][2].repeat_index,
-                                    pass_index=chunk[local_idx][2].pass_index,
+                                    chunk[local_idx][3].sample_index,
+                                    chunk[local_idx][3].repeat_index,
+                                    pass_index=chunk[local_idx][3].pass_index,
                                     stage=2,
                                 )
                                 for local_idx in final_prompt_indices
@@ -518,7 +471,7 @@ class CodingPipeline:
                         local_idx = output.prompt_index
                         if local_idx < 0 or local_idx >= len(chunk):
                             return
-                        prompt_text, _record, key = chunk[local_idx]
+                        _expected_context, prompt_text, _record, key = chunk[local_idx]
                         raw_output = output.text or ""
                         stage = StageRecord(
                             prompt=prompt_text,
@@ -538,7 +491,7 @@ class CodingPipeline:
                             on_record(payload)
                         payloads.append(payload)
 
-                    _ = self.engine.generate(
+                    _ = self.backend.generate(
                         prompts,
                         sampling=sampling,
                         batch_size=max(1, min(batch_size, len(prompts))),
@@ -551,7 +504,7 @@ class CodingPipeline:
                                 pass_index=key.pass_index,
                                 stage=1,
                             )
-                            for _prompt_text, _record, key in chunk
+                            for _expected_context, _prompt_text, _record, key in chunk
                         ],
                     )
 
@@ -595,14 +548,17 @@ class CodingPipeline:
             return CodingPipelineResult(dataset_name, 0, 0, [])
 
         if probe_only:
+            expected_contexts = []
             prompts = []
             probe_seeds_stage1: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
-                prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
+                expected_context = _build_livecodebench_context(record.prompt, record.starter_code)
+                prompt_text = prompt_for_cot(expected_context)
+                expected_contexts.append(expected_context)
                 prompts.append(prompt_text)
                 probe_seeds_stage1.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
-            cot_outputs = self.engine.generate(
+            cot_outputs = self.backend.generate(
                 prompts,
                 sampling=cot_sampling,
                 batch_size=batch_size,
@@ -612,16 +568,22 @@ class CodingPipeline:
             )
             final_prompts: list[str] = []
             cot_by_idx = {item.prompt_index: item for item in cot_outputs}
-            for local_idx, prompt_text in enumerate(prompts):
+            for local_idx, expected_context in enumerate(expected_contexts):
                 cot_seq = cot_by_idx.get(local_idx)
                 cot_text = cot_seq.text if cot_seq is not None else ""
-                final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_text))
+                final_prompts.append(
+                    prompt_for_marker(
+                        expected_context,
+                        CODE_COMPLETION_PLACEHOLDER,
+                        completions_of_cot=cot_text,
+                    )
+                )
             if final_prompts:
                 probe_seeds_stage2 = [
                         sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=2)
                         for idx in range(len(final_prompts))
                     ]
-                _ = self.engine.generate(
+                _ = self.backend.generate(
                     final_prompts,
                     sampling=final_sampling,
                     batch_size=batch_size,
@@ -647,10 +609,10 @@ class CodingPipeline:
             print(
                 f"⏩ LiveCodeBench 恢复运行：已完成 {resume_start_index}/{len(records) * samples_per_task}，剩余 {len(expanded)}"
             )
-        entries = [
-            (_format_lcb_cot_prompt(record.prompt, record.starter_code), record, key)
-            for key, record in expanded
-        ]
+        entries = []
+        for key, record in expanded:
+            expected_context = _build_livecodebench_context(record.prompt, record.starter_code)
+            entries.append((expected_context, prompt_for_cot(expected_context), record, key))
         skipped = total_expected - len(entries)
         if skipped > 0:
             print(f"⏩ LiveCodeBench 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
@@ -663,13 +625,13 @@ class CodingPipeline:
             chunk_size = max(1, int(batch_size))
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
-                prompts = [entry[0] for entry in chunk]
+                prompts = [entry[1] for entry in chunk]
 
                 def _on_cot_complete(output: GenerationOutput) -> None:
                     local_idx = output.prompt_index
                     if local_idx < 0 or local_idx >= len(chunk):
                         return
-                    prompt_text, _record, key = chunk[local_idx]
+                    _expected_context, prompt_text, _record, key = chunk[local_idx]
                     cot_stage = StageRecord(
                         prompt=prompt_text,
                         completion=output.text,
@@ -688,7 +650,7 @@ class CodingPipeline:
                     if on_record is not None:
                         on_record(payload)
 
-                cot_outputs = self.engine.generate(
+                cot_outputs = self.backend.generate(
                     prompts,
                     sampling=cot_sampling,
                     batch_size=max(1, min(batch_size, len(prompts))),
@@ -701,28 +663,38 @@ class CodingPipeline:
                             pass_index=key.pass_index,
                             stage=1,
                         )
-                        for _prompt_text, _record, key in chunk
+                        for _expected_context, _prompt_text, _record, key in chunk
                     ],
                 )
                 cot_by_idx = {item.prompt_index: item for item in cot_outputs}
 
                 final_prompts: list[str] = []
                 final_prompt_indices: list[int] = []
-                for local_idx, (prompt_text, _record, _key) in enumerate(chunk):
+                for local_idx, (expected_context, _prompt_text, _record, _key) in enumerate(chunk):
                     cot_seq = cot_by_idx.get(local_idx)
                     if cot_seq is None:
                         continue
-                    final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_seq.text))
+                    final_prompts.append(
+                        prompt_for_marker(
+                            expected_context,
+                            CODE_COMPLETION_PLACEHOLDER,
+                            completions_of_cot=cot_seq.text,
+                        )
+                    )
                     final_prompt_indices.append(local_idx)
 
                 def _on_final_complete(output: GenerationOutput) -> None:
                     local_idx = final_prompt_indices[output.prompt_index]
-                    prompt_text, _record, key = chunk[local_idx]
+                    expected_context, prompt_text, _record, key = chunk[local_idx]
                     cot_seq = cot_by_idx.get(local_idx)
                     if cot_seq is None:
                         return
                     prior_context = f"{prompt_text}{cot_seq.text}"
-                    final_prompt = _format_lcb_final_prompt(prompt_text, cot_seq.text)
+                    final_prompt = prompt_for_marker(
+                        expected_context,
+                        CODE_COMPLETION_PLACEHOLDER,
+                        completions_of_cot=cot_seq.text,
+                    )
                     delta_prompt = prompt_delta(final_prompt, prior_context)
                     cot_stage = StageRecord(
                         prompt=prompt_text,
@@ -751,14 +723,14 @@ class CodingPipeline:
                 if final_prompts:
                     final_prompt_seeds = [
                         sample_repeat_seed(
-                            chunk[local_idx][2].sample_index,
-                            chunk[local_idx][2].repeat_index,
-                            pass_index=chunk[local_idx][2].pass_index,
+                            chunk[local_idx][3].sample_index,
+                            chunk[local_idx][3].repeat_index,
+                            pass_index=chunk[local_idx][3].pass_index,
                             stage=2,
                         )
                         for local_idx in final_prompt_indices
                     ]
-                    _ = self.engine.generate(
+                    _ = self.backend.generate(
                         final_prompts,
                         sampling=final_sampling,
                         batch_size=max(1, min(batch_size, len(final_prompts))),

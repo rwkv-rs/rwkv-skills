@@ -6,14 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Collection, Mapping, Sequence, Pattern
 
+from src.eval.benchmark_registry import resolve_benchmark_metadata
 from src.eval.param_search.cot_grid import grid_size
 
 from .config import RESULTS_ROOT
-from .dataset_utils import canonical_slug, safe_slug
-from .jobs import JOB_CATALOGUE, JobSpec, detect_job_from_dataset
-from .models import expand_model_paths, filter_model_paths
+from .dataset_utils import canonical_slug, make_dataset_slug, safe_slug
+from .jobs import JOB_CATALOGUE
+from .models import expand_model_paths, filter_model_names, filter_model_paths
 from .naming import build_run_slug
-from .state import CompletedKey, RunningEntry
+from .state import CompletedKey
 
 
 @dataclass(slots=True)
@@ -21,29 +22,75 @@ class QueueItem:
     job_name: str
     job_id: str
     dataset_slug: str
-    model_path: Path
+    model_path: Path | None
     model_slug: str
+    model_name: str | None = None
+    infer_base_url: str | None = None
+    infer_model: str | None = None
     extra_args: tuple[str, ...] = ()
     dataset_path: Path | None = None
 
+    def __post_init__(self) -> None:
+        if self.model_name is None:
+            if self.infer_model:
+                self.model_name = str(self.infer_model)
+            elif self.model_path is not None:
+                self.model_name = self.model_path.stem
+            else:
+                raise ValueError("QueueItem requires model_name, infer_model, or model_path")
+        if self.infer_base_url and not self.infer_model:
+            self.infer_model = self.model_name
+
+    @property
+    def is_remote(self) -> bool:
+        return bool(self.infer_base_url)
+
 
 _UNKNOWN_QUESTION_COUNT = 10**9
-_EARLY_DATASET_SLUGS = frozenset(
-    canonical_slug(slug)
-    for slug in (
-        "mmlu_test",
-        "mmlu_pro_test",
-        "gsm8k_test",
-        "math_500_test",
-        "human_eval_test",
-        "mbpp_test",
-        "livecodebench_test",
-        "ifeval_test",
-        "ceval_test",
-    )
+_WARMUP_BENCHMARK_NAMES = (
+    "mmlu",
+    "mmlu_pro",
+    "gsm8k",
+    "math_500",
+    "human_eval",
+    "mbpp",
+    "livecodebench",
+    "ifeval",
+    "ceval",
 )
 
-_PARAM_SEARCH_BENCHMARKS = tuple(canonical_slug(slug) for slug in ("gsm8k_test", "math_500_test"))
+
+def _build_warmup_dataset_slugs() -> frozenset[str]:
+    slugs: set[str] = set()
+    for benchmark_name in _WARMUP_BENCHMARK_NAMES:
+        metadata = resolve_benchmark_metadata(benchmark_name)
+        slugs.add(canonical_slug(make_dataset_slug(metadata.dataset, metadata.default_split)))
+    return frozenset(slugs)
+
+
+def _build_param_search_target_jobs() -> dict[str, str]:
+    targets: dict[str, str] = {}
+    for job_name in JOB_CATALOGUE:
+        if not job_name.startswith("param_search_") or job_name == "param_search_select":
+            continue
+        target_job = job_name.removeprefix("param_search_")
+        if target_job in JOB_CATALOGUE:
+            targets[job_name] = target_job
+    return targets
+
+
+_EARLY_DATASET_SLUGS = _build_warmup_dataset_slugs()
+_PARAM_SEARCH_TARGET_JOBS = _build_param_search_target_jobs()
+_PARAM_SEARCH_BENCHMARKS = tuple(
+    sorted(
+        {
+            canonical_slug(dataset_slug)
+            for job_name in _PARAM_SEARCH_TARGET_JOBS
+            for dataset_slug in JOB_CATALOGUE[job_name].dataset_slugs
+        }
+    )
+)
+_PARAM_SEARCH_TRIAL_JOBS = frozenset(_PARAM_SEARCH_TARGET_JOBS.values())
 
 
 def _param_search_required_trial_indices() -> range:
@@ -77,6 +124,52 @@ def _param_search_done(model_slug: str, dataset_slug: str) -> bool:
     return all(idx in present for idx in required)
 
 
+def _param_search_mode_enabled_for_model(
+    *,
+    model_slug: str,
+    completed_set: Collection[CompletedKey],
+    failed_set: Collection[CompletedKey],
+) -> bool:
+    for search_job_name, target_job_name in _PARAM_SEARCH_TARGET_JOBS.items():
+        search_job = JOB_CATALOGUE[search_job_name]
+        target_job = JOB_CATALOGUE[target_job_name]
+        for dataset_slug in search_job.dataset_slugs:
+            key = CompletedKey(
+                job=target_job_name,
+                model_slug=model_slug,
+                dataset_slug=canonical_slug(dataset_slug),
+                is_cot=target_job.is_cot,
+            )
+            if key in completed_set or key in failed_set:
+                return False
+    return bool(_PARAM_SEARCH_TARGET_JOBS)
+
+
+def _should_replace_with_param_search(
+    *,
+    job_name: str,
+    dataset_slug: str,
+    param_search_enabled: bool,
+) -> bool:
+    return (
+        param_search_enabled
+        and canonical_slug(dataset_slug) in _PARAM_SEARCH_BENCHMARKS
+        and job_name in _PARAM_SEARCH_TRIAL_JOBS
+    )
+
+
+def _param_search_queue_ready(
+    *,
+    job_name: str,
+    model_slug: str,
+    dataset_slug: str,
+) -> bool:
+    canonical_dataset = canonical_slug(dataset_slug)
+    if job_name != "param_search_select":
+        return not _param_search_done(model_slug, canonical_dataset)
+    return all(_param_search_done(model_slug, slug) for slug in _PARAM_SEARCH_BENCHMARKS)
+
+
 def build_queue(
     *,
     model_globs: Sequence[str],
@@ -91,12 +184,28 @@ def build_queue(
     max_param_b: float | None,
     enable_param_search: bool = False,
     model_name_patterns: Sequence[Pattern[str]] | None = None,
+    infer_base_url: str | None = None,
+    infer_models: Sequence[str] = (),
 ) -> list[QueueItem]:
-    model_paths = expand_model_paths(model_globs)
-    if not model_paths:
-        return []
-    filtered_models = filter_model_paths(model_paths, model_select, min_param_b, max_param_b)
-    latest_2_9b_models = set(filter_model_paths(model_paths, "latest-data", 2.9, 2.9))
+    remote_base_url = str(infer_base_url or "").strip() or None
+    remote_models = tuple(str(name).strip() for name in infer_models if str(name).strip())
+    remote_mode = bool(remote_base_url or remote_models)
+
+    resolved_models: list[tuple[str, Path | None]] = []
+    latest_2_9b_models: set[str] = set()
+    if remote_mode:
+        if not remote_base_url or not remote_models:
+            raise ValueError("远端调度必须同时提供 infer_base_url 和 infer_models。")
+        filtered_model_names = filter_model_names(remote_models, model_select, min_param_b, max_param_b)
+        latest_2_9b_models = set(filter_model_names(remote_models, "latest-data", 2.9, 2.9))
+        resolved_models = [(model_name, None) for model_name in filtered_model_names]
+    else:
+        model_paths = expand_model_paths(model_globs)
+        if not model_paths:
+            return []
+        filtered_models = filter_model_paths(model_paths, model_select, min_param_b, max_param_b)
+        latest_2_9b_models = {path.stem for path in filter_model_paths(model_paths, "latest-data", 2.9, 2.9)}
+        resolved_models = [(path.stem, path) for path in filtered_models]
 
     pending: list[QueueItem] = []
     completed_set = set(completed)
@@ -106,22 +215,16 @@ def build_queue(
     running_set = set(running)
     compiled_patterns = tuple(model_name_patterns or ())
 
-    param_search_enabled: dict[Path, bool] = {}
+    param_search_enabled: dict[str, bool] = {}
     if enable_param_search and latest_2_9b_models:
-        gsm_slug, math_slug = _PARAM_SEARCH_BENCHMARKS
-        for model_path in filtered_models:
-            if model_path not in latest_2_9b_models:
+        for model_name, _model_path in resolved_models:
+            if model_name not in latest_2_9b_models:
                 continue
-            model_slug = safe_slug(model_path.stem)
-            gsm_job = detect_job_from_dataset(gsm_slug, True) or "free_response_judge"
-            math_job = detect_job_from_dataset(math_slug, True) or "free_response"
-            gsm_key = CompletedKey(job=gsm_job, model_slug=model_slug, dataset_slug=gsm_slug, is_cot=True)
-            math_key = CompletedKey(job=math_job, model_slug=model_slug, dataset_slug=math_slug, is_cot=True)
-            param_search_enabled[model_path] = (
-                gsm_key not in completed_set
-                and gsm_key not in failed_set
-                and math_key not in completed_set
-                and math_key not in failed_set
+            model_slug = safe_slug(model_name)
+            param_search_enabled[model_name] = _param_search_mode_enabled_for_model(
+                model_slug=model_slug,
+                completed_set=completed_set,
+                failed_set=failed_set,
             )
 
     for job_name in job_order:
@@ -134,24 +237,23 @@ def build_queue(
                 continue
             if canonical_dataset in skip_datasets:
                 continue
-            for model_path in filtered_models:
-                model_slug = safe_slug(model_path.stem)
+            for model_name, model_path in resolved_models:
+                model_slug = safe_slug(model_name)
                 if compiled_patterns:
-                    name = model_path.name
-                    stem = model_path.stem
-                    if not any(pattern.search(name) or pattern.search(stem) for pattern in compiled_patterns):
+                    local_name = model_path.name if model_path is not None else model_name
+                    if not any(pattern.search(local_name) or pattern.search(model_name) for pattern in compiled_patterns):
                         continue
 
                 # Latest 2.9b: replace gsm8k + hendrycks_math eval runs with a param-search workflow.
                 param_search_on = (
                     enable_param_search
-                    and model_path in latest_2_9b_models
-                    and param_search_enabled.get(model_path, False)
+                    and model_name in latest_2_9b_models
+                    and param_search_enabled.get(model_name, False)
                 )
-                if (
-                    param_search_on
-                    and canonical_dataset in _PARAM_SEARCH_BENCHMARKS
-                    and job_name in {"free_response", "free_response_judge"}
+                if _should_replace_with_param_search(
+                    job_name=job_name,
+                    dataset_slug=canonical_dataset,
+                    param_search_enabled=param_search_on,
                 ):
                     continue
                 if job_name.startswith("param_search_"):
@@ -159,12 +261,12 @@ def build_queue(
                         continue
                     if not param_search_on:
                         continue
-                    if job_name != "param_search_select":
-                        if _param_search_done(model_slug, canonical_dataset):
-                            continue
-                    else:
-                        if not all(_param_search_done(model_slug, slug) for slug in _PARAM_SEARCH_BENCHMARKS):
-                            continue
+                    if not _param_search_queue_ready(
+                        job_name=job_name,
+                        model_slug=model_slug,
+                        dataset_slug=canonical_dataset,
+                    ):
+                        continue
 
                 key = CompletedKey(
                     job=job_name,
@@ -174,7 +276,7 @@ def build_queue(
                 )
                 if key in completed_set or key in failed_set:
                     continue
-                job_id = f"{spec.id_prefix}{build_run_slug(model_path, canonical_dataset, is_cot=spec.is_cot)}"
+                job_id = f"{spec.id_prefix}{build_run_slug(model_name, canonical_dataset, is_cot=spec.is_cot)}"
                 if job_id in running_set:
                     continue
                 extra_args: tuple[str, ...] = ()
@@ -185,6 +287,9 @@ def build_queue(
                         dataset_slug=canonical_dataset,
                         model_path=model_path,
                         model_slug=model_slug,
+                        model_name=model_name,
+                        infer_base_url=remote_base_url,
+                        infer_model=(model_name if remote_mode else None),
                         extra_args=extra_args,
                     )
                 )

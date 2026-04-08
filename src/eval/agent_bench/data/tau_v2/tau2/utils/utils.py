@@ -5,7 +5,11 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    def load_dotenv(*args, **kwargs):  # type: ignore[no-redef]
+        return False
 from loguru import logger
 
 try:

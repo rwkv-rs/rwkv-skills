@@ -3,69 +3,29 @@ from __future__ import annotations
 """Knowledge benchmark pipeline for multiple-choice datasets."""
 
 from dataclasses import dataclass
+import re
 from typing import Callable, Sequence
-
-import torch
 
 from src.eval.benchmark_registry import CoTMode
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
 from src.eval.execution_plan import AttemptKey
+from src.eval.prompt_builders import (
+    ALPHABET,
+    LOGPROBS_PLACEHOLDER,
+    build_multiple_choice_expected_context,
+    concat_choices,
+    normalize_subject,
+    prompt_for_cot,
+    prompt_for_marker,
+)
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
-from src.infer.sampling import SamplingConfig
+from src.infer.backend import InferenceBackend
+from src.infer.sampling import GenerationOutput, SamplingConfig
 
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
-
-EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>.
-Answer this question and finish with a single option letter.
-Question: <Q>
-Choices:
-<CHOICES>
-
-Assistant: Therefore, the answer is"""
-
-EN_FAKE_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>.
-Answer this question and finish with a single option letter.
-Question: <Q>
-Choices:
-<CHOICES>
-
-Assistant: <think>
-</think>
-Therefore, the answer is"""
-
-EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>.
-Answer this question and finish with a single option letter.
-Question: <Q>
-Choices:
-<CHOICES>
-
-Assistant: <think>"""
-
-EN_FINAL_ANSWER_TEMPLATE = """<Q><COT></think>
-Therefore, the answer is"""
-
-
-@dataclass(frozen=True)
-class PromptTemplates:
-    direct: str
-    fake_cot: str
-    cot: str
-    final: str
-
-
-def _select_prompt_templates(_dataset_name: str | None) -> PromptTemplates:
-    return PromptTemplates(
-        EN_DIRECT_PROMPT_TEMPLATE,
-        EN_FAKE_COT_PROMPT_TEMPLATE,
-        EN_COT_PROMPT_TEMPLATE,
-        EN_FINAL_ANSWER_TEMPLATE,
-    )
 
 
 @dataclass(slots=True)
@@ -78,12 +38,9 @@ class MultipleChoicePipelineResult:
 class MultipleChoicePipeline:
     """Wrap direct and CoT multiple-choice execution into canonical payloads."""
 
-    def __init__(self, model_config: ModelLoadConfig, target_token_format: str = TARGET_TOKEN_FORMAT) -> None:
-        self.model, self.tokenizer = load_rwkv_model(model_config)
-        self.engine = InferenceEngine(self.model, self.tokenizer)
+    def __init__(self, backend: InferenceBackend, target_token_format: str = TARGET_TOKEN_FORMAT) -> None:
+        self.backend = backend
         self.target_token_format = target_token_format
-        self._choice_token_cache: dict[int, list[int]] = {}
-        self.model_path = model_config.weights_path
 
     def run_direct(
         self,
@@ -107,10 +64,6 @@ class MultipleChoicePipeline:
         )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
-        templates = _select_prompt_templates(dataset_name)
-        if prompt_template is None:
-            prompt_template = templates.fake_cot if cot_mode is CoTMode.FAKE_COT else templates.direct
-
         skip_keys = skip_keys or set()
         if resume_start_index < 0:
             resume_start_index = 0
@@ -135,7 +88,11 @@ class MultipleChoicePipeline:
 
         payloads: list[dict] = []
         for key, record in expanded:
-            prompt = self._format_prompt(record, prompt_template)
+            if prompt_template is not None:
+                prompt = self._format_prompt(record, prompt_template)
+            else:
+                expected_context = self._build_expected_context(record, cot_mode)
+                prompt = self._prompt_for_final_answer(expected_context, None)
             _, pred_letter = self._score_prompt(record, prompt)
             token_text = self.target_token_format.replace("<LETTER>", pred_letter)
             stages = [
@@ -185,12 +142,7 @@ class MultipleChoicePipeline:
         )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
-        templates = _select_prompt_templates(dataset_name)
         batch_size = max(1, int(batch_size))
-        if cot_prompt_template is None:
-            cot_prompt_template = templates.cot
-        if final_answer_template is None:
-            final_answer_template = templates.final
 
         repeats = max(1, int(samples_per_task)) if not probe_only else 1
         skip_keys = skip_keys or set()
@@ -243,7 +195,13 @@ class MultipleChoicePipeline:
         chunk_size = max(1, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in chunk]
+            expected_contexts = [self._build_expected_context(record, CoTMode.COT) for _key, record in chunk]
+            prompts = [
+                self._format_prompt(record, cot_prompt_template)
+                if cot_prompt_template is not None
+                else self._prompt_for_cot(expected_context)
+                for expected_context, (_key, record) in zip(expected_contexts, chunk, strict=True)
+            ]
 
             def _on_cot_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
@@ -251,6 +209,7 @@ class MultipleChoicePipeline:
                     return
                 key, record = chunk[local_idx]
                 cot_prompt = prompts[local_idx]
+                expected_context = expected_contexts[local_idx]
                 cot_stage = StageRecord(
                     prompt=cot_prompt,
                     completion=output.text,
@@ -268,11 +227,12 @@ class MultipleChoicePipeline:
                 cot_payload["_stage"] = "cot"
                 if on_record is not None:
                     on_record(cot_payload)
-                final_prompt = (
-                    (final_answer_template or EN_FINAL_ANSWER_TEMPLATE)
-                    .replace("<Q>", cot_prompt)
-                    .replace("<COT>", output.text)
-                )
+                if final_answer_template is not None:
+                    final_prompt = (
+                        final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", output.text)
+                    )
+                else:
+                    final_prompt = self._prompt_for_final_answer(expected_context, output.text)
                 _, pred_letter = self._score_prompt(record, final_prompt)
                 prior_context = f"{cot_prompt}{output.text}"
                 delta_prompt = prompt_delta(final_prompt, prior_context)
@@ -296,7 +256,7 @@ class MultipleChoicePipeline:
                     on_record(payload)
                 payloads.append(payload)
 
-            _ = self.engine.generate(
+            _ = self.backend.generate(
                 prompts,
                 sampling=cot_sampling,
                 batch_size=batch_size,
@@ -336,50 +296,97 @@ class MultipleChoicePipeline:
         dataset_name = infer_dataset_slug_from_path(dataset_path)
         return indexed_records, dataset_name
 
+    def _build_expected_context(self, record: MultipleChoiceRecord, cot_mode: CoTMode) -> str:
+        return build_multiple_choice_expected_context(
+            subject=normalize_subject(record.subject, "unknown"),
+            question=record.question,
+            choices=record.choices,
+            cot_mode=cot_mode,
+        )
+
+    def _prompt_for_cot(self, expected_context: str) -> str:
+        return prompt_for_cot(expected_context)
+
+    def _prompt_for_final_answer(self, expected_context: str, completions_of_cot: str | None) -> str:
+        return prompt_for_marker(
+            expected_context,
+            LOGPROBS_PLACEHOLDER,
+            completions_of_cot=completions_of_cot,
+        )
+
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
-        subject = (record.subject or "unknown").replace("_", " ")
-        choice_lines = [f"{ALPHABET[i]}. {choice}" for i, choice in enumerate(record.choices)]
         return (
-            template.replace("<SUBJECT>", subject)
+            template.replace("<SUBJECT>", normalize_subject(record.subject, "unknown"))
             .replace("<Q>", record.question)
-            .replace("<CHOICES>", "\n".join(choice_lines))
+            .replace("<CHOICES>", concat_choices(record.choices))
         )
 
     def _choice_tokens(self, num_choices: int) -> list[int]:
-        if num_choices not in self._choice_token_cache:
-            tokens = []
-            for letter in ALPHABET[:num_choices]:
-                text = self.target_token_format.replace("<LETTER>", letter)
-                token_ids = self.tokenizer.encode(text)
-                if len(token_ids) != 1:
-                    raise ValueError(
-                        f"target token format '{self.target_token_format}' 未映射为单 token: {token_ids}"
-                    )
-                tokens.append(token_ids[0])
-            self._choice_token_cache[num_choices] = tokens
-        return self._choice_token_cache[num_choices]
+        return [
+            self.target_token_format.replace("<LETTER>", letter)
+            for letter in ALPHABET[:num_choices]
+        ]
 
     def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
-        tokens = [0] + self.tokenizer.encode(prompt.strip())
-        state = self._blank_state()
-        logits = self.model.forward(tokens, state, full_output=False)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        logits = logits.to(torch.float32)
-        choice_tokens = self._choice_tokens(len(record.choices))
-        slice_values = logits[choice_tokens]
+        choice_texts = self._choice_tokens(len(record.choices))
+        try:
+            score_map, best_text = self.backend.score_choice_tokens(
+                prompt=prompt,
+                choice_token_texts=choice_texts,
+            )
+        except NotImplementedError:
+            return self._score_prompt_via_generation(record, prompt)
         logits_map = {
-            ALPHABET[i]: float(value)
-            for i, value in enumerate(slice_values.cpu())
+            ALPHABET[index]: float(score_map.get(choice_texts[index], float("-inf")))
+            for index in range(len(choice_texts))
         }
-        pred_idx = torch.argmax(slice_values).item()
+        try:
+            pred_idx = choice_texts.index(best_text)
+        except ValueError as exc:
+            raise RuntimeError(f"backend returned unexpected choice token text: {best_text!r}") from exc
         return logits_map, ALPHABET[pred_idx]
 
-    def _blank_state(self):
-        try:
-            return self.model.generate_zero_state(0)
-        except TypeError:
-            return self.model.generate_zero_state()
+    def _score_prompt_via_generation(
+        self,
+        record: MultipleChoiceRecord,
+        prompt: str,
+    ) -> tuple[dict[str, float], str]:
+        outputs = self.backend.generate(
+            [prompt],
+            sampling=SamplingConfig(
+                max_generate_tokens=8,
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                alpha_presence=0.0,
+                alpha_frequency=0.0,
+                alpha_decay=1.0,
+                stop_tokens=(),
+                no_penalty_token_ids=(),
+            ),
+            batch_size=1,
+            progress_desc="Generating MC answer",
+            show_progress=False,
+        )
+        if not outputs:
+            raise RuntimeError("backend returned no output for multiple-choice fallback generation")
+        pred_letter = self._extract_generated_choice_letter(outputs[0].text, len(record.choices))
+        score_map = {
+            letter: (0.0 if letter == pred_letter else float("-inf"))
+            for letter in ALPHABET[: len(record.choices)]
+        }
+        return score_map, pred_letter
+
+    def _extract_generated_choice_letter(self, text: str, num_choices: int) -> str:
+        valid_letters = ALPHABET[:num_choices]
+        normalized = (text or "").strip().upper()
+        boundary_match = re.search(rf"\b([{re.escape(valid_letters)}])\b", normalized)
+        if boundary_match is not None:
+            return boundary_match.group(1)
+        for char in normalized:
+            if char in valid_letters:
+                return char
+        raise RuntimeError(f"could not extract a valid choice letter from generated text: {text!r}")
 
 
 __all__ = ["MultipleChoicePipeline", "MultipleChoicePipelineResult"]

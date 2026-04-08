@@ -4,16 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Iterable, Sequence
+from typing import Final, Sequence
 
-from src.eval.benchmark_registry import resolve_benchmark_metadata
-from src.eval.datasets.data_prepper.data_manager import (
-    available_code_generation_datasets,
-    available_free_answer_datasets,
-    available_instruction_following_datasets,
-    available_multiple_choice_datasets,
-    prepare_dataset,
-)
+from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARKS_BY_FIELD, BenchmarkField
 from src.eval.runner_registry import ALL_RUNNERS, RunnerGroup, RunnerSpec as RegisteredRunnerSpec
 
 from .dataset_utils import (
@@ -55,6 +48,15 @@ class JobSpec:
         return f"{self.name}__"
 
 
+def _field_dataset_slugs(field: BenchmarkField) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            canonical_slug(make_dataset_slug(metadata.dataset, metadata.default_split))
+            for metadata in BENCHMARKS_BY_FIELD.get(field, ())
+        )
+    )
+
+
 def _build_dataset_catalogues() -> tuple[
     dict[str, DatasetPrepSpec],
     tuple[str, ...],
@@ -65,27 +67,11 @@ def _build_dataset_catalogues() -> tuple[
 ]:
     specs: dict[str, DatasetPrepSpec] = {}
     job_dataset_slugs: dict[str, list[str]] = {}
-
-    def register(name: str, split: str) -> str:
-        slug = make_dataset_slug(name, split)
-        if slug not in specs:
-            specs[slug] = DatasetPrepSpec(name, split)
-        return slug
-
-    def collect(datasets: Iterable[str]) -> list[str]:
-        family_slugs: list[str] = []
-        for dataset in datasets:
-            metadata = resolve_benchmark_metadata(dataset)
-            slug = register(dataset, metadata.default_split)
-            family_slugs.append(slug)
-            for job_name in metadata.scheduler_jobs:
-                job_dataset_slugs.setdefault(job_name, []).append(slug)
-        return family_slugs
-
-    multi_choice_slugs = collect(available_multiple_choice_datasets())
-    math_slugs = collect(available_free_answer_datasets())
-    special_slugs = collect(available_instruction_following_datasets())
-    code_slugs = collect(available_code_generation_datasets())
+    for metadata in ALL_BENCHMARKS:
+        slug = canonical_slug(make_dataset_slug(metadata.dataset, metadata.default_split))
+        specs.setdefault(slug, DatasetPrepSpec(metadata.dataset, metadata.default_split))
+        for job_name in metadata.scheduler_jobs:
+            job_dataset_slugs.setdefault(job_name, []).append(slug)
 
     for alias, target in DATASET_SLUG_ALIASES.items():
         canonical = canonical_slug(target)
@@ -93,10 +79,15 @@ def _build_dataset_catalogues() -> tuple[
             alias_slug = canonical_slug(alias)
             specs.setdefault(alias_slug, specs[canonical])
 
-    multi_choice_tuple = tuple(sorted({canonical_slug(s) for s in multi_choice_slugs}))
-    math_tuple = tuple(sorted({canonical_slug(s) for s in math_slugs}))
-    special_tuple = tuple(sorted({canonical_slug(s) for s in special_slugs}))
-    code_tuple = tuple(sorted({canonical_slug(s) for s in code_slugs}))
+    multi_choice_tuple = _field_dataset_slugs(BenchmarkField.KNOWLEDGE)
+    math_tuple = _field_dataset_slugs(BenchmarkField.MATHS)
+    special_tuple = _field_dataset_slugs(BenchmarkField.INSTRUCTION_FOLLOWING)
+    code_tuple = tuple(
+        sorted(
+            set(_field_dataset_slugs(BenchmarkField.CODING))
+            | set(_field_dataset_slugs(BenchmarkField.FUNCTION_CALLING))
+        )
+    )
     job_tuples = {
         job_name: tuple(sorted({canonical_slug(slug) for slug in slugs}))
         for job_name, slugs in job_dataset_slugs.items()
@@ -112,6 +103,7 @@ def _build_dataset_catalogues() -> tuple[
     CODE_DATASET_SLUGS,
     _JOB_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
+
 
 def _job_dataset_slugs(job_name: str) -> tuple[str, ...]:
     return _JOB_DATASET_SLUGS.get(job_name, ())
@@ -143,32 +135,6 @@ FUNCTION_TAU2_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function
 
 
 def _dataset_slugs_for_runner(runner: RegisteredRunnerSpec) -> tuple[str, ...]:
-    if runner.name == "multi_choice_plain":
-        return MULTICHOICE_DATASET_SLUGS
-    if runner.name == "multi_choice_fake_cot":
-        return MULTICHOICE_DATASET_SLUGS
-    if runner.name == "multi_choice_cot":
-        return MULTICHOICE_DATASET_SLUGS
-    if runner.name == "free_response":
-        return MATH_DATASET_SLUGS_FOR_FREE_RESPONSE
-    if runner.name == "free_response_judge":
-        return LLM_JUDGE_DATASET_SLUGS
-    if runner.name == "instruction_following":
-        return INSTRUCTION_FOLLOWING_DATASET_SLUGS
-    if runner.name == "code_human_eval":
-        return HUMAN_EVAL_CODE_SLUGS or runner.fallback_dataset_slugs
-    if runner.name in {"code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot"}:
-        return MBPP_CODE_SLUGS or runner.fallback_dataset_slugs
-    if runner.name == "code_livecodebench":
-        return LCB_CODE_SLUGS or runner.fallback_dataset_slugs
-    if runner.name == "function_browsecomp":
-        return FUNCTION_BROWSECOMP_SLUGS or runner.fallback_dataset_slugs
-    if runner.name == "function_mcp_bench":
-        return FUNCTION_MCP_BENCH_SLUGS or runner.fallback_dataset_slugs
-    if runner.name == "function_tau_bench":
-        return FUNCTION_TAU_BENCH_SLUGS or runner.fallback_dataset_slugs
-    if runner.name == "function_tau2_bench":
-        return FUNCTION_TAU2_BENCH_SLUGS or runner.fallback_dataset_slugs
     return _job_dataset_slugs(runner.name) or runner.fallback_dataset_slugs
 
 
@@ -226,6 +192,8 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
         raise FileNotFoundError(
             f"未找到数据集 {slug!r}。请将 JSONL 文件放置于以下目录之一：\n{locations}"
         )
+
+    from src.eval.datasets.data_prepper.data_manager import prepare_dataset
 
     prepared_paths = prepare_dataset(spec.dataset, output_root, spec.split)
     refresh_dataset_index(search)

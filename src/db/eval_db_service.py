@@ -9,15 +9,15 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
 
 from zoneinfo import ZoneInfo
-from src.db.orm import get_session, init_orm, transaction
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices, strict_nonneg_int
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG, REPO_ROOT
+from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags, normalize_model_name
 
-from .eval_db_repo import EvalDbRepository
+from .pool import init_db_pool
+from .sql_repo import SqlEvalDbRepository
 
 # Git SHA cache - resolved once per process
 _GIT_SHA_CACHE: str | None = None
@@ -96,18 +96,13 @@ class EvalDbService:
     """Database service for evaluation tasks.
 
     Usage:
-        # Option 1: Auto-initialize with default config
-        service = EvalDbService()
-
-        # Option 2: Initialize with custom config
-        init_orm(custom_config)
+        # Auto-initialize with default config
         service = EvalDbService()
     """
 
     def __init__(self) -> None:
-        self._repo = EvalDbRepository()
-        # Auto-initialize if not already done
-        init_orm()
+        init_db_pool()
+        self._repo = SqlEvalDbRepository()
 
     @staticmethod
     def _now_cn() -> datetime:
@@ -215,97 +210,90 @@ class EvalDbService:
 
         sanitized_sampling = self._sanitize_json_text(sampling_config) if sampling_config is not None else None
 
-        with get_session() as session:
-            # Layer 1: benchmark & model
-            ctx.benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+        ctx.benchmark_id = self._repo.get_benchmark_id(
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+        )
+        if ctx.benchmark_id is None:
+            resolved_samples = self._resolve_dataset_sample_count(dataset)
+            ctx.benchmark_id = self._repo.insert_benchmark(
+                benchmark_name=benchmark_name,
+                benchmark_split=benchmark_split,
+                url=None,
+                status="Todo",
+                num_samples=resolved_samples if resolved_samples is not None else 0,
             )
-            if ctx.benchmark_id is None:
+        else:
+            existing = self._parse_num_samples(
+                self._repo.get_benchmark_num_samples(benchmark_id=ctx.benchmark_id)
+            )
+            if not existing:
                 resolved_samples = self._resolve_dataset_sample_count(dataset)
-                ctx.benchmark_id = self._repo.insert_benchmark(
-                    session,
-                    benchmark_name=benchmark_name,
-                    benchmark_split=benchmark_split,
-                    url=None,
-                    status="Todo",
-                    num_samples=resolved_samples if resolved_samples is not None else 0,
-                )
-            else:
-                existing = self._parse_num_samples(
-                    self._repo.get_benchmark_num_samples(session, benchmark_id=ctx.benchmark_id)
-                )
-                if not existing:
-                    resolved_samples = self._resolve_dataset_sample_count(dataset)
-                    if resolved_samples is not None and resolved_samples > 0:
-                        self._repo.update_benchmark_num_samples(
-                            session,
-                            benchmark_id=ctx.benchmark_id,
-                            num_samples=resolved_samples,
-                        )
+                if resolved_samples is not None and resolved_samples > 0:
+                    self._repo.update_benchmark_num_samples(
+                        benchmark_id=ctx.benchmark_id,
+                        num_samples=resolved_samples,
+                    )
 
-            ctx.model_id = self._repo.get_model_id(
-                session,
+        ctx.model_id = self._repo.get_model_id(
+            model_name=model,
+            arch_version=arch_version,
+            data_version=data_version,
+            num_params=num_params,
+        )
+        if ctx.model_id is None:
+            ctx.model_id = self._repo.insert_model(
                 model_name=model,
                 arch_version=arch_version,
                 data_version=data_version,
                 num_params=num_params,
             )
-            if ctx.model_id is None:
-                ctx.model_id = self._repo.insert_model(
-                    session,
-                    model_name=model,
-                    arch_version=arch_version,
-                    data_version=data_version,
-                    num_params=num_params,
-                )
 
-            if force_new_task:
-                return ctx
+        if force_new_task:
+            return ctx
 
-            git_sha = _get_cached_git_sha()
-            config_path_str = self._resolve_task_config_path(benchmark_name, model)
-            raw_matches = self._repo.find_tasks_by_identity(
-                session,
-                config_path=config_path_str,
-                evaluator=job_name or "",
-                git_hash=git_sha,
-                model_id=ctx.model_id,
-                benchmark_id=ctx.benchmark_id,
-                sampling_config=sanitized_sampling if isinstance(sanitized_sampling, dict) else None,
+        git_sha = _get_cached_git_sha()
+        config_path_str = self._resolve_task_config_path(benchmark_name, model)
+        raw_matches = self._repo.find_tasks_by_identity(
+            config_path=config_path_str,
+            evaluator=job_name or "",
+            git_hash=git_sha,
+            model_id=ctx.model_id,
+            benchmark_id=ctx.benchmark_id,
+            sampling_config=sanitized_sampling if isinstance(sanitized_sampling, dict) else None,
+        )
+
+        matches: list[TaskLookup] = []
+        completed_ids: list[int] = []
+        resumable_ids: list[int] = []
+        for row in raw_matches:
+            task_id = int(row["task_id"])
+            status = str(row.get("status") or "")
+            if self._repo.task_has_score(task_id=task_id):
+                status = "Completed"
+            lookup = TaskLookup(task_id=task_id, status=status)
+            matches.append(lookup)
+            if self._is_completed_task_status(status):
+                completed_ids.append(task_id)
+            elif self._is_resumable_task_status(status):
+                resumable_ids.append(task_id)
+
+        ctx.matching_tasks = tuple(matches)
+        ctx.completed_task_ids = tuple(completed_ids)
+        ctx.resumable_task_ids = tuple(resumable_ids)
+
+        if not completed_ids and len(resumable_ids) == 1:
+            ctx.task_id = resumable_ids[0]
+            ctx.can_resume = True
+            answer_rows = self._repo.fetch_completion_keys(
+                task_id=ctx.task_id,
+                status="Completed",
             )
-
-            matches: list[TaskLookup] = []
-            completed_ids: list[int] = []
-            resumable_ids: list[int] = []
-            for row in raw_matches:
-                task_id = int(row["task_id"])
-                status = str(row.get("status") or "")
-                if self._repo.task_has_score(session, task_id=task_id):
-                    status = "Completed"
-                lookup = TaskLookup(task_id=task_id, status=status)
-                matches.append(lookup)
-                if self._is_completed_task_status(status):
-                    completed_ids.append(task_id)
-                elif self._is_resumable_task_status(status):
-                    resumable_ids.append(task_id)
-
-            ctx.matching_tasks = tuple(matches)
-            ctx.completed_task_ids = tuple(completed_ids)
-            ctx.resumable_task_ids = tuple(resumable_ids)
-
-            if not completed_ids and len(resumable_ids) == 1:
-                ctx.task_id = resumable_ids[0]
-                ctx.can_resume = True
-                answer_rows = self._repo.fetch_completion_keys(
-                    session,
-                    task_id=ctx.task_id,
-                    status="Completed",
-                )
-                ctx.completed_keys = set(answer_rows)
-            elif completed_ids:
-                ctx.task_id = completed_ids[-1]
-            elif resumable_ids:
-                ctx.task_id = resumable_ids[-1]
+            ctx.completed_keys = set(answer_rows)
+        elif completed_ids:
+            ctx.task_id = completed_ids[-1]
+        elif resumable_ids:
+            ctx.task_id = resumable_ids[-1]
 
         return ctx
 
@@ -325,9 +313,8 @@ class EvalDbService:
         否则创建新任务。
         """
         if ctx.can_resume and ctx.task_id is not None:
-            with get_session() as session:
-                self._repo.update_task_status(session, task_id=ctx.task_id, status="running")
-                self._repo.delete_scores_by_task_id(session, task_id=ctx.task_id)
+            self._repo.update_task_status(task_id=ctx.task_id, status="running")
+            self._repo.delete_scores_by_task_id(task_id=ctx.task_id)
             return str(ctx.task_id)
 
         benchmark_name, _ = split_benchmark_and_split(dataset)
@@ -337,24 +324,22 @@ class EvalDbService:
         desc = os.environ.get("RWKV_TASK_DESC")
         is_tmp = os.environ.get("RWKV_TASK_IS_TMP", "").strip().lower() in {"1", "true", "yes", "on"}
 
-        with get_session() as session:
-            task_id = self._repo.insert_task(
-                session,
-                config_path=config_path_str,
-                evaluator=job_name or "",
-                is_param_search=is_param_search,
-                is_tmp=is_tmp,
-                created_at=self._now_cn(),
-                status="running",
-                git_hash=git_sha,
-                model_id=ctx.model_id,
-                benchmark_id=ctx.benchmark_id,
-                desc=desc,
-                sampling_config=(
-                    self._sanitize_json_text(sampling_config) if sampling_config is not None else None
-                ),
-                log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
-            )
+        task_id = self._repo.insert_task(
+            config_path=config_path_str,
+            evaluator=job_name or "",
+            is_param_search=is_param_search,
+            is_tmp=is_tmp,
+            created_at=self._now_cn(),
+            status="running",
+            git_hash=git_sha,
+            model_id=ctx.model_id,
+            benchmark_id=ctx.benchmark_id,
+            desc=desc,
+            sampling_config=(
+                self._sanitize_json_text(sampling_config) if sampling_config is not None else None
+            ),
+            log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
+        )
         return str(task_id)
 
     def get_or_create_task(
@@ -405,44 +390,42 @@ class EvalDbService:
 
     def get_benchmark_num_samples(self, *, dataset: str) -> int | None:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
-            benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
-            )
-            if benchmark_id is None:
-                return None
-            return self._parse_num_samples(
-                self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
-            )
+        benchmark_id = self._repo.get_benchmark_id(
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+        )
+        if benchmark_id is None:
+            return None
+        return self._parse_num_samples(
+            self._repo.get_benchmark_num_samples(benchmark_id=benchmark_id)
+        )
 
     def ensure_benchmark_num_samples(self, *, dataset: str, num_samples: int) -> None:
         if num_samples <= 0:
             return
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
-        with get_session() as session:
-            benchmark_id = self._repo.get_benchmark_id(
-                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
-            )
-            if benchmark_id is None:
-                self._repo.insert_benchmark(
-                    session,
-                    benchmark_name=benchmark_name,
-                    benchmark_split=benchmark_split,
-                    url=None,
-                    status="Todo",
-                    num_samples=num_samples,
-                )
-                return
-            existing = self._parse_num_samples(
-                self._repo.get_benchmark_num_samples(session, benchmark_id=benchmark_id)
-            )
-            if existing == num_samples:
-                return
-            self._repo.update_benchmark_num_samples(
-                session,
-                benchmark_id=benchmark_id,
+        benchmark_id = self._repo.get_benchmark_id(
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+        )
+        if benchmark_id is None:
+            self._repo.insert_benchmark(
+                benchmark_name=benchmark_name,
+                benchmark_split=benchmark_split,
+                url=None,
+                status="Todo",
                 num_samples=num_samples,
             )
+            return
+        existing = self._parse_num_samples(
+            self._repo.get_benchmark_num_samples(benchmark_id=benchmark_id)
+        )
+        if existing == num_samples:
+            return
+        self._repo.update_benchmark_num_samples(
+            benchmark_id=benchmark_id,
+            num_samples=num_samples,
+        )
 
     def insert_completion_payload(
         self,
@@ -452,16 +435,14 @@ class EvalDbService:
     ) -> None:
         if not self._should_persist_completion_payload(payload):
             return
-        with get_session() as session:
-            context = self._build_completion_context(payload)
-            self._repo.insert_completion(
-                session,
-                task_id=int(task_id),
-                payload=payload,
-                context=context,
-                created_at=self._now_cn(),
-                status="Completed",
-            )
+        context = self._build_completion_context(payload)
+        self._repo.insert_completion(
+            task_id=int(task_id),
+            payload=payload,
+            context=context,
+            created_at=self._now_cn(),
+            status="Completed",
+        )
 
     def insert_completion_payloads_batch(
         self,
@@ -469,7 +450,7 @@ class EvalDbService:
         payloads: Sequence[dict[str, Any]],
         task_id: str,
     ) -> int:
-        """Batch insert multiple completion payloads in a single transaction.
+        """Batch insert completion payloads.
 
         Returns the number of payloads inserted.
         """
@@ -478,20 +459,18 @@ class EvalDbService:
         task_id_int = int(task_id)
         now = self._now_cn()
         inserted = 0
-        with transaction() as session:
-            for payload in payloads:
-                if not self._should_persist_completion_payload(payload):
-                    continue
-                context = self._build_completion_context(payload)
-                self._repo.insert_completion(
-                    session,
-                    task_id=task_id_int,
-                    payload=payload,
-                    context=context,
-                    created_at=now,
-                    status="Completed",
-                )
-                inserted += 1
+        for payload in payloads:
+            if not self._should_persist_completion_payload(payload):
+                continue
+            context = self._build_completion_context(payload)
+            self._repo.insert_completion(
+                task_id=task_id_int,
+                payload=payload,
+                context=context,
+                created_at=now,
+                status="Completed",
+            )
+            inserted += 1
         return inserted
 
     def ingest_eval_payloads(
@@ -506,16 +485,13 @@ class EvalDbService:
         pending_payloads: list[tuple[int, dict[str, Any]]] = []
         created_at = self._now_cn()
         task_id_int = int(task_id)
-        with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(
-                session,
-                task_id=task_id_int,
-                status="Completed",
-            )
-            existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
-                session,
-                task_id=task_id_int,
-            )
+        mapping = self._repo.fetch_completion_id_map(
+            task_id=task_id_int,
+            status="Completed",
+        )
+        existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
+            task_id=task_id_int,
+        )
         for payload in payloads:
             sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
             repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
@@ -557,23 +533,18 @@ class EvalDbService:
     ) -> int:
         if not rows:
             return 0
-        with get_session() as session:
-            known_ids = self._repo.fetch_existing_eval_completion_ids(
-                session,
-                task_id=task_id,
+        known_ids = self._repo.fetch_existing_eval_completion_ids(task_id=task_id)
+        inserted = 0
+        for completions_id, payload in rows:
+            if completions_id in known_ids:
+                continue
+            self._repo.insert_eval(
+                completions_id=completions_id,
+                payload=payload,
+                created_at=created_at,
             )
-            inserted = 0
-            for completions_id, payload in rows:
-                if completions_id in known_ids:
-                    continue
-                self._repo.insert_eval(
-                    session,
-                    completions_id=completions_id,
-                    payload=payload,
-                    created_at=created_at,
-                )
-                known_ids.add(completions_id)
-                inserted += 1
+            known_ids.add(completions_id)
+            inserted += 1
         return inserted
 
     def record_score_payload(
@@ -582,13 +553,17 @@ class EvalDbService:
         payload: dict[str, Any],
         task_id: str,
     ) -> None:
-        with get_session() as session:
-            self._repo.insert_score(
-                session,
-                task_id=int(task_id),
-                payload=payload,
-            )
-            self._repo.update_task_status(session, task_id=int(task_id), status="completed")
+        self._repo.insert_score(
+            task_id=int(task_id),
+            payload=payload,
+        )
+        self._repo.update_task_status(task_id=int(task_id), status="completed")
+        try:
+            from src.space.score_index import append_score_index_entry
+
+            append_score_index_entry(payload, task_id=task_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[space] failed to append score index for task {task_id}: {exc}")
 
     def ingest_checker_payloads(
         self,
@@ -598,46 +573,39 @@ class EvalDbService:
     ) -> int:
         task_id_int = int(task_id)
         created_at = self._now_cn()
-        with get_session() as session:
-            mapping = self._repo.fetch_completion_id_map(
-                session,
-                task_id=task_id_int,
-                status="Completed",
+        mapping = self._repo.fetch_completion_id_map(
+            task_id=task_id_int,
+            status="Completed",
+        )
+        existing_checker_ids = self._repo.fetch_existing_checker_completion_ids(
+            task_id=task_id_int,
+        )
+        inserted = 0
+        for payload in payloads:
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+            pass_index = strict_nonneg_int(payload.get("pass_index", 0), "pass_index")
+            completions_id = mapping.get((sample_index, repeat_index, pass_index))
+            if completions_id is None or completions_id in existing_checker_ids:
+                continue
+            checker_payload = dict(payload)
+            checker_payload["needs_human_review"] = self._checker_needs_human_review(payload)
+            self._repo.insert_checker(
+                completions_id=completions_id,
+                payload=checker_payload,
+                created_at=created_at,
             )
-            existing_checker_ids = self._repo.fetch_existing_checker_completion_ids(
-                session,
-                task_id=task_id_int,
-            )
-            inserted = 0
-            for payload in payloads:
-                sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
-                repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
-                pass_index = strict_nonneg_int(payload.get("pass_index", 0), "pass_index")
-                completions_id = mapping.get((sample_index, repeat_index, pass_index))
-                if completions_id is None or completions_id in existing_checker_ids:
-                    continue
-                checker_payload = dict(payload)
-                checker_payload["needs_human_review"] = self._checker_needs_human_review(payload)
-                self._repo.insert_checker(
-                    session,
-                    completions_id=completions_id,
-                    payload=checker_payload,
-                    created_at=created_at,
-                )
-                existing_checker_ids.add(completions_id)
-                inserted += 1
+            existing_checker_ids.add(completions_id)
+            inserted += 1
         return inserted
 
     def list_latest_scores(self) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_latest_scores(session)
+        return self._repo.fetch_latest_scores()
 
     def list_latest_scores_for_space(self, *, include_param_search: bool = False) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_latest_scores_for_space(
-                session,
-                include_param_search=include_param_search,
-            )
+        return self._repo.fetch_latest_scores_for_space(
+            include_param_search=include_param_search,
+        )
 
     def list_scores_by_dataset(
         self,
@@ -648,35 +616,12 @@ class EvalDbService:
     ) -> list[dict[str, Any]]:
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
         model = normalize_model_name(model)
-        with get_session() as session:
-            return self._repo.fetch_scores_by_benchmark(
-                session,
-                benchmark_name=benchmark_name,
-                benchmark_split=benchmark_split,
-                model_name=model,
-                is_param_search=is_param_search,
-            )
-
-    def should_allow_resume(
-        self,
-        *,
-        dataset: str,
-        model: str,
-        is_param_search: bool,
-        is_cot: bool,
-        job_name: str | None = None,
-    ) -> bool:
-        ctx = self.get_resume_context(
-            dataset=dataset,
-            model=model,
+        return self._repo.fetch_scores_by_benchmark(
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+            model_name=model,
             is_param_search=is_param_search,
-            job_name=job_name,
-            sampling_config=None,
-            force_new_task=False,
         )
-        if ctx.completed_task_ids:
-            return False
-        return len(ctx.resumable_task_ids) <= 1
 
     def count_completions(
         self,
@@ -684,12 +629,10 @@ class EvalDbService:
         task_id: str,
         status: str | None = None,
     ) -> int:
-        with get_session() as session:
-            return self._repo.count_completions(
-                session,
-                task_id=int(task_id),
-                status=status,
-            )
+        return self._repo.count_completions(
+            task_id=int(task_id),
+            status=status,
+        )
 
     def list_completion_payloads(
         self,
@@ -697,12 +640,10 @@ class EvalDbService:
         task_id: str,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        with get_session() as session:
-            rows = self._repo.fetch_completions(
-                session,
-                task_id=int(task_id),
-                status=status,
-            )
+        rows = self._repo.fetch_completions(
+            task_id=int(task_id),
+            status=status,
+        )
         payloads: list[dict[str, Any]] = []
         for row in rows:
             if isinstance(row, Mapping):
@@ -765,12 +706,10 @@ class EvalDbService:
         task_id: str,
         status: str | None = None,
     ) -> set[tuple[int, int, int]]:
-        with get_session() as session:
-            rows = self._repo.fetch_completion_keys(
-                session,
-                task_id=int(task_id),
-                status=status,
-            )
+        rows = self._repo.fetch_completion_keys(
+            task_id=int(task_id),
+            status=status,
+        )
         return set(rows)
 
     def get_score_payload(
@@ -778,37 +717,29 @@ class EvalDbService:
         *,
         task_id: str,
     ) -> dict[str, Any] | None:
-        with get_session() as session:
-            return self._repo.fetch_score_by_task(session, task_id=int(task_id))
+        return self._repo.fetch_score_by_task(task_id=int(task_id))
 
     def get_task_bundle(self, *, task_id: str) -> dict[str, Any] | None:
-        with get_session() as session:
-            task = self._repo.fetch_task(session, task_id=int(task_id))
-            if not task:
-                return None
-            model_id = task.get("model_id")
-            benchmark_id = task.get("benchmark_id")
-            model = self._repo.fetch_model(session, model_id=int(model_id)) if model_id else None
-            benchmark = (
-                self._repo.fetch_benchmark(session, benchmark_id=int(benchmark_id)) if benchmark_id else None
-            )
-            return {"task": task, "model": model, "benchmark": benchmark}
+        task = self._repo.fetch_task(task_id=int(task_id))
+        if not task:
+            return None
+        model_id = task.get("model_id")
+        benchmark_id = task.get("benchmark_id")
+        model = self._repo.fetch_model(model_id=int(model_id)) if model_id else None
+        benchmark = self._repo.fetch_benchmark(benchmark_id=int(benchmark_id)) if benchmark_id else None
+        return {"task": task, "model": model, "benchmark": benchmark}
 
     def list_completions_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_completions_rows(session, task_id=int(task_id))
+        return self._repo.fetch_completions_rows(task_id=int(task_id))
 
     def list_eval_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_eval_rows(session, task_id=int(task_id))
+        return self._repo.fetch_eval_rows(task_id=int(task_id))
 
     def list_checker_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_checker_rows(session, task_id=int(task_id))
+        return self._repo.fetch_checker_rows(task_id=int(task_id))
 
     def list_checker_keys(self, *, task_id: str) -> set[tuple[int, int, int]]:
-        with get_session() as session:
-            return self._repo.fetch_checker_keys(session, task_id=int(task_id))
+        return self._repo.fetch_checker_keys(task_id=int(task_id))
 
     def list_eval_records_for_space(
         self,
@@ -828,15 +759,13 @@ class EvalDbService:
             safe_offset = 0
         safe_offset = max(0, safe_offset)
 
-        with get_session() as session:
-            rows = self._repo.fetch_eval_with_completions_by_task(
-                session,
-                task_id=int(task_id),
-                only_wrong=bool(only_wrong),
-                limit=safe_limit,
-                offset=safe_offset,
-                include_context=bool(include_context),
-            )
+        rows = self._repo.fetch_eval_with_completions_by_task(
+            task_id=int(task_id),
+            only_wrong=bool(only_wrong),
+            limit=safe_limit,
+            offset=safe_offset,
+            include_context=bool(include_context),
+        )
         payloads: list[dict[str, Any]] = []
         for row in rows:
             mapping = dict(row) if isinstance(row, Mapping) else row
@@ -865,22 +794,18 @@ class EvalDbService:
         repeat_index: int,
         pass_index: int = 0,
     ) -> Any | None:
-        with get_session() as session:
-            return self._repo.fetch_eval_context_by_task_attempt(
-                session,
-                task_id=int(task_id),
-                sample_index=int(sample_index),
-                repeat_index=int(repeat_index),
-                pass_index=int(pass_index),
-            )
+        return self._repo.fetch_eval_context_by_task_attempt(
+            task_id=int(task_id),
+            sample_index=int(sample_index),
+            repeat_index=int(repeat_index),
+            pass_index=int(pass_index),
+        )
 
     def list_scores_rows(self, *, task_id: str) -> list[dict[str, Any]]:
-        with get_session() as session:
-            return self._repo.fetch_scores_rows(session, task_id=int(task_id))
+        return self._repo.fetch_scores_rows(task_id=int(task_id))
 
     def update_task_status(self, *, task_id: str, status: str) -> None:
-        with get_session() as session:
-            self._repo.update_task_status(session, task_id=int(task_id), status=status)
+        self._repo.update_task_status(task_id=int(task_id), status=status)
 
     @staticmethod
     def _build_completion_context(payload: dict[str, Any]) -> dict[str, Any]:

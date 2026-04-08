@@ -12,9 +12,9 @@ from src.eval.datasets.data_struct.instruction_following import (
     InstructionFollowingRecord,
 )
 from src.eval.execution_plan import AttemptKey
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
-from src.infer.sampling import SamplingConfig
+from src.eval.prompt_builders import build_instruction_following_prompt
+from src.infer.backend import InferenceBackend
+from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
@@ -29,10 +29,8 @@ class InstructionFollowingPipelineResult:
 
 
 class InstructionFollowingPipeline:
-    def __init__(self, model_config: ModelLoadConfig) -> None:
-        self.model, self.tokenizer = load_rwkv_model(model_config)
-        self.engine = InferenceEngine(self.model, self.tokenizer)
-        self.model_path = model_config.weights_path
+    def __init__(self, backend: InferenceBackend) -> None:
+        self.backend = backend
 
     def run(
         self,
@@ -139,7 +137,7 @@ class InstructionFollowingPipeline:
                     on_record(payload)
                 payloads.append(payload)
 
-            _ = self.engine.generate(
+            _ = self.backend.generate(
                 prompts,
                 sampling=sampling_cfg,
                 batch_size=min(batch_size, len(prompts)),
@@ -158,13 +156,8 @@ class InstructionFollowingPipeline:
         return InstructionFollowingPipelineResult(dataset_name, len(expanded), payloads)
 
     def _make_prompt(self, dataset_name: str, prompt: str, enable_think: bool) -> str:
-        slug = dataset_name.lower()
-        if slug.startswith("arena_hard"):
-            return f"User: {prompt}\n\nAssistant: Here is my answer:\n"
-        if slug.startswith("wmt24pp"):
-            return f"User: {prompt}\n\nAssistant: Translation:\n"
-        suffix = " <think>" if enable_think else ""
-        return f"User: {prompt}\n\nAssistant:{suffix}"
+        _ = dataset_name
+        return build_instruction_following_prompt(prompt, enable_think=enable_think)
 
     def _load_records(
         self,

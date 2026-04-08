@@ -1,4 +1,4 @@
-"""Helpers to load score records from SQL and normalise them for the space dashboard."""
+"""Helpers to load score index records and normalise them for the space dashboard."""
 
 from __future__ import annotations
 
@@ -8,11 +8,19 @@ from pathlib import Path
 import sys
 from typing import Any, Iterable, Mapping
 
-from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.benchmark_registry import BenchmarkField, resolve_benchmark_metadata
 from src.eval.scheduler.dataset_utils import canonical_slug
-from src.eval.scheduler.jobs import detect_job_from_dataset
+from src.eval.scheduler.jobs import DATASET_PREP_SPECS, detect_job_from_dataset
+from .score_index import iter_score_index_payloads, resolve_score_index_path
+from .domains import (
+    DOMAIN_CODING,
+    DOMAIN_FUNCTION_CALL,
+    DOMAIN_INSTRUCTION_FOLLOWING,
+    DOMAIN_MATH,
+    DOMAIN_MULTI_CHOICE,
+    DOMAIN_OTHER,
+    domain_for_benchmark_field,
+)
 
 
 ARCH_VERSIONS = ("rwkv7", "rwkv7a", "rwkv7b")
@@ -115,10 +123,11 @@ def _normalize_metrics(payload: dict[str, Any], *, dataset: str, is_cot: bool, t
             else:
                 metrics[key] = value
 
+    benchmark_field = _benchmark_field_hint(dataset)
     job_name = detect_job_from_dataset(dataset, is_cot=is_cot)
     slug = canonical_slug(dataset)
     normalized_slug = "".join(ch for ch in slug if ch.isalnum()).lower()
-    code_like = job_name in {"code_human_eval", "code_mbpp", "code_livecodebench"} or (
+    code_like = benchmark_field is BenchmarkField.CODING or job_name in {"code_human_eval", "code_mbpp", "code_livecodebench"} or (
         task and task.startswith("code")
     ) or (
         "humaneval" in normalized_slug or "mbpp" in normalized_slug or "livecodebench" in normalized_slug
@@ -229,35 +238,52 @@ def _parse_int(
 
 def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
     slug = canonical_slug(dataset_slug)
-    if slug.startswith("mmlu"):
-        return "mmlu系列"
+    field = _benchmark_field_hint(slug)
+    if field is not None:
+        return domain_for_benchmark_field(field, dataset_slug=slug)
+
     job = detect_job_from_dataset(slug, is_cot=is_cot)
-    if job in {"code_human_eval", "code_mbpp", "code_livecodebench"}:
-        return "coding系列"
-    if job == "instruction_following":
-        return "instruction following系列"
-    if job in {"function_browsecomp", "function_mcp_bench", "function_tau_bench", "function_tau2_bench"}:
-        return "function_call系列"
-    if job in {"free_response", "free_response_judge"}:
-        return "math reasoning系列"
     if job in {"multi_choice_plain", "multi_choice_fake_cot", "multi_choice_cot"}:
-        return "multi-choice系列"
+        return domain_for_benchmark_field(BenchmarkField.KNOWLEDGE, dataset_slug=slug)
+    if job in {"code_human_eval", "code_mbpp", "code_livecodebench"}:
+        return DOMAIN_CODING
+    if job == "instruction_following":
+        return DOMAIN_INSTRUCTION_FOLLOWING
+    if job in {"function_browsecomp", "function_mcp_bench", "function_tau_bench", "function_tau2_bench"}:
+        return DOMAIN_FUNCTION_CALL
+    if job in {"free_response", "free_response_judge"}:
+        return DOMAIN_MATH
     if task:
         if "code" in task:
-            return "coding系列"
+            return DOMAIN_CODING
         if "instruction" in task:
-            return "instruction following系列"
+            return DOMAIN_INSTRUCTION_FOLLOWING
         if "function" in task or "browsecomp" in task or "mcp" in task:
-            return "function_call系列"
+            return DOMAIN_FUNCTION_CALL
         if "multi_choice" in task:
-            return "multi-choice系列"
-    return "其他"
+            return DOMAIN_MULTI_CHOICE
+    return DOMAIN_OTHER
 
 
-def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> ScoreEntry | None:
+def _benchmark_field_hint(dataset_slug: str) -> BenchmarkField | None:
+    slug = canonical_slug(dataset_slug)
+    if slug not in DATASET_PREP_SPECS:
+        return None
+    return resolve_benchmark_metadata(slug).field
+
+
+def _score_entry_from_payload(
+    payload: dict[str, Any],
+    *,
+    source_path: Path,
+    errors: list[str] | None,
+) -> ScoreEntry | None:
     dataset = canonical_slug(str(payload.get("dataset", "")).strip())
     model = str(payload.get("model", "")).strip()
     if not dataset or not model:
+        return None
+
+    if bool(payload.get("is_param_search", False)):
         return None
 
     is_cot = bool(payload.get("cot", False))
@@ -302,7 +328,7 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
         cot=is_cot,
         task=task,
         task_details=task_details,
-        path=DB_PLACEHOLDER_PATH,
+        path=source_path,
         relative_path=relative,
         domain=domain,
         extra=extra,
@@ -313,27 +339,30 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
 
 
 def load_scores(errors: list[str] | None = None) -> list[ScoreEntry]:
-    try:
-        init_orm(DEFAULT_DB_CONFIG)
-    except Exception as exc:  # noqa: BLE001
-        _record_error(f"初始化数据库失败: {exc}", errors)
+    index_path = resolve_score_index_path()
+    if not index_path.exists():
+        _record_error(f"score index 不存在: {index_path}", errors)
         return []
 
+    latest_by_key: dict[tuple[str, str, bool, str | None], ScoreEntry] = {}
     try:
-        rows = EvalDbService().list_latest_scores_for_space(include_param_search=False)
+        rows = list(iter_score_index_payloads(index_path))
     except Exception as exc:  # noqa: BLE001
-        _record_error(f"读取数据库分数失败: {exc}", errors)
+        _record_error(f"读取 score index 失败: {exc}", errors)
         return []
 
-    entries: list[ScoreEntry] = []
     for row in rows:
         payload = dict(row) if isinstance(row, Mapping) else None
         if payload is None:
             continue
-        entry = _score_entry_from_db(payload, errors)
-        if entry is not None:
-            entries.append(entry)
-    return entries
+        entry = _score_entry_from_payload(payload, source_path=index_path, errors=errors)
+        if entry is None:
+            continue
+        key = (entry.dataset, entry.model, entry.cot, entry.task)
+        previous = latest_by_key.get(key)
+        if previous is None or entry.created_at > previous.created_at:
+            latest_by_key[key] = entry
+    return list(latest_by_key.values())
 
 
 def pick_latest_model(entries: Iterable[ScoreEntry]) -> str | None:

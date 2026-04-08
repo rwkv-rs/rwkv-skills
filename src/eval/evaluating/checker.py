@@ -8,12 +8,12 @@ from src.db.eval_db_service import EvalDbService
 from src.eval.checkers.llm_checker import run_llm_checker_rows
 
 
-def run_checker_for_task(
+def collect_pending_checker_inputs(
     *,
     service: EvalDbService,
     task_id: str,
     model_name: str,
-) -> int:
+) -> list[dict[str, Any]]:
     bundle = service.get_task_bundle(task_id=task_id)
     benchmark = bundle.get("benchmark") if isinstance(bundle, dict) else None
     benchmark_name = str((benchmark or {}).get("benchmark_name") or "")
@@ -25,7 +25,7 @@ def run_checker_for_task(
         include_context=True,
     )
     if not failed_rows:
-        return 0
+        return []
     existing_keys = service.list_checker_keys(task_id=task_id)
 
     checker_inputs: list[dict[str, Any]] = []
@@ -50,11 +50,36 @@ def run_checker_for_task(
                 "model_name": model_name,
             }
         )
+    return checker_inputs
 
-    checker_rows = run_llm_checker_rows(checker_inputs)
+
+def run_checker_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    return run_llm_checker_rows(rows)
+
+
+def run_checker_for_task(
+    *,
+    service: EvalDbService,
+    task_id: str,
+    model_name: str,
+) -> int:
+    checker_inputs = collect_pending_checker_inputs(
+        service=service,
+        task_id=task_id,
+        model_name=model_name,
+    )
+    if not checker_inputs:
+        return 0
+    checker_rows = run_checker_rows(checker_inputs)
     if not checker_rows:
         return 0
     return service.ingest_checker_payloads(payloads=checker_rows, task_id=task_id)
 
 
-__all__ = ["run_checker_for_task"]
+__all__ = [
+    "collect_pending_checker_inputs",
+    "run_checker_for_task",
+    "run_checker_rows",
+]

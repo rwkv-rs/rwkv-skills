@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
@@ -14,13 +14,21 @@ from src.eval.field_common import (
     build_task_sampling_config,
     set_task_env,
 )
+from src.infer.backend import (
+    add_inference_backend_arguments,
+    build_inference_backend_from_args,
+    resolve_backend_model_name,
+    validate_inference_backend_args,
+)
+
+if TYPE_CHECKING:
+    from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV knowledge benchmark runner")
-    parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", required=True, help="JSONL dataset path")
-    parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
+    add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation/scoring")
     parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
@@ -77,12 +85,19 @@ def _task_sampling_config(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    run_context: "RunContext | None" = None,
+    task_spec: "TaskSpec | None" = None,
+) -> int:
+    del task_spec
     args = parse_args(argv)
+    validate_inference_backend_args(args)
 
     from src.eval.benchmark_config import resolve_sampling_config
     from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
-    from src.eval.evaluating import prepare_task_execution, run_checker_for_task
+    from src.eval.evaluating import TaskRunController, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, build_auto_avg_k_execution_plan, plan_attempt_count
     from src.eval.knowledge.pipeline import MultipleChoicePipeline
     from src.eval.metrics.multi_choice import evaluate_multiple_choice
@@ -90,10 +105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
     from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-    from src.db.async_writer import CompletionWriteWorker
+    from src.db.database import init_db
     from src.db.eval_db_service import EvalDbService
-    from src.db.orm import init_orm
-    from src.infer.model import ModelLoadConfig
 
     cot_mode = CoTMode(args.cot_mode)
     if args.probe_only and cot_mode is not CoTMode.COT:
@@ -101,12 +114,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
-    model_name = Path(args.model_path).stem
+    model_name = resolve_backend_model_name(args)
     dataset_records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
     plan = build_auto_avg_k_execution_plan(slug, len(dataset_records))
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
-    config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
-    pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
+    backend = build_inference_backend_from_args(args)
+    pipeline = MultipleChoicePipeline(backend, target_token_format=args.target_token_format)
 
     cot_sampling = None
     if cot_mode is CoTMode.COT:
@@ -134,15 +147,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
-    init_orm(DEFAULT_DB_CONFIG)
+    init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
-    job_name = os.environ.get("RWKV_SKILLS_JOB_NAME", _default_job_name(cot_mode))
+    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", _default_job_name(cot_mode))
+    expected_count = plan_attempt_count(plan, max_pass_k=1)
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
         model=model_name,
         is_param_search=False,
         job_name=job_name,
+        run_mode=(run_context.run_mode if run_context is not None else None),
         sampling_config=_task_sampling_config(
             cot_mode,
             avg_k=plan.avg_k,
@@ -150,16 +165,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             cot_sampling=cot_sampling,
         ),
     )
-    task_id = task_state.task_id
+    task_run = TaskRunState.from_task_execution(
+        execution_state=task_state,
+        attempt_keys=attempt_keys,
+        expected_attempt_count=expected_count,
+    )
+    runtime = TaskRunController(service=service, state=task_run)
+    task_id = task_run.task_id
     skip_keys = task_state.skip_keys
 
     set_task_env(task_id)
-    writer = CompletionWriteWorker(
-        service=service,
-        task_id=task_id,
-        max_queue=args.db_write_queue,
-    )
-    expected_count = plan_attempt_count(plan, max_pass_k=1)
+    writer = runtime.create_writer(max_queue=args.db_write_queue)
     try:
         if cot_mode is CoTMode.COT:
             result = pipeline.run_chain_of_thought(
@@ -183,38 +199,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 on_record=writer.enqueue,
             )
     except BaseException:
-        try:
-            writer.close()
-        finally:
-            actual = service.count_completions(task_id=task_id, status="Completed")
-            status = "completed" if actual == expected_count else "failed"
-            service.update_task_status(task_id=task_id, status=status)
+        runtime.handle_attempt_stage_failure(writer)
         raise
 
-    writer.close()
-    completions_payloads = service.list_completion_payloads(task_id=task_id, status="Completed")
-    metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
-    service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
-    run_checker_for_task(service=service, task_id=task_id, model_name=model_name)
-    score_payload = make_score_payload(
-        slug,
-        is_cot=cot_mode is not CoTMode.NO_COT,
-        model_name=model_name,
-        metrics=build_avg_k_metrics(
-            metrics.rows,
-            avg_k=plan.avg_k,
-            primary_name="accuracy",
-            primary_value=metrics.accuracy,
-        ),
-        samples=metrics.samples,
-        task=job_name,
-        task_details={
-            "accuracy_by_subject": metrics.accuracy_by_subject,
-            **build_plan_task_details(plan, cot_mode=cot_mode.value),
-        },
-        extra={"cot_mode": cot_mode.value},
-    )
-    service.record_score_payload(payload=score_payload, task_id=task_id)
+    completions_payloads = runtime.complete_attempt_stage(writer)
+    try:
+        metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
+        runtime.ingest_eval_payloads(metrics.payloads)
+        runtime.run_checker(model_name=model_name)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=cot_mode is not CoTMode.NO_COT,
+            model_name=model_name,
+            metrics=build_avg_k_metrics(
+                metrics.rows,
+                avg_k=plan.avg_k,
+                primary_name="accuracy",
+                primary_value=metrics.accuracy,
+            ),
+            samples=metrics.samples,
+            task=job_name,
+            task_details={
+                "accuracy_by_subject": metrics.accuracy_by_subject,
+                **build_plan_task_details(plan, cot_mode=cot_mode.value),
+            },
+            extra={"cot_mode": cot_mode.value},
+        )
+        runtime.record_score(score_payload)
+    except BaseException as exc:
+        runtime.fail_task(error=str(exc))
+        raise
     _print_done_message(cot_mode, result.sample_count)
     return 0
 

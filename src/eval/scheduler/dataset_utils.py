@@ -29,6 +29,7 @@ _CANONICALIZE_SPLIT_NAMES = {
     "val",
     "dev",
     "devtest",
+    "base",
     "main",
     "science",
     "verified",

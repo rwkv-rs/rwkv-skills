@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
 from collections.abc import Sequence
 
-from ..data_utils import write_jsonl
 from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
+from src.eval.datasets.runtime import StaticRowsDatasetSpec
 
 STATIC_DATASETS = {
     "aime24": "aime24_test.jsonl",
     "aime25": "aime25_test.jsonl",
-    "comp-math-24-25": "comp-math-24-25_test.jsonl",
+    "comp_math_24_25": "comp-math-24-25_test.jsonl",
 }
 
 
@@ -68,12 +67,14 @@ def _load_static(filename: str, dataset: str) -> list[dict]:
 for dataset, filename in STATIC_DATASETS.items():
     rows = _load_static(filename, dataset)
 
-    @FREE_ANSWER_REGISTRY.register(dataset)
-    def _prepare(output_root: Path, split: str = "test", *, _rows=rows, _dataset=dataset) -> list[Path]:
+    @FREE_ANSWER_REGISTRY.register_spec(dataset)
+    def _prepare_spec(
+        output_root: Path,
+        split: str = "test",
+        *,
+        _rows=rows,
+        _dataset=dataset,
+    ) -> StaticRowsDatasetSpec:
         if split != "test":
             raise ValueError(f"{_dataset} 仅提供 test split")
-        dataset_dir = output_root / _dataset
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        target = dataset_dir / f"{split}.jsonl"
-        write_jsonl(target, _rows)
-        return [target]
+        return StaticRowsDatasetSpec(_dataset, output_root, split, rows=_rows)

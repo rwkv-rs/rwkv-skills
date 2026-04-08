@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import json
+import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable, Iterable
 
-from filelock import FileLock
+from filelock import FileLock  # pyright: ignore[reportMissingImports]
 
 from src.eval.datasets.data_prepper.data_utils import write_jsonl
 
@@ -103,9 +106,13 @@ class DatasetSpec(ABC):
         self.context.lock_root.mkdir(parents=True, exist_ok=True)
         return (self.context.lock_root / f"{self.name}__{self.split}.lock").resolve()
 
+    def materialized_paths(self) -> list[Path]:
+        return [self.artifact_path]
+
     def validate_materialized_artifact(self) -> bool:
         try:
-            validate_jsonl_file(self.artifact_path, self.required_fields)
+            for path in self.materialized_paths():
+                validate_jsonl_file(path, self.required_fields)
         except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
             return False
         return True
@@ -146,7 +153,51 @@ class DatasetSpec(ABC):
             extra=self.manifest_extra(),
         )
         self.manifest_path.write_text(json.dumps(asdict(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
-        return [self.artifact_path]
+        return self.materialized_paths()
+
+
+@contextmanager
+def _dataset_runtime_env(context: DatasetPrepareContext) -> Iterable[None]:
+    hf_home = (context.cache_root / "hf_cache").resolve()
+    overrides = {
+        "RWKV_SKILLS_DATA_ROOT": str(context.data_root),
+        "RWKV_SKILLS_HF_HOME": str(hf_home),
+        "HF_HOME": str(hf_home),
+        "HUGGINGFACE_HUB_CACHE": str((hf_home / "hub").resolve()),
+        "HF_DATASETS_CACHE": str((hf_home / "datasets").resolve()),
+    }
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _call_with_optional_context(
+    callback: Callable[..., Any],
+    split: str,
+    context: DatasetPrepareContext,
+) -> Any:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return callback(split)
+
+    parameters = tuple(signature.parameters.values())
+    positional_count = sum(
+        1
+        for parameter in parameters
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    has_varargs = any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters)
+    if has_varargs or positional_count >= 2:
+        return callback(split, context)
+    return callback(split)
 
 
 class LegacyPreparerDatasetSpec(DatasetSpec):
@@ -165,6 +216,9 @@ class LegacyPreparerDatasetSpec(DatasetSpec):
 
     def _candidate_paths(self) -> list[Path]:
         return self._prepared_paths or [self.artifact_path]
+
+    def materialized_paths(self) -> list[Path]:
+        return self._candidate_paths()
 
     def load(self) -> bool:
         try:
@@ -206,7 +260,7 @@ class LegacyPreparerDatasetSpec(DatasetSpec):
         return paths
 
 
-class MaterializingDatasetSpec(DatasetSpec):
+class MaterializingDatasetSpec(DatasetSpec, ABC):
     def __init__(
         self,
         name: str,
@@ -221,9 +275,10 @@ class MaterializingDatasetSpec(DatasetSpec):
 
     def load(self) -> bool:
         try:
-            self._records = list(self.load_records())
+            with _dataset_runtime_env(self.context):
+                self._records = list(self.load_records())
             validate_non_empty_records(self._records, self.name)
-        except (FileNotFoundError, ValueError):
+        except FileNotFoundError:
             self._records = []
             return True
         return False
@@ -265,6 +320,37 @@ class StaticRowsDatasetSpec(MaterializingDatasetSpec):
 
     def load_records(self) -> Iterable[dict[str, Any]]:
         return list(self._static_rows)
+
+
+class CallableRowsDatasetSpec(MaterializingDatasetSpec):
+    def __init__(
+        self,
+        name: str,
+        output_root: str | Path,
+        split: str,
+        *,
+        load_rows: Callable[[str], Iterable[dict[str, Any]]],
+        required_fields: tuple[str, ...] = (),
+        source_kind: str = "callable_rows",
+        manifest_extra_factory: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(name, output_root, split, required_fields=required_fields, source_kind=source_kind)
+        self._load_rows = load_rows
+        self._manifest_extra_factory = manifest_extra_factory
+
+    def download(self) -> None:
+        return None
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        with _dataset_runtime_env(self.context):
+            return list(_call_with_optional_context(self._load_rows, self.split, self.context))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        if self._manifest_extra_factory is None:
+            return {}
+        with _dataset_runtime_env(self.context):
+            payload = _call_with_optional_context(self._manifest_extra_factory, self.split, self.context)
+        return dict(payload)
 
 
 class UrlFilesJsonlDatasetSpec(MaterializingDatasetSpec):
@@ -413,7 +499,7 @@ class HfRepoJsonlDatasetSpec(MaterializingDatasetSpec):
 def ensure_dataset_materialized(spec: DatasetSpec) -> list[Path]:
     with FileLock(str(spec.lock_path)):
         if spec.validate_materialized_artifact():
-            return [spec.artifact_path]
+            return spec.materialized_paths()
         if spec.load():
             spec.download()
             if spec.load():
@@ -424,6 +510,7 @@ def ensure_dataset_materialized(spec: DatasetSpec) -> list[Path]:
 
 
 __all__ = [
+    "CallableRowsDatasetSpec",
     "DatasetManifest",
     "DatasetPrepareContext",
     "DatasetSpec",

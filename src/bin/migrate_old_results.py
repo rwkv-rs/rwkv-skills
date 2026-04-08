@@ -14,9 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from src.eval.results.layout import ensure_results_structure, scores_path
+from src.eval.benchmark_registry import scheduler_jobs_for_benchmark
 from src.eval.scheduler import jobs as job_catalog
-from src.eval.scheduler.config import REPO_ROOT
+from src.eval.scheduler.jobs import JOB_CATALOGUE
 from src.eval.scheduler.dataset_utils import (
     canonical_slug,
     infer_dataset_slug_from_path,
@@ -25,21 +25,14 @@ from src.eval.scheduler.dataset_utils import (
 
 
 LEGACY_PREFIX_MAP: dict[str, tuple[bool, str]] = {
-    "single_choice_plain": (False, "multiple_choice"),
-    "single_choice_cot": (True, "multiple_choice_cot"),
+    "single_choice_plain": (False, "multi_choice_plain"),
+    "single_choice_cot": (True, "multi_choice_cot"),
     "cot_general": (True, "free_response"),
     "cot_llm_judge": (True, "free_response_judge"),
     "instruction_following": (False, "instruction_following"),
 }
 
-KNOWN_SLUGS: set[str] = set(
-    list(job_catalog.MULTICHOICE_DATASET_SLUGS)
-    + list(job_catalog.MATH_DATASET_SLUGS)
-    + list(job_catalog.SPECIAL_DATASET_SLUGS)
-    + list(job_catalog.CODE_DATASET_SLUGS)
-    + list(job_catalog.LLM_JUDGE_DATASET_SLUGS)
-    + list(job_catalog.INSTRUCTION_FOLLOWING_DATASET_SLUGS)
-)
+KNOWN_SLUGS: set[str] = set(job_catalog.DATASET_PREP_SPECS.keys())
 
 
 @dataclass(slots=True)
@@ -55,6 +48,12 @@ class LegacyScore:
     task_details: dict[str, Any] | None
     created_at: datetime
     source_path: Path
+
+
+def _repo_root() -> Path:
+    from src.eval.scheduler.config import REPO_ROOT
+
+    return REPO_ROOT
 
 
 def _instruction_following_from_results(path: Path, data: Mapping[str, Any]) -> LegacyScore | None:
@@ -331,14 +330,36 @@ def _infer_type_from_name(path: Path, dataset_slug: str | None) -> tuple[str | N
     if name.startswith("cot_llm_judge"):
         return "free_response_judge", True
     if name.startswith("cot_"):
-        if canonical in job_catalog.LLM_JUDGE_DATASET_SLUGS:
-            return "free_response_judge", True
-        if canonical in job_catalog.MULTICHOICE_DATASET_SLUGS:
-            return "multiple_choice_cot", True
-        return "free_response", True
+        return _canonical_legacy_job_name(canonical, is_cot=True), True
     if name.startswith("results_"):
-        return "multiple_choice", False
+        return _canonical_legacy_job_name(canonical, is_cot=False), False
     return None, None
+
+
+def _canonical_legacy_job_name(dataset_slug: str, *, is_cot: bool) -> str | None:
+    canonical = canonical_slug(dataset_slug)
+    scheduler_jobs = scheduler_jobs_for_benchmark(canonical)
+    if not scheduler_jobs:
+        return None
+
+    if is_cot:
+        for preferred in ("multi_choice_cot", "free_response_judge", "free_response", "code_mbpp_cot"):
+            if preferred in scheduler_jobs:
+                return preferred
+        for job_name in scheduler_jobs:
+            spec = JOB_CATALOGUE.get(job_name)
+            if spec is not None and spec.is_cot:
+                return job_name
+        return None
+
+    for preferred in ("multi_choice_plain", "instruction_following", "code_human_eval", "code_mbpp"):
+        if preferred in scheduler_jobs:
+            return preferred
+    for job_name in scheduler_jobs:
+        spec = JOB_CATALOGUE.get(job_name)
+        if spec is not None and not spec.is_cot:
+            return job_name
+    return None
 
 
 def _build_metrics(task: str | None, data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -346,7 +367,7 @@ def _build_metrics(task: str | None, data: dict[str, Any]) -> tuple[dict[str, An
     task_details: dict[str, Any] | None = None
     metrics: dict[str, Any] = {}
 
-    if task in {"multiple_choice", "multiple_choice_cot"}:
+    if task in {"multi_choice_plain", "multi_choice_fake_cot", "multi_choice_cot"}:
         acc = data.get("accuracy")
         if isinstance(acc, (int, float)):
             metrics["accuracy"] = float(acc)
@@ -429,7 +450,7 @@ def _infer_samples(data: dict[str, Any]) -> int:
 
 def _log_path_for(path: Path) -> str:
     try:
-        return str(path.resolve().relative_to(REPO_ROOT))
+        return str(path.resolve().relative_to(_repo_root()))
     except ValueError:
         return str(path.resolve())
 
@@ -536,6 +557,8 @@ def _deduplicate(records: Iterable[LegacyScore]) -> list[LegacyScore]:
 
 
 def write_scores(records: Iterable[LegacyScore], *, dry_run: bool, overwrite: bool, verbose: bool) -> tuple[int, int]:
+    from src.eval.results.layout import ensure_results_structure, scores_path
+
     ensure_results_structure()
     written = 0
     skipped = 0

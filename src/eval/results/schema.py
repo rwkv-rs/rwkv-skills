@@ -38,6 +38,14 @@ def sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     raw = asdict(config)
     normalized: dict[str, object] = {}
     for key, value in raw.items():
+        if key == "max_generate_tokens":
+            key = "max_new_tokens"
+        elif key == "alpha_presence":
+            key = "presence_penalty"
+        elif key == "alpha_frequency":
+            key = "repetition_penalty"
+        elif key == "alpha_decay":
+            key = "penalty_decay"
         if isinstance(value, tuple):
             normalized[key] = list(value)
         else:

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Sequence
 
 from src.db.async_writer import CompletionWriteWorker
+from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.db.orm import init_orm
 from src.eval.agent_bench.chat_bridge import RWKVChatBridge
 from src.eval.agent_bench.deps import ensure_tau_v2_runtime_dependencies
 from src.eval.evaluating import prepare_task_execution, run_checker_for_task
@@ -34,16 +34,19 @@ from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, split_benchmark_and_split
-from src.infer.engine import InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
+from src.infer.backend import (
+    add_inference_backend_arguments,
+    build_inference_backend_from_args,
+    resolve_backend_model_name,
+    validate_inference_backend_args,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV tau2-bench evaluator")
     parser.epilog = "Requires .env with API_KEY (or OPENAI_API_KEY) and model_name (or MODEL_NAME)."
-    parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", required=True, help="tau2-bench manifest JSONL path")
-    parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
+    add_inference_backend_arguments(parser)
     parser.add_argument(
         "--user-strategy",
         default="llm",
@@ -108,6 +111,7 @@ def _ingest_current_eval_payloads(
 def main(argv: Sequence[str] | None = None) -> int:
     load_env_file(Path(".env"))
     args = parse_args(argv)
+    validate_inference_backend_args(args)
     ensure_tau_v2_runtime_dependencies()
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     dataset_slug = infer_dataset_slug_from_path(str(dataset_path))
@@ -125,16 +129,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest = load_manifest(dataset_path, max_samples=effective_max_samples)
     expected_count = len(manifest) * num_trials
 
-    model_name = Path(args.model_path).stem
+    model_name = resolve_backend_model_name(args)
     sampling = _resolve_sampling(args, dataset_slug=dataset_slug, model_name=model_name)
     user_model = resolve_required_user_model_config()
     apply_openai_env(user_model)
 
-    model, tokenizer = load_rwkv_model(
-        ModelLoadConfig(weights_path=args.model_path, device=args.device)
-    )
-    engine = InferenceEngine(model, tokenizer)
-    bridge = RWKVChatBridge(engine=engine, default_sampling=sampling)
+    backend = build_inference_backend_from_args(args)
+    bridge = RWKVChatBridge(engine=backend, default_sampling=sampling)
 
     judge: NLAssertionJudge | None = None
     judge_cfg: OpenAIModelConfig | None = resolve_judge_model_config(default_model=args.judge_model)
@@ -146,7 +147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     runtime_env = TauV2Env(domain=domain, judge=judge)
 
-    init_orm(DEFAULT_DB_CONFIG)
+    init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
     sampling_payload = {
         "stage1": sampling_config_to_dict(sampling),

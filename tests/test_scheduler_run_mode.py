@@ -6,11 +6,27 @@ from src.eval.scheduler.actions import QueueOptions
 from src.eval.scheduler.state import CompletedKey
 
 
+def test_completed_for_queue_merges_or_resets_by_run_mode() -> None:
+    historical = CompletedKey(job="free_response", model_slug="rwkv", dataset_slug="gsm8k_test", is_cot=True)
+    current = CompletedKey(job="multi_choice_plain", model_slug="rwkv", dataset_slug="mmlu_test", is_cot=False)
+
+    assert actions._completed_for_queue(
+        run_mode=RunMode.AUTO,
+        completed={historical},
+        session_completed={current},
+    ) == {historical, current}
+    assert actions._completed_for_queue(
+        run_mode=RunMode.RERUN,
+        completed={historical},
+        session_completed={current},
+    ) == {current}
+
+
 def test_action_queue_auto_filters_completed(monkeypatch, tmp_path) -> None:
     completed_key = CompletedKey(job="free_response", model_slug="rwkv", dataset_slug="gsm8k_test", is_cot=True)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda _log_dir: ({completed_key}, {}))
+    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: ({completed_key}, {}))
     monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
     monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
     monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)
@@ -38,7 +54,7 @@ def test_action_queue_rerun_ignores_completed_for_queue_building(monkeypatch, tm
     completed_key = CompletedKey(job="free_response", model_slug="rwkv", dataset_slug="gsm8k_test", is_cot=True)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda _log_dir: ({completed_key}, {}))
+    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: ({completed_key}, {}))
     monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
     monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
     monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
 from collections.abc import Iterator, Sequence
 
-from ..data_utils import dataset_cache_dir, download_file, write_jsonl
+from ..data_utils import dataset_cache_dir, download_file
 from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
 
 DATA_URL = (
     "https://huggingface.co/datasets/qintongli/GSM-Plus/resolve/main/data/test-00000-of-00001.jsonl?download=true"
@@ -31,12 +31,13 @@ def _load_cleaning_rules() -> dict[str, set[int]]:
 
 def _records(
     split: str,
+    context: DatasetPrepareContext,
     categories: Sequence[str],
     cleaning: str,
 ) -> Iterator[dict]:
     if split != "test":
         raise ValueError("gsm-plus 仅提供 test split")
-    cache_dir = dataset_cache_dir(Path("data"), "gsm_plus")
+    cache_dir = dataset_cache_dir(context.data_root, "gsm_plus")
     raw_path = cache_dir / "gsm_plus_test.jsonl"
     download_file(DATA_URL, raw_path)
 
@@ -76,16 +77,28 @@ def _records(
         yield entry
 
 
-@FREE_ANSWER_REGISTRY.register("gsm-plus")
-def prepare_gsm_plus(
+@FREE_ANSWER_REGISTRY.register_spec("gsm_plus")
+def prepare_gsm_plus_spec(
     output_root: Path,
     split: str = "test",
     *,
     categories: Sequence[str] = DEFAULT_CATEGORIES,
     cleaning: str = "light",
-) -> list[Path]:
-    dataset_dir = output_root / "gsm-plus"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _records(split, categories, cleaning))
-    return [target]
+) -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec(
+        "gsm-plus",
+        output_root,
+        split,
+        load_rows=lambda resolved_split, context, _categories=tuple(categories), _cleaning=cleaning: _records(
+            resolved_split,
+            context,
+            _categories,
+            _cleaning,
+        ),
+        source_kind="url_download",
+        manifest_extra_factory=lambda resolved_split, _categories=tuple(categories), _cleaning=cleaning: {
+            "source_split": resolved_split,
+            "categories": list(_categories),
+            "cleaning": _cleaning,
+        },
+    )

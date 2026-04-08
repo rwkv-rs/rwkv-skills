@@ -18,6 +18,7 @@ from .constants import (
     SUBDOMAIN_ORDER,
     DetailPoint,
 )
+from .domains import is_coding_domain, is_multi_choice_domain
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +220,7 @@ def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) 
         if key:
             return key, value
 
-    if entry.domain == "coding系列":
+    if is_coding_domain(entry.domain):
         for k in (1, 2, 4, 8, 16):
             key, value = _preferred_numeric(metrics, (f"pass@{k}",))
             if key:
@@ -476,7 +477,7 @@ def _is_multi_choice_entry(entry: ScoreEntry) -> bool:
     task = (entry.task or "").lower()
     if "multi" in task and "choice" in task:
         return True
-    job_hint = entry.domain in {"mmlu系列", "multi-choice系列"}
+    job_hint = is_multi_choice_domain(entry.domain)
     return job_hint and _numeric_value(entry.metrics.get("accuracy")) is not None
 
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
 from collections.abc import Iterable, Sequence
 
-from ..data_utils import configure_hf_home, write_jsonl
+from ..data_utils import configure_hf_home
 from src.eval.datasets.data_prepper.prepper_registry import INSTRUCTION_FOLLOWING_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec
 
 DATASET_ID = "google/wmt24pp"
 DEFAULT_TARGET_LANGUAGES: Sequence[str] = ("de_DE", "es_MX", "fr_FR", "it_IT", "ja_JP")
@@ -48,22 +48,34 @@ def _generate_rows(target_languages: Sequence[str]) -> Iterable[dict]:
             }
 
 
-@INSTRUCTION_FOLLOWING_REGISTRY.register("wmt24pp")
-def prepare_wmt24pp(
+def _records(split: str, *, target_languages: Sequence[str] = DEFAULT_TARGET_LANGUAGES) -> Iterable[dict]:
+    if split != "test":
+        raise ValueError("wmt24pp 仅提供 test split")
+    return _generate_rows(target_languages)
+
+
+@INSTRUCTION_FOLLOWING_REGISTRY.register_spec("wmt24pp")
+def prepare_wmt24pp_spec(
     output_root: Path,
     split: str = "test",
     *,
     target_languages: Sequence[str] = DEFAULT_TARGET_LANGUAGES,
-) -> list[Path]:
-    if split != "test":
-        raise ValueError("wmt24pp 仅提供 test split")
+) -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec(
+        "wmt24pp",
+        output_root,
+        split,
+        load_rows=lambda resolved_split, _targets=tuple(target_languages): _records(
+            resolved_split,
+            target_languages=_targets,
+        ),
+        source_kind="hf_load_dataset",
+        manifest_extra_factory=lambda resolved_split, _targets=tuple(target_languages): {
+            "dataset_id": DATASET_ID,
+            "source_split": resolved_split,
+            "target_languages": list(_targets),
+        },
+    )
 
-    dataset_dir = output_root / "wmt24pp"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
 
-    write_jsonl(target, _generate_rows(target_languages))
-    return [target]
-
-
-__all__ = ["prepare_wmt24pp"]
+__all__ = ["prepare_wmt24pp_spec"]

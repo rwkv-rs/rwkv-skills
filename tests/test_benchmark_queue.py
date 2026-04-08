@@ -85,6 +85,32 @@ def test_build_queue_adds_param_search_select_after_trials_finish(monkeypatch, t
     ]
 
 
+def test_sort_queue_prioritizes_metadata_derived_warmup_datasets() -> None:
+    items = [
+        queue.QueueItem(
+            job_name="multi_choice_plain",
+            job_id="multi_choice_plain__other",
+            dataset_slug="supergpqa_test",
+            model_path=Path("/tmp/model.pth"),
+            model_slug="model",
+        ),
+        queue.QueueItem(
+            job_name="multi_choice_plain",
+            job_id="multi_choice_plain__warmup",
+            dataset_slug="mmlu_test",
+            model_path=Path("/tmp/model.pth"),
+            model_slug="model",
+        ),
+    ]
+
+    ordered = queue.sort_queue_items(
+        items,
+        question_counts={"supergpqa_test": 10, "mmlu_test": 100000},
+    )
+
+    assert [item.dataset_slug for item in ordered] == ["mmlu_test", "supergpqa_test"]
+
+
 def test_cli_supports_rwkv_rs_style_benchmark_selection_flags() -> None:
     parser = build_parser()
     args = parser.parse_args(

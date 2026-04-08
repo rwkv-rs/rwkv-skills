@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Sequence
 
-from src.eval.benchmark_registry import ALL_BENCHMARKS, BenchmarkField
+from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARK_ALIASES, BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
 
 from .actions import (
@@ -21,7 +21,12 @@ from .actions import (
     action_status,
     action_stop,
 )
+from .admin import SchedulerAdminController, serve_scheduler_admin
 from .config import (
+    DEFAULT_ADMIN_API_KEY,
+    DEFAULT_ADMIN_HOST,
+    DEFAULT_ADMIN_PORT,
+    DEFAULT_ADMIN_STATE_DIR,
     DEFAULT_LOG_DIR,
     DEFAULT_MODEL_GLOBS,
     DEFAULT_PID_DIR,
@@ -35,7 +40,9 @@ from .models import MODEL_SELECT_CHOICES
 _KNOWN_DATASET_SLUGS: tuple[str, ...] = tuple(
     sorted({canonical_slug(slug) for spec in JOB_CATALOGUE.values() for slug in spec.dataset_slugs})
 )
-_KNOWN_BENCHMARK_NAMES: tuple[str, ...] = tuple(sorted(item.name for item in ALL_BENCHMARKS))
+_KNOWN_BENCHMARK_NAMES: tuple[str, ...] = tuple(
+    sorted({item.name for item in ALL_BENCHMARKS} | set(BENCHMARK_ALIASES))
+)
 _BENCHMARK_FIELD_CHOICES: tuple[str, ...] = tuple(field.value for field in BenchmarkField)
 _RUN_MODE_CHOICES: tuple[str, ...] = tuple(mode.value for mode in RunMode)
 
@@ -66,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
     logs_parser.add_argument("--tail-lines", type=int, default=60, help="每次展示的尾行数")
     logs_parser.add_argument("--rotate-seconds", type=int, default=15, help="轮播间隔秒数")
 
+    serve_parser = sub.add_parser("serve", help="启动 HTTP / admin 控制服务")
+    serve_parser.add_argument("--host", default=DEFAULT_ADMIN_HOST, help="HTTP 监听地址")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_ADMIN_PORT, help="HTTP 监听端口")
+    serve_parser.add_argument("--state-dir", default=str(DEFAULT_ADMIN_STATE_DIR), help="scheduler admin 状态目录")
+    serve_parser.add_argument(
+        "--admin-api-key",
+        default=DEFAULT_ADMIN_API_KEY,
+        help="Bearer token；为空时不鉴权",
+    )
+
     return parser
 
 
@@ -77,7 +94,7 @@ def _add_job_filters(parser: argparse.ArgumentParser) -> None:
         "--models",
         nargs="+",
         default=list(DEFAULT_MODEL_GLOBS),
-        help="模型文件 glob（用于定位权重，可多次指定；也可配合 --model-regex 过滤文件名）",
+        help="本地模型文件 glob（用于定位权重；远端推理模式下忽略）",
     )
     parser.add_argument(
         "--model-regex",
@@ -150,6 +167,14 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     """Add dispatch-related options (also used by `queue` for dry-run parity)."""
 
     parser.add_argument("--run-log-dir", default=str(DEFAULT_RUN_LOG_DIR), help="运行日志目录")
+    parser.add_argument("--infer-base-url", help="远端推理服务地址；设置后 scheduler 进入评测/推理分离模式")
+    parser.add_argument("--infer-models", nargs="+", help="远端推理服务上的模型名列表")
+    parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
+    parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
+    parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument("--distributed-claims", action="store_true", help="启用 PostgreSQL claim/lease，允许多个 scheduler 节点协同")
+    parser.add_argument("--scheduler-node-id", help="当前 scheduler 节点标识；默认取主机名")
+    parser.add_argument("--lease-duration-s", type=int, default=900, help="claim/lease 有效期秒数")
     parser.add_argument(
         "--run-mode",
         choices=_RUN_MODE_CHOICES,
@@ -167,6 +192,11 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=1000,
         help="将 GPU 视为空闲的显存占用阈值 (MB)",
+    )
+    parser.add_argument(
+        "--max-concurrent-jobs",
+        type=int,
+        help="限制同时运行的评测 worker 数；远端推理模式下未指定时默认 1",
     )
     parser.add_argument(
         "--skip-missing-dataset",
@@ -207,6 +237,8 @@ def _dispatch_options_from_args(
     max_param_b: float | None,
     model_select: str,
     run_mode: RunMode,
+    infer_base_url: str | None,
+    infer_models: tuple[str, ...],
 ) -> DispatchOptions:
     batch_cache = Path(args.batch_cache) if getattr(args, "batch_cache", None) else None
     return DispatchOptions(
@@ -224,12 +256,25 @@ def _dispatch_options_from_args(
         model_name_patterns=model_name_patterns,
         enable_param_search=bool(args.enable_param_search),
         run_mode=run_mode,
+        infer_base_url=infer_base_url,
+        infer_models=infer_models,
+        infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
+        infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
+        infer_max_workers=int(getattr(args, "infer_max_workers", 32)),
+        distributed_claims=bool(getattr(args, "distributed_claims", False)),
+        scheduler_node_id=(str(getattr(args, "scheduler_node_id", "") or "").strip() or None),
+        lease_duration_s=int(getattr(args, "lease_duration_s", 900)),
         dispatch_poll_seconds=int(args.dispatch_poll_seconds),
         gpu_idle_max_mem=int(args.gpu_idle_max_mem),
         skip_missing_dataset=bool(args.skip_missing_dataset),
         clean_param_swap=bool(args.clean_param_swap),
         batch_cache_path=batch_cache,
         disable_checker=bool(args.disable_checker),
+        max_concurrent_jobs=(
+            int(args.max_concurrent_jobs)
+            if getattr(args, "max_concurrent_jobs", None) is not None
+            else None
+        ),
     )
 
 
@@ -333,6 +378,24 @@ def _resolve_run_mode(parser: argparse.ArgumentParser, args: argparse.Namespace)
         parser.error(str(exc))
 
 
+def _resolve_scheduler_inference_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    model_globs: tuple[str, ...],
+) -> tuple[tuple[str, ...], str | None, tuple[str, ...]]:
+    infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip() or None
+    infer_models = tuple(str(item).strip() for item in (getattr(args, "infer_models", None) or []) if str(item).strip())
+    remote_mode = bool(infer_base_url or infer_models)
+    if remote_mode:
+        if not infer_base_url:
+            parser.error("远端推理模式缺少 --infer-base-url")
+        if not infer_models:
+            parser.error("远端推理模式缺少 --infer-models")
+        return tuple(), infer_base_url, infer_models
+    return model_globs, None, tuple()
+
+
 __all__ = ["build_parser", "main"]
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -351,6 +414,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     job_priority = _resolve_job_priority(getattr(args, "job_order", None), job_list)
 
     model_globs = tuple(getattr(args, "models", list(DEFAULT_MODEL_GLOBS)))
+    model_globs, infer_base_url, infer_models = _resolve_scheduler_inference_args(
+        parser,
+        args,
+        model_globs=model_globs,
+    )
     skip_dataset_slugs = _canonicalize_slugs(parser, getattr(args, "skip_datasets", None))
     benchmark_fields = _parse_benchmark_fields(getattr(args, "benchmark_fields", None))
     only_dataset_slugs = _collect_selected_dataset_slugs(
@@ -378,6 +446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_param_b=max_param_b,
             model_select=model_select,
             run_mode=run_mode,
+            infer_base_url=infer_base_url,
+            infer_models=infer_models,
         )
         action_queue(opts)
     elif command == "dispatch":
@@ -393,6 +463,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_param_b=max_param_b,
             model_select=model_select,
             run_mode=run_mode,
+            infer_base_url=infer_base_url,
+            infer_models=infer_models,
         )
         action_dispatch(opts)
     elif command == "status":
@@ -408,6 +480,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 tail_lines=int(args.tail_lines),
                 rotate_seconds=int(args.rotate_seconds),
             )
+        )
+    elif command == "serve":
+        controller = SchedulerAdminController(state_dir=Path(args.state_dir))
+        serve_scheduler_admin(
+            host=str(args.host),
+            port=int(args.port),
+            controller=controller,
+            api_key=str(args.admin_api_key) if args.admin_api_key else None,
         )
     else:
         parser.print_help()

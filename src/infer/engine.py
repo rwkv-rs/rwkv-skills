@@ -14,6 +14,8 @@ from tqdm import tqdm
 from .rapid_sampling_loader import get_rapid_sampling_module
 from .sampling import GenerationOutput, SamplingConfig
 
+DEFAULT_PREFILL_CHUNK_SIZE = 16
+
 
 class TokenizerProtocol:
     def encode(self, text: str) -> list[int]:  # pragma: no cover - protocol
@@ -45,10 +47,12 @@ class InferenceEngine:
         *,
         sampling: SamplingConfig,
         batch_size: int,
+        prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
-        prompt_seeds: Sequence[int] | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
+        show_progress: bool = True,
     ) -> list[GenerationOutput]:
         return _continuous_batching(
             self.model,
@@ -56,10 +60,12 @@ class InferenceEngine:
             prompts,
             sampling,
             batch_size,
+            prefill_chunk_size,
             progress_desc,
             probe_only,
             on_complete,
             prompt_seeds,
+            show_progress,
         )
 
 
@@ -68,6 +74,7 @@ class _ActiveTask:
     prompt_index: int
     prompt: str
     pending_tokens: deque[int]
+    prompt_tokens_remaining: int
     generated_tokens: list[int]
     new_token: int | None
     finish_reason: str | None
@@ -79,20 +86,24 @@ def _continuous_batching(
     prompts: Sequence[str],
     sampling: SamplingConfig,
     batch_size: int,
+    prefill_chunk_size: int,
     progress_desc: str,
     probe_only: bool = False,
     on_complete: Callable[[GenerationOutput], None] | None = None,
-    prompt_seeds: Sequence[int] | None = None,
+    prompt_seeds: Sequence[int | None] | None = None,
+    show_progress: bool = True,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
     if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
     batch_size = max(1, min(batch_size, len(prompts)))
+    prefill_chunk_size = max(1, int(prefill_chunk_size))
 
     vocab_size = _infer_vocab_size(model)
     device = _infer_device(model)
     states = _prepare_state_container(model.generate_zero_state(batch_size))
+    sampling = sampling.checked(vocab_size)
 
     rapid_sampler = get_rapid_sampling_module()
     sampler_states: torch.Tensor | None = None
@@ -144,7 +155,11 @@ def _continuous_batching(
         tokens = tokenizer.encode(prompt)
         if sampling.pad_zero:
             tokens = [0] + tokens
-        seed = int(prompt_seeds[idx]) if prompt_seeds is not None else None
+        seed = (
+            None
+            if prompt_seeds is None or prompt_seeds[idx] is None
+            else int(prompt_seeds[idx])
+        )
         encoded.append((idx, prompt, tokens, seed))
 
     stop_tokens = set(sampling.stop_tokens)
@@ -156,9 +171,9 @@ def _continuous_batching(
     sampler_top_k = int(sampling.top_k) if sampling.top_k is not None else -1
     sampler_top_p = float(sampling.top_p) if sampling.top_p is not None else 1.0
 
-    alpha_presence_value = float(sampling.alpha_presence)
-    alpha_frequency_value = float(sampling.alpha_frequency)
-    alpha_decay_value = float(sampling.alpha_decay)
+    presence_penalty_value = float(sampling.presence_penalty)
+    repetition_penalty_value = float(sampling.repetition_penalty)
+    penalty_decay_value = float(sampling.penalty_decay)
 
     penalties = torch.zeros((batch_size, vocab_size), dtype=torch.float32, device=device)
     no_penalty_ids: torch.Tensor | None = None
@@ -170,7 +185,7 @@ def _continuous_batching(
     for slot_idx in range(batch_size):
         prompt_idx, prompt, tokens, seed = encoded.popleft()
         pending = deque(tokens)
-        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], None, None))
+        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, len(tokens), [], None, None))
         if seed is not None:
             _set_sampler_seed(slot_idx, seed)
 
@@ -179,6 +194,7 @@ def _continuous_batching(
         desc=progress_desc,
         unit=" sequence",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}, {postfix}]",
+        disable=not show_progress,
     )
 
     outputs: list[GenerationOutput] = []
@@ -216,6 +232,67 @@ def _continuous_batching(
             active_tasks[remove_idx] = active_tasks[last_idx]
         active_tasks.pop()
 
+    def _sample_subset(logits: torch.Tensor, active_count: int, sample_rows: list[int]) -> list[int]:
+        if not sample_rows:
+            return []
+
+        if sampler_states is None:
+            raise RuntimeError("rapid-sampling 状态未初始化")
+
+        row_index = torch.tensor(sample_rows, dtype=torch.int64, device=device)
+        logits_subset = logits.index_select(0, row_index).contiguous()
+        penalties_view = penalties[:active_count]
+        penalties_subset = penalties_view.index_select(0, row_index).clone()
+        if no_penalty_ids is not None:
+            penalties_subset[:, no_penalty_ids] = 0.0
+
+        if len(sample_rows) == active_count:
+            sampler_subset = _sampler_states_view(active_count)
+        else:
+            sampler_subset = torch.empty(
+                (len(sample_rows) * sampler_state_row_width,),
+                dtype=sampler_states.dtype,
+                device=sampler_states.device,
+            )
+            for dst_idx, src_idx in enumerate(sample_rows):
+                dst_start = dst_idx * sampler_state_row_width
+                src_start = src_idx * sampler_state_row_width
+                sampler_subset.narrow(0, dst_start, sampler_state_row_width).copy_(
+                    sampler_states.narrow(0, src_start, sampler_state_row_width)
+                )
+
+        if sampling.penalties_enabled():
+            sampled_raw = rapid_sampler.batch_sampling_repetition_temperature_topk_topp(
+                logits_subset,
+                penalties_subset,
+                sampler_subset,
+                presence_penalty_value,
+                repetition_penalty_value,
+                penalty_decay_value,
+                sampler_temperature,
+                sampler_top_k,
+                sampler_top_p,
+            )
+        else:
+            sampled_raw = rapid_sampler.batch_sampling_temperature_topk_topp(
+                logits_subset,
+                sampler_subset,
+                sampler_temperature,
+                sampler_top_k,
+                sampler_top_p,
+            )
+        sampled_tensor = _validate_sampled_tokens(sampled_raw, len(sample_rows))
+
+        penalties_view.index_copy_(0, row_index, penalties_subset)
+        if len(sample_rows) != active_count:
+            for src_idx, dst_idx in enumerate(sample_rows):
+                src_start = src_idx * sampler_state_row_width
+                dst_start = dst_idx * sampler_state_row_width
+                sampler_states.narrow(0, dst_start, sampler_state_row_width).copy_(
+                    sampler_subset.narrow(0, src_start, sampler_state_row_width)
+                )
+        return sampled_tensor.tolist()
+
     while active_tasks:
         accomplished: list[int] = []
 
@@ -227,9 +304,10 @@ def _continuous_batching(
                 continue
             reached_stop = new_token in stop_tokens
             reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
-            if not reached_stop:
+            if not reached_stop and not reached_length:
                 task.pending_tokens.append(new_token)
                 task.generated_tokens.append(new_token)
+            task.new_token = None
             if reached_stop or reached_length:
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
@@ -246,7 +324,7 @@ def _continuous_batching(
                 if encoded:
                     prompt_idx, prompt, tokens, seed = encoded.popleft()
                     pending = deque(tokens)
-                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], None, None)
+                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, len(tokens), [], None, None)
                     _reset_slot(idx)
                     if seed is not None:
                         _set_sampler_seed(idx, seed)
@@ -258,11 +336,20 @@ def _continuous_batching(
                 _remove_slot(remove_idx)
 
         next_tokens: list[list[int]] = []
+        rows_to_sample: list[int] = []
         active_count = len(active_tasks)
-        for task in active_tasks:
-            token = task.pending_tokens.popleft()
-            next_tokens.append([token])
-        tokens_processed += active_count
+        for task_idx, task in enumerate(active_tasks):
+            if task.prompt_tokens_remaining > 0:
+                take_count = min(prefill_chunk_size, task.prompt_tokens_remaining)
+                step_tokens = [task.pending_tokens.popleft() for _ in range(take_count)]
+                task.prompt_tokens_remaining -= take_count
+                if task.prompt_tokens_remaining == 0:
+                    rows_to_sample.append(task_idx)
+            else:
+                step_tokens = [task.pending_tokens.popleft()]
+                rows_to_sample.append(task_idx)
+            next_tokens.append(step_tokens)
+        tokens_processed += sum(len(tokens) for tokens in next_tokens)
 
         now = time.time()
         elapsed = max(now - start_time, 1e-6)
@@ -290,25 +377,9 @@ def _continuous_batching(
         if ban_token_ids:
             logits[:, ban_token_ids] = -math.inf
 
-        sampler_states_view = _sampler_states_view(active_count)
-        if no_penalty_ids is not None:
-            penalties[:active_count, no_penalty_ids] = 0.0
-        sampled_raw = rapid_sampler.batch_sampling_repetition_temperature_topk_topp(
-            logits,
-            penalties[:active_count],
-            sampler_states_view,
-            alpha_presence_value,
-            alpha_frequency_value,
-            alpha_decay_value,
-            sampler_temperature,
-            sampler_top_k,
-            sampler_top_p,
-        )
-        sampled_tensor = _validate_sampled_tokens(sampled_raw, active_count)
-
-        sampled_list = sampled_tensor.tolist()
-        for idx, task in enumerate(active_tasks):
-            task.new_token = int(sampled_list[idx])
+        sampled_list = _sample_subset(logits, active_count, rows_to_sample)
+        for local_idx, task_idx in enumerate(rows_to_sample):
+            active_tasks[task_idx].new_token = int(sampled_list[local_idx])
 
     pbar.close()
 

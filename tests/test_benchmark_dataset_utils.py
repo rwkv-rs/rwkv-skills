@@ -38,6 +38,7 @@ def test_canonicalize_benchmark_list_rejects_unknown_names() -> None:
 def test_infer_dataset_slug_from_path_handles_split_files_and_aliases() -> None:
     assert infer_dataset_slug_from_path("/tmp/data/mmlu/test.jsonl") == "mmlu_test"
     assert infer_dataset_slug_from_path("/tmp/data/hle/math.jsonl") == "hle_math"
+    assert infer_dataset_slug_from_path("/tmp/data/tau2_bench_airline/base.jsonl") == "tau2_bench_airline_base"
     assert infer_dataset_slug_from_path("/tmp/data/lcb.jsonl") == "livecodebench_test"
 
 

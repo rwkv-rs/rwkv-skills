@@ -11,6 +11,7 @@ from .loaders import (
     read_parquet_items,
 )
 from .spec import (
+    CallableRowsDatasetSpec,
     DatasetManifest,
     DatasetPrepareContext,
     DatasetSpec,
@@ -25,6 +26,7 @@ from .spec import (
 from .validators import validate_jsonl_file, validate_non_empty_records, validate_required_fields
 
 __all__ = [
+    "CallableRowsDatasetSpec",
     "DatasetManifest",
     "DatasetPrepareContext",
     "DatasetSpec",

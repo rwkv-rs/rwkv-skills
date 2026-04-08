@@ -11,8 +11,6 @@ import re
 import tempfile
 from typing import Any, Iterable
 
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-
 from .constants import (
     DEFAULT_TABLE_VIEW,
     DOMAIN_GROUPS,
@@ -25,6 +23,8 @@ from .constants import (
     _normalize_table_view,
 )
 from .data import ScoreEntry, parse_model_signature
+from .domains import is_instruction_following_domain, is_multi_choice_domain
+from .score_index import resolve_score_index_path
 from .metrics import (
     _cell_metric_value,
     _cell_numeric_value,
@@ -95,21 +95,24 @@ def _render_summary(
     view_mode: str = DEFAULT_TABLE_VIEW,
     warnings: Iterable[str] | None = None,
 ) -> str:
-    db_host = os.environ.get("PG_HOST", DEFAULT_DB_CONFIG.host)
-    db_port = os.environ.get("PG_PORT", str(DEFAULT_DB_CONFIG.port))
-    db_name = os.environ.get("PG_DBNAME", DEFAULT_DB_CONFIG.dbname)
+    score_index_path = resolve_score_index_path()
+    pg_host = os.environ.get("PG_HOST", "localhost")
+    pg_port = os.environ.get("PG_PORT", "5432")
+    pg_name = os.environ.get("PG_DBNAME", "rwkv-eval")
 
     if not all_entries:
         return (
-            "数据库暂无可展示分数。"
-            f"（连接目标：`{db_host}:{db_port}/{db_name}`，仅统计非 param-search 结果）"
+            "当前没有可展示分数。"
+            f"（score index：`{score_index_path}`，明细回看仍使用 PostgreSQL `"
+            f"{pg_host}:{pg_port}/{pg_name}`）"
         )
 
     normalized_view = _normalize_table_view(view_mode)
     benchmark_count = len({(_dataset_base(entry.dataset), _entry_method_tag(entry)) for entry in visible})
     lines = [
-        f"- 数据源：PostgreSQL (`{db_host}:{db_port}/{db_name}`)",
+        f"- 数据源：score_index (`{score_index_path}`)",
         "- 数据范围：仅正式评测（已过滤 param-search）",
+        f"- 明细回看：PostgreSQL (`{pg_host}:{pg_port}/{pg_name}`)",
         f"- 当前策略：`{selection.selected_label}`" + ("（按排序规则自动选择）" if selection.auto_selected else ""),
         f"- 表格视图：{TABLE_VIEW_LABELS.get(normalized_view, TABLE_VIEW_LABELS[DEFAULT_TABLE_VIEW])}",
         "- 领域分块：knowledge / math / coding / instruction_following / function_call",
@@ -249,11 +252,11 @@ def _metric_fallback_tooltip(entry: ScoreEntry) -> str | None:
 
 def _tooltip_for_entry(entry: ScoreEntry) -> str | None:
     dataset = _dataset_base(entry.dataset).lower()
-    if dataset.startswith("mmlu") or entry.domain in {"mmlu系列", "multi-choice系列"}:
+    if dataset.startswith("mmlu") or is_multi_choice_domain(entry.domain):
         tooltip = _mmlu_tooltip(entry)
         if tooltip:
             return tooltip
-    if dataset.startswith("ifeval") or entry.domain == "instruction following系列":
+    if dataset.startswith("ifeval") or is_instruction_following_domain(entry.domain):
         tooltip = _ifeval_tooltip(entry)
         if tooltip:
             return tooltip

@@ -3,19 +3,19 @@ from __future__ import annotations
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List
 from collections.abc import Iterator
 
-from ..data_utils import dataset_cache_dir, download_file, write_jsonl
+from ..data_utils import dataset_cache_dir, download_file
 from src.eval.datasets.data_prepper.prepper_registry import FREE_ANSWER_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
 
 DATA_URL = "https://raw.githubusercontent.com/chaochun/nlu-asdiv-dataset/master/dataset/ASDiv.xml"
 
 
-def _records(split: str) -> Iterator[dict]:
+def _records(split: str, context: DatasetPrepareContext) -> Iterator[dict]:
     if split != "test":
         raise ValueError("asdiv 仅提供 test split")
-    cache_dir = dataset_cache_dir(Path("data"), "asdiv")
+    cache_dir = dataset_cache_dir(context.data_root, "asdiv")
     source_path = cache_dir / "ASDiv.xml"
     download_file(DATA_URL, source_path)
 
@@ -39,10 +39,6 @@ def _records(split: str) -> Iterator[dict]:
         }
 
 
-@FREE_ANSWER_REGISTRY.register("asdiv")
-def prepare_asdiv(output_root: Path, split: str = "test") -> list[Path]:
-    dataset_dir = output_root / "asdiv"
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    target = dataset_dir / f"{split}.jsonl"
-    write_jsonl(target, _records(split))
-    return [target]
+@FREE_ANSWER_REGISTRY.register_spec("asdiv")
+def prepare_asdiv_spec(output_root: Path, split: str = "test") -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec("asdiv", output_root, split, load_rows=_records, source_kind="url_download")

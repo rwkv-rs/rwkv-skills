@@ -20,14 +20,20 @@ def test_collect_benchmarks_matches_field_plus_extra_union() -> None:
 
     assert "mmlu" in names
     assert "gsm8k" in names
+    assert "gpqa_main" in names
+    assert "gpqa_extended" in names
+    assert "gpqa_diamond" in names
     assert canonical_slug("mmlu_test") in dataset_slugs
     assert canonical_slug("gpqa_main") in dataset_slugs
+    assert canonical_slug("gpqa_extended") in dataset_slugs
+    assert canonical_slug("gpqa_diamond") in dataset_slugs
     assert canonical_slug("gsm8k_test") in dataset_slugs
 
 
 def test_resolve_registered_benchmark_name_accepts_dataset_slug() -> None:
     assert resolve_registered_benchmark_name("simpleqa_verified") == "simpleqa"
     assert resolve_registered_benchmark_name("ifeval_test") == "ifeval"
+    assert resolve_registered_benchmark_name("arena_hard_test") == "arena_hard_v2"
 
 
 def test_collect_benchmark_dataset_slugs_uses_default_splits() -> None:
@@ -39,3 +45,14 @@ def test_collect_benchmark_dataset_slugs_uses_default_splits() -> None:
     assert canonical_slug("ifeval_test") in slugs
     assert canonical_slug("flores200_devtest") in slugs
     assert canonical_slug("browsecomp_test") in slugs
+
+
+def test_collect_benchmark_dataset_slugs_expands_group_aliases() -> None:
+    slugs = collect_benchmark_dataset_slugs(extra_benchmark_names=("tau_bench", "gpqa"))
+
+    assert canonical_slug("tau_bench_retail_test") in slugs
+    assert canonical_slug("tau_bench_airline_test") in slugs
+    assert canonical_slug("tau_bench_telecom_test") in slugs
+    assert canonical_slug("gpqa_main") in slugs
+    assert canonical_slug("gpqa_extended") in slugs
+    assert canonical_slug("gpqa_diamond") in slugs

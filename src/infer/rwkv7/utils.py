@@ -5,6 +5,7 @@
 ########################################################################################################
 
 import torch
+from typing import Sequence
 
 MyModule = torch.jit.ScriptModule
 MyFunction = torch.jit.script_method
@@ -82,7 +83,7 @@ class TRIE_TOKENIZER():
         for t, i in self.token2idx.items():
             _ = self.root.add(t, val=(t, i))
 
-    def encodeBytes(self, src:bytes):
+    def encodeBytes(self, src: bytes) -> list[int]:
         idx:int = 0
         tokens = []
         while (idx < len(src)):
@@ -93,14 +94,15 @@ class TRIE_TOKENIZER():
             tokens.append(token)
         return tokens
 
-    def decodeBytes(self, tokens):
+    def decodeBytes(self, token_ids: Sequence[int]) -> bytes:
+        tokens = token_ids
         return b''.join(map(lambda i: self.idx2token[i], tokens))
 
-    def encode(self, src):
-        return self.encodeBytes(src.encode("utf-8"))
+    def encode(self, text: str) -> list[int]:
+        return self.encodeBytes(text.encode("utf-8"))
 
-    def decode(self, tokens, utf8_errors="strict"):
-        return self.decodeBytes(tokens).decode('utf-8', errors=utf8_errors)
+    def decode(self, token_ids: Sequence[int], utf8_errors: str = "strict") -> str:
+        return self.decodeBytes(token_ids).decode('utf-8', errors=utf8_errors)
 
     def printTokens(self, tokens):
         for i in tokens:
