@@ -3,6 +3,7 @@ from __future__ import annotations
 """OpenAI-compatible request/response models for the RWKV infer service."""
 
 from dataclasses import dataclass
+import json
 from time import time
 from typing import Literal
 from uuid import uuid4
@@ -53,6 +54,16 @@ class CompletionResponse(BaseModel):
     choices: list[CompletionChoice]
 
 
+class CompletionChunkResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=next_completion_id)
+    object: str = "text_completion.chunk"
+    created: int = Field(default_factory=current_unix_seconds)
+    model: str
+    choices: list[CompletionChoice]
+
+
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -64,6 +75,7 @@ class CompletionRequest(BaseModel):
     top_p: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
     penalty_decay: float | None = None
     stop: str | list[str] | None = None
     stream: bool | None = None
@@ -97,7 +109,9 @@ class CompletionRequest(BaseModel):
                 else defaults.alpha_presence
             ),
             alpha_frequency=(
-                float(self.frequency_penalty)
+                float(self.repetition_penalty)
+                if self.repetition_penalty is not None
+                else float(self.frequency_penalty)
                 if self.frequency_penalty is not None
                 else defaults.alpha_frequency
             ),
@@ -161,11 +175,129 @@ class ChatCompletionMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: str | list[ChatMessageTextPart]
+    content: str | list[ChatMessageTextPart] | None = None
     name: str | None = None
+    tool_calls: list["ChatCompletionToolCall"] | None = None
+    tool_call_id: str | None = None
 
     def text_content(self) -> str:
         return chat_message_content_to_text(self.content)
+
+
+class ChatCompletionToolCallFunction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    arguments: str
+
+
+class ChatCompletionToolCall(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str
+    type: Literal["function"] = "function"
+    function: ChatCompletionToolCallFunction
+
+
+class ChatJsonSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    name: str
+    description: str | None = None
+    schema_: dict[str, object] | None = Field(default=None, alias="schema")
+    strict: bool | None = None
+
+
+class ChatResponseFormat(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["text", "json_object", "json_schema"]
+    json_schema: ChatJsonSchema | None = None
+
+
+class ChatToolFunction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    description: str | None = None
+    parameters: dict[str, object] | None = None
+    strict: bool | None = None
+
+
+class ChatTool(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["function"] = "function"
+    function: ChatToolFunction
+
+
+class ChatNamedToolChoiceFunction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+
+
+class ChatNamedToolChoice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["function"] = "function"
+    function: ChatNamedToolChoiceFunction
+
+
+class ChatTopLogprob(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    token: str
+    bytes: list[int]
+    logprob: float
+
+
+class ChatTokenLogprob(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    token: str
+    bytes: list[int]
+    logprob: float
+    top_logprobs: list[ChatTopLogprob]
+
+
+class ChatChoiceLogprobs(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    content: list[ChatTokenLogprob]
+
+
+class ChatCompletionChunkToolCallFunction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    name: str | None = None
+    arguments: str | None = None
+
+
+class ChatCompletionChunkToolCall(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    index: int
+    id: str | None = None
+    type: Literal["function"] | None = None
+    function: ChatCompletionChunkToolCallFunction | None = None
+
+
+class ChatCompletionDelta(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    role: str | None = None
+    content: str | None = None
+    tool_calls: list[ChatCompletionChunkToolCall] | None = None
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    index: int = 0
+    delta: ChatCompletionDelta
+    finish_reason: str | None = None
+    logprobs: ChatChoiceLogprobs | None = None
 
 
 class ChatCompletionChoice(BaseModel):
@@ -174,6 +306,7 @@ class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: ChatCompletionMessage
     finish_reason: str | None = None
+    logprobs: ChatChoiceLogprobs | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -196,10 +329,21 @@ class ChatCompletionResponse(BaseModel):
                     index=choice.index,
                     message=ChatCompletionMessage(role="assistant", content=choice.text),
                     finish_reason=completion_finish_reason_to_chat(choice.finish_reason),
+                    logprobs=completion_logprobs_to_chat_logprobs(choice.logprobs),
                 )
                 for choice in response.choices
             ],
         )
+
+
+class ChatCompletionChunkResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=next_chat_completion_id)
+    object: str = "chat.completion.chunk"
+    created: int = Field(default_factory=current_unix_seconds)
+    model: str
+    choices: list[ChatCompletionChunkChoice]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -210,38 +354,28 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=0)
     max_completion_tokens: int | None = Field(default=None, ge=0)
     temperature: float | None = None
+    top_k: int | None = None
     top_p: float | None = None
     presence_penalty: float | None = None
     frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
+    penalty_decay: float | None = None
     stop: str | list[str] | None = None
     stream: bool | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = Field(default=None, ge=0)
+    candidate_token_texts: list[str] | None = None
+    response_format: ChatResponseFormat | None = None
+    tools: list[ChatTool] | None = None
+    tool_choice: str | ChatNamedToolChoice | None = None
+    parallel_tool_calls: bool | None = None
     seed: int | None = None
     n: int | None = None
 
-    def to_completion_request(self) -> CompletionRequest:
-        if not self.messages:
-            raise ValueError("messages cannot be empty")
-        if self.n not in (None, 1):
-            raise ValueError("only n=1 is supported")
-        return CompletionRequest(
-            model=self.model,
-            prompt=render_chat_messages_as_prompt(self.messages),
-            max_tokens=(
-                self.max_completion_tokens
-                if self.max_completion_tokens is not None
-                else self.max_tokens
-            ),
-            temperature=self.temperature,
-            top_p=self.top_p,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
-            stop=self.stop,
-            stream=self.stream,
-            seed=self.seed,
-        )
 
-
-def chat_message_content_to_text(content: str | list[ChatMessageTextPart]) -> str:
+def chat_message_content_to_text(content: str | list[ChatMessageTextPart] | None) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
     return "".join(part.text for part in content)
@@ -279,27 +413,86 @@ def completion_finish_reason_to_chat(finish_reason: str | None) -> str | None:
     return finish_reason
 
 
+def completion_logprobs_to_chat_logprobs(logprobs: CompletionLogprobs | None) -> ChatChoiceLogprobs | None:
+    if logprobs is None or not logprobs.tokens:
+        return None
+    token_logprobs = list(logprobs.token_logprobs or [])
+    top_logprobs = list(logprobs.top_logprobs or [])
+    content: list[ChatTokenLogprob] = []
+    for index, token in enumerate(logprobs.tokens):
+        top_map = top_logprobs[index] if index < len(top_logprobs) else {}
+        token_logprob = token_logprobs[index] if index < len(token_logprobs) else None
+        content.append(
+            ChatTokenLogprob(
+                token=token,
+                bytes=list(token.encode("utf-8")),
+                logprob=float(token_logprob if token_logprob is not None else 0.0),
+                top_logprobs=[
+                    ChatTopLogprob(
+                        token=top_token,
+                        bytes=list(top_token.encode("utf-8")),
+                        logprob=float(top_logprob),
+                    )
+                    for top_token, top_logprob in top_map.items()
+                ],
+            )
+        )
+    return ChatChoiceLogprobs(content=content)
+
+
+def serialize_chat_tool(tool: ChatTool) -> str:
+    payload = {
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "parameters": tool.function.parameters or {},
+        "strict": tool.function.strict,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 @dataclass(frozen=True, slots=True)
 class ChoiceScore:
     text: str
     logprob: float
 
 
+ChatCompletionMessage.model_rebuild()
+
+
 __all__ = [
     "ChatCompletionChoice",
+    "ChatCompletionChunkChoice",
+    "ChatCompletionChunkResponse",
+    "ChatCompletionChunkToolCall",
+    "ChatCompletionChunkToolCallFunction",
+    "ChatCompletionDelta",
     "ChatCompletionMessage",
     "ChatCompletionRequest",
     "ChatCompletionResponse",
+    "ChatCompletionToolCall",
+    "ChatCompletionToolCallFunction",
+    "ChatChoiceLogprobs",
+    "ChatJsonSchema",
     "ChatMessageTextPart",
+    "ChatNamedToolChoice",
+    "ChatNamedToolChoiceFunction",
+    "ChatResponseFormat",
+    "ChatTokenLogprob",
+    "ChatTool",
+    "ChatToolFunction",
+    "ChatTopLogprob",
     "ChoiceScore",
     "CompletionChoice",
+    "CompletionChunkResponse",
     "CompletionLogprobs",
     "CompletionRequest",
     "CompletionResponse",
     "chat_message_content_to_text",
+    "completion_logprobs_to_chat_logprobs",
     "completion_finish_reason_to_chat",
     "current_unix_seconds",
     "next_chat_completion_id",
     "next_completion_id",
     "render_chat_messages_as_prompt",
+    "serialize_chat_tool",
 ]
