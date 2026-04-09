@@ -15,13 +15,18 @@ from .engine import (
     DEFAULT_PREFILL_CHUNK_SIZE,
     InferenceEngine,
     TokenizerProtocol,
+    _build_generated_token,
     _decode_tokens,
+    _finish_generated_text,
     _infer_device,
     _infer_vocab_size,
+    _normalize_stop_suffixes,
     _prepare_state_container,
+    _push_generated_token_text,
+    _record_generated_text_delta,
 )
 from .rapid_sampling_loader import get_rapid_sampling_module
-from .sampling import GenerationOutput, SamplingConfig
+from .sampling import GeneratedTextDelta, GeneratedToken, GenerationOutput, SamplingConfig
 from .state_pool import DEFAULT_PREFIX_CACHE_BUCKETS, StateCacheManager, StatePoolConfig
 
 LocalEngineMode = Literal["classic", "lightning"]
@@ -38,7 +43,10 @@ class LocalEngineProtocol(Protocol):
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete=None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
+        top_logprobs: int = 0,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         ...
@@ -64,8 +72,15 @@ class _LightningTask:
     pending_tokens: deque[int]
     prompt_tokens_remaining: int
     processed_prompt_tokens: int
+    generated_token_count: int
     generated_tokens: list[int]
-    new_token: int | None
+    generated_events: list[GeneratedToken]
+    emitted_text_parts: list[str]
+    utf8_tokens_in_buffer: list[GeneratedToken]
+    pending_stop_tokens: list[GeneratedToken]
+    stop_suffixes: tuple[tuple[str, bytes], ...]
+    max_stop_suffix_len: int
+    pending_token: GeneratedToken | None
     ready_logits: torch.Tensor | None
 
 
@@ -83,7 +98,10 @@ class ClassicInferenceEngineAdapter:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete=None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
+        top_logprobs: int = 0,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         return self._delegate.generate(
@@ -94,7 +112,10 @@ class ClassicInferenceEngineAdapter:
             progress_desc=progress_desc,
             probe_only=probe_only,
             on_complete=on_complete,
+            on_token=on_token,
+            prompt_stop_suffixes=prompt_stop_suffixes,
             prompt_seeds=prompt_seeds,
+            top_logprobs=top_logprobs,
             show_progress=show_progress,
         )
 
@@ -134,7 +155,10 @@ class LightningInferenceEngineAdapter:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete=None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
+        top_logprobs: int = 0,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         return _lightning_continuous_batching(
@@ -148,7 +172,10 @@ class LightningInferenceEngineAdapter:
             progress_desc,
             probe_only,
             on_complete,
+            on_token,
+            prompt_stop_suffixes,
             prompt_seeds,
+            top_logprobs,
             show_progress,
             self.config.prefix_cache_buckets,
         )
@@ -195,7 +222,10 @@ def _lightning_continuous_batching(
     progress_desc: str,
     probe_only: bool,
     on_complete: Callable[[GenerationOutput], None] | None,
+    on_token: Callable[[int, GeneratedTextDelta], None] | None,
+    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
     prompt_seeds: Sequence[int | None] | None,
+    top_logprobs: int,
     show_progress: bool,
     prefix_cache_buckets: Sequence[int],
 ) -> list[GenerationOutput]:
@@ -203,9 +233,12 @@ def _lightning_continuous_batching(
         return []
     if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
+    if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
+        raise ValueError("prompt_stop_suffixes 长度必须与 prompts 一致")
 
     batch_size = max(1, min(int(batch_size), len(prompts)))
     prefill_chunk_size = max(1, int(prefill_chunk_size))
+    top_logprobs = max(0, int(top_logprobs))
 
     vocab_size = _infer_vocab_size(model)  # type: ignore[arg-type]
     device = _infer_device(model)  # type: ignore[arg-type]
@@ -248,7 +281,9 @@ def _lightning_continuous_batching(
             if prompt_seeds is None or prompt_seeds[idx] is None
             else int(prompt_seeds[idx])
         )
-        encoded.append((idx, prompt, tokens, seed))
+        stop_suffixes = None if prompt_stop_suffixes is None else prompt_stop_suffixes[idx]
+        normalized_stop_suffixes, max_stop_suffix_len = _normalize_stop_suffixes(stop_suffixes)
+        encoded.append((idx, prompt, tokens, seed, normalized_stop_suffixes, max_stop_suffix_len))
 
     active_tasks: list[_LightningTask] = []
 
@@ -401,7 +436,7 @@ def _lightning_continuous_batching(
     def _activate_slot(slot_idx: int) -> bool:
         if not encoded:
             return False
-        prompt_idx, prompt, tokens, seed = encoded.popleft()
+        prompt_idx, prompt, tokens, seed, stop_suffixes, max_stop_suffix_len = encoded.popleft()
         _reset_slot(slot_idx)
         ready_logits: torch.Tensor | None = None
         processed_prompt_tokens = 0
@@ -433,8 +468,15 @@ def _lightning_continuous_batching(
             pending_tokens=pending,
             prompt_tokens_remaining=prompt_tokens_remaining,
             processed_prompt_tokens=processed_prompt_tokens,
+            generated_token_count=0,
             generated_tokens=[],
-            new_token=None,
+            generated_events=[],
+            emitted_text_parts=[],
+            utf8_tokens_in_buffer=[],
+            pending_stop_tokens=[],
+            stop_suffixes=stop_suffixes,
+            max_stop_suffix_len=max_stop_suffix_len,
+            pending_token=None,
             ready_logits=ready_logits,
         )
         if slot_idx < len(active_tasks):
@@ -471,25 +513,37 @@ def _lightning_continuous_batching(
         for idx, task in enumerate(active_tasks):
             if task.pending_tokens or task.ready_logits is not None:
                 continue
-            new_token = task.new_token
-            if new_token is None:
+            generated_token = task.pending_token
+            if generated_token is None:
                 continue
-            reached_stop = new_token in stop_tokens
-            reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
-            if not reached_stop and not reached_length:
-                task.pending_tokens.append(new_token)
-                task.generated_tokens.append(new_token)
-            task.new_token = None
-            if reached_stop or reached_length:
+            task.pending_token = None
+            token_id = generated_token.token_id
+            if token_id is None:
+                raise RuntimeError("generated token event is missing token id")
+            max_generated_tokens = 1 if probe_only else sampling.max_generate_tokens
+            reached_stop = token_id in stop_tokens
+            matched_stop_suffix = False
+            if not reached_stop:
+                task.generated_token_count += 1
+                deltas, matched_stop_suffix = _push_generated_token_text(task, generated_token)
+                for delta in deltas:
+                    _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+            reached_length = task.generated_token_count >= max_generated_tokens
+            if not reached_stop and not matched_stop_suffix and not reached_length:
+                task.pending_tokens.append(token_id)
+            if reached_stop or matched_stop_suffix or reached_length:
+                if not matched_stop_suffix:
+                    for delta in _finish_generated_text(task):
+                        _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
-                    text="",
-                    finish_reason="stop_token" if reached_stop else "max_length",
+                    text="".join(task.emitted_text_parts),
+                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
+                    tokens=list(task.generated_events),
                 )
                 if on_complete is not None and not probe_only:
-                    output.text = _decode_tokens(tokenizer, output.token_ids)
                     on_complete(output)
                 outputs.append(output)
                 pbar.update(1)
@@ -592,7 +646,14 @@ def _lightning_continuous_batching(
             combined_logits[:, ban_token_ids] = -math.inf
         sampled_list = _sample_rows(combined_logits, active_count, sample_rows)
         for local_idx, task_idx in enumerate(sample_rows):
-            active_tasks[task_idx].new_token = int(sampled_list[local_idx])
+            token_id = int(sampled_list[local_idx])
+            active_tasks[task_idx].pending_token = _build_generated_token(
+                tokenizer,
+                combined_logits[local_idx],
+                token_id,
+                top_logprobs=top_logprobs,
+                include_logprobs=top_logprobs > 0,
+            )
 
         now = time.time()
         elapsed = max(now - start_time, 1e-6)

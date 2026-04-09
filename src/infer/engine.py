@@ -12,7 +12,7 @@ import torch
 from tqdm import tqdm
 
 from .rapid_sampling_loader import get_rapid_sampling_module
-from .sampling import GenerationOutput, SamplingConfig
+from .sampling import GeneratedTextDelta, GeneratedToken, GeneratedTokenCandidate, GenerationOutput, SamplingConfig
 
 DEFAULT_PREFILL_CHUNK_SIZE = 16
 
@@ -51,7 +51,10 @@ class InferenceEngine:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
+        top_logprobs: int = 0,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         return _continuous_batching(
@@ -64,7 +67,10 @@ class InferenceEngine:
             progress_desc,
             probe_only,
             on_complete,
+            on_token,
+            prompt_stop_suffixes,
             prompt_seeds,
+            top_logprobs,
             show_progress,
         )
 
@@ -75,8 +81,15 @@ class _ActiveTask:
     prompt: str
     pending_tokens: deque[int]
     prompt_tokens_remaining: int
+    generated_token_count: int
     generated_tokens: list[int]
-    new_token: int | None
+    generated_events: list[GeneratedToken]
+    emitted_text_parts: list[str]
+    utf8_tokens_in_buffer: list[GeneratedToken]
+    pending_stop_tokens: list[GeneratedToken]
+    stop_suffixes: tuple[tuple[str, bytes], ...]
+    max_stop_suffix_len: int
+    pending_token: GeneratedToken | None
     finish_reason: str | None
 
 
@@ -90,15 +103,21 @@ def _continuous_batching(
     progress_desc: str,
     probe_only: bool = False,
     on_complete: Callable[[GenerationOutput], None] | None = None,
+    on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
     prompt_seeds: Sequence[int | None] | None = None,
+    top_logprobs: int = 0,
     show_progress: bool = True,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
     if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
+    if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
+        raise ValueError("prompt_stop_suffixes 长度必须与 prompts 一致")
     batch_size = max(1, min(batch_size, len(prompts)))
     prefill_chunk_size = max(1, int(prefill_chunk_size))
+    top_logprobs = max(0, int(top_logprobs))
 
     vocab_size = _infer_vocab_size(model)
     device = _infer_device(model)
@@ -160,7 +179,9 @@ def _continuous_batching(
             if prompt_seeds is None or prompt_seeds[idx] is None
             else int(prompt_seeds[idx])
         )
-        encoded.append((idx, prompt, tokens, seed))
+        stop_suffixes = None if prompt_stop_suffixes is None else prompt_stop_suffixes[idx]
+        normalized_stop_suffixes, max_stop_suffix_len = _normalize_stop_suffixes(stop_suffixes)
+        encoded.append((idx, prompt, tokens, seed, normalized_stop_suffixes, max_stop_suffix_len))
 
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())
@@ -183,9 +204,26 @@ def _continuous_batching(
 
     active_tasks: list[_ActiveTask] = []
     for slot_idx in range(batch_size):
-        prompt_idx, prompt, tokens, seed = encoded.popleft()
+        prompt_idx, prompt, tokens, seed, stop_suffixes, max_stop_suffix_len = encoded.popleft()
         pending = deque(tokens)
-        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, len(tokens), [], None, None))
+        active_tasks.append(
+            _ActiveTask(
+                prompt_idx,
+                prompt,
+                pending,
+                len(tokens),
+                0,
+                [],
+                [],
+                [],
+                [],
+                [],
+                stop_suffixes,
+                max_stop_suffix_len,
+                None,
+                None,
+            )
+        )
         if seed is not None:
             _set_sampler_seed(slot_idx, seed)
 
@@ -299,32 +337,59 @@ def _continuous_batching(
         for idx, task in enumerate(active_tasks):
             if task.pending_tokens:
                 continue
-            new_token = task.new_token
-            if new_token is None:
+            generated_token = task.pending_token
+            if generated_token is None:
                 continue
-            reached_stop = new_token in stop_tokens
-            reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
-            if not reached_stop and not reached_length:
-                task.pending_tokens.append(new_token)
-                task.generated_tokens.append(new_token)
-            task.new_token = None
-            if reached_stop or reached_length:
+            task.pending_token = None
+            token_id = generated_token.token_id
+            if token_id is None:
+                raise RuntimeError("generated token event is missing token id")
+            max_generated_tokens = 1 if probe_only else sampling.max_generate_tokens
+            reached_stop = token_id in stop_tokens
+            matched_stop_suffix = False
+            if not reached_stop:
+                task.generated_token_count += 1
+                deltas, matched_stop_suffix = _push_generated_token_text(task, generated_token)
+                for delta in deltas:
+                    _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+            reached_length = task.generated_token_count >= max_generated_tokens
+            if not reached_stop and not matched_stop_suffix and not reached_length:
+                task.pending_tokens.append(token_id)
+            if reached_stop or matched_stop_suffix or reached_length:
+                if not matched_stop_suffix:
+                    for delta in _finish_generated_text(task):
+                        _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
-                    text="",
-                    finish_reason="stop_token" if reached_stop else "max_length",
+                    text="".join(task.emitted_text_parts),
+                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
+                    tokens=list(task.generated_events),
                 )
                 if on_complete is not None and not probe_only:
-                    output.text = _decode_tokens(tokenizer, output.token_ids)
                     on_complete(output)
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
-                    prompt_idx, prompt, tokens, seed = encoded.popleft()
+                    prompt_idx, prompt, tokens, seed, stop_suffixes, max_stop_suffix_len = encoded.popleft()
                     pending = deque(tokens)
-                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, len(tokens), [], None, None)
+                    active_tasks[idx] = _ActiveTask(
+                        prompt_idx,
+                        prompt,
+                        pending,
+                        len(tokens),
+                        0,
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
+                        stop_suffixes,
+                        max_stop_suffix_len,
+                        None,
+                        None,
+                    )
                     _reset_slot(idx)
                     if seed is not None:
                         _set_sampler_seed(idx, seed)
@@ -379,7 +444,14 @@ def _continuous_batching(
 
         sampled_list = _sample_subset(logits, active_count, rows_to_sample)
         for local_idx, task_idx in enumerate(rows_to_sample):
-            active_tasks[task_idx].new_token = int(sampled_list[local_idx])
+            token_id = int(sampled_list[local_idx])
+            active_tasks[task_idx].pending_token = _build_generated_token(
+                tokenizer,
+                logits[task_idx],
+                token_id,
+                top_logprobs=top_logprobs,
+                include_logprobs=top_logprobs > 0,
+            )
 
     pbar.close()
 
@@ -436,6 +508,226 @@ def _decode_tokens(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> st
         except Exception:
             tokens = tokens[:-1]
     return text
+
+
+def _decode_token_bytes(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> bytes:
+    decode_bytes = getattr(tokenizer, "decodeBytes", None)
+    if callable(decode_bytes):
+        data = decode_bytes(token_ids)
+        if isinstance(data, bytes):
+            return data
+    decode_bytes = getattr(tokenizer, "decode_bytes", None)
+    if callable(decode_bytes):
+        data = decode_bytes(token_ids)
+        if isinstance(data, bytes):
+            return data
+    try:
+        return tokenizer.decode(token_ids).encode("utf-8")
+    except Exception:
+        return b""
+
+
+def _normalize_stop_suffixes(stop_suffixes: Sequence[str] | None) -> tuple[tuple[tuple[str, bytes], ...], int]:
+    normalized = tuple(
+        (suffix, suffix.encode("utf-8"))
+        for suffix in (str(item) for item in (stop_suffixes or ()))
+        if suffix
+    )
+    max_len = max((len(bytes_) for _suffix, bytes_ in normalized), default=0)
+    return normalized, max_len
+
+
+def _record_generated_text_delta(
+    task: _ActiveTask,
+    delta: GeneratedTextDelta,
+    *,
+    on_token: Callable[[int, GeneratedTextDelta], None] | None,
+    probe_only: bool,
+) -> None:
+    if not delta.text and not delta.tokens:
+        return
+    task.emitted_text_parts.append(delta.text)
+    task.generated_tokens.extend(
+        int(token.token_id)
+        for token in delta.tokens
+        if token.token_id is not None
+    )
+    task.generated_events.extend(delta.tokens)
+    if on_token is not None and not probe_only:
+        on_token(task.prompt_index, delta)
+
+
+def _push_generated_token_text(
+    task: _ActiveTask,
+    token: GeneratedToken,
+) -> tuple[list[GeneratedTextDelta], bool]:
+    task.utf8_tokens_in_buffer.append(token)
+    emit_count = _longest_valid_utf8_token_prefix(task.utf8_tokens_in_buffer)
+    if emit_count <= 0:
+        return [], False
+    stable_tokens = task.utf8_tokens_in_buffer[:emit_count]
+    del task.utf8_tokens_in_buffer[:emit_count]
+    return _push_stop_tokens(task, stable_tokens)
+
+
+def _push_stop_tokens(
+    task: _ActiveTask,
+    tokens: Sequence[GeneratedToken],
+) -> tuple[list[GeneratedTextDelta], bool]:
+    if not tokens:
+        return [], False
+    task.pending_stop_tokens.extend(tokens)
+    pending_bytes = _collect_token_bytes(task.pending_stop_tokens)
+    matched = _find_stop_suffix(pending_bytes, task.stop_suffixes)
+    if matched is not None:
+        delta = _take_stop_output(task, matched[0], allow_partial_text=True)
+        task.pending_stop_tokens.clear()
+        task.utf8_tokens_in_buffer.clear()
+        return ([delta] if delta.text or delta.tokens else []), True
+    emit_limit = len(pending_bytes)
+    if task.max_stop_suffix_len > 0:
+        emit_limit = max(0, emit_limit - (task.max_stop_suffix_len - 1))
+    delta = _take_stop_output(task, emit_limit, allow_partial_text=False)
+    return ([delta] if delta.text or delta.tokens else []), False
+
+
+def _finish_generated_text(task: _ActiveTask) -> list[GeneratedTextDelta]:
+    task.utf8_tokens_in_buffer.clear()
+    if not task.pending_stop_tokens:
+        return []
+    emit_limit = len(_collect_token_bytes(task.pending_stop_tokens))
+    delta = _take_stop_output(task, emit_limit, allow_partial_text=False)
+    return [delta] if delta.text or delta.tokens else []
+
+
+def _take_stop_output(
+    task: _ActiveTask,
+    emit_limit: int,
+    *,
+    allow_partial_text: bool,
+) -> GeneratedTextDelta:
+    if emit_limit <= 0 or not task.pending_stop_tokens:
+        return GeneratedTextDelta(text="", tokens=[])
+    emit_count = 0
+    emitted_bytes = 0
+    for token in task.pending_stop_tokens:
+        next_bytes = emitted_bytes + len(token.bytes)
+        if next_bytes > emit_limit:
+            break
+        emitted_bytes = next_bytes
+        emit_count += 1
+    tokens = task.pending_stop_tokens[:emit_count]
+    del task.pending_stop_tokens[:emit_count]
+    text_bytes = bytearray(_collect_token_bytes(tokens))
+    if allow_partial_text and emitted_bytes < emit_limit and task.pending_stop_tokens:
+        partial_len = emit_limit - emitted_bytes
+        partial_bytes = task.pending_stop_tokens[0].bytes[:partial_len]
+        valid_prefix_len = _longest_valid_utf8_prefix_len(partial_bytes)
+        if valid_prefix_len > 0:
+            text_bytes.extend(partial_bytes[:valid_prefix_len])
+    return GeneratedTextDelta(
+        text=bytes(text_bytes).decode("utf-8", errors="replace"),
+        tokens=list(tokens),
+    )
+
+
+def _token_bytes(token: GeneratedToken) -> bytes:
+    if token.bytes:
+        return bytes(token.bytes)
+    if token.text:
+        return token.text.encode("utf-8")
+    return b""
+
+
+def _collect_token_bytes(tokens: Sequence[GeneratedToken]) -> bytes:
+    return b"".join(_token_bytes(token) for token in tokens)
+
+
+def _longest_valid_utf8_token_prefix(tokens: Sequence[GeneratedToken]) -> int:
+    if not tokens:
+        return 0
+    buffer = bytearray()
+    last_valid = 0
+    for index, token in enumerate(tokens):
+        buffer.extend(_token_bytes(token))
+        try:
+            bytes(buffer).decode("utf-8")
+            last_valid = index + 1
+        except UnicodeDecodeError as exc:
+            if exc.reason == "unexpected end of data" and exc.end == len(buffer):
+                continue
+            last_valid = index + 1
+            break
+    return last_valid
+
+
+def _longest_valid_utf8_prefix_len(data: bytes) -> int:
+    try:
+        data.decode("utf-8")
+        return len(data)
+    except UnicodeDecodeError as exc:
+        return int(exc.start)
+
+
+def _find_stop_suffix(
+    data: bytes,
+    stop_suffixes: Sequence[tuple[str, bytes]],
+) -> tuple[int, int] | None:
+    matched: tuple[int, int, int] | None = None
+    for suffix_index, (_suffix, suffix_bytes) in enumerate(stop_suffixes):
+        if not suffix_bytes or len(suffix_bytes) > len(data):
+            continue
+        start = data.find(suffix_bytes)
+        if start < 0:
+            continue
+        if matched is None or start < matched[0] or (start == matched[0] and len(suffix_bytes) > matched[2]):
+            matched = (start, suffix_index, len(suffix_bytes))
+    if matched is None:
+        return None
+    return matched[0], matched[1]
+
+
+def _build_generated_token(
+    tokenizer: TokenizerProtocol,
+    logits_row: torch.Tensor,
+    token_id: int,
+    *,
+    top_logprobs: int,
+    include_logprobs: bool,
+) -> GeneratedToken:
+    token_bytes = _decode_token_bytes(tokenizer, [int(token_id)])
+    text = token_bytes.decode("utf-8", errors="replace")
+    if not include_logprobs:
+        return GeneratedToken(token_id=int(token_id), text=text, bytes=token_bytes)
+
+    row = logits_row.to(dtype=torch.float32)
+    logprobs = torch.log_softmax(row, dim=0)
+    limit = max(1, min(int(top_logprobs), int(logprobs.shape[0])))
+    top_values, top_indices = torch.topk(logprobs, k=limit)
+    return GeneratedToken(
+        token_id=int(token_id),
+        text=text,
+        bytes=token_bytes,
+        logprob=float(logprobs[int(token_id)].item()),
+        top_logprobs=[
+            _build_generated_token_candidate(tokenizer, int(candidate_id), float(candidate_logprob))
+            for candidate_id, candidate_logprob in zip(top_indices.tolist(), top_values.tolist(), strict=True)
+        ],
+    )
+
+
+def _build_generated_token_candidate(
+    tokenizer: TokenizerProtocol,
+    token_id: int,
+    logprob: float,
+) -> GeneratedTokenCandidate:
+    token_bytes = _decode_token_bytes(tokenizer, [token_id])
+    return GeneratedTokenCandidate(
+        token_id=token_id,
+        text=token_bytes.decode("utf-8", errors="replace"),
+        bytes=token_bytes,
+        logprob=logprob,
+    )
 
 
 __all__ = ["InferenceEngine", "GenerationOutput"]

@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from .engine import DEFAULT_PREFILL_CHUNK_SIZE, TokenizerProtocol
 from .lightning_engine import LocalEngineProtocol, build_local_engine
-from .sampling import GenerationOutput, SamplingConfig
+from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
 
 if TYPE_CHECKING:
     from .model import ModelLoadConfig
@@ -101,7 +101,10 @@ class InferenceBackend(Protocol):
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int] | None = None,
+        top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
@@ -153,7 +156,10 @@ class LocalInferenceBackend:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int] | None = None,
+        top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
@@ -165,7 +171,10 @@ class LocalInferenceBackend:
             progress_desc=progress_desc,
             probe_only=probe_only,
             on_complete=on_complete,
+            on_token=on_token,
+            prompt_stop_suffixes=prompt_stop_suffixes,
             prompt_seeds=prompt_seeds,
+            top_logprobs=top_logprobs,
             show_progress=show_progress,
         )
 
@@ -230,7 +239,10 @@ class RemoteInferenceBackend:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int] | None = None,
+        top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
@@ -238,6 +250,8 @@ class RemoteInferenceBackend:
             return []
         if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
             raise ValueError("prompt_seeds length must match prompts length")
+        if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
+            raise ValueError("prompt_stop_suffixes length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
@@ -250,6 +264,7 @@ class RemoteInferenceBackend:
                     prompt,
                     effective_sampling,
                     None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
+                    None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index],
                     prefill_chunk_size,
                 ): prompt_index
                 for prompt_index, prompt in enumerate(prompts)
@@ -257,6 +272,8 @@ class RemoteInferenceBackend:
             for future in concurrent.futures.as_completed(future_map):
                 output = future.result()
                 outputs[output.prompt_index] = output
+                if on_token is not None and output.text:
+                    on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
                 if on_complete is not None and not probe_only:
                     on_complete(output)
                 progress.update(1)
@@ -314,6 +331,7 @@ class RemoteInferenceBackend:
         prompt: str,
         sampling: SamplingConfig,
         seed: int | None,
+        stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
         _ = prefill_chunk_size
@@ -328,6 +346,8 @@ class RemoteInferenceBackend:
         }
         if seed is not None:
             payload["seed"] = int(seed)
+        if stop_suffixes:
+            payload["stop"] = list(stop_suffixes)
         response = self._post_json(self.config.chat_completions_url(), payload)
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:

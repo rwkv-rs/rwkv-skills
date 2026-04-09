@@ -23,11 +23,14 @@ from .api import (
     ChatTool,
     CompletionChoice,
     CompletionChunkResponse,
+    CompletionLogprobs,
     CompletionRequest,
     CompletionResponse,
+    ChatChoiceLogprobs,
     completion_finish_reason_to_chat,
     completion_logprobs_to_chat_logprobs,
 )
+from .sampling import GeneratedTextDelta
 
 
 StructuredResponseMode = Literal["plain_text", "json_text", "tool_call"]
@@ -37,6 +40,24 @@ StructuredResponseMode = Literal["plain_text", "json_text", "tool_call"]
 class PreparedChatCompletionRequest:
     completion_request: CompletionRequest
     response_mode: StructuredResponseMode
+
+
+@dataclass(frozen=True, slots=True)
+class StreamResponseMetadata:
+    id: str
+    created: int
+    model: str
+
+
+@dataclass(slots=True)
+class CompletionStreamState:
+    text_offset: int = 0
+
+
+@dataclass(slots=True)
+class ChatCompletionStreamState:
+    structured_buffer: str = ""
+    emitted_structured_chunk: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +110,7 @@ def prepare_chat_completion_request(request: ChatCompletionRequest) -> PreparedC
         penalty_decay=request.penalty_decay,
         stop=request.stop,
         stream=request.stream,
-        logprobs=request.top_logprobs if request.logprobs else None,
+        logprobs=max(1, int(request.top_logprobs or 0)) if request.logprobs else None,
         candidate_token_texts=request.candidate_token_texts,
         seed=request.seed,
     )
@@ -117,6 +138,170 @@ def build_chat_completion_response(
             for choice in response.choices
         ],
     )
+
+
+def new_completion_stream_state() -> CompletionStreamState:
+    return CompletionStreamState()
+
+
+def build_completion_stream_chunk(
+    metadata: StreamResponseMetadata,
+    state: CompletionStreamState,
+    delta: GeneratedTextDelta,
+    *,
+    index: int = 0,
+    requested_top_logprobs: int = 0,
+) -> CompletionChunkResponse:
+    chunk = CompletionChunkResponse(
+        id=metadata.id,
+        created=metadata.created,
+        model=metadata.model,
+        choices=[
+            CompletionChoice(
+                text=delta.text,
+                index=index,
+                finish_reason=None,
+                logprobs=_generated_text_delta_to_completion_logprobs(
+                    delta,
+                    text_offset=state.text_offset,
+                    requested_top_logprobs=requested_top_logprobs,
+                )
+                if requested_top_logprobs > 0
+                else None,
+            )
+        ],
+    )
+    state.text_offset += len(delta.text)
+    return chunk
+
+
+def build_completion_stream_finish_chunk(
+    metadata: StreamResponseMetadata,
+    *,
+    finish_reason: str | None,
+    index: int = 0,
+) -> CompletionChunkResponse:
+    return CompletionChunkResponse(
+        id=metadata.id,
+        created=metadata.created,
+        model=metadata.model,
+        choices=[
+            CompletionChoice(
+                text="",
+                index=index,
+                finish_reason=finish_reason,
+                logprobs=None,
+            )
+        ],
+    )
+
+
+def new_chat_completion_stream_state() -> ChatCompletionStreamState:
+    return ChatCompletionStreamState()
+
+
+def build_chat_completion_stream_role_chunk(
+    metadata: StreamResponseMetadata,
+    *,
+    index: int = 0,
+) -> ChatCompletionChunkResponse:
+    return ChatCompletionChunkResponse(
+        id=metadata.id,
+        created=metadata.created,
+        model=metadata.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=index,
+                delta=ChatCompletionDelta(role="assistant"),
+                finish_reason=None,
+                logprobs=None,
+            )
+        ],
+    )
+
+
+def build_chat_completion_stream_token_chunks(
+    request: ChatCompletionRequest,
+    prepared: PreparedChatCompletionRequest,
+    metadata: StreamResponseMetadata,
+    state: ChatCompletionStreamState,
+    delta: GeneratedTextDelta,
+    *,
+    index: int = 0,
+) -> list[ChatCompletionChunkResponse]:
+    if prepared.response_mode in {"plain_text", "json_text"}:
+        return [
+            ChatCompletionChunkResponse(
+                id=metadata.id,
+                created=metadata.created,
+                model=metadata.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=index,
+                        delta=ChatCompletionDelta(content=delta.text or None),
+                        finish_reason=None,
+                        logprobs=_generated_text_delta_to_chat_logprobs(
+                            delta,
+                            requested_top_logprobs=int(request.top_logprobs or 0),
+                        )
+                        if request.logprobs
+                        else None,
+                    )
+                ],
+            )
+        ]
+
+    state.structured_buffer += delta.text
+    if state.emitted_structured_chunk:
+        return []
+    try:
+        parsed = _parse_tool_model_output(state.structured_buffer)
+    except ValueError:
+        return []
+    state.emitted_structured_chunk = True
+    return [_build_chat_structured_chunk(metadata, parsed, index=index)]
+
+
+def build_chat_completion_stream_finish_chunks(
+    prepared: PreparedChatCompletionRequest,
+    metadata: StreamResponseMetadata,
+    state: ChatCompletionStreamState,
+    *,
+    finish_reason: str | None,
+    index: int = 0,
+) -> list[ChatCompletionChunkResponse]:
+    chunks: list[ChatCompletionChunkResponse] = []
+    normalized_finish_reason = completion_finish_reason_to_chat(finish_reason)
+
+    if prepared.response_mode == "tool_call":
+        parsed = None
+        if state.structured_buffer:
+            try:
+                parsed = _parse_tool_model_output(state.structured_buffer)
+            except ValueError:
+                parsed = None
+        if parsed is not None and not state.emitted_structured_chunk:
+            chunks.append(_build_chat_structured_chunk(metadata, parsed, index=index))
+            state.emitted_structured_chunk = True
+        if parsed is not None and parsed["type"] == "tool_calls":
+            normalized_finish_reason = "tool_calls"
+
+    chunks.append(
+        ChatCompletionChunkResponse(
+            id=metadata.id,
+            created=metadata.created,
+            model=metadata.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=index,
+                    delta=ChatCompletionDelta(),
+                    finish_reason=normalized_finish_reason,
+                    logprobs=None,
+                )
+            ],
+        )
+    )
+    return chunks
 
 
 def build_completion_stream_responses(response: CompletionResponse) -> list[CompletionChunkResponse]:
@@ -271,6 +456,87 @@ def _build_stream_delta(choice: ChatCompletionChoice) -> ChatCompletionDelta:
             ]
         )
     return ChatCompletionDelta(content=choice.message.text_content() or None)
+
+
+def _generated_text_delta_to_completion_logprobs(
+    delta: GeneratedTextDelta,
+    *,
+    text_offset: int,
+    requested_top_logprobs: int,
+) -> CompletionLogprobs:
+    token_texts = [token.text for token in delta.tokens]
+    token_logprobs = [token.logprob for token in delta.tokens]
+    top_logprobs = [
+        {
+            candidate.text: float(candidate.logprob)
+            for candidate in token.top_logprobs[: max(int(requested_top_logprobs), 0)]
+        }
+        for token in delta.tokens
+    ]
+    offsets: list[int] = []
+    current_offset = text_offset
+    for token_text in token_texts:
+        offsets.append(current_offset)
+        current_offset += len(token_text)
+    return CompletionLogprobs(
+        tokens=token_texts,
+        token_logprobs=token_logprobs,
+        top_logprobs=top_logprobs,
+        text_offset=offsets,
+    )
+
+
+def _generated_text_delta_to_chat_logprobs(
+    delta: GeneratedTextDelta,
+    *,
+    requested_top_logprobs: int,
+) -> ChatChoiceLogprobs | None:
+    if not delta.tokens or all(token.logprob is None for token in delta.tokens):
+        return None
+    completion_logprobs = _generated_text_delta_to_completion_logprobs(
+        delta,
+        text_offset=0,
+        requested_top_logprobs=requested_top_logprobs,
+    )
+    return completion_logprobs_to_chat_logprobs(completion_logprobs)
+
+
+def _build_chat_structured_chunk(
+    metadata: StreamResponseMetadata,
+    parsed: dict[str, object],
+    *,
+    index: int,
+) -> ChatCompletionChunkResponse:
+    if parsed["type"] == "message":
+        delta = ChatCompletionDelta(content=str(parsed["content"]))
+    else:
+        delta = ChatCompletionDelta(
+            tool_calls=[
+                ChatCompletionChunkToolCall(
+                    index=tool_index,
+                    id=f"call_{tool_index}",
+                    type="function",
+                    function=ChatCompletionChunkToolCallFunction(
+                        name=item["name"],
+                        arguments=item["arguments"],
+                    ),
+                )
+                for tool_index, item in enumerate(parsed["tool_calls"])
+            ]
+        )
+    return ChatCompletionChunkResponse(
+        id=metadata.id,
+        created=metadata.created,
+        model=metadata.model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=index,
+                delta=delta,
+                finish_reason=None,
+                logprobs=None,
+            )
+        ],
+    )
 
 
 def _validate_chat_structured_output(request: ChatCompletionRequest) -> _StructuredPlan:
@@ -540,9 +806,19 @@ def _parse_json_like(text: str) -> object:
 
 
 __all__ = [
+    "ChatCompletionStreamState",
+    "CompletionStreamState",
     "PreparedChatCompletionRequest",
+    "StreamResponseMetadata",
+    "build_chat_completion_stream_finish_chunks",
+    "build_chat_completion_stream_role_chunk",
     "build_chat_completion_stream_responses",
+    "build_chat_completion_stream_token_chunks",
     "build_chat_completion_response",
+    "build_completion_stream_chunk",
+    "build_completion_stream_finish_chunk",
     "build_completion_stream_responses",
+    "new_chat_completion_stream_state",
+    "new_completion_stream_state",
     "prepare_chat_completion_request",
 ]

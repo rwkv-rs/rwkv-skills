@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Sampling primitives shared across所有推理/评估流水线。"""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 DEFAULT_NO_PENALTY_TOKEN_IDS = (33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58)
 
@@ -82,6 +82,35 @@ class GenerationOutput:
     token_ids: list[int]
     text: str
     finish_reason: str
+    tokens: list["GeneratedToken"] = field(default_factory=list)
 
 
-__all__ = ["SamplingConfig", "GenerationOutput"]
+@dataclass(slots=True)
+class GeneratedTokenCandidate:
+    token_id: int | None
+    text: str
+    logprob: float
+    bytes: bytes = b""
+
+
+@dataclass(slots=True)
+class GeneratedToken:
+    token_id: int | None
+    text: str
+    bytes: bytes = b""
+    logprob: float | None = None
+    top_logprobs: list[GeneratedTokenCandidate] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class GeneratedTextDelta:
+    text: str
+    tokens: list[GeneratedToken] = field(default_factory=list)
+
+__all__ = [
+    "GeneratedTextDelta",
+    "GeneratedToken",
+    "GeneratedTokenCandidate",
+    "GenerationOutput",
+    "SamplingConfig",
+]

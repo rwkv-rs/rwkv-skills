@@ -12,14 +12,34 @@ from typing import Sequence
 
 import torch
 
-from .api import ChoiceScore, CompletionChoice, CompletionLogprobs, CompletionRequest, CompletionResponse
+from .api import (
+    ChoiceScore,
+    CompletionChoice,
+    CompletionLogprobs,
+    CompletionRequest,
+    CompletionResponse,
+    current_unix_seconds,
+    next_completion_id,
+)
 from .backend import InferenceBackend
+from .sampling import GeneratedTextDelta, GeneratedToken
 
 
 @dataclass(slots=True)
 class _PendingRequest:
     request: CompletionRequest
+    response_id: str
+    created: int
     future: Future[CompletionResponse]
+    stream_queue: Queue[GeneratedTextDelta | None] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class CompletionStreamHandle:
+    response_id: str
+    created: int
+    future: Future[CompletionResponse]
+    token_queue: Queue[GeneratedTextDelta | None]
 
 
 class InferenceService:
@@ -43,9 +63,34 @@ class InferenceService:
         return self.backend.model_name
 
     def submit_completion(self, request: CompletionRequest) -> Future[CompletionResponse]:
+        return self._submit_pending(request).future
+
+    def submit_streaming_completion(self, request: CompletionRequest) -> CompletionStreamHandle:
+        token_queue: Queue[GeneratedTextDelta | None] = Queue()
+        pending = self._submit_pending(request, stream_queue=token_queue)
+        return CompletionStreamHandle(
+            response_id=pending.response_id,
+            created=pending.created,
+            future=pending.future,
+            token_queue=token_queue,
+        )
+
+    def _submit_pending(
+        self,
+        request: CompletionRequest,
+        *,
+        stream_queue: Queue[GeneratedTextDelta | None] | None = None,
+    ) -> _PendingRequest:
         future: Future[CompletionResponse] = Future()
-        self._queue.put(_PendingRequest(request=request, future=future))
-        return future
+        pending = _PendingRequest(
+            request=request,
+            response_id=next_completion_id(),
+            created=current_unix_seconds(),
+            future=future,
+            stream_queue=stream_queue,
+        )
+        self._queue.put(pending)
+        return pending
 
     def shutdown(self) -> None:
         if self._stop.is_set():
@@ -135,31 +180,35 @@ class InferenceService:
         sampling = request0.to_sampling_config()
         prompts = [item.request.prompt for item in batch]
         seeds = [item.request.seed for item in batch]
+        stop_suffixes = [_request_stop_suffixes(item.request) for item in batch]
+        max_top_logprobs = max(max(int(item.request.logprobs or 0), 0) for item in batch)
+
+        def _on_token(prompt_index: int, delta: GeneratedTextDelta) -> None:
+            item = batch[prompt_index]
+            if item.stream_queue is not None:
+                item.stream_queue.put(delta)
+
         try:
             outputs = self.backend.generate(
                 prompts,
                 sampling=sampling,
                 batch_size=len(prompts),
                 progress_desc="Infer",
+                prompt_stop_suffixes=stop_suffixes,
                 prompt_seeds=seeds,
                 prefill_chunk_size=request0.effective_prefill_chunk_size(),
+                on_token=_on_token if any(item.stream_queue is not None for item in batch) else None,
+                top_logprobs=max_top_logprobs,
                 show_progress=False,
             )
             for item, output in zip(batch, outputs, strict=True):
-                item.future.set_result(
-                    CompletionResponse(
-                        model=self.model_name,
-                        choices=[
-                            CompletionChoice(
-                                text=output.text,
-                                index=0,
-                                finish_reason=output.finish_reason,
-                            )
-                        ],
-                    )
-                )
+                item.future.set_result(self._build_generation_response(item, output))
+                if item.stream_queue is not None:
+                    item.stream_queue.put(None)
         except BaseException as exc:
             for item in batch:
+                if item.stream_queue is not None:
+                    item.stream_queue.put(None)
                 item.future.set_exception(exc)
 
     def _execute_score(self, item: _PendingRequest) -> None:
@@ -175,6 +224,8 @@ class InferenceService:
             pred_logprob = top_map.get(best_text)
             item.future.set_result(
                 CompletionResponse(
+                    id=item.response_id,
+                    created=item.created,
                     model=self.model_name,
                     choices=[
                         CompletionChoice(
@@ -194,6 +245,30 @@ class InferenceService:
         except BaseException as exc:
             item.future.set_exception(exc)
 
+    def _build_generation_response(
+        self,
+        item: _PendingRequest,
+        output,
+    ) -> CompletionResponse:
+        request = item.request
+        logprobs = None
+        requested_top = max(int(request.logprobs or 0), 0)
+        if requested_top > 0 and output.tokens:
+            logprobs = _build_completion_logprobs(output.tokens, requested_top)
+        return CompletionResponse(
+            id=item.response_id,
+            created=item.created,
+            model=self.model_name,
+            choices=[
+                CompletionChoice(
+                    text=output.text,
+                    index=0,
+                    finish_reason=output.finish_reason,
+                    logprobs=logprobs,
+                )
+            ],
+        )
+
 
 def _normalize_choice_scores(scores: dict[str, float]) -> list[ChoiceScore]:
     items = list(scores.items())
@@ -207,4 +282,42 @@ def _normalize_choice_scores(scores: dict[str, float]) -> list[ChoiceScore]:
     ]
 
 
-__all__ = ["InferenceService"]
+def _request_stop_suffixes(request: CompletionRequest) -> tuple[str, ...]:
+    stop = request.stop
+    if stop is None:
+        return ()
+    if isinstance(stop, str):
+        return (stop,) if stop else ()
+    return tuple(item for item in stop if item)
+
+
+def _build_completion_logprobs(
+    tokens: Sequence[GeneratedToken],
+    requested_top_logprobs: int,
+) -> CompletionLogprobs:
+    top_limit = max(int(requested_top_logprobs), 0)
+    text_offset: list[int] = []
+    current_offset = 0
+    token_texts: list[str] = []
+    token_logprobs: list[float | None] = []
+    top_logprobs: list[dict[str, float]] = []
+    for token in tokens:
+        token_texts.append(token.text)
+        token_logprobs.append(token.logprob)
+        text_offset.append(current_offset)
+        current_offset += len(token.text)
+        top_logprobs.append(
+            {
+                candidate.text: float(candidate.logprob)
+                for candidate in token.top_logprobs[:top_limit]
+            }
+        )
+    return CompletionLogprobs(
+        tokens=token_texts,
+        token_logprobs=token_logprobs,
+        top_logprobs=top_logprobs,
+        text_offset=text_offset,
+    )
+
+
+__all__ = ["CompletionStreamHandle", "InferenceService"]

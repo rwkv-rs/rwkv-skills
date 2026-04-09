@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from queue import Empty
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -16,12 +17,21 @@ from .api import (
 )
 from .openai_service import (
     build_chat_completion_response,
-    build_chat_completion_stream_responses,
-    build_completion_stream_responses,
+    build_chat_completion_stream_finish_chunks,
+    build_chat_completion_stream_role_chunk,
+    build_chat_completion_stream_token_chunks,
+    build_completion_stream_chunk,
+    build_completion_stream_finish_chunk,
     prepare_chat_completion_request,
+    new_chat_completion_stream_state,
+    new_completion_stream_state,
+    StreamResponseMetadata,
 )
 from .service import InferenceService
-from .sse import iter_sse_payloads
+from .sse import encode_sse_comment, iter_sse_payloads
+
+
+SSE_KEEPALIVE_INTERVAL_S = 10.0
 
 
 def create_app(service: InferenceService, *, api_key: str | None = None) -> FastAPI:
@@ -43,12 +53,29 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
 
     app = FastAPI(title="RWKV Skills Infer", version="0.1.0", lifespan=lifespan)
 
-    def _streaming_response(payloads) -> StreamingResponse:
+    async def _encode_sse_stream(payload_stream) -> object:
+        async for payload in payload_stream:
+            if isinstance(payload, bytes):
+                yield payload
+                continue
+            for encoded in iter_sse_payloads([payload]):
+                yield encoded
+        for encoded in iter_sse_payloads(["[DONE]"]):
+            yield encoded
+
+    async def _next_stream_item(token_queue):
+        try:
+            return await asyncio.to_thread(token_queue.get, True, SSE_KEEPALIVE_INTERVAL_S)
+        except Empty:
+            return encode_sse_comment()
+
+    def _streaming_response(payload_stream) -> StreamingResponse:
         return StreamingResponse(
-            iter_sse_payloads((*payloads, "[DONE]")),
+            _encode_sse_stream(payload_stream),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -82,12 +109,37 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"unknown model {request.model!r}; available model is {service.model_name!r}",
             )
+        if request.stream:
+            handle = service.submit_streaming_completion(request)
+            metadata = StreamResponseMetadata(
+                id=handle.response_id,
+                created=handle.created,
+                model=service.model_name,
+            )
+
+            async def _iter_completion_stream():
+                state = new_completion_stream_state()
+                while True:
+                    item = await _next_stream_item(handle.token_queue)
+                    if isinstance(item, bytes):
+                        yield item
+                        continue
+                    if item is None:
+                        break
+                    yield build_completion_stream_chunk(
+                        metadata,
+                        state,
+                        item,
+                        requested_top_logprobs=max(int(request.logprobs or 0), 0),
+                    )
+                response = await asyncio.wrap_future(handle.future)
+                finish_reason = response.choices[0].finish_reason if response.choices else None
+                yield build_completion_stream_finish_chunk(metadata, finish_reason=finish_reason)
+
+            return _streaming_response(_iter_completion_stream())
         future = service.submit_completion(request)
         try:
-            response = await asyncio.wrap_future(future)
-            if request.stream:
-                return _streaming_response(build_completion_stream_responses(response))
-            return response
+            return await asyncio.wrap_future(future)
         except HTTPException:
             raise
         except Exception as exc:  # pragma: no cover - exercised through integration
@@ -118,13 +170,46 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"unknown model {request.model!r}; available model is {service.model_name!r}",
             )
+        if prepared.completion_request.stream:
+            handle = service.submit_streaming_completion(prepared.completion_request)
+            metadata = StreamResponseMetadata(
+                id=handle.response_id.replace("cmpl-", "chatcmpl-", 1),
+                created=handle.created,
+                model=service.model_name,
+            )
+
+            async def _iter_chat_stream():
+                state = new_chat_completion_stream_state()
+                yield build_chat_completion_stream_role_chunk(metadata)
+                while True:
+                    item = await _next_stream_item(handle.token_queue)
+                    if isinstance(item, bytes):
+                        yield item
+                        continue
+                    if item is None:
+                        break
+                    for chunk in build_chat_completion_stream_token_chunks(
+                        request,
+                        prepared,
+                        metadata,
+                        state,
+                        item,
+                    ):
+                        yield chunk
+                response = await asyncio.wrap_future(handle.future)
+                finish_reason = response.choices[0].finish_reason if response.choices else None
+                for chunk in build_chat_completion_stream_finish_chunks(
+                    prepared,
+                    metadata,
+                    state,
+                    finish_reason=finish_reason,
+                ):
+                    yield chunk
+
+            return _streaming_response(_iter_chat_stream())
         future = service.submit_completion(prepared.completion_request)
         try:
             response = await asyncio.wrap_future(future)
-            if prepared.completion_request.stream:
-                return _streaming_response(
-                    build_chat_completion_stream_responses(request, prepared, response)
-                )
             return build_chat_completion_response(request, prepared, response)
         except HTTPException:
             raise

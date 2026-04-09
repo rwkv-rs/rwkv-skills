@@ -16,4 +16,8 @@ def iter_sse_payloads(payloads: Iterable[BaseModel | str]) -> Iterator[bytes]:
         yield f"data: {data}\n\n".encode("utf-8")
 
 
-__all__ = ["iter_sse_payloads"]
+def encode_sse_comment(comment: str = "keep-alive") -> bytes:
+    return f": {comment}\n\n".encode("utf-8")
+
+
+__all__ = ["encode_sse_comment", "iter_sse_payloads"]
