@@ -12,25 +12,24 @@ import torch
 
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
+from src.eval.execution_plan import avg_k_metric_key, build_auto_avg_k_execution_plan
 from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.job_env import ensure_job_id
 from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, safe_slug
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.scheduler.profiler import update_batch_cache_locked
 from src.eval.evaluators.multi_choice import MultipleChoicePipeline
 from src.infer.model import ModelLoadConfig
 
 
 DEFAULT_PASS_K = (1,)
-DEFAULT_AVG_K: tuple[int, ...] = ()
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -105,7 +104,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--avg-k",
         type=int,
         action="append",
-        help="avg@k values to compute (default: none; can be set in configs/<benchmark>.toml)",
+        help="Legacy compatibility flag; multiple-choice avg@k now follows the auto execution plan.",
     )
     return parser.parse_args(argv)
 
@@ -123,27 +122,11 @@ def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tup
     return DEFAULT_PASS_K
 
 
-def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
-    if args.avg_k:
-        return tuple(args.avg_k)
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    if config is not None and config.avg_k is not None:
-        return config.avg_k
-    return DEFAULT_AVG_K
-
-
 def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple[int, ...]:
     config = resolve_benchmark_model_config(slug, model_name, stage=None)
     if config is not None and config.report_pass_k is not None:
         return config.report_pass_k
     return pass_k
-
-
-def _report_avg_k(slug: str, model_name: str, avg_k: tuple[int, ...]) -> tuple[int, ...]:
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    if config is not None and config.report_avg_k is not None:
-        return config.report_avg_k
-    return avg_k
 
 
 def _filter_metrics_by_k(metric_map: dict[str, float] | None, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
@@ -171,13 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
     pass_k = _resolve_pass_k(slug, model_name, args)
-    avg_k = _resolve_avg_k(slug, model_name, args)
     report_pass_k = _report_pass_k(slug, model_name, pass_k)
-    report_avg_k = _report_avg_k(slug, model_name, avg_k)
-    samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
 
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
+    effective_problem_count = min(len(records), args.max_samples) if args.max_samples else len(records)
+    plan = build_auto_avg_k_execution_plan(slug, effective_problem_count)
+    samples_per_task = max(_max_k(pass_k), plan.repeat_count, 1)
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -205,7 +188,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
-        sampling_config={"cot": sampling_config_to_dict(cot_sampling)},
+        sampling_config={
+            "cot": sampling_config_to_dict(cot_sampling),
+            "avg_k": plan.avg_k,
+            "sample_size": plan.sample_size,
+            "effective_sample_count": plan.effective_sample_count,
+        },
     )
     skip_keys = ctx.completed_keys
 
@@ -232,23 +220,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    sample_limit: int | None = args.max_samples
     min_prompt_count: int | None = None
     target_batch = max(1, args.batch_size)
-    problem_count = min(len(records), sample_limit) if sample_limit else len(records)
-    expected_count = service.expected_completion_count(
-        dataset=str(slug),
-        sample_limit=sample_limit,
-        repeats_per_problem=samples_per_task,
-    )
-    if expected_count is None:
-        expected_count = problem_count * samples_per_task
+    expected_count = plan.sample_size * samples_per_task
     try:
         result = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
             cot_sampling=cot_sampling,
             batch_size=target_batch,
-            sample_limit=sample_limit,
+            record_indices=plan.sample_indices,
             min_prompt_count=min_prompt_count,
             samples_per_task=samples_per_task,
             skip_keys=skip_keys,
@@ -276,30 +256,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_path=dataset_path,
     )
     pass_metrics_all = compute_pass_at_k(metrics.rows, pass_k)
-    avg_metrics_all = compute_avg_at_k(metrics.rows, avg_k)
-    # When explicit k-metrics are requested, treat them as the primary score output
-    # and avoid writing legacy `accuracy` into score.metrics.
-    has_explicit_k_metrics = bool(report_pass_k) or bool(report_avg_k)
-    metrics_payload: dict[str, float] = {}
-    if not has_explicit_k_metrics:
-        metrics_payload["accuracy"] = metrics.accuracy
+    avg_metric_name = avg_k_metric_key(plan.avg_k)
+    avg_metrics_all = compute_avg_at_k(metrics.rows, (plan.avg_k,))
+    metrics_payload: dict[str, float] = {
+        "accuracy": metrics.accuracy,
+        avg_metric_name: avg_metrics_all.get(avg_metric_name, metrics.accuracy),
+    }
     pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:
         pass_payload = pass_metrics_all or {}
     if pass_payload:
         metrics_payload.update(pass_payload)
-    avg_payload = _filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
-    if report_avg_k and not avg_payload:
-        avg_payload = avg_metrics_all or {}
-    if avg_payload:
-        metrics_payload.update(avg_payload)
     task_details: dict[str, object] = {
         "accuracy_by_subject": metrics.accuracy_by_subject,
+        "avg_k": plan.avg_k,
+        "sample_size": plan.sample_size,
+        "avg_repeat_count": plan.repeat_count,
+        "effective_sample_count": plan.effective_sample_count,
     }
     if pass_metrics_all and pass_payload != pass_metrics_all:
         task_details["pass_curve"] = pass_metrics_all
-    if avg_metrics_all and avg_payload != avg_metrics_all:
-        task_details["avg_curve"] = avg_metrics_all
     service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
     score_payload = make_score_payload(
         slug,
