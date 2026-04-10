@@ -3,7 +3,7 @@ from __future__ import annotations
 """Multiple-choice 评估流水线：负责读数据、跑模型、导出阶段化 JSONL。"""
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Sequence
 
 import torch
 
@@ -95,11 +95,18 @@ class MultipleChoicePipeline:
         prompt_template: str | None = None,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
+        record_indices: Sequence[int] | None = None,
+        samples_per_task: int = 1,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
     ) -> MultipleChoicePipelineResult:
-        records, resolved_name = self._load_records(dataset_path, sample_limit)
+        all_records, resolved_name = self._load_records(dataset_path)
+        indexed_records = self._select_records(
+            all_records,
+            sample_limit=sample_limit,
+            record_indices=record_indices,
+        )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         templates = _select_prompt_templates(dataset_name)
@@ -107,18 +114,30 @@ class MultipleChoicePipeline:
             prompt_template = templates.direct
 
         skip_keys = skip_keys or set()
+        repeats = max(1, int(samples_per_task))
+        expanded: list[tuple[int, MultipleChoiceRecord, int]] = []
+        for sample_index, record in indexed_records:
+            for sample_id in range(repeats):
+                if (sample_index, sample_id) in skip_keys:
+                    continue
+                expanded.append((sample_index, record, sample_id))
+
         if resume_start_index < 0:
             resume_start_index = 0
-        indexed_records = [
-            (idx, record)
-            for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
-            if (idx, 0) not in skip_keys
-        ]
-        if not indexed_records:
+        if resume_start_index:
+            if resume_start_index >= len(expanded):
+                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+            remaining_records = [
+                (sample_index, record, sample_id)
+                for sample_index, record, sample_id in expanded[resume_start_index:]
+            ]
+        else:
+            remaining_records = expanded
+        if not remaining_records:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
         payloads: list[dict] = []
-        for idx, record in indexed_records:
+        for sample_index, record, sample_id in remaining_records:
             prompt = self._format_prompt(record, prompt_template)
             _, pred_letter = self._score_prompt(record, prompt)
             token_text = self.target_token_format.replace("<LETTER>", pred_letter)
@@ -132,15 +151,15 @@ class MultipleChoicePipeline:
             payload = SampleRecord(
                 benchmark_name=benchmark_name,
                 dataset_split=dataset_split,
-                sample_index=idx,
-                repeat_index=0,
+                sample_index=sample_index,
+                repeat_index=sample_id,
                 sampling_config={},
                 stages=stages,
             ).as_payload()
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
-        return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
+        return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     def run_chain_of_thought(
         self,
@@ -152,6 +171,7 @@ class MultipleChoicePipeline:
         batch_size: int = 64,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
+        record_indices: Sequence[int] | None = None,
         min_prompt_count: int | None = None,
         samples_per_task: int = 1,
         probe_only: bool = False,
@@ -159,7 +179,12 @@ class MultipleChoicePipeline:
         skip_keys: set[tuple[int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
     ) -> MultipleChoicePipelineResult:
-        records, resolved_name = self._load_records(dataset_path, sample_limit)
+        all_records, resolved_name = self._load_records(dataset_path)
+        indexed_records = self._select_records(
+            all_records,
+            sample_limit=sample_limit,
+            record_indices=record_indices,
+        )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         templates = _select_prompt_templates(dataset_name)
@@ -172,11 +197,11 @@ class MultipleChoicePipeline:
         repeats = max(1, int(samples_per_task)) if not probe_only else 1
         skip_keys = skip_keys or set()
         expanded: list[tuple[int, MultipleChoiceRecord, int]] = []
-        for idx, record in enumerate(records):
+        for sample_index, record in indexed_records:
             for sample_id in range(repeats):
-                if (idx, sample_id) in skip_keys:
+                if (sample_index, sample_id) in skip_keys:
                     continue
-                expanded.append((idx, record, sample_id))
+                expanded.append((sample_index, record, sample_id))
 
         if min_prompt_count and min_prompt_count > len(expanded) and expanded:
             repeat = (min_prompt_count + len(expanded) - 1) // len(expanded)
@@ -195,8 +220,8 @@ class MultipleChoicePipeline:
             if resume_start_index >= len(expanded):
                 return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
             remaining_entries = [
-                (idx, record, sample_id)
-                for idx, record, sample_id in expanded[resume_start_index:]
+                (sample_index, record, sample_id)
+                for sample_index, record, sample_id in expanded[resume_start_index:]
             ]
             print(
                 f"⏩ 多选 CoT 恢复运行：已完成 {resume_start_index}/{len(expanded)}，剩余 {len(remaining_entries)}"
@@ -281,16 +306,30 @@ class MultipleChoicePipeline:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _load_records(
-        self, dataset_path: str, sample_limit: int | None
-    ) -> tuple[list[MultipleChoiceRecord], str]:
+    def _load_records(self, dataset_path: str) -> tuple[list[MultipleChoiceRecord], str]:
         loader = JsonlMultipleChoiceLoader(dataset_path)
         dataset = loader.load()
         records = list(dataset)
-        if sample_limit is not None and sample_limit > 0:
-            records = records[: min(sample_limit, len(records))]
         dataset_name = infer_dataset_slug_from_path(dataset_path)
         return records, dataset_name
+
+    def _select_records(
+        self,
+        records: Sequence[MultipleChoiceRecord],
+        *,
+        sample_limit: int | None = None,
+        record_indices: Sequence[int] | None = None,
+    ) -> list[tuple[int, MultipleChoiceRecord]]:
+        if record_indices is not None:
+            selected: list[tuple[int, MultipleChoiceRecord]] = []
+            for index in record_indices:
+                sample_index = int(index)
+                selected.append((sample_index, records[sample_index]))
+            return selected
+        limited_records = list(records)
+        if sample_limit is not None and sample_limit > 0:
+            limited_records = limited_records[: min(sample_limit, len(limited_records))]
+        return list(enumerate(limited_records))
 
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
         subject = (record.subject or "unknown").replace("_", " ")

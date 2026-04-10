@@ -13,11 +13,12 @@
 - SamplingConfig 字段：max_generate_tokens、temperature、top_k、top_p、
   alpha_presence、alpha_frequency、alpha_decay、stop_tokens、ban_tokens、
   pad_zero、no_penalty_token_ids
-- 评测字段：pass_k、avg_k、report_pass_k、report_avg_k（free_response 与 multi_choice_cot）
+- 评测字段：pass_k、avg_k、report_pass_k、report_avg_k（free_response 与 free_response_judge）
 
 备注：
 - CLI 参数会覆盖配置值。
-- pass_k / avg_k 可用于 CoT 评测入口（free_response / free_response_judge / multi_choice_cot），CLI 参数优先生效。
+- pass_k / avg_k 可用于自由问答 CoT 评测入口（free_response / free_response_judge），CLI 参数优先生效。
+- knowledge 风格的多选入口现在使用自动 avg@k 执行计划，目标是约 5000 次尝试，因此 TOML 里的 avg_k 不再驱动它们。
 - llm_judge 仍由评测脚本或 CLI 控制，不从 TOML 读取。
 - free_response 的采样配置只用于 CoT 生成阶段。
 - livecodebench 的采样配置同时作用于 CoT 和 final 阶段。

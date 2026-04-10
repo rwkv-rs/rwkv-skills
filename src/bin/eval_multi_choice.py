@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
+from src.eval.execution_plan import avg_k_metric_key, build_auto_avg_k_execution_plan
+from src.eval.metrics.at_k import compute_avg_at_k
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.job_env import ensure_job_id
 from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
@@ -43,6 +44,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
+    effective_problem_count = min(len(records), args.max_samples) if args.max_samples else len(records)
+    plan = build_auto_avg_k_execution_plan(slug, effective_problem_count)
 
     init_orm(DEFAULT_DB_CONFIG)
     
@@ -62,7 +65,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset=str(slug),
         model=Path(args.model_path).stem,
         is_param_search=False,
-        sampling_config={"mode": "logits_only"},
+        sampling_config={
+            "mode": "logits_only",
+            "avg_k": plan.avg_k,
+            "sample_size": plan.sample_size,
+            "effective_sample_count": plan.effective_sample_count,
+        },
     )
     skip_keys = ctx.completed_keys
 
@@ -73,18 +81,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_id=task_id,
         max_queue=args.db_write_queue,
     )
-    sample_limit = args.max_samples
-    expected_count = service.expected_completion_count(
-        dataset=str(slug),
-        sample_limit=sample_limit,
-        repeats_per_problem=1,
-    )
-    if expected_count is None:
-        expected_count = min(len(records), sample_limit) if sample_limit else len(records)
+    expected_count = plan.effective_sample_count
     try:
         result = pipeline.run_direct(
             dataset_path=str(dataset_path),
-            sample_limit=sample_limit,
+            record_indices=plan.sample_indices,
+            samples_per_task=plan.repeat_count,
             skip_keys=skip_keys,
             on_record=writer.enqueue,
         )
@@ -109,16 +111,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         completions_payloads,
         dataset_path=dataset_path,
     )
+    avg_metric_name = avg_k_metric_key(plan.avg_k)
+    avg_metrics = compute_avg_at_k(metrics.rows, (plan.avg_k,))
     service.ingest_eval_payloads(payloads=metrics.payloads, task_id=task_id)
     score_payload = make_score_payload(
         slug,
         is_cot=False,
         model_name=Path(args.model_path).stem,
-        metrics={"accuracy": metrics.accuracy},
+        metrics={
+            "accuracy": metrics.accuracy,
+            avg_metric_name: avg_metrics.get(avg_metric_name, metrics.accuracy),
+        },
         samples=metrics.samples,
         task="multiple_choice",
         task_details={
             "accuracy_by_subject": metrics.accuracy_by_subject,
+            "avg_k": plan.avg_k,
+            "sample_size": plan.sample_size,
+            "avg_repeat_count": plan.repeat_count,
+            "effective_sample_count": plan.effective_sample_count,
         },
     )
     service.record_score_payload(
