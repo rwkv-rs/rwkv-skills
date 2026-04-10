@@ -28,7 +28,7 @@ from src.infer.model import ModelLoadConfig
 from src.infer.sampling import SamplingConfig
 
 
-DEFAULT_PASS_K = (1,)
+DEFAULT_PASS_K: tuple[int, ...] = ()
 DEFAULT_AVG_K: tuple[int, ...] = ()
 
 
@@ -108,7 +108,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to generate for and compute (default: 1)",
+        help="pass@k values to generate for and compute (default: none)",
     )
     parser.add_argument(
         "--avg-k",

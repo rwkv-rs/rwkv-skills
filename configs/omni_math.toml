@@ -1,7 +1,7 @@
 [default]
-pass_k = [1]
+pass_k = []
 avg_k = [1]
-report_pass_k = [1]
+report_pass_k = []
 report_avg_k = [1]
 max_samples = 4428
 

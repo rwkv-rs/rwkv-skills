@@ -243,7 +243,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
+        probe_samples_per_task=1,  # coding probe 只做单样本探测
     ),
     "code_mbpp": JobSpec(
         name="code_mbpp",
@@ -254,7 +254,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
+        probe_samples_per_task=1,  # coding probe 只做单样本探测
     ),
     "code_livecodebench": JobSpec(
         name="code_livecodebench",
@@ -265,7 +265,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
         probe_flag="--probe-only",
         probe_max_generate_flag="--max-tokens",
-        probe_samples_per_task=1,  # coding 默认只做 pass@1
+        probe_samples_per_task=1,  # coding probe 只做单样本探测
     ),
     "instruction_following": JobSpec(
         name="instruction_following",

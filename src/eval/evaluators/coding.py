@@ -14,8 +14,8 @@ from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord, sample_repeat_seed
 
-# Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
-DEFAULT_PASS_K = (1,)
+# Coding 默认不计算 pass@k；如需单独产出 pass，请通过 CLI/配置显式传入
+DEFAULT_PASS_K: tuple[int, ...] = ()
 
 
 def _compress_newlines(text: str) -> str:
@@ -120,6 +120,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -128,7 +129,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
@@ -242,6 +244,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -250,7 +253,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
@@ -371,6 +375,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -379,7 +384,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:

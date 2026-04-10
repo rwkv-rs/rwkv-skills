@@ -31,7 +31,7 @@ from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.infer.model import ModelLoadConfig
 
 
-DEFAULT_PASS_K = (1,)
+DEFAULT_PASS_K: tuple[int, ...] = ()
 DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 
 
@@ -79,7 +79,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to generate for and compute (default: 1; can be set in configs/<benchmark>.toml)",
+        help="pass@k values to generate for and compute (default: none; can be set in configs/<benchmark>.toml)",
     )
     parser.add_argument(
         "--avg-k",
