@@ -2,4 +2,3 @@
 template = "instruction_following_default"
 avg_k = [8]
 report_avg_k = [8]
-max_samples = 541

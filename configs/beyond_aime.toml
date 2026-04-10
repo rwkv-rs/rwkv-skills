@@ -3,7 +3,6 @@ pass_k = []
 avg_k = [64]
 report_pass_k = []
 report_avg_k = [64]
-max_samples = 100
 
 [cot]
 template = "math_cot_default"

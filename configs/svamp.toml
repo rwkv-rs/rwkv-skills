@@ -3,7 +3,6 @@ pass_k = []
 avg_k = [4]
 report_pass_k = []
 report_avg_k = [4]
-max_samples = 1000
 
 [cot]
 template = "free_response_cot_default"
