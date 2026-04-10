@@ -8,6 +8,7 @@ import signal
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     compute_pass_at_k,
@@ -29,7 +30,7 @@ from src.infer.model import ModelLoadConfig
 
 
 DEFAULT_PASS_K = (1,)
-DEFAULT_AVG_K: tuple[int, ...] = ()
+DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 
 
 def _count_records(path: str | Path, limit: int | None) -> int:
@@ -77,15 +78,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--avg-k",
-        type=int,
+        type=float,
         action="append",
         help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
     )
     return parser.parse_args(argv)
-
-
-def _max_k(values: Sequence[int] | None) -> int:
-    return max(values) if values else 0
 
 
 def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
@@ -97,7 +94,7 @@ def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tup
     return DEFAULT_PASS_K
 
 
-def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
+def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[NumericK, ...]:
     if args.avg_k:
         return tuple(args.avg_k)
     config = resolve_benchmark_model_config(slug, model_name, stage=None)
@@ -113,28 +110,22 @@ def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple
     return pass_k
 
 
-def _report_avg_k(slug: str, model_name: str, avg_k: tuple[int, ...]) -> tuple[int, ...]:
+def _report_avg_k(
+    slug: str,
+    model_name: str,
+    avg_k: tuple[NumericK, ...],
+) -> tuple[NumericK, ...]:
     config = resolve_benchmark_model_config(slug, model_name, stage=None)
     if config is not None and config.report_avg_k is not None:
         return config.report_avg_k
     return avg_k
 
 
-def _filter_metrics_by_k(metric_map: dict[str, float] | None, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
-    if not metric_map or not ks:
-        return {}
-    allowed = {int(k) for k in ks if int(k) > 0}
-    filtered: dict[str, float] = {}
-    for key, value in metric_map.items():
-        if not key.startswith(prefix):
-            continue
-        suffix_text = key[len(prefix) :]
-        if not suffix_text.isdigit():
-            continue
-        suffix = int(suffix_text)
-        if suffix in allowed:
-            filtered[key] = value
-    return filtered
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -150,6 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     avg_k = _resolve_avg_k(slug, model_name, args)
     report_pass_k = _report_pass_k(slug, model_name, pass_k)
     report_avg_k = _report_avg_k(slug, model_name, avg_k)
+    sample_limit = _resolve_max_samples(slug, model_name, args)
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -214,14 +206,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
 
-    samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
+    samples_per_task = max(max_generation_k(pass_k), max_generation_k(avg_k), 1)
     expected_count = service.expected_completion_count(
         dataset=str(slug),
-        sample_limit=args.max_samples,
+        sample_limit=sample_limit,
         repeats_per_problem=samples_per_task,
     )
     if expected_count is None:
-        expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+        expected_count = _count_records(dataset_path, sample_limit) * samples_per_task
     close_timeout_s = max(0.0, float(args.db_close_timeout_s))
     writer = CompletionWriteWorker(
         service=service,
@@ -264,7 +256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
-            sample_limit=args.max_samples,
+            sample_limit=sample_limit,
             pad_to_batch=False,
             pass_k=pass_k,
             samples_per_task=samples_per_task,
@@ -305,12 +297,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if evaluation.judge_accuracy is not None:
         metrics_payload["judge_accuracy"] = evaluation.judge_accuracy
 
-    pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
+    pass_payload = filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:
         pass_payload = pass_metrics_all or {}
     if pass_payload:
         metrics_payload.update(pass_payload)
-    avg_payload = _filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
+    avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
     if report_avg_k and not avg_payload:
         avg_payload = avg_metrics_all or {}
     if avg_payload:

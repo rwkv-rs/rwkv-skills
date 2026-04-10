@@ -109,24 +109,24 @@ def _parse_pass_suffix(key: str) -> int | None:
         return None
 
 
-def _parse_k_metric(key: str) -> tuple[str, int] | None:
+def _parse_k_metric(key: str) -> tuple[str, float] | None:
     token = str(key).strip().lower()
     if token.startswith("pass@"):
         try:
-            return "pass", int(token.split("@", 1)[1])
+            return "pass", float(token.split("@", 1)[1])
         except ValueError:
             return None
     if token.startswith("avg@"):
         try:
-            return "avg", int(token.split("@", 1)[1])
+            return "avg", float(token.split("@", 1)[1])
         except ValueError:
             return None
     return None
 
 
 def _preferred_k_metric(metrics: dict[str, Any]) -> str:
-    avg_candidates: list[tuple[int, str]] = []
-    pass_candidates: list[tuple[int, str]] = []
+    avg_candidates: list[tuple[float, str]] = []
+    pass_candidates: list[tuple[float, str]] = []
     for key, value in metrics.items():
         parsed = _parse_k_metric(str(key))
         if parsed is None or _numeric_value(value) is None:

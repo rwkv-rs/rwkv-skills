@@ -8,9 +8,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.evaluators.coding import CodingPipeline
+from src.eval.k_values import filter_metrics_by_k
 from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
@@ -53,6 +54,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
+    if args.pass_k:
+        return tuple(args.pass_k)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.pass_k is not None:
+        return config.pass_k
+    return (1,)
+
+
+def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple[int, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_pass_k is not None:
+        return config.report_pass_k
+    return pass_k
+
+
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
@@ -88,9 +112,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = CodingPipeline(config)
     batch_size = max(1, args.batch_size)
-    default_pass_k = (1,)
-    pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
-    sample_limit = batch_size if args.probe_only else args.max_samples
+    pass_k = (1,) if args.probe_only else _resolve_pass_k(slug, model_name, args)
+    report_pass_k = _report_pass_k(slug, model_name, pass_k)
+    sample_limit = batch_size if args.probe_only else _resolve_max_samples(slug, model_name, args)
     init_orm(DEFAULT_DB_CONFIG)
     
     service = EvalDbService()
@@ -187,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             slug,
             is_cot=True,
             model_name=Path(args.model_path).stem,
-            metrics=eval_metrics or {},
+            metrics=filter_metrics_by_k(eval_metrics, report_pass_k, "pass@") or (eval_metrics or {}),
             samples=len(completions_payloads),
             problems=result.problem_count,
             task="code_livecodebench",

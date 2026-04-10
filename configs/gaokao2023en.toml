@@ -1,8 +1,9 @@
 [default]
-pass_k = []
+pass_k = [1]
 avg_k = [16]
-report_pass_k = []
+report_pass_k = [1]
 report_avg_k = [16]
+max_samples = 385
 
 [cot]
 template = "free_response_cot_default"

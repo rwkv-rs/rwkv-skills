@@ -1,2 +1,5 @@
 [default]
 template = "code_default"
+pass_k = [32]
+report_pass_k = [1]
+max_samples = 164

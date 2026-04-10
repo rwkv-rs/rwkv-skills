@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.benchmark_config import resolve_benchmark_model_config
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.eval.results.payloads import make_score_payload
@@ -34,12 +35,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = MultipleChoicePipeline(config, target_token_format=args.target_token_format)
+    model_name = Path(args.model_path).stem
+    sample_limit = _resolve_max_samples(slug, model_name, args)
 
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
@@ -73,7 +83,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         task_id=task_id,
         max_queue=args.db_write_queue,
     )
-    sample_limit = args.max_samples
     expected_count = service.expected_completion_count(
         dataset=str(slug),
         sample_limit=sample_limit,
@@ -113,7 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     score_payload = make_score_payload(
         slug,
         is_cot=False,
-        model_name=Path(args.model_path).stem,
+        model_name=model_name,
         metrics={"accuracy": metrics.accuracy},
         samples=metrics.samples,
         task="multiple_choice",

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     LLMJudge,
@@ -31,7 +32,7 @@ from src.infer.model import ModelLoadConfig
 
 
 DEFAULT_PASS_K = (1,)
-DEFAULT_AVG_K: tuple[int, ...] = ()
+DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 
 
 def _load_env_file(path: Path) -> None:
@@ -82,7 +83,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--avg-k",
-        type=int,
+        type=float,
         action="append",
         help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
     )
@@ -91,10 +92,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-base-url", help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)")
     parser.add_argument("--judge-max-workers", type=int, default=32, help="Max concurrent workers for LLM judge")
     return parser.parse_args(argv)
-
-
-def _max_k(values) -> int:
-    return max(values) if values else 0
 
 
 def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
@@ -106,7 +103,7 @@ def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tup
     return DEFAULT_PASS_K
 
 
-def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
+def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[NumericK, ...]:
     if args.avg_k:
         return tuple(args.avg_k)
     config = resolve_benchmark_model_config(slug, model_name, stage=None)
@@ -122,28 +119,22 @@ def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple
     return pass_k
 
 
-def _report_avg_k(slug: str, model_name: str, avg_k: tuple[int, ...]) -> tuple[int, ...]:
+def _report_avg_k(
+    slug: str,
+    model_name: str,
+    avg_k: tuple[NumericK, ...],
+) -> tuple[NumericK, ...]:
     config = resolve_benchmark_model_config(slug, model_name, stage=None)
     if config is not None and config.report_avg_k is not None:
         return config.report_avg_k
     return avg_k
 
 
-def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
-    if not metric_map or not ks:
-        return {}
-    allowed = {int(k) for k in ks if int(k) > 0}
-    filtered: dict[str, float] = {}
-    for key, value in metric_map.items():
-        if not key.startswith(prefix):
-            continue
-        suffix_text = key[len(prefix) :]
-        if not suffix_text.isdigit():
-            continue
-        suffix = int(suffix_text)
-        if suffix in allowed:
-            filtered[key] = value
-    return filtered
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -158,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     avg_k_final = _resolve_avg_k(slug, model_name, args)
     report_pass_k = _report_pass_k(slug, model_name, pass_k_final)
     report_avg_k = _report_avg_k(slug, model_name, avg_k_final)
+    sample_limit = _resolve_max_samples(slug, model_name, args)
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -175,19 +167,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
     cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
     final_sampling = final_sampling.clamp(args.final_max_tokens)
-    sample_limit: int | None = args.max_samples
     generate_pass_k = (1,) if args.probe_only else pass_k_final
-    samples_per_task = max(_max_k(pass_k_final), _max_k(avg_k_final), 1)
+    samples_per_task = max(max_generation_k(pass_k_final), max_generation_k(avg_k_final), 1)
     init_orm(DEFAULT_DB_CONFIG)
 
     service = EvalDbService()
     expected_count = service.expected_completion_count(
         dataset=str(slug),
-        sample_limit=args.max_samples,
+        sample_limit=sample_limit,
         repeats_per_problem=samples_per_task,
     )
     if expected_count is None:
-        expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
+        expected_count = _count_records(dataset_path, sample_limit) * samples_per_task
     force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
     # 三层级联检索：一次查询获取所有续跑信息
@@ -309,12 +300,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if evaluation.judge_accuracy is None:
         raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
     metrics_payload = {"judge_accuracy": evaluation.judge_accuracy}
-    pass_payload = _filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
+    pass_payload = filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
     if report_pass_k and not pass_payload:
         pass_payload = pass_metrics_all or {}
     if pass_payload:
         metrics_payload.update(pass_payload)
-    avg_payload = _filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
+    avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
     if report_avg_k and not avg_payload:
         avg_payload = avg_metrics_all or {}
     if avg_payload:

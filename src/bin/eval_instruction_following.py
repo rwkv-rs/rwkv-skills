@@ -9,7 +9,8 @@ from typing import Sequence
 
 from dataclasses import replace
 
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
 from src.eval.results.payloads import make_score_payload
@@ -25,45 +26,41 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canon
 from src.eval.evaluators.instruction_following import InstructionFollowingPipeline
 from src.infer.model import ModelLoadConfig
 
-DEFAULT_AVG_K: tuple[int, ...] = ()
+DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 IFEVAL_AVG_K = (4,)
 
 
-def _max_k(values) -> int:
-    return max(values) if values else 0
-
-
-def _resolve_avg_k(slug: str, args: argparse.Namespace) -> tuple[int, ...]:
+def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[NumericK, ...]:
     if args.avg_k:
         return tuple(args.avg_k)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.avg_k is not None:
+        return config.avg_k
     lower_slug = canonical_slug(str(slug))
     if lower_slug.startswith("ifeval"):
         return IFEVAL_AVG_K
     return DEFAULT_AVG_K
 
 
-def _report_avg_k(slug: str, final_avg_k: tuple[int, ...]) -> tuple[int, ...]:
+def _report_avg_k(
+    slug: str,
+    model_name: str,
+    final_avg_k: tuple[NumericK, ...],
+) -> tuple[NumericK, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_avg_k is not None:
+        return config.report_avg_k
     lower_slug = canonical_slug(str(slug))
     if lower_slug.startswith("ifeval"):
         return IFEVAL_AVG_K
     return final_avg_k
 
 
-def _filter_metrics_by_k(metric_map, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
-    if not metric_map or not ks:
-        return {}
-    allowed = {int(k) for k in ks if int(k) > 0}
-    filtered: dict[str, float] = {}
-    for key, value in metric_map.items():
-        if not key.startswith(prefix):
-            continue
-        suffix_text = key[len(prefix) :]
-        if not suffix_text.isdigit():
-            continue
-        suffix = int(suffix_text)
-        if suffix in allowed:
-            filtered[key] = value
-    return filtered
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -84,7 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--avg-k",
-        type=int,
+        type=float,
         action="append",
         help="avg@k values to compute from generated samples (IFEval 默认 4)",
     )
@@ -97,9 +94,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     slug = infer_dataset_slug_from_path(str(dataset_path))
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = InstructionFollowingPipeline(config)
-    avg_k_final = _resolve_avg_k(slug, args)
-    report_avg_k = _report_avg_k(slug, avg_k_final)
-    samples_per_prompt = max(_max_k(avg_k_final), 1)
+    model_name = Path(args.model_path).stem
+    avg_k_final = _resolve_avg_k(slug, model_name, args)
+    report_avg_k = _report_avg_k(slug, model_name, avg_k_final)
+    sample_limit = _resolve_max_samples(slug, model_name, args)
+    samples_per_prompt = max(max_generation_k(avg_k_final), 1)
     records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
 
     sampling = resolve_sampling_config(
@@ -118,11 +117,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     service = EvalDbService()
     expected_count = service.expected_completion_count(
         dataset=str(slug),
-        sample_limit=args.max_samples,
+        sample_limit=sample_limit,
         repeats_per_problem=samples_per_prompt,
     )
     if expected_count is None:
-        expected_count = (min(len(records), args.max_samples) if args.max_samples else len(records)) * samples_per_prompt
+        expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * samples_per_prompt
     force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
 
     # 三层级联检索：一次查询获取所有续跑信息
@@ -154,7 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset_path=str(dataset_path),
             sampling=sampling,
             batch_size=max(1, args.batch_size),
-            sample_limit=args.max_samples,
+            sample_limit=sample_limit,
             enable_think=bool(args.enable_think),
             stop_tokens=sampling.stop_tokens,
             ban_tokens=ban_tokens,
@@ -184,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         strict=True,
         avg_k=avg_k_final,
     )
-    avg_payload = _filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
+    avg_payload = filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
     service.ingest_eval_payloads(payloads=metrics.payloads or [], task_id=task_id)
     score_payload = make_score_payload(
         slug,
