@@ -1,5 +1,8 @@
 # 11 Benchmark 对齐与线路收口计划
 
+状态说明：本文件聚焦 benchmark catalog / runner / scheduler matrix 的后续收口，不再承担“`rwkv-rs -> rwkv-skills` 是否已经迁入主干”的总判断。
+该总判断已收口到 `docs/review/12-rwkv-rs-migration-status.md`。
+
 目标：把 `rwkv-skills` 的 benchmark 组织方式、领域划分、运行入口逐步收敛到 `rwkv-rs` 的风格，同时保留 Python 侧更灵活的 scheduler / DB / 分布式能力。
 
 ## 1. 当前对齐结果
@@ -12,10 +15,12 @@
 
 ### 1.1 真正缺失于 `rwkv-skills` 的 benchmark
 
+- 截至当前主干，**无**
+
+以下两项已经补齐并进入 benchmark catalog：
+
 - `include`
 - `polymath`
-
-这两个是实质缺口，需要补 benchmark 接入、dataset spec、runner 适配和 scheduler matrix。
 
 ### 1.2 主要是建模方式不同，不是完全缺失
 
@@ -27,7 +32,7 @@
   - `rwkv-skills`：拆成 `tau_bench_retail` / `tau_bench_airline` / `tau_bench_telecom`
 - `arena_hard_v2`
   - `rwkv-rs`：显式带版本号
-  - `rwkv-skills`：当前是 `arena_hard`
+  - `rwkv-skills`：canonical name 已改为 `arena_hard_v2`，并保留 `arena_hard -> arena_hard_v2` alias
 
 这类差异的核心不是“能不能跑”，而是“catalog 是否统一”。后续要决定 canonical name 是向 `rwkv-rs` 靠齐，还是保留 Python 侧更细的 domain slug，再加 alias。
 
@@ -42,13 +47,12 @@
 - `tau_bench_airline`
 - `tau_bench_telecom`
 - `gpqa`
-- `arena_hard`
 
 其中：
 
 - `flores200` / `ifbench` 属于功能扩展，不应删除。
 - `tau2_*` 是 Python 侧新增能力，也不应向 `rwkv-rs` 回退。
-- `gpqa` / `arena_hard` / `tau_bench_*` 属于命名与抽象层不一致，应该收敛。
+- `gpqa` / `tau_bench_*` 属于命名与抽象层不一致，应该继续收敛。
 
 ## 2. 当前 `rwkv-skills` 的测评线路
 
@@ -111,19 +115,21 @@
 
 ### 3.1 线路不是按“领域 + runner”收敛，而是按脚本横向增长
 
-现在的主入口仍是：
+现在的主入口已不再是早期那组 `src/bin/eval_*` 脚本，而是：
 
-- `src/bin/eval_multi_choice*.py`
-- `src/bin/eval_free_response*.py`
-- `src/bin/eval_code_*.py`
-- `src/bin/eval_function_*.py`
+- `src/main.py` / 仓库根 `main.py`
+- `src.eval.knowledge.runner`
+- `src.eval.maths.runner`
+- `src.eval.coding.runner`
+- `src.eval.instruction_following.runner`
+- `src.eval.function_calling.runner`
+- `src.eval.scheduler.cli`
 
 问题不是只有文件多，而是：
 
-- task 创建逻辑重复
-- writer 生命周期重复
-- score payload 拼装重复
-- probe / resume / failure 收尾重复
+- field runner 之间仍有 task 创建 / writer 生命周期 / score payload 的重复
+- `scheduler CLI` 与 `main.py` 还不是同一个编排层
+- `param_search_*` 与 `eval_agent_tau*` 仍在正式主线外
 
 ### 3.2 同一领域内部，dataset-specific 与 runner-specific 逻辑还混着
 
@@ -198,8 +204,8 @@ dataset-specific 只提供：
 
 ### P1. 先收 catalog
 
-- 已完成一部分：`benchmark_registry.py` 现在已带 `field/default_split/scheduler_jobs`，并提供按领域分组。
-- 已完成一部分：`src/eval/evaluating/task_persistence.py` 现在已提供 `auto/new/resume/rerun` 四种 run mode，
+- 已明显吸收进来：`benchmark_registry.py` 现在已带 `field/default_split/scheduler_jobs`，并提供按领域分组。
+- 已明显吸收进来：`src/eval/evaluating/task_persistence.py` 现在已提供 `auto/new/resume/rerun` 四种 run mode，
   scheduler CLI 也支持 `--run-mode`，runner 已切到统一 `prepare_task_execution(...)`。
 - 下一步：
   - 把 scheduler CLI / Space / 文档都改成读取 `BENCHMARKS_BY_FIELD`
@@ -209,13 +215,10 @@ dataset-specific 只提供：
 
 优先补：
 
-1. `include`
-2. `polymath`
+1. 已完成：`include`
+2. 已完成：`polymath`
 
-原因：
-
-- 这两个是 `rwkv-rs` 有而 `rwkv-skills` 真没有的 benchmark。
-- 补完之后，两边 benchmark 覆盖才能谈“对齐”。
+当前这一阶段已结束，后续重点不再是“补 benchmark 缺口”，而是 catalog / naming / runner 收口。
 
 ### P3. 再收命名差异
 
@@ -231,17 +234,17 @@ dataset-specific 只提供：
 
 按风险从低到高：
 
-0. 已完成一部分：`src/eval/runner_registry.py` 已按 `knowledge / maths / coding / instruction_following / function_calling / param_search`
+0. 已明显吸收进来：`src/eval/runner_registry.py` 已按 `knowledge / maths / coding / instruction_following / function_calling / param_search`
    建好 runner registry，`scheduler/jobs.py` 已改成从 registry 派生 `JOB_CATALOGUE`。
-1. 已完成一部分：`src/bin/knowledge_runner.py` 现在已经把 `multi_choice_plain / multi_choice_fake_cot / multi_choice_cot`
-   收成单入口，`runner_registry.py` 里的 knowledge jobs 已统一指向它；`src/bin/eval_multi_choice*.py` 只保留兼容壳。
-2. 已完成一部分：`src/bin/maths_runner.py` 现在已经把 `free_response / free_response_judge` 收成单入口，
-   `runner_registry.py` 里的 maths jobs 已统一指向它；`src/bin/eval_free_response*.py` 只保留兼容壳。
-3. 已完成一部分：runner / pipeline 实现现在开始按领域下沉到 `src/eval/knowledge/` 和 `src/eval/maths/`，
+1. 已明显吸收进来：`src.eval.knowledge.runner` 已把 `multi_choice_plain / multi_choice_fake_cot / multi_choice_cot`
+   收成单入口。
+2. 已明显吸收进来：`src.eval.maths.runner` 已把 `free_response / free_response_judge` 收成单入口。
+3. 已明显吸收进来：`src.eval.coding.runner`、`src.eval.instruction_following.runner` 也已进入统一 field runner 形态。
+4. 已明显吸收进来：`src.eval.function_calling.runner` 现在已直接内建 BrowseComp / MCP-Bench / tau_bench / tau2_bench，
+   旧的 benchmark-specific runner 文件已删除，不再存在“统一门面 + 二次转发”。
+5. 已明显吸收进来：runner / pipeline 实现现在开始按领域下沉到 `src/eval/knowledge/` 和 `src/eval/maths/`，
    更接近 `rwkv-rs/crates/rwkv-eval/src/datasets/<field>/...` 的组织方式。
-4. coding runner 合并
-5. instruction-following runner 合并
-6. function-calling runner 分三类模板收口
+6. 下一步重点：继续抽 `function-calling` 内部的共享 task/runtime/score 模板，减少 BrowseComp / MCP / tau 三类实现之间的重复。
 
 ### P5. 分布式拆分
 
@@ -255,6 +258,14 @@ dataset-specific 只提供：
 这样才符合你说的“像 rwkv-rs 一样只注册 runner 和调度器”，同时又保住 Python 侧分布式能力。
 
 ### P6. 最后删 legacy
+
+当前 residual legacy 主要包括：
+
+- `src/bin/param_search_free_response.py`
+- `src/bin/param_search_free_response_judge.py`
+- `src/bin/param_search_select.py`
+- `src/bin/eval_agent_tau_bench.py`
+- `src/bin/eval_agent_tau2_bench.py`
 
 只有在以下三项完成后再删：
 

@@ -50,6 +50,30 @@ extra_args = ["--foo", "bar"]
     assert config.runner.extra_args == ("--foo", "bar")
 
 
+def test_resolve_run_config_path_accepts_named_config(monkeypatch, tmp_path: Path) -> None:
+    run_root = tmp_path / "configs" / "run"
+    run_root.mkdir(parents=True)
+    config_path = run_root / "bfcl_v3.toml"
+    config_path.write_text("[dataset]\nname='bfcl_v3'\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "RUN_CONFIG_ROOT", run_root)
+
+    resolved = main_module.resolve_run_config_path("bfcl_v3")
+
+    assert resolved == config_path.resolve()
+
+
+def test_resolve_run_config_path_accepts_benchmark_alias(monkeypatch, tmp_path: Path) -> None:
+    run_root = tmp_path / "configs" / "run"
+    run_root.mkdir(parents=True)
+    config_path = run_root / "bfcl_v3.toml"
+    config_path.write_text("[dataset]\nname='bfcl_v3'\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "RUN_CONFIG_ROOT", run_root)
+
+    resolved = main_module.resolve_run_config_path(benchmark="bfcl_v3")
+
+    assert resolved == config_path.resolve()
+
+
 def test_resolve_run_config_dispatches_to_field_runner(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
@@ -76,6 +100,33 @@ def test_resolve_run_config_dispatches_to_field_runner(monkeypatch, tmp_path: Pa
     assert "--batch-size" in resolved.argv
     assert "--cot-mode" in resolved.argv
     assert "--db-write-queue" in resolved.argv
+
+
+def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch, tmp_path: Path) -> None:
+    config = main_module.RunConfig.from_mapping(
+        {
+            "dataset": {"name": "bfcl_v3"},
+            "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
+            "runner": {
+                "benchmark_kind": "bfcl_v3",
+                "avg_ks": [1.0],
+                "max_steps": 20,
+                "max_tool_errors": 20,
+            },
+        }
+    )
+
+    dataset_path = tmp_path / "bfcl_v3" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    resolved = main_module.resolve_run_config(config)
+
+    assert resolved.runner.name == "function_bfcl_v3"
+    assert resolved.module == "src.eval.function_calling.runner"
+    assert "--avg-k" in resolved.argv
+    assert "1.0" in resolved.argv
 
 
 def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: Path) -> None:
@@ -185,6 +236,38 @@ path = "weights/model.pth"
     assert payload["job"] == "instruction_following"
     assert payload["module"] == "src.eval.instruction_following.runner"
     assert payload["dataset_slug"] == "ifeval_test"
+
+
+def test_main_dry_run_accepts_benchmark_alias(monkeypatch, tmp_path: Path, capsys) -> None:
+    run_root = tmp_path / "configs" / "run"
+    run_root.mkdir(parents=True)
+    config_path = run_root / "bfcl_v3.toml"
+    config_path.write_text(
+        """
+[dataset]
+name = "bfcl_v3"
+
+[model]
+infer_base_url = "http://127.0.0.1:8181"
+infer_model = "demo"
+
+[runner]
+benchmark_kind = "bfcl_v3"
+""".strip(),
+        encoding="utf-8",
+    )
+    dataset_path = tmp_path / "bfcl_v3" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "RUN_CONFIG_ROOT", run_root)
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    assert main_module.main(["--benchmark", "bfcl_v3", "--dry-run"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["config_path"] == str(config_path.resolve())
+    assert payload["job"] == "function_bfcl_v3"
+    assert payload["dataset_slug"] == "bfcl_v3_test"
 
 
 def test_dataset_prepare_false_uses_existing_index(monkeypatch, tmp_path: Path) -> None:

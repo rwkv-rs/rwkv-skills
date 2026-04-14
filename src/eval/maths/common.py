@@ -101,7 +101,12 @@ def build_llm_judge(
 ):
     from src.eval.metrics.free_response import LLMJudge, LLMJudgeConfig
 
-    resolved_model = judge_model or os.environ.get("JUDGE_MODEL") or os.environ.get("LLM_JUDGE_MODEL")
+    resolved_model = (
+        judge_model
+        or os.environ.get("judge_model_name")
+        or os.environ.get("JUDGE_MODEL")
+        or os.environ.get("LLM_JUDGE_MODEL")
+    )
     resolved_api_key = (
         judge_api_key
         or os.environ.get("JUDGE_API_KEY")
@@ -112,6 +117,7 @@ def build_llm_judge(
         judge_base_url
         or os.environ.get("JUDGE_BASE_URL")
         or os.environ.get("LLM_JUDGE_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
         or os.environ.get("API_BASE")
     )
 

@@ -25,6 +25,8 @@
 8. `docs/review/08-space.md`：可视化（Space）
 9. `docs/review/09-tests-and-quality.md`：测试与质量保障
 10. `docs/review/10-refactor-roadmap-mainpy.md`：`main.py + 配置驱动 + 多进程` 重构路线
+11. `docs/review/11-benchmark-alignment-plan.md`：benchmark catalog / runner / job 收口计划
+12. `docs/review/12-rwkv-rs-migration-status.md`：`rwkv-rs -> rwkv-skills` 当前已迁入主干与未迁入外壳
 
 ## 重点结论（摘要）
 
@@ -35,4 +37,5 @@
   - 评估器对输入迭代器的消费语义
   - 测试在收集阶段即失败
 - 现有结构适合进入“**一次架构收敛 + 分阶段迁移**”而不是继续补丁式修复。
-
+- 其中 `docs/review/12-rwkv-rs-migration-status.md` 是当前这轮 `rwkv-rs -> rwkv-skills` 迁入判断的收口文档。
+  01-10 更多反映早期全量审阅视角，不应替代该迁入状态结论。

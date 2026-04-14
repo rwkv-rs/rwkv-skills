@@ -10,11 +10,13 @@
   - 很难做单元测试与局部替换（例如将来换成后端 API 拉取）。
 - 建议：拆为 `view_model.py` / `charts.py` / `tables.py` / `io.py` / `app.py`。
 
-### SPC-2. 每次交互都全量扫描分数文件，扩展性差
+### SPC-2. 每次交互都全量重读分数索引，扩展性仍然一般
+- 状态更新（2026-04-03）：**原先“rglob 全盘扫分数目录”问题已修复**
 - 位置：
-  - `src/space/app.py:1311`
-  - `src/space/data.py:306-311`
-- 问题：`update_dashboard` 每次触发都调用 `load_scores()`，而 `load_scores` 会 `rglob("*.json")` 全盘重读。
+  - `src/space/app.py`
+  - `src/space/data.py`
+- 当前行为：`load_scores()` 已改为只读取 `score_index.jsonl`，不再扫 DB latest-score 视图或结果目录。
+- 当前问题：refresh 仍会重读整个 index 文件，还没有增量缓存或内存快照。
 - 影响：结果文件规模稍大时，UI 切换模型会明显卡顿。
 - 建议：
   - 增加增量缓存（mtime/index）。
@@ -61,7 +63,8 @@
 
 ## 模块重构建议
 
-1. **后端先行**：Space 不直接扫文件，改读统一 `score_index`（由主 orchestrator 维护）。
+1. **后端先行**：这一条已完成第一步，Space 主分数已改读统一 `score_index`。
+   剩余问题是把 index 的维护职责进一步收敛到 orchestrator。
 2. **缓存层**：`load_scores` 改为增量索引 + 内存快照。
 3. **组件化 UI**：按“摘要/表格/图表/导出”拆函数与文件，降低变更风险。
 4. **可观测性**：添加 `space_metrics`（扫描时延、加载文件数、解析失败数）。

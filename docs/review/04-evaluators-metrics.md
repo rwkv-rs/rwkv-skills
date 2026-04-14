@@ -15,10 +15,11 @@
 - 建议：开头物化为 list，再复用。
 
 ### EM-3. 指令遵循模块在 import 阶段触发 NLTK 下载
-- 位置：`src/eval/metrics/instruction_following/instructions_util.py:27-35`
-- 问题：模块导入时下载资源，测试/离线环境会直接失败。
-- 影响：`pytest` 收集阶段就报错（已复现）。
-- 建议：改为惰性初始化 + 可配置 data dir + 失败降级。
+- 状态更新（2026-04-03）：**已修复**
+- 当前实现：`instructions_util.py` 已改为惰性初始化，仅在真正构造 sentence tokenizer 时检查/下载资源。
+- 后续可继续增强：
+  - 补更明确的 data dir 配置接口。
+  - 在下载失败时提供更清晰的降级或报错信息。
 
 ## 中优先级问题
 
@@ -45,4 +46,3 @@
 ### EM-7. 指令遵循规则库体量过大且混入大量 TODO
 - 位置：`src/eval/metrics/instruction_following/instructions.py`, `src/eval/metrics/instruction_following/instructions_registry.py`
 - 建议：将规则库与执行框架解耦，支持按数据集裁剪加载。
-

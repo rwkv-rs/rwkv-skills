@@ -26,9 +26,11 @@ from src.infer.backend import (
     RemoteInferenceBackend,
     RemoteInferenceConfig,
     normalize_api_base,
+    normalize_local_device,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
+from src.infer.constraints import LiteralChoiceConstraint
 from src.infer.openai_service import build_chat_completion_response, prepare_chat_completion_request
 from src.infer.openai_service import (
     build_chat_completion_stream_responses,
@@ -58,6 +60,8 @@ class _FakeBackend:
         on_complete=None,
         on_token=None,
         prompt_stop_suffixes=None,
+        constraints=None,
+        constraint_mode="off",
         prompt_seeds=None,
         top_logprobs=0,
         prefill_chunk_size=16,
@@ -68,6 +72,8 @@ class _FakeBackend:
                 "prompts": list(prompts),
                 "batch_size": batch_size,
                 "prompt_stop_suffixes": None if prompt_stop_suffixes is None else [list(item or ()) for item in prompt_stop_suffixes],
+                "constraints": constraints,
+                "constraint_mode": constraint_mode,
                 "prompt_seeds": None if prompt_seeds is None else list(prompt_seeds),
                 "prefill_chunk_size": prefill_chunk_size,
                 "show_progress": show_progress,
@@ -135,12 +141,25 @@ class _Utf8StreamingBackend(_FakeBackend):
         on_complete=None,
         on_token=None,
         prompt_stop_suffixes=None,
+        constraints=None,
+        constraint_mode="off",
         prompt_seeds=None,
         top_logprobs=0,
         prefill_chunk_size=16,
         show_progress=True,
     ):
-        del sampling, batch_size, progress_desc, prompt_stop_suffixes, prompt_seeds, top_logprobs, prefill_chunk_size, show_progress
+        del (
+            sampling,
+            batch_size,
+            progress_desc,
+            prompt_stop_suffixes,
+            constraints,
+            constraint_mode,
+            prompt_seeds,
+            top_logprobs,
+            prefill_chunk_size,
+            show_progress,
+        )
         tokens = [
             GeneratedToken(token_id=1, text="\ufffd", bytes=b"\xe4"),
             GeneratedToken(token_id=2, text="\ufffd", bytes=b"\xb8"),
@@ -652,6 +671,25 @@ def test_remote_backend_uses_chat_completions_and_caches_unsupported_choice_scor
     assert len(completion_calls) == 1
 
 
+def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+        )
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support prompt constraints"):
+        backend.generate(
+            ["prompt"],
+            sampling=SamplingConfig(max_generate_tokens=4),
+            batch_size=1,
+            constraints=[LiteralChoiceConstraint(("TOOL", "ASK", "HANDOFF"))],
+            constraint_mode="strict",
+            show_progress=False,
+        )
+
+
 def test_local_inference_backend_can_select_lightning_engine(monkeypatch, tmp_path) -> None:
     captured: dict[str, object] = {}
 
@@ -703,3 +741,43 @@ def test_local_inference_backend_can_select_lightning_engine(monkeypatch, tmp_pa
 
     backend.shutdown()
     assert fake_engine.shutdown_calls == 1
+
+
+def test_normalize_local_device_promotes_bare_cuda_to_index_zero() -> None:
+    assert normalize_local_device("cuda") == "cuda:0"
+    assert normalize_local_device("cuda:1") == "cuda:1"
+    assert normalize_local_device("cpu") == "cpu"
+
+
+def test_local_inference_backend_normalizes_bare_cuda_before_model_load(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeTokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [1]
+
+        def decode(self, token_ids) -> str:
+            return ""
+
+    class _FakeEngine:
+        def generate(self, prompts, **_kwargs):
+            return []
+
+        def shutdown(self) -> None:
+            return None
+
+    def _fake_load_rwkv_model(config):
+        captured["device"] = config.device
+        return object(), _FakeTokenizer()
+
+    fake_model_module = ModuleType("src.infer.model")
+    fake_model_module.load_rwkv_model = _fake_load_rwkv_model
+    monkeypatch.setitem(sys.modules, "src.infer.model", fake_model_module)
+    monkeypatch.setattr("src.infer.backend.build_local_engine", lambda *_args, **_kwargs: _FakeEngine())
+
+    _ = LocalInferenceBackend.from_model_config(
+        SimpleNamespace(weights_path="/tmp/demo-model.pth", device="cuda"),
+        engine_mode="classic",
+    )
+
+    assert captured["device"] == "cuda:0"

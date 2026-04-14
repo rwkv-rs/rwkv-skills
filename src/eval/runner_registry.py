@@ -265,6 +265,18 @@ FUNCTION_CALLING_RUNNERS: tuple[RunnerSpec, ...] = (
         probe_dataset_required=True,
     ),
     _runner(
+        "function_bfcl_v3",
+        group=RunnerGroup.FUNCTION_CALLING,
+        scheduler_domain="function_calling",
+        module="src.eval.function_calling.runner",
+        is_cot=True,
+        fallback_dataset_slugs=("bfcl_v3_test",),
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_dataset_required=True,
+        probe_question_floor=TARGET_EVAL_ATTEMPTS,
+    ),
+    _runner(
         "function_tau_bench",
         group=RunnerGroup.FUNCTION_CALLING,
         scheduler_domain="function_calling",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
 from urllib import error as urllib_error
@@ -14,6 +14,7 @@ from urllib import request as urllib_request
 import torch
 from tqdm import tqdm
 
+from .constraints import DecodeConstraint
 from .engine import DEFAULT_PREFILL_CHUNK_SIZE, TokenizerProtocol
 from .lightning_engine import LocalEngineProtocol, build_local_engine
 from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
@@ -37,6 +38,14 @@ def normalize_api_base(base_url: str) -> str:
         base = f"http://{base}"
     base = base.rstrip("/")
     return base if base.endswith("/v1") else f"{base}/v1"
+
+
+def normalize_local_device(device: str) -> str:
+    raw = str(device or "").strip() or "cuda"
+    parsed = torch.device(raw)
+    if parsed.type == "cuda" and parsed.index is None:
+        return "cuda:0"
+    return str(parsed)
 
 
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
@@ -103,6 +112,8 @@ class InferenceBackend(Protocol):
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        constraints: Sequence[DecodeConstraint | None] | None = None,
+        constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
@@ -137,6 +148,12 @@ class LocalInferenceBackend:
     ) -> LocalInferenceBackend:
         from .model import load_rwkv_model
 
+        normalized_device = normalize_local_device(str(getattr(config, "device", "cuda") or "cuda"))
+        if getattr(config, "device", None) != normalized_device:
+            if is_dataclass(config):
+                config = replace(config, device=normalized_device)
+            else:
+                setattr(config, "device", normalized_device)
         model, tokenizer = load_rwkv_model(config)
         model_name = Path(config.weights_path).stem
         return cls(
@@ -158,11 +175,17 @@ class LocalInferenceBackend:
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        constraints: Sequence[DecodeConstraint | None] | None = None,
+        constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
+        effective_constraints = _resolve_effective_constraints(
+            constraints=constraints,
+            constraint_mode=constraint_mode,
+        )
         return self.engine.generate(
             prompts,
             sampling=sampling,
@@ -173,6 +196,7 @@ class LocalInferenceBackend:
             on_complete=on_complete,
             on_token=on_token,
             prompt_stop_suffixes=prompt_stop_suffixes,
+            prompt_constraints=effective_constraints,
             prompt_seeds=prompt_seeds,
             top_logprobs=top_logprobs,
             show_progress=show_progress,
@@ -241,11 +265,19 @@ class RemoteInferenceBackend:
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        constraints: Sequence[DecodeConstraint | None] | None = None,
+        constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
+        effective_constraints = _resolve_effective_constraints(
+            constraints=constraints,
+            constraint_mode=constraint_mode,
+        )
+        if effective_constraints is not None and any(constraint is not None for constraint in effective_constraints):
+            raise NotImplementedError("remote infer backend does not support prompt constraints")
         if not prompts:
             return []
         if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
@@ -461,6 +493,24 @@ def _single_token_id(tokenizer: TokenizerProtocol, text: str) -> int:
     return int(token_ids[0])
 
 
+def _normalize_constraint_mode(mode: str | None) -> Literal["off", "soft", "strict"]:
+    normalized = str(mode or "off").strip().lower()
+    if normalized not in {"off", "soft", "strict"}:
+        raise ValueError("constraint_mode must be one of: off, soft, strict")
+    return normalized  # type: ignore[return-value]
+
+
+def _resolve_effective_constraints(
+    *,
+    constraints: Sequence[DecodeConstraint | None] | None,
+    constraint_mode: str | None,
+) -> Sequence[DecodeConstraint | None] | None:
+    mode = _normalize_constraint_mode(constraint_mode)
+    if mode == "off":
+        return None
+    return constraints
+
+
 __all__ = [
     "InferenceBackend",
     "LocalInferenceBackend",
@@ -469,6 +519,7 @@ __all__ = [
     "add_inference_backend_arguments",
     "build_inference_backend_from_args",
     "normalize_api_base",
+    "normalize_local_device",
     "resolve_backend_model_name",
     "validate_inference_backend_args",
 ]

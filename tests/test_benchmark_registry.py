@@ -74,6 +74,7 @@ def test_human_eval_family_is_no_cot_only() -> None:
 def test_function_calling_benchmarks_are_cot_only() -> None:
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     mcp_bench = resolve_benchmark_metadata("mcp_bench_test")
+    bfcl_v3 = resolve_benchmark_metadata("bfcl_v3_test")
     tau_bench = resolve_benchmark_metadata("tau_bench_airline_test")
     tau2_bench = resolve_benchmark_metadata("tau2_bench_retail_base")
 
@@ -82,6 +83,8 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)
     assert mcp_bench.field is BenchmarkField.FUNCTION_CALLING
     assert mcp_bench.scheduler_jobs == ("function_mcp_bench",)
+    assert bfcl_v3.field is BenchmarkField.FUNCTION_CALLING
+    assert bfcl_v3.scheduler_jobs == ("function_bfcl_v3",)
     assert tau_bench.field is BenchmarkField.FUNCTION_CALLING
     assert tau_bench.scheduler_jobs == ("function_tau_bench",)
     assert tau2_bench.default_split == "base"

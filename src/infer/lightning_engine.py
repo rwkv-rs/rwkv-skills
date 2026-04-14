@@ -11,6 +11,7 @@ from typing import Callable, Literal, Protocol, Sequence
 import torch
 from tqdm import tqdm
 
+from .constraints import ConstraintRuntime, DecodeConstraint, build_token_constraint_cache
 from .engine import (
     DEFAULT_PREFILL_CHUNK_SIZE,
     InferenceEngine,
@@ -24,6 +25,7 @@ from .engine import (
     _prepare_state_container,
     _push_generated_token_text,
     _record_generated_text_delta,
+    _token_bytes,
 )
 from .rapid_sampling_loader import get_rapid_sampling_module
 from .sampling import GeneratedTextDelta, GeneratedToken, GenerationOutput, SamplingConfig
@@ -45,6 +47,7 @@ class LocalEngineProtocol(Protocol):
         on_complete=None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        prompt_constraints: Sequence[DecodeConstraint | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         show_progress: bool = True,
@@ -82,6 +85,8 @@ class _LightningTask:
     max_stop_suffix_len: int
     pending_token: GeneratedToken | None
     ready_logits: torch.Tensor | None
+    constraint_runtime: ConstraintRuntime | None
+    finish_reason: str | None
 
 
 class ClassicInferenceEngineAdapter:
@@ -100,6 +105,7 @@ class ClassicInferenceEngineAdapter:
         on_complete=None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        prompt_constraints: Sequence[DecodeConstraint | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         show_progress: bool = True,
@@ -114,6 +120,7 @@ class ClassicInferenceEngineAdapter:
             on_complete=on_complete,
             on_token=on_token,
             prompt_stop_suffixes=prompt_stop_suffixes,
+            prompt_constraints=prompt_constraints,
             prompt_seeds=prompt_seeds,
             top_logprobs=top_logprobs,
             show_progress=show_progress,
@@ -157,6 +164,7 @@ class LightningInferenceEngineAdapter:
         on_complete=None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        prompt_constraints: Sequence[DecodeConstraint | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         show_progress: bool = True,
@@ -174,6 +182,7 @@ class LightningInferenceEngineAdapter:
             on_complete,
             on_token,
             prompt_stop_suffixes,
+            prompt_constraints,
             prompt_seeds,
             top_logprobs,
             show_progress,
@@ -224,6 +233,7 @@ def _lightning_continuous_batching(
     on_complete: Callable[[GenerationOutput], None] | None,
     on_token: Callable[[int, GeneratedTextDelta], None] | None,
     prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+    prompt_constraints: Sequence[DecodeConstraint | None] | None,
     prompt_seeds: Sequence[int | None] | None,
     top_logprobs: int,
     show_progress: bool,
@@ -235,6 +245,8 @@ def _lightning_continuous_batching(
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
     if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
         raise ValueError("prompt_stop_suffixes 长度必须与 prompts 一致")
+    if prompt_constraints is not None and len(prompt_constraints) != len(prompts):
+        raise ValueError("prompt_constraints 长度必须与 prompts 一致")
 
     batch_size = max(1, min(int(batch_size), len(prompts)))
     prefill_chunk_size = max(1, int(prefill_chunk_size))
@@ -284,6 +296,10 @@ def _lightning_continuous_batching(
         stop_suffixes = None if prompt_stop_suffixes is None else prompt_stop_suffixes[idx]
         normalized_stop_suffixes, max_stop_suffix_len = _normalize_stop_suffixes(stop_suffixes)
         encoded.append((idx, prompt, tokens, seed, normalized_stop_suffixes, max_stop_suffix_len))
+
+    constraint_cache = None
+    if prompt_constraints is not None and any(constraint is not None for constraint in prompt_constraints):
+        constraint_cache = build_token_constraint_cache(tokenizer, vocab_size=vocab_size)
 
     active_tasks: list[_LightningTask] = []
 
@@ -433,6 +449,16 @@ def _lightning_continuous_batching(
     def _extract_slot_logits(logits: torch.Tensor, local_idx: int) -> torch.Tensor:
         return logits[local_idx].detach().clone()
 
+    def _build_constraint_runtime(prompt_idx: int) -> ConstraintRuntime | None:
+        if prompt_constraints is None:
+            return None
+        constraint = prompt_constraints[prompt_idx]
+        if constraint is None:
+            return None
+        if constraint_cache is None:
+            raise RuntimeError("constraint cache was not initialized")
+        return ConstraintRuntime(constraint=constraint.clone(), cache=constraint_cache)
+
     def _activate_slot(slot_idx: int) -> bool:
         if not encoded:
             return False
@@ -478,6 +504,8 @@ def _lightning_continuous_batching(
             max_stop_suffix_len=max_stop_suffix_len,
             pending_token=None,
             ready_logits=ready_logits,
+            constraint_runtime=_build_constraint_runtime(prompt_idx),
+            finish_reason=None,
         )
         if slot_idx < len(active_tasks):
             active_tasks[slot_idx] = task
@@ -511,6 +539,25 @@ def _lightning_continuous_batching(
     while active_tasks:
         accomplished: list[int] = []
         for idx, task in enumerate(active_tasks):
+            if task.finish_reason is not None:
+                if not task.pending_tokens and task.pending_token is None and task.ready_logits is None:
+                    for delta in _finish_generated_text(task):
+                        _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+                    output = GenerationOutput(
+                        prompt_index=task.prompt_index,
+                        prompt=task.prompt,
+                        token_ids=list(task.generated_tokens),
+                        text="".join(task.emitted_text_parts),
+                        finish_reason=task.finish_reason,
+                        tokens=list(task.generated_events),
+                    )
+                    if on_complete is not None and not probe_only:
+                        on_complete(output)
+                    outputs.append(output)
+                    pbar.update(1)
+                    if not _activate_slot(idx):
+                        accomplished.append(idx)
+                continue
             if task.pending_tokens or task.ready_logits is not None:
                 continue
             generated_token = task.pending_token
@@ -523,15 +570,21 @@ def _lightning_continuous_batching(
             max_generated_tokens = 1 if probe_only else sampling.max_generate_tokens
             reached_stop = token_id in stop_tokens
             matched_stop_suffix = False
+            reached_constraint = False
             if not reached_stop:
                 task.generated_token_count += 1
                 deltas, matched_stop_suffix = _push_generated_token_text(task, generated_token)
                 for delta in deltas:
                     _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+                if task.constraint_runtime is not None:
+                    if not task.constraint_runtime.commit_token_bytes(_token_bytes(generated_token)):
+                        task.finish_reason = "constraint_violation"
+                    elif task.constraint_runtime.is_complete():
+                        reached_constraint = True
             reached_length = task.generated_token_count >= max_generated_tokens
-            if not reached_stop and not matched_stop_suffix and not reached_length:
+            if not reached_stop and not matched_stop_suffix and not reached_length and not reached_constraint and task.finish_reason is None:
                 task.pending_tokens.append(token_id)
-            if reached_stop or matched_stop_suffix or reached_length:
+            if reached_stop or matched_stop_suffix or reached_length or reached_constraint or task.finish_reason is not None:
                 if not matched_stop_suffix:
                     for delta in _finish_generated_text(task):
                         _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
@@ -540,7 +593,10 @@ def _lightning_continuous_batching(
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
                     text="".join(task.emitted_text_parts),
-                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
+                    finish_reason=(
+                        task.finish_reason
+                        or ("constraint_stop" if reached_constraint else ("stop_token" if (reached_stop or matched_stop_suffix) else "max_length"))
+                    ),
                     tokens=list(task.generated_events),
                 )
                 if on_complete is not None and not probe_only:
@@ -644,12 +700,31 @@ def _lightning_continuous_batching(
         combined_logits = torch.cat(sample_logits_parts, dim=0).to(device=device, dtype=torch.float32)
         if ban_token_ids:
             combined_logits[:, ban_token_ids] = -math.inf
-        sampled_list = _sample_rows(combined_logits, active_count, sample_rows)
+        eligible_sample_rows: list[int] = []
+        eligible_logits_parts: list[torch.Tensor] = []
         for local_idx, task_idx in enumerate(sample_rows):
+            runtime = active_tasks[task_idx].constraint_runtime
+            row_logits = combined_logits[local_idx]
+            if runtime is not None:
+                allowed_ids = runtime.allowed_token_ids()
+                if not allowed_ids:
+                    active_tasks[task_idx].finish_reason = "constraint_dead_end"
+                    continue
+                allowed_tensor = torch.tensor(sorted(allowed_ids), dtype=torch.int64, device=device)
+                masked = torch.full_like(row_logits, -math.inf)
+                masked.index_copy_(0, allowed_tensor, row_logits.index_select(0, allowed_tensor))
+                row_logits = masked
+            eligible_sample_rows.append(task_idx)
+            eligible_logits_parts.append(row_logits.reshape(1, -1))
+        if not eligible_sample_rows:
+            continue
+        sampled_logits = torch.cat(eligible_logits_parts, dim=0)
+        sampled_list = _sample_rows(sampled_logits, active_count, eligible_sample_rows)
+        for local_idx, task_idx in enumerate(eligible_sample_rows):
             token_id = int(sampled_list[local_idx])
             active_tasks[task_idx].pending_token = _build_generated_token(
                 tokenizer,
-                combined_logits[local_idx],
+                sampled_logits[local_idx],
                 token_id,
                 top_logprobs=top_logprobs,
                 include_logprobs=top_logprobs > 0,

@@ -29,3 +29,10 @@
 - 可用 template = "name" 或 templates = ["base", "override"] 先合并模板再覆盖。
 - 同时存在 [default] 与 [cot]/[final] 时，按 default -> stage -> model 的顺序合并。
 - 如果缺少 benchmark 文件，调用方可通过 fallback_templates 使用 configs/_templates.toml 里的模板。
+
+`python -m src.main` 使用的统一运行配置放在 `configs/run/`：
+
+- 路径：`configs/run/<benchmark>.toml`
+- 可用 `python -m src.main --benchmark <benchmark>` 自动解析这个文件
+- 也可用 `python -m src.main --config <name>` 解析 `configs/run/<name>.toml`
+- 这类运行配置与 `configs/<benchmark>.toml` 的采样配置是两套独立文件

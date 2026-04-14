@@ -36,6 +36,7 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["instruction_following"].module == "src.eval.instruction_following.runner"
     assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_bfcl_v3"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["multi_choice_plain"].extra_args == ("--cot-mode", "no_cot")
@@ -86,17 +87,20 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
 def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert "function_browsecomp" in JOB_CATALOGUE
     assert "function_mcp_bench" in JOB_CATALOGUE
+    assert "function_bfcl_v3" in JOB_CATALOGUE
     assert "function_tau_bench" in JOB_CATALOGUE
     assert "function_tau2_bench" in JOB_CATALOGUE
 
     browsecomp_slugs = JOB_CATALOGUE["function_browsecomp"].dataset_slugs
     mcp_slugs = JOB_CATALOGUE["function_mcp_bench"].dataset_slugs
+    bfcl_slugs = JOB_CATALOGUE["function_bfcl_v3"].dataset_slugs
     tau_slugs = JOB_CATALOGUE["function_tau_bench"].dataset_slugs
     tau2_slugs = JOB_CATALOGUE["function_tau2_bench"].dataset_slugs
 
     assert canonical_slug("browsecomp_test") in browsecomp_slugs
     assert canonical_slug("browsecomp_zh_test") in browsecomp_slugs
     assert canonical_slug("mcp_bench_test") in mcp_slugs
+    assert canonical_slug("bfcl_v3_test") in bfcl_slugs
     assert canonical_slug("tau_bench_retail_test") in tau_slugs
     assert canonical_slug("tau_bench_airline_test") in tau_slugs
     assert canonical_slug("tau_bench_telecom_test") in tau_slugs
@@ -106,6 +110,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
 
     assert detect_job_from_dataset(canonical_slug("browsecomp_test"), is_cot=True) == "function_browsecomp"
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
+    assert detect_job_from_dataset(canonical_slug("bfcl_v3_test"), is_cot=True) == "function_bfcl_v3"
     assert detect_job_from_dataset(canonical_slug("tau_bench_retail_test"), is_cot=True) == "function_tau_bench"
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"
 

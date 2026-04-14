@@ -31,3 +31,10 @@ Notes:
 - Use template = "name" or templates = ["base", "override"] to merge templates before overrides.
 - When both [default] and [cot]/[final] exist, values are merged in order: default -> stage -> model.
 - When benchmark config is missing, callers may supply fallback_templates to use templates from configs/_templates.toml.
+
+Unified run configs for `python -m src.main` live under `configs/run/`:
+
+- Path: `configs/run/<benchmark>.toml`
+- Use `python -m src.main --benchmark <benchmark>` to resolve that file automatically
+- Use `python -m src.main --config <name>` to resolve `configs/run/<name>.toml`
+- These run configs are separate from the sampling configs in `configs/<benchmark>.toml`

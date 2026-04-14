@@ -21,6 +21,7 @@ from src.space.domains import (
 def test_infer_domain_recognizes_function_calling_jobs() -> None:
     assert _infer_domain("browsecomp_test", is_cot=True, task="function_browsecomp") == DOMAIN_FUNCTION_CALL
     assert _infer_domain("mcp_bench_test", is_cot=True, task="function_mcp_bench") == DOMAIN_FUNCTION_CALL
+    assert _infer_domain("bfcl_v3_test", is_cot=True, task="function_bfcl_v3") == DOMAIN_FUNCTION_CALL
     assert _infer_domain("tau_bench_airline_test", is_cot=True, task="function_tau_bench") == DOMAIN_FUNCTION_CALL
     assert _infer_domain("tau2_bench_telecom_base", is_cot=True, task="function_tau2_bench") == DOMAIN_FUNCTION_CALL
 

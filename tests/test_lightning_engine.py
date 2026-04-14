@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import torch
 
+from src.infer.constraints import LiteralChoiceConstraint
 from src.infer.engine import InferenceEngine
 from src.infer.lightning_engine import LightningEngineConfig, LightningInferenceEngineAdapter
 from src.infer.sampling import SamplingConfig
@@ -330,3 +331,97 @@ def test_local_engines_stop_on_text_suffix_without_extra_forward(monkeypatch, tm
     assert lightning_outputs[0].token_ids == [2]
     assert lightning_outputs[0].finish_reason == "stop_token"
     assert lightning_model.forward_calls == [(1,), (2,), (3,)]
+
+
+def test_local_engines_support_literal_choice_constraints(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("src.infer.engine.get_rapid_sampling_module", lambda: _FakeRapidSampler())
+    monkeypatch.setattr("src.infer.lightning_engine.get_rapid_sampling_module", lambda: _FakeRapidSampler())
+
+    tokenizer = _FakeTokenizer()
+
+    classic_model = _StreamingFakeModel()
+    classic_engine = InferenceEngine(classic_model, tokenizer)
+    classic_outputs = classic_engine.generate(
+        ["abcd"],
+        sampling=_sampling(),
+        batch_size=1,
+        prefill_chunk_size=8,
+        prompt_constraints=[LiteralChoiceConstraint(("7",))],
+        show_progress=False,
+    )
+
+    lightning_model = _StreamingFakeModel()
+    lightning_engine = LightningInferenceEngineAdapter(
+        lightning_model,
+        tokenizer,
+        config=LightningEngineConfig(
+            state_db_path=str(tmp_path / "constraint-cache.db"),
+            prefix_cache_buckets=(2, 4),
+            prefix_bucket_capacity=8,
+        ),
+    )
+    try:
+        lightning_outputs = lightning_engine.generate(
+            ["abcd"],
+            sampling=_sampling(),
+            batch_size=1,
+            prefill_chunk_size=8,
+            prompt_constraints=[LiteralChoiceConstraint(("7",))],
+            show_progress=False,
+        )
+    finally:
+        lightning_engine.shutdown()
+
+    assert classic_outputs[0].finish_reason == "constraint_stop"
+    assert classic_outputs[0].token_ids == [7]
+    assert classic_outputs[0].text == "7"
+    assert lightning_outputs[0].finish_reason == "constraint_stop"
+    assert lightning_outputs[0].token_ids == [7]
+    assert lightning_outputs[0].text == "7"
+
+
+def test_local_engines_report_constraint_dead_end(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("src.infer.engine.get_rapid_sampling_module", lambda: _FakeRapidSampler())
+    monkeypatch.setattr("src.infer.lightning_engine.get_rapid_sampling_module", lambda: _FakeRapidSampler())
+
+    tokenizer = _FakeTokenizer()
+
+    classic_model = _StreamingFakeModel()
+    classic_engine = InferenceEngine(classic_model, tokenizer)
+    classic_outputs = classic_engine.generate(
+        ["abcd"],
+        sampling=_sampling(),
+        batch_size=1,
+        prefill_chunk_size=8,
+        prompt_constraints=[LiteralChoiceConstraint(("9",))],
+        show_progress=False,
+    )
+
+    lightning_model = _StreamingFakeModel()
+    lightning_engine = LightningInferenceEngineAdapter(
+        lightning_model,
+        tokenizer,
+        config=LightningEngineConfig(
+            state_db_path=str(tmp_path / "constraint-dead-end.db"),
+            prefix_cache_buckets=(2, 4),
+            prefix_bucket_capacity=8,
+        ),
+    )
+    try:
+        lightning_outputs = lightning_engine.generate(
+            ["abcd"],
+            sampling=_sampling(),
+            batch_size=1,
+            prefill_chunk_size=8,
+            prompt_constraints=[LiteralChoiceConstraint(("9",))],
+            show_progress=False,
+        )
+    finally:
+        lightning_engine.shutdown()
+
+    assert classic_outputs[0].finish_reason == "constraint_dead_end"
+    assert classic_outputs[0].token_ids == []
+    assert classic_outputs[0].text == ""
+    assert lightning_outputs[0].finish_reason == "constraint_dead_end"
+    assert lightning_outputs[0].token_ids == []
+    assert lightning_outputs[0].text == ""

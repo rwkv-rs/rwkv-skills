@@ -20,6 +20,9 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path, make_dataset_slug, split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RUN_CONFIG_ROOT = REPO_ROOT / "configs" / "run"
+
 
 def _as_mapping(value: object, *, field_name: str) -> Mapping[str, Any]:
     if value is None:
@@ -180,6 +183,7 @@ class RunnerSection:
     max_rounds: int | None = None
     max_steps: int | None = None
     max_tool_errors: int | None = None
+    history_max_chars: int | None = None
     enable_think: bool = False
     stop_tokens: tuple[int, ...] = ()
     ban_tokens: tuple[int, ...] = ()
@@ -214,6 +218,7 @@ class RunnerSection:
             max_rounds=_maybe_int(payload.get("max_rounds"), field_name="runner.max_rounds"),
             max_steps=_maybe_int(payload.get("max_steps"), field_name="runner.max_steps"),
             max_tool_errors=_maybe_int(payload.get("max_tool_errors"), field_name="runner.max_tool_errors"),
+            history_max_chars=_maybe_int(payload.get("history_max_chars"), field_name="runner.history_max_chars"),
             enable_think=bool(_maybe_bool(payload.get("enable_think"), field_name="runner.enable_think") or False),
             stop_tokens=_tuple_int(payload.get("stop_tokens"), field_name="runner.stop_tokens"),
             ban_tokens=_tuple_int(payload.get("ban_tokens"), field_name="runner.ban_tokens"),
@@ -267,9 +272,46 @@ class ResolvedRun:
 
 
 def load_run_config(config_path: str | Path) -> RunConfig:
-    path = Path(config_path).expanduser().resolve()
+    path = resolve_run_config_path(config_path)
     payload = _load_config_mapping(path)
     return RunConfig.from_mapping(payload, source_path=path)
+
+
+def resolve_run_config_path(config_path: str | Path | None = None, *, benchmark: str | None = None) -> Path:
+    if benchmark:
+        benchmark_slug = canonical_slug(benchmark)
+        candidate = RUN_CONFIG_ROOT / f"{benchmark_slug}.toml"
+        if candidate.is_file():
+            return candidate.resolve()
+        raise FileNotFoundError(
+            f"run config for benchmark {benchmark_slug!r} not found: {candidate}"
+        )
+
+    if config_path is None:
+        raise ValueError("config path or benchmark name is required")
+
+    raw = str(config_path).strip()
+    if not raw:
+        raise ValueError("config path must not be empty")
+
+    direct = Path(raw).expanduser()
+    if direct.is_file():
+        return direct.resolve()
+
+    candidate = RUN_CONFIG_ROOT / raw
+    if candidate.is_file():
+        return candidate.resolve()
+
+    if direct.suffix:
+        raise FileNotFoundError(f"config file not found: {direct.resolve()}")
+
+    named = RUN_CONFIG_ROOT / f"{canonical_slug(raw)}.toml"
+    if named.is_file():
+        return named.resolve()
+
+    raise FileNotFoundError(
+        f"config file not found: {raw!r}; searched {direct.resolve()} and {named}"
+    )
 
 
 def _load_config_mapping(path: Path) -> Mapping[str, Any]:
@@ -479,6 +521,8 @@ def _function_calling_benchmark_kind(job_name: str) -> str:
         return "browsecomp"
     if job_name == "function_mcp_bench":
         return "mcp_bench"
+    if job_name == "function_bfcl_v3":
+        return "bfcl_v3"
     if job_name == "function_tau2_bench":
         return "tau2_bench"
     return "tau_bench"
@@ -548,6 +592,8 @@ def _build_runner_argv(
         _append_flag(argv, "--benchmark-kind", runner_cfg.benchmark_kind or _function_calling_benchmark_kind(runner.name))
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
         _append_flag(argv, "--db-close-timeout-s", runner_cfg.db_close_timeout_s)
+        _append_flag(argv, "--history-max-chars", runner_cfg.history_max_chars)
+        _append_repeatable(argv, "--avg-k", runner_cfg.avg_ks)
         if runner.name == "function_browsecomp":
             _append_flag(argv, "--cot-max-tokens", runner_cfg.cot_max_tokens)
             _append_flag(argv, "--answer-max-tokens", runner_cfg.answer_max_tokens)
@@ -624,17 +670,27 @@ def _patched_environ(overrides: Mapping[str, str]) -> Iterator[None]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RWKV unified config-driven entry")
-    parser.add_argument("--config", required=True, help="Run config path (.toml/.json/.yaml)")
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument(
+        "--config",
+        help="Run config path (.toml/.json/.yaml) or config name under configs/run/",
+    )
+    target.add_argument(
+        "--benchmark",
+        help="Benchmark name resolved to configs/run/<benchmark>.toml",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Resolve config and print runner invocation without executing")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config = load_run_config(args.config)
+    config_path = resolve_run_config_path(args.config, benchmark=args.benchmark)
+    config = load_run_config(config_path)
     resolved = resolve_run_config(config)
     if args.dry_run:
         payload = {
+            "config_path": str(config_path),
             "module": resolved.module,
             "job": resolved.runner.name,
             "dataset_slug": resolved.dataset_slug,
@@ -657,6 +713,11 @@ __all__ = [
     "build_parser",
     "load_run_config",
     "main",
+    "resolve_run_config_path",
     "resolve_run_config",
     "run_from_config",
 ]
+
+
+if __name__ == "__main__":  # pragma: no cover - module entrypoint
+    raise SystemExit(main())

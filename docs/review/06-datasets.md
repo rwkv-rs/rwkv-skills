@@ -3,20 +3,24 @@
 ## 高优先级问题（会影响结果可信度或重构可行性）
 
 ### DS-1. 数据缓存路径协议不统一，`output_root` 与缓存根混用
+- 状态更新（2026-04-03）：**主干已基本修复**
 - 位置：
   - `src/eval/datasets/data_prepper/code_generation/human_eval.py:19`
   - `src/eval/datasets/data_prepper/free_answer/gsm_plus.py:39`
   - `src/eval/datasets/data_prepper/instruction_following/ifbench.py:18`
   - `src/eval/datasets/data_prepper/free_answer/mawps.py:18`
   - （同类问题分布在多个 prepper）
-- 问题：大量 preparer 直接写死 `dataset_cache_dir(Path("data"), ...)`，而不是从调用方传入的运行目录/缓存策略生成。
+- 原始问题：大量 preparer 直接写死 `dataset_cache_dir(Path("data"), ...)`，而不是从调用方传入的运行目录/缓存策略生成。
+- 当前状态：
+  - `DatasetPrepareContext` 已真正下传到 runtime loader。
+  - `CallableRowsDatasetSpec` / `MaterializingDatasetSpec` 已在准备阶段注入统一的数据根与 HF cache 环境。
+  - 这批 `Path("data")` / `data/hf_cache` 硬编码已从主干中清掉。
 - 影响：
   - 多进程并发准备数据时，缓存目录冲突概率高。
   - 未来切到 `main.py + 配置文件` 后，配置化的输出根与缓存根无法严格隔离。
   - 在不同工作目录运行同一任务时，行为不可预测（隐式依赖 CWD）。
-- 建议：
-  - 明确拆分 `data_root` / `cache_root` / `artifact_root` 三个路径，并全部来自 `RunConfig`。
-  - preparer 接口从 `Callable[[Path, str], list[Path]]` 升级为接收结构化上下文（如 `DatasetPrepareContext`）。
+- 后续建议：
+  - 继续把 `data_root` / `cache_root` / `artifact_root` 暴露到顶层 `RunConfig`，而不是仅存在于 dataset runtime 内部。
 
 ### DS-2. split 语义与真实数据源不一致，存在“名义 test / 实际 train”风险
 - 位置：

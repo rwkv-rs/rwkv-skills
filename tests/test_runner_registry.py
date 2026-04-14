@@ -20,6 +20,7 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]] == [
         "function_browsecomp",
         "function_mcp_bench",
+        "function_bfcl_v3",
         "function_tau_bench",
         "function_tau2_bench",
     ]

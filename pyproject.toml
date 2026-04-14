@@ -10,6 +10,7 @@ dependencies = [
     "datasets>=3.6.0,<4.0.0",
     "deepspeed>=0.17.1",
     "einops>=0.8.1",
+    "fastapi>=0.115.0,<1.0.0",
     "gputils>=1.0.6",
     "lightning>=2.5.1.post0",
     "loguru>=0.7.3",
@@ -64,6 +65,7 @@ dependencies = [
     "jsonschema>=4.25.1",
     "psycopg[binary,pool]>=3.3.2",
     "socksio>=1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
 ]
 
 [build-system]
@@ -140,7 +142,9 @@ url = "https://mirrors.ustc.edu.cn/pypi/simple"
 default = true
 
 [project.scripts]
+rwkv-skills = "src.main:main"
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"
+rwkv-skills-infer = "src.bin.run_infer_server:main"
 rwkv-download-weights = "src.bin.download_weights:main"
 rwkv-skills-space = "src.space.app:main"
 

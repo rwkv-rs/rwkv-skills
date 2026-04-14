@@ -9,12 +9,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .context_budget import (
+    DEFAULT_HISTORY_MAX_CHARS,
+    DEFAULT_TOOL_ERROR_MAX_CHARS,
+    DEFAULT_TOOL_RESULT_MAX_CHARS,
+    DEFAULT_TOOL_SCHEMA_MAX_CHARS,
+    trim_history,
+    truncate_text,
+)
 
 MCP_BENCH_PASS_THRESHOLD = 7.0
-MCP_BENCH_MAX_TOOL_SCHEMA_CHARS = 1200
-MCP_BENCH_MAX_RESULT_CHARS = 4000
-MCP_BENCH_MAX_ERROR_CHARS = 1000
-MCP_BENCH_MAX_HISTORY_CHARS = 24000
+MCP_BENCH_MAX_TOOL_SCHEMA_CHARS = DEFAULT_TOOL_SCHEMA_MAX_CHARS
+MCP_BENCH_MAX_RESULT_CHARS = DEFAULT_TOOL_RESULT_MAX_CHARS
+MCP_BENCH_MAX_ERROR_CHARS = DEFAULT_TOOL_ERROR_MAX_CHARS
+MCP_BENCH_MAX_HISTORY_CHARS = DEFAULT_HISTORY_MAX_CHARS
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,19 +547,6 @@ def render_schema_summary(schema: Any) -> str:
     if schema is None:
         return ""
     return truncate_text(json.dumps(schema, ensure_ascii=False), MCP_BENCH_MAX_TOOL_SCHEMA_CHARS)
-
-
-def trim_history(history: str, max_chars: int) -> str:
-    if len(history) <= max_chars:
-        return history
-    keep_tail = max(0, max_chars - 64)
-    return "[Earlier execution history truncated]\n\n" + history[-keep_tail:]
-
-
-def truncate_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "..."
 
 
 def _fmt_optional(value: float | None) -> str:

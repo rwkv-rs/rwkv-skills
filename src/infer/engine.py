@@ -11,6 +11,7 @@ from typing import Callable, Sequence
 import torch
 from tqdm import tqdm
 
+from .constraints import ConstraintRuntime, DecodeConstraint, build_token_constraint_cache
 from .rapid_sampling_loader import get_rapid_sampling_module
 from .sampling import GeneratedTextDelta, GeneratedToken, GeneratedTokenCandidate, GenerationOutput, SamplingConfig
 
@@ -53,6 +54,7 @@ class InferenceEngine:
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        prompt_constraints: Sequence[DecodeConstraint | None] | None = None,
         prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         show_progress: bool = True,
@@ -69,6 +71,7 @@ class InferenceEngine:
             on_complete,
             on_token,
             prompt_stop_suffixes,
+            prompt_constraints,
             prompt_seeds,
             top_logprobs,
             show_progress,
@@ -90,6 +93,7 @@ class _ActiveTask:
     stop_suffixes: tuple[tuple[str, bytes], ...]
     max_stop_suffix_len: int
     pending_token: GeneratedToken | None
+    constraint_runtime: ConstraintRuntime | None
     finish_reason: str | None
 
 
@@ -105,6 +109,7 @@ def _continuous_batching(
     on_complete: Callable[[GenerationOutput], None] | None = None,
     on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
     prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+    prompt_constraints: Sequence[DecodeConstraint | None] | None = None,
     prompt_seeds: Sequence[int | None] | None = None,
     top_logprobs: int = 0,
     show_progress: bool = True,
@@ -115,6 +120,8 @@ def _continuous_batching(
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
     if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
         raise ValueError("prompt_stop_suffixes 长度必须与 prompts 一致")
+    if prompt_constraints is not None and len(prompt_constraints) != len(prompts):
+        raise ValueError("prompt_constraints 长度必须与 prompts 一致")
     batch_size = max(1, min(batch_size, len(prompts)))
     prefill_chunk_size = max(1, int(prefill_chunk_size))
     top_logprobs = max(0, int(top_logprobs))
@@ -202,6 +209,20 @@ def _continuous_batching(
     if valid_no_penalty_ids:
         no_penalty_ids = torch.tensor(valid_no_penalty_ids, dtype=torch.int64, device=device)
 
+    constraint_cache = None
+    if prompt_constraints is not None and any(constraint is not None for constraint in prompt_constraints):
+        constraint_cache = build_token_constraint_cache(tokenizer, vocab_size=vocab_size)
+
+    def _build_constraint_runtime(prompt_idx: int) -> ConstraintRuntime | None:
+        if prompt_constraints is None:
+            return None
+        constraint = prompt_constraints[prompt_idx]
+        if constraint is None:
+            return None
+        if constraint_cache is None:
+            raise RuntimeError("constraint cache was not initialized")
+        return ConstraintRuntime(constraint=constraint.clone(), cache=constraint_cache)
+
     active_tasks: list[_ActiveTask] = []
     for slot_idx in range(batch_size):
         prompt_idx, prompt, tokens, seed, stop_suffixes, max_stop_suffix_len = encoded.popleft()
@@ -221,6 +242,7 @@ def _continuous_batching(
                 stop_suffixes,
                 max_stop_suffix_len,
                 None,
+                _build_constraint_runtime(prompt_idx),
                 None,
             )
         )
@@ -335,6 +357,48 @@ def _continuous_batching(
         accomplished: list[int] = []
 
         for idx, task in enumerate(active_tasks):
+            if task.finish_reason is not None:
+                if not task.pending_tokens and task.pending_token is None:
+                    for delta in _finish_generated_text(task):
+                        _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+                    output = GenerationOutput(
+                        prompt_index=task.prompt_index,
+                        prompt=task.prompt,
+                        token_ids=list(task.generated_tokens),
+                        text="".join(task.emitted_text_parts),
+                        finish_reason=task.finish_reason,
+                        tokens=list(task.generated_events),
+                    )
+                    if on_complete is not None and not probe_only:
+                        on_complete(output)
+                    outputs.append(output)
+                    pbar.update(1)
+                    if encoded:
+                        prompt_idx, prompt, tokens, seed, stop_suffixes, max_stop_suffix_len = encoded.popleft()
+                        pending = deque(tokens)
+                        active_tasks[idx] = _ActiveTask(
+                            prompt_idx,
+                            prompt,
+                            pending,
+                            len(tokens),
+                            0,
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
+                            stop_suffixes,
+                            max_stop_suffix_len,
+                            None,
+                            _build_constraint_runtime(prompt_idx),
+                            None,
+                        )
+                        _reset_slot(idx)
+                        if seed is not None:
+                            _set_sampler_seed(idx, seed)
+                    else:
+                        accomplished.append(idx)
+                continue
             if task.pending_tokens:
                 continue
             generated_token = task.pending_token
@@ -347,15 +411,21 @@ def _continuous_batching(
             max_generated_tokens = 1 if probe_only else sampling.max_generate_tokens
             reached_stop = token_id in stop_tokens
             matched_stop_suffix = False
+            reached_constraint = False
             if not reached_stop:
                 task.generated_token_count += 1
                 deltas, matched_stop_suffix = _push_generated_token_text(task, generated_token)
                 for delta in deltas:
                     _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
+                if task.constraint_runtime is not None:
+                    if not task.constraint_runtime.commit_token_bytes(_token_bytes(generated_token)):
+                        task.finish_reason = "constraint_violation"
+                    elif task.constraint_runtime.is_complete():
+                        reached_constraint = True
             reached_length = task.generated_token_count >= max_generated_tokens
-            if not reached_stop and not matched_stop_suffix and not reached_length:
+            if not reached_stop and not matched_stop_suffix and not reached_length and not reached_constraint and task.finish_reason is None:
                 task.pending_tokens.append(token_id)
-            if reached_stop or matched_stop_suffix or reached_length:
+            if reached_stop or matched_stop_suffix or reached_length or reached_constraint or task.finish_reason is not None:
                 if not matched_stop_suffix:
                     for delta in _finish_generated_text(task):
                         _record_generated_text_delta(task, delta, on_token=on_token, probe_only=probe_only)
@@ -364,7 +434,10 @@ def _continuous_batching(
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
                     text="".join(task.emitted_text_parts),
-                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
+                    finish_reason=(
+                        task.finish_reason
+                        or ("constraint_stop" if reached_constraint else ("stop_token" if (reached_stop or matched_stop_suffix) else "max_length"))
+                    ),
                     tokens=list(task.generated_events),
                 )
                 if on_complete is not None and not probe_only:
@@ -388,6 +461,7 @@ def _continuous_batching(
                         stop_suffixes,
                         max_stop_suffix_len,
                         None,
+                        _build_constraint_runtime(prompt_idx),
                         None,
                     )
                     _reset_slot(idx)
@@ -442,8 +516,24 @@ def _continuous_batching(
         if ban_token_ids:
             logits[:, ban_token_ids] = -math.inf
 
-        sampled_list = _sample_subset(logits, active_count, rows_to_sample)
-        for local_idx, task_idx in enumerate(rows_to_sample):
+        constrained_rows: list[int] = []
+        for task_idx in rows_to_sample:
+            runtime = active_tasks[task_idx].constraint_runtime
+            if runtime is None:
+                constrained_rows.append(task_idx)
+                continue
+            allowed_ids = runtime.allowed_token_ids()
+            if not allowed_ids:
+                active_tasks[task_idx].finish_reason = "constraint_dead_end"
+                continue
+            allowed_tensor = torch.tensor(sorted(allowed_ids), dtype=torch.int64, device=device)
+            masked = torch.full_like(logits[task_idx], -math.inf)
+            masked.index_copy_(0, allowed_tensor, logits[task_idx].index_select(0, allowed_tensor))
+            logits[task_idx] = masked
+            constrained_rows.append(task_idx)
+
+        sampled_list = _sample_subset(logits, active_count, constrained_rows)
+        for local_idx, task_idx in enumerate(constrained_rows):
             token_id = int(sampled_list[local_idx])
             active_tasks[task_idx].pending_token = _build_generated_token(
                 tokenizer,

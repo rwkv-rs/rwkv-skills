@@ -7,6 +7,7 @@ from typing import Collection, Sequence
 
 
 DATASET_SLUG_ALIASES: dict[str, str] = {
+    "gsm8k": "gsm8k_test",
     "math500": "math_500_test",
     "math": "hendrycks_math_test",
     "input_data": "ifeval_test",

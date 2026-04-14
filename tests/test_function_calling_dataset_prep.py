@@ -13,6 +13,7 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "browsecomp" in names
     assert "browsecomp_zh" in names
     assert "mcp_bench" in names
+    assert "bfcl_v3" in names
     assert "tau_bench_retail" in names
     assert "tau2_bench_airline" in names
 
@@ -111,6 +112,105 @@ def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch
             "runtime_root": str(runtime_root),
             "tasks_root": str(tasks_root),
             "task_assets_commit_hint": "local_rwkv_rs_snapshot",
+        }
+    ]
+
+
+def test_prepare_dataset_materializes_bfcl_v3_spec(tmp_path: Path, monkeypatch) -> None:
+    source_a = tmp_path / "BFCL_v3_multi_turn_base.json"
+    source_b = tmp_path / "BFCL_v3_multi_turn_miss_func.json"
+    source_a.write_text('{"id":"a"}\n', encoding="utf-8")
+    source_b.write_text('{"id":"b"}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.bfcl_v3.bfcl_v3_source_paths",
+        lambda _split: (source_a, source_b),
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.bfcl_v3.load_bfcl_v3_rows_from_source",
+        lambda path: [
+            {
+                "task_id": f"bfcl_v3_{Path(path).stem}",
+                "instruction": f"Instruction from {Path(path).name}",
+                "tools": [
+                    {
+                        "name": "search_flights",
+                        "description": "Search flights",
+                        "parameters": {"type": "object", "properties": {"from": {"type": "string"}}},
+                    }
+                ],
+                "expected_tool_calls": [
+                    {
+                        "name": "search_flights",
+                        "arguments": {"from": "SFO"},
+                        "result": {"flight_id": "F1"},
+                        "error": None,
+                        "state_updates": {"selected_flight": "F1"},
+                        "optional": False,
+                    }
+                ],
+                "expected_final_answers": ["Booked flight F1"],
+                "expected_state": {"selected_flight": "F1"},
+                "initial_state": {},
+                "metadata": {"source_path": str(path)},
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("bfcl_v3", output_root, "test")
+
+    assert paths == [output_root / "bfcl_v3" / "test.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "bfcl_v3_BFCL_v3_multi_turn_base",
+            "instruction": f"Instruction from {source_a.name}",
+            "tools": [
+                {
+                    "name": "search_flights",
+                    "description": "Search flights",
+                    "parameters": {"type": "object", "properties": {"from": {"type": "string"}}},
+                }
+            ],
+            "expected_tool_calls": [
+                {
+                    "name": "search_flights",
+                    "arguments": {"from": "SFO"},
+                    "result": {"flight_id": "F1"},
+                    "error": None,
+                    "state_updates": {"selected_flight": "F1"},
+                    "optional": False,
+                }
+            ],
+            "expected_final_answers": ["Booked flight F1"],
+            "expected_state": {"selected_flight": "F1"},
+            "initial_state": {},
+            "metadata": {"source_path": str(source_a)},
+        },
+        {
+            "task_id": "bfcl_v3_BFCL_v3_multi_turn_miss_func",
+            "instruction": f"Instruction from {source_b.name}",
+            "tools": [
+                {
+                    "name": "search_flights",
+                    "description": "Search flights",
+                    "parameters": {"type": "object", "properties": {"from": {"type": "string"}}},
+                }
+            ],
+            "expected_tool_calls": [
+                {
+                    "name": "search_flights",
+                    "arguments": {"from": "SFO"},
+                    "result": {"flight_id": "F1"},
+                    "error": None,
+                    "state_updates": {"selected_flight": "F1"},
+                    "optional": False,
+                }
+            ],
+            "expected_final_answers": ["Booked flight F1"],
+            "expected_state": {"selected_flight": "F1"},
+            "initial_state": {},
+            "metadata": {"source_path": str(source_b)},
         }
     ]
 

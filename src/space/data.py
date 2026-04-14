@@ -249,7 +249,7 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
         return DOMAIN_CODING
     if job == "instruction_following":
         return DOMAIN_INSTRUCTION_FOLLOWING
-    if job in {"function_browsecomp", "function_mcp_bench", "function_tau_bench", "function_tau2_bench"}:
+    if job in {"function_browsecomp", "function_mcp_bench", "function_bfcl_v3", "function_tau_bench", "function_tau2_bench"}:
         return DOMAIN_FUNCTION_CALL
     if job in {"free_response", "free_response_judge"}:
         return DOMAIN_MATH
@@ -258,7 +258,7 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
             return DOMAIN_CODING
         if "instruction" in task:
             return DOMAIN_INSTRUCTION_FOLLOWING
-        if "function" in task or "browsecomp" in task or "mcp" in task:
+        if "function" in task or "browsecomp" in task or "mcp" in task or "bfcl" in task:
             return DOMAIN_FUNCTION_CALL
         if "multi_choice" in task:
             return DOMAIN_MULTI_CHOICE

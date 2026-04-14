@@ -20,6 +20,7 @@ def _prepare_single_latest_model(monkeypatch, tmp_path: Path) -> Path:
 def test_detect_job_from_dataset_prioritizes_judge_and_agent_benchmarks() -> None:
     assert jobs.detect_job_from_dataset("math_500_test", True) == "free_response_judge"
     assert jobs.detect_job_from_dataset("hendrycks_math_test", True) == "free_response"
+    assert jobs.detect_job_from_dataset("bfcl_v3_test", True) == "function_bfcl_v3"
     assert jobs.detect_job_from_dataset("tau_bench_retail_test", True) == "function_tau_bench"
     assert jobs.detect_job_from_dataset("tau2_bench_telecom_base", True) == "function_tau2_bench"
 

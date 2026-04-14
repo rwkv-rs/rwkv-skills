@@ -65,6 +65,7 @@ _LIVECODEBENCH_JOBS = ("code_livecodebench",)
 _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following",)
 _BROWSECOMP_JOBS = ("function_browsecomp",)
 _MCP_BENCH_JOBS = ("function_mcp_bench",)
+_BFCL_V3_JOBS = ("function_bfcl_v3",)
 _TAU_BENCH_JOBS = ("function_tau_bench",)
 _TAU2_BENCH_JOBS = ("function_tau2_bench",)
 
@@ -247,6 +248,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("browsecomp"): _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("mcp_bench"): _function_calling("mcp_bench", scheduler_jobs=_MCP_BENCH_JOBS),
+    canonical_slug("bfcl_v3"): _function_calling("bfcl_v3", scheduler_jobs=_BFCL_V3_JOBS),
     canonical_slug("tau_bench_retail"): _function_calling("tau_bench_retail", scheduler_jobs=_TAU_BENCH_JOBS),
     canonical_slug("tau_bench_airline"): _function_calling("tau_bench_airline", scheduler_jobs=_TAU_BENCH_JOBS),
     canonical_slug("tau_bench_telecom"): _function_calling("tau_bench_telecom", scheduler_jobs=_TAU_BENCH_JOBS),

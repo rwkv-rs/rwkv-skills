@@ -1,0 +1,20 @@
+[run]
+run_mode = "rerun"
+max_samples = 50
+
+[dataset]
+name = "bfcl_v3"
+split = "test"
+
+[model]
+infer_base_url = "http://127.0.0.1:8181"
+infer_model = "rwkv7-g1e-1.5b-20260309-ctx8192"
+
+[runner]
+benchmark_kind = "bfcl_v3"
+avg_ks = [1]
+history_max_chars = 24000
+max_steps = 20
+max_tool_errors = 20
+cot_max_tokens = 2048
+decision_max_tokens = 1024

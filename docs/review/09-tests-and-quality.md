@@ -2,30 +2,29 @@
 
 ## 高优先级问题（当前就会阻断质量闭环）
 
-### TQ-1. 测试在收集阶段即失败，CI 不能提供有效反馈
-- 证据（已复现）：`pytest -q` 直接在 collection 报错。
-- 具体位置：
-  - `tests/test_db_integration.py:5` 依赖已不存在的 `DatabaseManager`。
-  - `src/db/database.py:1-12` 当前只导出 `init_db/is_initialized`。
-  - `src/eval/metrics/instruction_following/instructions_util.py:27-35` import 阶段触发 NLTK 下载。
-- 影响：
-  - 大部分测试根本没执行。
-  - 开发者容易误判“代码没问题，只是环境问题”。
+### TQ-1. collection 阻塞问题已解除，但文档结论需要更新
+- 当前状态（2026-04-03 复核）：
+  - 使用项目虚拟环境执行 `.venv/bin/pytest -q`，结果为 `133 passed`
+  - `src/eval/metrics/instruction_following/instructions_util.py` 的 import 阶段 NLTK 下载副作用已去除
+  - 历史 `tests/test_db_integration.py` 已不再构成 collection 阻塞项
+- 当前真正的问题：
+  - 不是“测试跑不起来”，而是“关键 correctness 场景仍缺少定向回归”
 - 建议：
-  - 先恢复“可收集”状态：移除过时代码路径、取消 import side-effect。
-  - 把资源下载迁移到显式 setup 步骤。
+  - 继续把资源下载限制在显式 setup / lazy path
+  - 把测试重点从“恢复 collection”切到“补高风险行为回归”
 
 ### TQ-2. 数据库正确性关键路径缺少回归测试
 - 已知高风险点：
-  - `src/db/eval_db_repo.py:417-426` 非法索引回退为 0。
-  - `src/db/eval_db_repo.py:476-479` `insert_eval` 宽条件 update。
+  - completion / eval 幂等写入语义是否持续保持唯一约束与精确插入
+  - task identity / resume 语义在 `run_mode=auto|new|resume|rerun` 下是否稳定
 - 现状：没有对应的 repo/service 级回归用例。
 - 影响：后续重构很容易再次引入“分数统计错误/覆盖写入”问题。
 - 建议：为每个高风险 bug 建“先失败后修复”的回归测试模板。
 
 ### TQ-3. 指标正确性缺少“重复样本/续跑”场景覆盖
 - 已知问题：`src/eval/metrics/at_k.py:27-30`, `src/eval/metrics/at_k.py:54-56`。
-- 现有测试：`tests/test_free_response_metrics.py:8-29` 仅覆盖理想输入。
+- 已补回归：`LiveCodeBench` 生成器输入的二次消费问题已修，并新增专门测试覆盖。
+- 现有测试缺口：仓库中仍缺少重复键、脏数据、断点续跑场景的专门指标用例。
 - 影响：最关键的线上场景（resume/retry）未被验证。
 - 建议：新增重复键、脏数据、断点续跑组合用例，并要求与 DB 写入契约联测。
 
@@ -43,10 +42,9 @@
 - 缺口：没有“从任务创建到分数入库再到 Space 展示”的端到端可重复用例。
 - 建议：增加最小 E2E 场景（本地 sqlite/临时目录）作为发布前门禁。
 
-### TQ-6. `param_search` 暴露符号错误未被任何测试捕获
-- 位置：`src/eval/param_search/cot_grid.py:121`
-- 问题：`__all__` 包含不存在的 `total_grid_size`。
-- 影响：`from ... import *` 时会触发 `AttributeError`，属于静态正确性错误。
+### TQ-6. 静态导出契约仍缺系统性测试
+- 现状：仓库还没有统一检查 `__all__`、入口函数导出、配置 schema 的静态契约测试。
+- 影响：这类错误即使已在个别模块修复，后续也容易在别处再次出现。
 - 建议：补充“模块导出契约测试”（检查 `__all__` 内符号均存在）。
 
 ### TQ-7. Space/UI 关键路径测试不足
@@ -61,7 +59,7 @@
 
 ## 建议的测试修复优先级
 
-1. **先修收集失败**：`test_db_integration` 迁移 + NLTK import side-effect 去除。
-2. **补正确性回归**：DB upsert、`pass@k/avg@k` 去重、generator 二次消费。
-3. **建最小 E2E**：主流程跑通并断言最终 score 与 task 状态。
-4. **加静态契约测试**：`__all__`、配置 schema、结果 payload schema。
+1. **补正确性回归**：DB 幂等写入、`pass@k/avg@k` 去重、generator 二次消费。
+2. **建最小 E2E**：主流程跑通并断言最终 score 与 task 状态。
+3. **加静态契约测试**：`__all__`、配置 schema、结果 payload schema。
+4. **继续收敛测试基建**：为 SQL/service 主链、dataset runtime、Space 消费层沉淀共用 fixture。
