@@ -1,7 +1,6 @@
 [default]
 template = "multi_choice_cot_default"
 pass_k = []
-avg_k = [16]
+avg_k = [8]
 report_pass_k = []
-report_avg_k = [16]
-
+report_avg_k = [8]

@@ -3,19 +3,21 @@ from __future__ import annotations
 """Code generation / HumanEval evaluation pipeline."""
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord, sample_repeat_seed
 
-# Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
-DEFAULT_PASS_K = (1,)
+if TYPE_CHECKING:
+    from src.infer.engine import GenerationOutput
+    from src.infer.model import ModelLoadConfig
+
+# Coding 默认不计算 pass@k；如需单独产出 pass，请通过 CLI/配置显式传入
+DEFAULT_PASS_K: tuple[int, ...] = ()
 
 
 def _compress_newlines(text: str) -> str:
@@ -53,7 +55,7 @@ def _extract_function_signature(code: str | None) -> str | None:
     return None
 
 
-def _format_signature_prompt(prompt: str, signature: str ) -> str:
+def _format_signature_prompt(prompt: str, signature: str) -> str:
     prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
     return _format_prompt_no_echo(prompt)
 
@@ -63,7 +65,9 @@ _LCB_SYSTEM_MESSAGE = (
     "(problem specification) and will generate a correct Python program "
     "that matches the specification and passes all tests."
 )
-_LCB_FORMAT_WITH_STARTER = "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
+_LCB_FORMAT_WITH_STARTER = (
+    "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
+)
 _LCB_FORMAT_WITHOUT_STARTER = (
     "Read the inputs from stdin solve the problem and write the answer to stdout "
     "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
@@ -84,7 +88,9 @@ def _format_lcb_body(question: str, starter_code: str | None) -> str:
     return body
 
 
-_LCB_FINAL_ANSWER_PREFIX = "\nTherefore, the correct code is ```python\n"
+# Match the existing RWKV code prompts: finish the reasoning span and enter a
+# Python code block directly, instead of adding an extra natural-language bridge.
+_LCB_FINAL_ANSWER_PREFIX = "\n</think>\n```python\n"
 
 
 def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
@@ -106,6 +112,9 @@ class CodingPipelineResult:
 
 class CodingPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
+        from src.infer.engine import InferenceEngine
+        from src.infer.model import load_rwkv_model
+
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path
@@ -120,6 +129,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -128,7 +138,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
@@ -242,6 +253,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -250,7 +262,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
@@ -371,6 +384,7 @@ class CodingPipeline:
         eval_timeout: float = 3.0,
         eval_workers: int = 4,
         pass_k: Iterable[int] = DEFAULT_PASS_K,
+        samples_per_task: int | None = None,
         probe_only: bool = False,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
@@ -379,7 +393,8 @@ class CodingPipeline:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
             sample_limit = batch_size
-        samples_per_task = 1 if probe_only else max(1, max(pass_k) if pass_k else 1)
+        resolved_samples_per_task = samples_per_task if samples_per_task is not None else (max(pass_k) if pass_k else 1)
+        samples_per_task = 1 if probe_only else max(1, int(resolved_samples_per_task))
         records, dataset_name = self._load_records(dataset_path, sample_limit)
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:

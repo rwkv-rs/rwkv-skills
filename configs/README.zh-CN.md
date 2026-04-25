@@ -13,11 +13,14 @@
 - SamplingConfig 字段：max_generate_tokens、temperature、top_k、top_p、
   alpha_presence、alpha_frequency、alpha_decay、stop_tokens、ban_tokens、
   pad_zero、no_penalty_token_ids
-- 评测字段：pass_k、avg_k、report_pass_k、report_avg_k（free_response 与 multi_choice_cot）
+- 评测字段：pass_k、avg_k、report_pass_k、report_avg_k、max_samples（free_response 与 multi_choice_cot；direct/code/instruction 入口也会读取 max_samples）
 
 备注：
 - CLI 参数会覆盖配置值。
 - pass_k / avg_k 可用于 CoT 评测入口（free_response / free_response_judge / multi_choice_cot），CLI 参数优先生效。
+- avg_k / report_avg_k 既支持整数（例如 `16`），也支持 `(0, 1)` 之间的小数比例（例如 `0.2`）。
+- 当 `avg_k` 配成比例时，评测会对每道题使用前 `ceil(比例 * repeats)` 个可用样本计算 avg。
+- 未显式传入 CLI `--max-samples` 时，会默认读取配置里的 `max_samples`。
 - llm_judge 仍由评测脚本或 CLI 控制，不从 TOML 读取。
 - free_response 的采样配置只用于 CoT 生成阶段。
 - livecodebench 的采样配置同时作用于 CoT 和 final 阶段。

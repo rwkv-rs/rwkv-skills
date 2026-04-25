@@ -8,9 +8,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.evaluators.coding import CodingPipeline
+from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
+from src.eval.metrics.at_k import compute_avg_at_k
 from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
@@ -22,7 +24,12 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.metrics.code_generation.evaluate import eval_rows_from_payloads
 from src.infer.model import ModelLoadConfig
+
+
+DEFAULT_PASS_K: tuple[int, ...] = ()
+DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -48,9 +55,54 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to report (default: 1)",
+        help="pass@k values to report (default: none)",
+    )
+    parser.add_argument(
+        "--avg-k",
+        type=float,
+        action="append",
+        help="avg@k values to compute from generated samples (default: none)",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_pass_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[int, ...]:
+    if args.pass_k:
+        return tuple(args.pass_k)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.pass_k is not None:
+        return config.pass_k
+    return DEFAULT_PASS_K
+
+
+def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[NumericK, ...]:
+    if args.avg_k:
+        return tuple(args.avg_k)
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.avg_k is not None:
+        return config.avg_k
+    return DEFAULT_AVG_K
+
+
+def _report_pass_k(slug: str, model_name: str, pass_k: tuple[int, ...]) -> tuple[int, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_pass_k is not None:
+        return config.report_pass_k
+    return pass_k
+
+
+def _report_avg_k(slug: str, model_name: str, avg_k: tuple[NumericK, ...]) -> tuple[NumericK, ...]:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is not None and config.report_avg_k is not None:
+        return config.report_avg_k
+    return avg_k
+
+
+def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
+    if args.max_samples is not None:
+        return args.max_samples
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    return config.max_samples if config is not None else None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -88,9 +140,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = ModelLoadConfig(weights_path=args.model_path, device=args.device)
     pipeline = CodingPipeline(config)
     batch_size = max(1, args.batch_size)
-    default_pass_k = (1,)
-    pass_k = (1,) if args.probe_only else (tuple(args.pass_k) if args.pass_k else default_pass_k)
-    sample_limit = batch_size if args.probe_only else args.max_samples
+    pass_k = (1,) if args.probe_only else _resolve_pass_k(slug, model_name, args)
+    avg_k = _resolve_avg_k(slug, model_name, args)
+    report_pass_k = _report_pass_k(slug, model_name, pass_k)
+    report_avg_k = _report_avg_k(slug, model_name, avg_k)
+    samples_per_task = max(max_generation_k(pass_k), max_generation_k(avg_k), 1)
+    sample_limit = batch_size if args.probe_only else _resolve_max_samples(slug, model_name, args)
     init_orm(DEFAULT_DB_CONFIG)
     
     service = EvalDbService()
@@ -125,14 +180,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_queue=args.db_write_queue,
     )
     records = JsonlCodeGenerationLoader(str(dataset_path)).load()
-    repeats = max(1, max(pass_k))
     expected_count = service.expected_completion_count(
         dataset=str(slug),
         sample_limit=sample_limit,
-        repeats_per_problem=repeats,
+        repeats_per_problem=samples_per_task,
     )
     if expected_count is None:
-        expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * repeats
+        expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * samples_per_task
     try:
         result = pipeline.run_livecodebench(
             dataset_path=str(dataset_path),
@@ -143,6 +197,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             eval_timeout=args.eval_timeout,
             eval_workers=args.eval_workers,
             pass_k=pass_k,
+            samples_per_task=samples_per_task,
             probe_only=args.probe_only,
             skip_keys=skip_keys,
             on_record=writer.enqueue,
@@ -181,16 +236,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             n_workers=args.eval_workers,
             timeout=args.eval_timeout,
         )
+        avg_metrics_all = compute_avg_at_k(eval_rows_from_payloads(eval_payloads), avg_k)
         print(f"LiveCodeBench 评测: {eval_metrics}")
         service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        metrics_payload: dict[str, float] = {}
+        pass_payload = filter_metrics_by_k(eval_metrics, report_pass_k, "pass@")
+        if report_pass_k and not pass_payload:
+            pass_payload = eval_metrics or {}
+        if pass_payload:
+            metrics_payload.update(pass_payload)
+        avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
+        if report_avg_k and not avg_payload:
+            avg_payload = avg_metrics_all or {}
+        if avg_payload:
+            metrics_payload.update(avg_payload)
+        task_details: dict[str, object] = {}
+        if eval_metrics and pass_payload != eval_metrics:
+            task_details["pass_curve"] = eval_metrics
+        if avg_metrics_all and avg_payload != avg_metrics_all:
+            task_details["avg_curve"] = avg_metrics_all
         score_payload = make_score_payload(
             slug,
             is_cot=True,
             model_name=Path(args.model_path).stem,
-            metrics=eval_metrics or {},
+            metrics=metrics_payload,
             samples=len(completions_payloads),
             problems=result.problem_count,
             task="code_livecodebench",
+            task_details=task_details,
         )
         service.record_score_payload(
             payload=score_payload,

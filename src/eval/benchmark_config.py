@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.eval.k_values import NumericK
 from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import (
     canonical_slug,
@@ -37,9 +38,10 @@ class BenchmarkModelConfig:
     sampling_overrides: dict[str, object]
     # Optional evaluation-level overrides (e.g. free-response pass@k / avg@k).
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[int, ...] | None = None
+    avg_k: tuple[NumericK, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[NumericK, ...] | None = None
+    max_samples: int | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -215,9 +217,10 @@ def _normalize_model_key(value: str) -> str:
 def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     sampling_overrides: dict[str, object] = {}
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[int, ...] | None = None
+    avg_k: tuple[NumericK, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[int, ...] | None = None
+    report_avg_k: tuple[NumericK, ...] | None = None
+    max_samples: int | None = None
 
     for key, raw in table.items():
         if key in _INT_FIELDS:
@@ -232,13 +235,16 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             pass_k = _coerce_k_tuple(raw)
             continue
         elif key == "avg_k":
-            avg_k = _coerce_k_tuple(raw)
+            avg_k = _coerce_avg_k_tuple(raw)
             continue
         elif key == "report_pass_k":
             report_pass_k = _coerce_k_tuple(raw)
             continue
         elif key == "report_avg_k":
-            report_avg_k = _coerce_k_tuple(raw)
+            report_avg_k = _coerce_avg_k_tuple(raw)
+            continue
+        elif key == "max_samples":
+            max_samples = _coerce_int(raw)
             continue
         else:
             continue
@@ -251,6 +257,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         avg_k=avg_k,
         report_pass_k=report_pass_k,
         report_avg_k=report_avg_k,
+        max_samples=max_samples,
     )
 
 
@@ -308,6 +315,41 @@ def _coerce_k_tuple(value: Any) -> tuple[int, ...] | None:
         return None
     filtered = sorted({int(item) for item in raw if int(item) > 0})
     return tuple(filtered)
+
+
+def _coerce_avg_k_tuple(value: Any) -> tuple[NumericK, ...] | None:
+    """Coerce avg@k configs.
+
+    Accepts:
+    - positive integers (e.g. 16 -> avg@16)
+    - positive ratios in (0, 1) (e.g. 0.2 -> avg@0.2)
+    """
+
+    if value is None or isinstance(value, bool):
+        return None
+    values: list[NumericK] = []
+    raw_items = value if isinstance(value, (list, tuple)) else (value,)
+    for item in raw_items:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if number <= 0:
+            continue
+        if number >= 1:
+            if not number.is_integer():
+                return None
+            values.append(int(number))
+            continue
+        values.append(number)
+    normalized: list[NumericK] = []
+    seen: set[str] = set()
+    for item in sorted(values, key=float):
+        key = str(int(item)) if isinstance(item, int) else f"{float(item):.12g}"
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return tuple(normalized)
 
 
 def resolve_sampling_config(

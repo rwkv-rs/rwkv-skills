@@ -13,7 +13,11 @@ from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 from filelock import FileLock
 
+from src.eval.benchmark_config import resolve_benchmark_model_config
+from src.eval.k_values import max_generation_k
+
 from .config import DEFAULT_PYTHON, REPO_ROOT
+from .dataset_utils import infer_dataset_slug_from_path
 from .jobs import JobSpec
 
 
@@ -202,9 +206,21 @@ class BatchProfiler:
 
         max_allowed_batch = max(base_candidates)
         question_count = dataset_questions if dataset_questions and dataset_questions > 0 else None
-        if question_count and job.probe_samples_per_task > 1:
+        probe_samples_per_task = max(1, job.probe_samples_per_task)
+        if dataset_path is not None:
+            slug = infer_dataset_slug_from_path(str(dataset_path))
+            config = resolve_benchmark_model_config(slug, model_path.stem, stage=None)
+            if config is not None:
+                probe_samples_per_task = max(
+                    max_generation_k(config.pass_k),
+                    max_generation_k(config.avg_k),
+                    probe_samples_per_task,
+                )
+                if question_count and config.max_samples is not None and config.max_samples > 0:
+                    question_count = min(question_count, int(config.max_samples))
+        if question_count and probe_samples_per_task > 1:
             # 估算实际生成样本量（题目数 * 每题样本数），避免对少样本数据集从过小的 batch 起 probe
-            question_count *= max(1, job.probe_samples_per_task)
+            question_count *= probe_samples_per_task
         candidates = self._select_probe_candidates(
             base_candidates,
             question_count=question_count,

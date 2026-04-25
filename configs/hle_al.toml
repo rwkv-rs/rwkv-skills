@@ -1,7 +1,7 @@
 [default]
-pass_k = [8]
+pass_k = []
 avg_k = [8]
-report_pass_k = [8]
+report_pass_k = []
 report_avg_k = [8]
 
 [cot]

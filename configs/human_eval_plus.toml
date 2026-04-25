@@ -1,2 +1,6 @@
 [default]
 template = "code_default"
+pass_k = []
+avg_k = [32]
+report_pass_k = []
+report_avg_k = [32]

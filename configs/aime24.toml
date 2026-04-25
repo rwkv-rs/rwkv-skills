@@ -1,8 +1,8 @@
 [default]
-pass_k = [8, 256]
-avg_k = [16]
-report_pass_k = [8]
-report_avg_k = [16]
+pass_k = []
+avg_k = [64]
+report_pass_k = []
+report_avg_k = [64]
 
 [cot]
 max_generate_tokens = 16384

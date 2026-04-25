@@ -135,6 +135,15 @@ def _build_canonical_eval_from_results(
     return eval_payloads
 
 
+def eval_rows_from_payloads(payloads: Iterable[dict]) -> list[tuple[int, int, bool]]:
+    rows: list[tuple[int, int, bool]] = []
+    for payload in payloads:
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+        rows.append((sample_index, repeat_index, bool(payload.get("is_passed"))))
+    return rows
+
+
 def evaluate_human_eval(
     completions: Iterable[dict] | str | Path,
     *,
@@ -201,4 +210,4 @@ def evaluate_mbpp_dataset(
         return metrics or {}, eval_payloads
 
 
-__all__ = ["evaluate_human_eval", "evaluate_mbpp_dataset"]
+__all__ = ["eval_rows_from_payloads", "evaluate_human_eval", "evaluate_mbpp_dataset"]

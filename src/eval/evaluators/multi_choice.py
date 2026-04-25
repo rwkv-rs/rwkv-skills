@@ -95,6 +95,7 @@ class MultipleChoicePipeline:
         prompt_template: str | None = None,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
+        samples_per_task: int = 1,
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
@@ -109,16 +110,20 @@ class MultipleChoicePipeline:
         skip_keys = skip_keys or set()
         if resume_start_index < 0:
             resume_start_index = 0
+        repeats = max(1, int(samples_per_task))
         indexed_records = [
-            (idx, record)
-            for idx, record in enumerate(records[resume_start_index:], start=resume_start_index)
-            if (idx, 0) not in skip_keys
+            (idx, record, sample_id)
+            for idx, record in enumerate(records)
+            for sample_id in range(repeats)
+            if (idx, sample_id) not in skip_keys
         ]
+        if resume_start_index:
+            indexed_records = indexed_records[resume_start_index:]
         if not indexed_records:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
         payloads: list[dict] = []
-        for idx, record in indexed_records:
+        for idx, record, sample_id in indexed_records:
             prompt = self._format_prompt(record, prompt_template)
             _, pred_letter = self._score_prompt(record, prompt)
             token_text = self.target_token_format.replace("<LETTER>", pred_letter)
@@ -133,14 +138,14 @@ class MultipleChoicePipeline:
                 benchmark_name=benchmark_name,
                 dataset_split=dataset_split,
                 sample_index=idx,
-                repeat_index=0,
+                repeat_index=sample_id,
                 sampling_config={},
                 stages=stages,
             ).as_payload()
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
-        return MultipleChoicePipelineResult(dataset_name, len(records), payloads)
+        return MultipleChoicePipelineResult(dataset_name, len(indexed_records), payloads)
 
     def run_chain_of_thought(
         self,
