@@ -1,120 +1,434 @@
 # Prompt ablation records.
-# Run generator example:
-# uv run python scripts/prompt_ablation.py --prompt-set prompt_trials.toml --run-id prompt_test_001 --models <paths...> --overwrite --disable-checker
+# Generate commands:
+# uv run python scripts/prompt_ablation.py --prompt-set prompt_trials.toml --run-id prompt_test_001 --models <model.pth> --pg-dbname prompt --overwrite --disable-checker
+#
+# Important:
+# - Do not set avg_k/report_avg_k here unless the trial is explicitly testing sampling.
+# - The overlay inherits true benchmark avg_k/report_avg_k from configs/<benchmark>.toml.
+# - max_samples is only the pilot subset size.
+
+[trial.control_zh_cot]
+description = "Control: original Chinese multi-choice CoT prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["ceval_cot", "cmmlu_cot"]
+max_samples = 80
 
 [trial.multi_choice_zh_cot_v1]
-description = "Chinese multi-choice CoT, concise single-answer constraint."
+description = "Chinese CoT: minimal unique-option instruction."
 jobs = ["multi_choice_cot"]
 benchmarks = ["ceval_cot", "cmmlu_cot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: 请解答这道单选题，只能选择一个最佳选项。思考时请始终对应选项字母。
+cot_prompt_template = """User: 选出唯一正确选项。
 <Q>
 <CHOICES>
 
-Assistant: <think"""
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
-只输出最终选项字母："""
+答案："""
 
 [trial.multi_choice_zh_cot_v2]
-description = "Chinese multi-choice CoT, shorter wording for smaller RWKV models."
+description = "Chinese CoT: short reasoning with final option letter."
 jobs = ["multi_choice_cot"]
 benchmarks = ["ceval_cot", "cmmlu_cot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: 从选项中选出唯一正确答案。
+cot_prompt_template = """User: 解这道单选题，最后只能给一个选项字母。
 <Q>
 <CHOICES>
 
-Assistant: <think"""
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
-答案选项是"""
+最终选项："""
 
-[trial.multi_choice_en_cot_v1]
-description = "English multi-choice CoT, concise option-letter final answer."
+[trial.multi_choice_zh_cot_v3]
+description = "Chinese CoT: preserve original style, add one-answer constraint."
 jobs = ["multi_choice_cot"]
-benchmarks = ["gpqa_main_cot", "supergpqa_cot"]
+benchmarks = ["ceval_cot", "cmmlu_cot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: Choose the single best option. Think briefly and track the option letter.
-<Q>
+cot_prompt_template = """User: <Q>
 <CHOICES>
 
-Assistant: <think"""
+请判断唯一最佳选项。
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
-Answer only with the option letter:"""
+综上，答案是"""
 
-[trial.multi_choice_en_cot_v2]
-description = "English multi-choice CoT, minimal prompt."
+[trial.control_en_avg1_cot]
+description = "Control: original English avg@1 multi-choice CoT prompt."
 jobs = ["multi_choice_cot"]
-benchmarks = ["gpqa_main_cot", "supergpqa_cot"]
+benchmarks = ["mmlu_cot", "mmlu_pro_cot", "mmlu_redux_cot", "supergpqa_cot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: Answer this multiple-choice question. Pick exactly one option.
+
+[trial.multi_choice_en_avg1_cot_v1]
+description = "English avg@1 CoT: concise single-best-option instruction."
+jobs = ["multi_choice_cot"]
+benchmarks = ["mmlu_cot", "mmlu_pro_cot", "mmlu_redux_cot", "supergpqa_cot"]
+max_samples = 80
+cot_prompt_template = """User: Choose the single best option.
 <Q>
 <CHOICES>
 
-Assistant: <think"""
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.multi_choice_en_avg1_cot_v2]
+description = "English avg@1 CoT: option-letter tracking."
+jobs = ["multi_choice_cot"]
+benchmarks = ["mmlu_cot", "mmlu_pro_cot", "mmlu_redux_cot", "supergpqa_cot"]
+max_samples = 80
+cot_prompt_template = """User: Solve the question. Track the option letter.
+<Q>
+<CHOICES>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+The answer is"""
+
+[trial.multi_choice_en_avg1_cot_v3]
+description = "English avg@1 CoT: very short prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["mmlu_cot", "mmlu_pro_cot", "mmlu_redux_cot", "supergpqa_cot"]
+max_samples = 80
+cot_prompt_template = """User: Pick exactly one option.
+<Q>
+<CHOICES>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Option:"""
+
+[trial.control_gpqa_cot]
+description = "Control: original GPQA CoT prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot"]
+max_samples = 40
+
+[trial.multi_choice_gpqa_cot_v1]
+description = "GPQA CoT: concise expert-free prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot"]
+max_samples = 40
+cot_prompt_template = """User: Choose the single best option.
+<Q>
+<CHOICES>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.multi_choice_gpqa_cot_v2]
+description = "GPQA CoT: solve then option letter."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot"]
+max_samples = 40
+cot_prompt_template = """User: Solve carefully. Select one option.
+<Q>
+<CHOICES>
+
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
 The correct option is"""
 
-[trial.multi_choice_zh_nocot_v1]
-description = "Chinese direct multiple-choice prompt."
+[trial.multi_choice_gpqa_cot_v3]
+description = "GPQA CoT: minimal option prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot"]
+max_samples = 40
+cot_prompt_template = """User: Pick the best answer.
+<Q>
+<CHOICES>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Option:"""
+
+[trial.control_zh_nocot]
+description = "Control: original Chinese direct multi-choice prompt."
 jobs = ["multi_choice_plain"]
 benchmarks = ["ceval_nocot", "cmmlu_nocot"]
 max_samples = 80
-avg_k = [1]
-report_avg_k = [1]
-direct_prompt_template = """User: 请从下面的单选题中选择唯一最佳选项，只输出选项字母。
-<Q>
-<CHOICES>
 
-Assistant: 正确答案是"""
-
-[trial.multi_choice_en_nocot_v1]
-description = "English direct multiple-choice prompt."
+[trial.multi_choice_zh_nocot_v1]
+description = "Chinese direct: one-letter final."
 jobs = ["multi_choice_plain"]
-benchmarks = ["gpqa_main_nocot", "mmlu_redux_nocot", "supergpqa_nocot"]
+benchmarks = ["ceval_nocot", "cmmlu_nocot"]
 max_samples = 80
-avg_k = [1]
-report_avg_k = [1]
-direct_prompt_template = """User: Choose the single best option. Answer only with the option letter.
+direct_prompt_template = """User: 选唯一正确项，只输出选项字母。
 <Q>
 <CHOICES>
 
-Assistant: The answer is"""
+Assistant: 答案是"""
 
-[trial.free_response_format_v1]
-description = "Free-response CoT prompt, format-aware but shorter than the reverted default."
-jobs = ["free_response", "free_response_judge"]
-benchmarks = ["asdiv_cot", "svamp_cot", "gsm8k_cot", "math_500_cot"]
+[trial.multi_choice_zh_nocot_v2]
+description = "Chinese direct: shorter answer prefix."
+jobs = ["multi_choice_plain"]
+benchmarks = ["ceval_nocot", "cmmlu_nocot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: Solve the problem carefully. Keep the answer format and units requested by the question. Do not give the final answer yet.
+direct_prompt_template = """User: <Q>
+<CHOICES>
+
+Assistant: 正确选项："""
+
+[trial.control_en_avg1_nocot]
+description = "Control: original English avg@1 direct prompt."
+jobs = ["multi_choice_plain"]
+benchmarks = ["mmlu_nocot", "mmlu_pro_nocot", "mmlu_redux_nocot", "supergpqa_nocot"]
+max_samples = 80
+
+[trial.multi_choice_en_avg1_nocot_v1]
+description = "English direct: single best option."
+jobs = ["multi_choice_plain"]
+benchmarks = ["mmlu_nocot", "mmlu_pro_nocot", "mmlu_redux_nocot", "supergpqa_nocot"]
+max_samples = 80
+direct_prompt_template = """User: Choose the single best option. Answer only with its letter.
+<Q>
+<CHOICES>
+
+Assistant: Answer:"""
+
+[trial.multi_choice_en_avg1_nocot_v2]
+description = "English direct: minimal answer prefix."
+jobs = ["multi_choice_plain"]
+benchmarks = ["mmlu_nocot", "mmlu_pro_nocot", "mmlu_redux_nocot", "supergpqa_nocot"]
+max_samples = 80
+direct_prompt_template = """User: Pick one option.
+<Q>
+<CHOICES>
+
+Assistant: Option:"""
+
+[trial.control_gpqa_nocot]
+description = "Control: original GPQA direct prompt."
+jobs = ["multi_choice_plain"]
+benchmarks = ["gpqa_main_nocot"]
+max_samples = 40
+
+[trial.multi_choice_gpqa_nocot_v1]
+description = "GPQA direct: single best option."
+jobs = ["multi_choice_plain"]
+benchmarks = ["gpqa_main_nocot"]
+max_samples = 40
+direct_prompt_template = """User: Choose the single best option. Answer only with its letter.
+<Q>
+<CHOICES>
+
+Assistant: Answer:"""
+
+[trial.multi_choice_gpqa_nocot_v2]
+description = "GPQA direct: minimal answer prefix."
+jobs = ["multi_choice_plain"]
+benchmarks = ["gpqa_main_nocot"]
+max_samples = 40
+direct_prompt_template = """User: Pick one option.
+<Q>
+<CHOICES>
+
+Assistant: Option:"""
+
+[trial.control_format_light]
+description = "Control: original prompt for low/medium-k free-response datasets."
+jobs = ["free_response"]
+benchmarks = ["asdiv_cot", "mawps_cot", "college_math_cot"]
+max_samples = 80
+
+[trial.free_response_format_light_v1]
+description = "Free-response: short format-aware prompt."
+jobs = ["free_response"]
+benchmarks = ["asdiv_cot", "mawps_cot", "college_math_cot"]
+max_samples = 80
+cot_prompt_template = """User: Solve. Keep the requested answer form and unit.
 
 <Q>
 
-Assistant: <think"""
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
-Give only the final answer, using the requested format and units.
 Answer:"""
 
-[trial.free_response_format_v2]
-description = "Free-response CoT prompt with minimal final-answer instruction."
-jobs = ["free_response", "free_response_judge"]
-benchmarks = ["asdiv_cot", "svamp_cot", "gsm8k_cot", "math_500_cot"]
+[trial.free_response_format_light_v2]
+description = "Free-response: exact-form emphasis."
+jobs = ["free_response"]
+benchmarks = ["asdiv_cot", "mawps_cot", "college_math_cot"]
 max_samples = 80
-avg_k = [2]
-report_avg_k = [2]
-cot_prompt_template = """User: Solve this question. Preserve units and exact forms if the question asks for them.
+cot_prompt_template = """User: Work out the answer. Preserve exact forms and units.
 
 <Q>
 
-Assistant: <think"""
+Assistant:<think"""
 final_prompt_template = """<Q><COT>
 Final answer:"""
+
+[trial.free_response_format_light_v3]
+description = "Free-response: ASDiv-style text/unit answer guard."
+jobs = ["free_response"]
+benchmarks = ["asdiv_cot", "mawps_cot", "college_math_cot"]
+max_samples = 80
+cot_prompt_template = """User: Answer the question. Keep Yes/No, text, units, fractions, or decimals as asked.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer only:"""
+
+[trial.control_arithmetic_judge]
+description = "Control: original prompt for judge-scored arithmetic datasets."
+jobs = ["free_response_judge"]
+benchmarks = ["svamp_cot", "gsm8k_cot"]
+max_samples = 80
+
+[trial.free_response_arithmetic_v1]
+description = "Arithmetic judge: short format-aware prompt."
+jobs = ["free_response_judge"]
+benchmarks = ["svamp_cot", "gsm8k_cot"]
+max_samples = 80
+cot_prompt_template = """User: Solve. Keep the requested answer form and unit.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.free_response_arithmetic_v2]
+description = "Arithmetic judge: minimal prompt."
+jobs = ["free_response_judge"]
+benchmarks = ["svamp_cot", "gsm8k_cot"]
+max_samples = 80
+cot_prompt_template = """User: Solve this problem.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Final answer:"""
+
+[trial.control_math500_judge]
+description = "Control: original MATH-500 prompt."
+jobs = ["free_response_judge"]
+benchmarks = ["math_500_cot"]
+max_samples = 40
+
+[trial.free_response_math500_v1]
+description = "MATH-500: exact answer form."
+jobs = ["free_response_judge"]
+benchmarks = ["math_500_cot"]
+max_samples = 40
+cot_prompt_template = """User: Solve. Use an exact answer when possible.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.free_response_math500_v2]
+description = "MATH-500: minimal final answer."
+jobs = ["free_response_judge"]
+benchmarks = ["math_500_cot"]
+max_samples = 40
+cot_prompt_template = """User: Solve this math problem.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Final answer:"""
+
+[trial.control_math_hard]
+description = "Control: original prompt for higher-k free-response math."
+jobs = ["free_response"]
+benchmarks = ["algebra222_cot", "math_odyssey_cot", "olympiadbench_cot"]
+max_samples = 24
+
+[trial.free_response_math_hard_v1]
+description = "Hard math: exact-answer prompt."
+jobs = ["free_response"]
+benchmarks = ["algebra222_cot", "math_odyssey_cot", "olympiadbench_cot"]
+max_samples = 24
+cot_prompt_template = """User: Solve. Keep the answer exact.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.free_response_math_hard_v2]
+description = "Hard math: minimal prompt."
+jobs = ["free_response"]
+benchmarks = ["algebra222_cot", "math_odyssey_cot", "olympiadbench_cot"]
+max_samples = 24
+cot_prompt_template = """User: Solve this problem.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Final answer:"""
+
+[trial.control_competition_judge]
+description = "Control: original prompt for judge-scored competition math."
+jobs = ["free_response_judge"]
+benchmarks = ["amc23_cot", "minerva_math_cot", "comp_math_24_25_cot"]
+max_samples = 24
+
+[trial.free_response_competition_judge_v1]
+description = "Competition judge: exact-answer prompt."
+jobs = ["free_response_judge"]
+benchmarks = ["amc23_cot", "minerva_math_cot", "comp_math_24_25_cot"]
+max_samples = 24
+cot_prompt_template = """User: Solve. Keep the answer exact.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Answer:"""
+
+[trial.free_response_competition_judge_v2]
+description = "Competition judge: minimal prompt."
+jobs = ["free_response_judge"]
+benchmarks = ["amc23_cot", "minerva_math_cot", "comp_math_24_25_cot"]
+max_samples = 24
+cot_prompt_template = """User: Solve this problem.
+
+<Q>
+
+Assistant:<think"""
+final_prompt_template = """<Q><COT>
+Final answer:"""
+
+[trial.control_function_call]
+description = "Control: original function-call prompt."
+jobs = ["function_call"]
+benchmarks = ["assistantbench_offline_nocot"]
+max_samples = 80
+
+[trial.function_call_v1]
+description = "Function-call single-turn QA: concise no-tools guard."
+jobs = ["function_call"]
+benchmarks = ["assistantbench_offline_nocot"]
+max_samples = 80
+function_call_system_template = "Answer the task. Use only the provided text. Return only the final answer."
+function_call_user_template = """Task:
+<INSTRUCTION>
+
+Attachments:
+<ATTACHMENTS>
+
+Available tools:
+<TOOLS>"""
+
+[trial.function_call_v2]
+description = "Function-call single-turn QA: exact format guard."
+jobs = ["function_call"]
+benchmarks = ["assistantbench_offline_nocot"]
+max_samples = 80
+function_call_system_template = "Give the exact final answer. Do not mention tools, browsing, or files unless provided."
+function_call_user_template = """<INSTRUCTION>
+
+Attachments:
+<ATTACHMENTS>
+
+Tools:
+<TOOLS>"""

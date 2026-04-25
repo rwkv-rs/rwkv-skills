@@ -25,4 +25,5 @@ def test_prompt_trials_file_records_candidate_prompts() -> None:
     prompt_trials = (ROOT / "prompt_trials.toml").read_text(encoding="utf-8")
 
     assert "[trial.multi_choice_zh_cot_v1]" in prompt_trials
-    assert "[trial.free_response_format_v1]" in prompt_trials
+    assert "[trial.multi_choice_gpqa_cot_v1]" in prompt_trials
+    assert "[trial.free_response_math500_v1]" in prompt_trials
