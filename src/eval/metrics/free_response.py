@@ -7,7 +7,7 @@ import re
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -143,6 +143,7 @@ class LLMJudgeConfig:
     model: str
     base_url: str | None = None
     max_workers: int = 4
+    max_completion_tokens: int | None = None
 
     max_retries: int = 3
     backoff_base: float = 0.5
@@ -150,15 +151,41 @@ class LLMJudgeConfig:
     prompt_template: str = DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE
 
 
+@dataclass(slots=True)
+class LLMJudgeStats:
+    total: int = 0
+    parsed_count: int = 0
+    invalid_output_count: int = 0
+    request_error_count: int = 0
+    invalid_output_examples: list[str] = field(default_factory=list)
+    request_error_examples: list[str] = field(default_factory=list)
+
+    @property
+    def error_count(self) -> int:
+        return self.invalid_output_count + self.request_error_count
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "total": self.total,
+            "parsed_count": self.parsed_count,
+            "invalid_output_count": self.invalid_output_count,
+            "request_error_count": self.request_error_count,
+            "error_count": self.error_count,
+            "invalid_output_examples": self.invalid_output_examples,
+            "request_error_examples": self.request_error_examples,
+        }
+
+
 class LLMJudge:
     def __init__(self, config: LLMJudgeConfig) -> None:
         self.config = config
         self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        self.last_run_stats: LLMJudgeStats | None = None
 
     def judge(self, items: list[tuple[str, str, str]]) -> list[bool]:
         """Return judge flags for (question, reference, prediction) items."""
 
-        def worker(entry: tuple[str, str, str]) -> bool:
+        def worker(entry: tuple[str, str, str]) -> tuple[bool, str, str | None]:
             question, reference, prediction = entry
             prompt = self.config.prompt_template
             prompt = prompt.replace("<Q>", question)
@@ -166,32 +193,46 @@ class LLMJudge:
             prompt = prompt.replace("<A>", prediction)
 
             # Retry loop with exponential backoff
+            last_error = ""
+            last_error_kind = "request_error"
             for attempt in range(self.config.max_retries + 1):
                 try:
+                    request_kwargs: dict[str, Any] = {
+                        "model": self.config.model,
+                        "stream": False,
+                        "temperature": 0.0,
+                        "messages": [{"role": "user", "content": prompt}],
+                    }
+                    if self.config.max_completion_tokens is not None:
+                        request_kwargs["max_tokens"] = self.config.max_completion_tokens
                     response = self.client.chat.completions.create(
-                        model=self.config.model,
-                        stream=False,
-                        temperature=0.0,
-                        messages=[{"role": "user", "content": prompt}],
+                        **request_kwargs,
                     )
                     content = (response.choices[0].message.content or "").strip()
 
                     if content not in {"True", "False"}:
+                        last_error_kind = "invalid_output"
+                        last_error = f"invalid output: {content!r}"
                         raise ValueError(f"LLM judge 输出非法值: {content!r}")
 
-                    return content == "True"
+                    return content == "True", "parsed", None
 
-                except Exception:
+                except Exception as exc:
+                    if not last_error:
+                        last_error = repr(exc)
+                    if last_error_kind != "invalid_output":
+                        last_error_kind = "request_error"
                     # Final attempt failed: don't crash overall eval, just return False
                     if attempt == self.config.max_retries:
-                        return False
+                        return False, last_error_kind, last_error
 
                     backoff = self.config.backoff_base * (2**attempt)
                     time.sleep(backoff)
 
-            return False
+            return False, last_error_kind, last_error or None
 
         results: list[bool] = [False for _ in range(len(items))]
+        stats = LLMJudgeStats(total=len(items))
         with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
             futures = {
                 executor.submit(worker, entry): idx for idx, entry in enumerate(items)
@@ -200,7 +241,19 @@ class LLMJudge:
                 as_completed(futures), total=len(futures), desc="LLM judging"
             ):
                 idx = futures[future]
-                results[idx] = future.result()
+                passed, status, detail = future.result()
+                results[idx] = passed
+                if status == "parsed":
+                    stats.parsed_count += 1
+                elif status == "invalid_output":
+                    stats.invalid_output_count += 1
+                    if detail and len(stats.invalid_output_examples) < 5:
+                        stats.invalid_output_examples.append(detail)
+                else:
+                    stats.request_error_count += 1
+                    if detail and len(stats.request_error_examples) < 5:
+                        stats.request_error_examples.append(detail)
+        self.last_run_stats = stats
         return results
 
 
@@ -286,6 +339,7 @@ def evaluate_free_response(
 __all__ = [
     "LLMJudge",
     "LLMJudgeConfig",
+    "LLMJudgeStats",
     "DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE",
     "FreeResponseEvaluation",
     "evaluate_free_response",
