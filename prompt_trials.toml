@@ -1,0 +1,120 @@
+# Prompt ablation records.
+# Run generator example:
+# uv run python scripts/prompt_ablation.py --prompt-set prompt_trials.toml --run-id prompt_test_001 --models <paths...> --overwrite --disable-checker
+
+[trial.multi_choice_zh_cot_v1]
+description = "Chinese multi-choice CoT, concise single-answer constraint."
+jobs = ["multi_choice_cot"]
+benchmarks = ["ceval_cot", "cmmlu_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: 请解答这道单选题，只能选择一个最佳选项。思考时请始终对应选项字母。
+<Q>
+<CHOICES>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+只输出最终选项字母："""
+
+[trial.multi_choice_zh_cot_v2]
+description = "Chinese multi-choice CoT, shorter wording for smaller RWKV models."
+jobs = ["multi_choice_cot"]
+benchmarks = ["ceval_cot", "cmmlu_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: 从选项中选出唯一正确答案。
+<Q>
+<CHOICES>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+答案选项是"""
+
+[trial.multi_choice_en_cot_v1]
+description = "English multi-choice CoT, concise option-letter final answer."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot", "supergpqa_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: Choose the single best option. Think briefly and track the option letter.
+<Q>
+<CHOICES>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+Answer only with the option letter:"""
+
+[trial.multi_choice_en_cot_v2]
+description = "English multi-choice CoT, minimal prompt."
+jobs = ["multi_choice_cot"]
+benchmarks = ["gpqa_main_cot", "supergpqa_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: Answer this multiple-choice question. Pick exactly one option.
+<Q>
+<CHOICES>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+The correct option is"""
+
+[trial.multi_choice_zh_nocot_v1]
+description = "Chinese direct multiple-choice prompt."
+jobs = ["multi_choice_plain"]
+benchmarks = ["ceval_nocot", "cmmlu_nocot"]
+max_samples = 80
+avg_k = [1]
+report_avg_k = [1]
+direct_prompt_template = """User: 请从下面的单选题中选择唯一最佳选项，只输出选项字母。
+<Q>
+<CHOICES>
+
+Assistant: 正确答案是"""
+
+[trial.multi_choice_en_nocot_v1]
+description = "English direct multiple-choice prompt."
+jobs = ["multi_choice_plain"]
+benchmarks = ["gpqa_main_nocot", "mmlu_redux_nocot", "supergpqa_nocot"]
+max_samples = 80
+avg_k = [1]
+report_avg_k = [1]
+direct_prompt_template = """User: Choose the single best option. Answer only with the option letter.
+<Q>
+<CHOICES>
+
+Assistant: The answer is"""
+
+[trial.free_response_format_v1]
+description = "Free-response CoT prompt, format-aware but shorter than the reverted default."
+jobs = ["free_response", "free_response_judge"]
+benchmarks = ["asdiv_cot", "svamp_cot", "gsm8k_cot", "math_500_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: Solve the problem carefully. Keep the answer format and units requested by the question. Do not give the final answer yet.
+
+<Q>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+Give only the final answer, using the requested format and units.
+Answer:"""
+
+[trial.free_response_format_v2]
+description = "Free-response CoT prompt with minimal final-answer instruction."
+jobs = ["free_response", "free_response_judge"]
+benchmarks = ["asdiv_cot", "svamp_cot", "gsm8k_cot", "math_500_cot"]
+max_samples = 80
+avg_k = [2]
+report_avg_k = [2]
+cot_prompt_template = """User: Solve this question. Preserve units and exact forms if the question asks for them.
+
+<Q>
+
+Assistant: <think"""
+final_prompt_template = """<Q><COT>
+Final answer:"""

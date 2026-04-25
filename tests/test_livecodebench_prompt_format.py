@@ -29,9 +29,8 @@ class LiveCodeBenchPromptFormatTest(unittest.TestCase):
         mbpp_prompt = _format_prompt_no_echo("Write a function that returns 1.")
 
         self.assertTrue(mbpp_prompt.endswith("Assistant: <think></think>\n```python"))
-        self.assertIn("Treat every assert/example as a required behavioral constraint", mbpp_prompt)
-        self.assertIn("Do not solve by matching the problem title to a memorized formula", mbpp_prompt)
-        self.assertIn("Include the complete Python function definition", mbpp_prompt)
+        self.assertIn("You are a top-level code master", mbpp_prompt)
+        self.assertIn("Complete the following code without any additional text or explanation", mbpp_prompt)
 
     def test_mbpp_single_assert_prompt_discourages_formula_memorization(self) -> None:
         prompt = '''"""
@@ -42,11 +41,9 @@ assert find_star_num(3) == 37
         formatted = _format_prompt_no_echo(prompt)
 
         self.assertIn("assert find_star_num(3) == 37", formatted)
-        self.assertIn("verify the code against them before finalizing", formatted)
-        self.assertIn("infer the general rule from the text and examples", formatted)
         self.assertTrue(formatted.endswith("Assistant: <think></think>\n```python"))
 
-    def test_humaneval_prompt_uses_signature_no_echo_format(self) -> None:
+    def test_humaneval_prompt_uses_legacy_echo_format(self) -> None:
         prompt = '''
 from typing import List
 
@@ -56,13 +53,9 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
         formatted = _format_prompt(prompt)
 
-        self.assertIn(
-            "Function signature: def has_close_elements(numbers: List[float], threshold: float) -> bool:",
-            formatted,
-        )
-        self.assertIn("Write the full function definition.", formatted)
-        self.assertTrue(formatted.endswith("Assistant: <think></think>\n```python"))
-        self.assertNotIn("Assistant:from typing import List", formatted)
+        self.assertIn("Assistant:from typing import List", formatted)
+        self.assertIn("def has_close_elements(numbers: List[float], threshold: float) -> bool:", formatted)
+        self.assertNotIn("Function signature:", formatted)
 
 
 if __name__ == "__main__":

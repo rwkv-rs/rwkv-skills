@@ -26,12 +26,13 @@ def _compress_newlines(text: str) -> str:
 
 
 def _format_prompt(prompt: str) -> str:
-    """HumanEval prompt aligned with the MBPP no-echo code-block format."""
+    """Match the rwkv_mmlu HumanEval prompt: duplicate code after Assistant."""
 
-    signature = _extract_function_signature(prompt)
-    if signature:
-        return _format_signature_prompt(prompt, signature)
-    return _format_prompt_no_echo(prompt)
+    clean = _compress_newlines(prompt).strip()
+    return (
+        "User:You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        f"{clean}\n\nAssistant:{clean}"
+    )
 
 
 def _format_prompt_no_echo(prompt: str) -> str:
@@ -39,13 +40,7 @@ def _format_prompt_no_echo(prompt: str) -> str:
 
     clean = _compress_newlines(prompt).strip()
     return (
-        "User: You are a careful Python programmer. Write a correct solution from the specification and examples below.\n"
-        "Rules:\n"
-        "- Treat every assert/example as a required behavioral constraint and verify the code against them before finalizing.\n"
-        "- Do not solve by matching the problem title to a memorized formula or template; infer the general rule from the text and examples.\n"
-        "- Include the complete Python function definition, and any imports needed by that function.\n"
-        "- If this is a bug-fix task, replace the buggy implementation with the corrected one.\n"
-        "- Output only Python code inside this code block. Do not add explanations and do not close the code block.\n\n"
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
         f"{clean}\n\nAssistant: <think></think>\n```python"
     )
 
