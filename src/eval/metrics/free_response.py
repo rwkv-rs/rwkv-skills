@@ -28,6 +28,13 @@ _PREFERRED_ANSWER_KEYS = (
     "final_answer",
 )
 
+DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
+    "You are a rigorous AI judge. Your task is to evaluate whether a student's "
+    "answer is semantically completely equivalent to the reference answer, based on "
+    "the provided question and reference answer.\\n\\nInput:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
+    "Student's Answer: <A>\\n\\nOutput Format:\\nStrictly adhere to the output format: Only output 'True' or 'False'."
+)
+
 
 def _normalize_text(value: str) -> str:
     if not value:
@@ -140,12 +147,7 @@ class LLMJudgeConfig:
     max_retries: int = 3
     backoff_base: float = 0.5
 
-    prompt_template: str = (
-        "You are a rigorous AI judge. Your task is to evaluate whether a student's "
-        "answer is semantically completely equivalent to the reference answer, based on "
-        "the provided question and reference answer.\\n\\nInput:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
-        "Student's Answer: <A>\\n\\nOutput Format:\\nStrictly adhere to the output format: Only output 'True' or 'False'."
-    )
+    prompt_template: str = DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE
 
 
 class LLMJudge:
@@ -284,6 +286,7 @@ def evaluate_free_response(
 __all__ = [
     "LLMJudge",
     "LLMJudgeConfig",
+    "DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE",
     "FreeResponseEvaluation",
     "evaluate_free_response",
     "compute_avg_at_k",
