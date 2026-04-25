@@ -3,16 +3,18 @@ from __future__ import annotations
 """Code generation / HumanEval evaluation pipeline."""
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord, sample_repeat_seed
+
+if TYPE_CHECKING:
+    from src.infer.engine import GenerationOutput
+    from src.infer.model import ModelLoadConfig
 
 # Coding 默认不计算 pass@k；如需单独产出 pass，请通过 CLI/配置显式传入
 DEFAULT_PASS_K: tuple[int, ...] = ()
@@ -24,13 +26,12 @@ def _compress_newlines(text: str) -> str:
 
 
 def _format_prompt(prompt: str) -> str:
-    """Match the rwkv_mmlu HumanEval prompt: duplicate code after Assistant."""
+    """HumanEval prompt aligned with the MBPP no-echo code-block format."""
 
-    clean = _compress_newlines(prompt).strip()
-    return (
-        "User:You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant:{clean}"
-    )
+    signature = _extract_function_signature(prompt)
+    if signature:
+        return _format_signature_prompt(prompt, signature)
+    return _format_prompt_no_echo(prompt)
 
 
 def _format_prompt_no_echo(prompt: str) -> str:
@@ -38,7 +39,13 @@ def _format_prompt_no_echo(prompt: str) -> str:
 
     clean = _compress_newlines(prompt).strip()
     return (
-        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        "User: You are a careful Python programmer. Write a correct solution from the specification and examples below.\n"
+        "Rules:\n"
+        "- Treat every assert/example as a required behavioral constraint and verify the code against them before finalizing.\n"
+        "- Do not solve by matching the problem title to a memorized formula or template; infer the general rule from the text and examples.\n"
+        "- Include the complete Python function definition, and any imports needed by that function.\n"
+        "- If this is a bug-fix task, replace the buggy implementation with the corrected one.\n"
+        "- Output only Python code inside this code block. Do not add explanations and do not close the code block.\n\n"
         f"{clean}\n\nAssistant: <think></think>\n```python"
     )
 
@@ -53,7 +60,7 @@ def _extract_function_signature(code: str | None) -> str | None:
     return None
 
 
-def _format_signature_prompt(prompt: str, signature: str ) -> str:
+def _format_signature_prompt(prompt: str, signature: str) -> str:
     prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
     return _format_prompt_no_echo(prompt)
 
@@ -63,7 +70,9 @@ _LCB_SYSTEM_MESSAGE = (
     "(problem specification) and will generate a correct Python program "
     "that matches the specification and passes all tests."
 )
-_LCB_FORMAT_WITH_STARTER = "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
+_LCB_FORMAT_WITH_STARTER = (
+    "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
+)
 _LCB_FORMAT_WITHOUT_STARTER = (
     "Read the inputs from stdin solve the problem and write the answer to stdout "
     "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
@@ -84,7 +93,9 @@ def _format_lcb_body(question: str, starter_code: str | None) -> str:
     return body
 
 
-_LCB_FINAL_ANSWER_PREFIX = "\nTherefore, the correct code is ```python\n"
+# Match the existing RWKV code prompts: finish the reasoning span and enter a
+# Python code block directly, instead of adding an extra natural-language bridge.
+_LCB_FINAL_ANSWER_PREFIX = "\n</think>\n```python\n"
 
 
 def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
@@ -106,6 +117,9 @@ class CodingPipelineResult:
 
 class CodingPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
+        from src.infer.engine import InferenceEngine
+        from src.infer.model import load_rwkv_model
+
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path

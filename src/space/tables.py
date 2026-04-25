@@ -31,6 +31,7 @@ from .metrics import (
     _cell_numeric_value,
     _dataset_base,
     _detail_sort_key,
+    _delta_from_display_scores,
     _field_average_score,
     _format_param,
     _map_subject_to_subdomain,
@@ -117,7 +118,7 @@ def _render_summary(
         f"- 模型列数：{len(selection.model_sequence)}",
         f"- 基准行数：{benchmark_count}",
         f"- 可见数据集：{len(visible)} / 总分数记录：{len(all_entries)}",
-        "- 排序：架构 > 参数量 > data_version（G0→…→G1d）> domain > dataset / task",
+        "- 排序：架构 > 参数量 > data_version（G0→…→G1f）> domain > dataset / task",
     ]
     if selection.aggregated_models:
         lines.extend(_summarise_snapshots(selection.aggregated_models))
@@ -325,11 +326,7 @@ def _build_field_avg_delta_table(
         prev_score = _field_average_score(prev_entries)
         score_values.extend([prev_score, latest_score])
 
-        delta_value = None
-        latest_n = _score_to_percent(latest_score)
-        prev_n = _score_to_percent(prev_score)
-        if latest_n is not None and prev_n is not None:
-            delta_value = latest_n - prev_n
+        delta_value = _delta_from_display_scores(latest_score, prev_score)
 
         row.extend(
             [
@@ -478,11 +475,8 @@ def _build_benchmark_detail_delta_table(
             prev_point = prev_by_param.get(item.param, {}).get(row_key)
             latest_score = latest_point.score if latest_point else None
             prev_score = prev_point.score if prev_point else None
-            delta_value = None
-            latest_n = _score_to_percent(latest_score)
-            prev_n = _score_to_percent(prev_score)
-            if latest_n is not None and prev_n is not None:
-                delta_value = latest_n - prev_n
+            delta_value = _delta_from_display_scores(latest_score, prev_score)
+            if delta_value is not None:
                 delta_values.append(delta_value)
 
             prev_col_idx = len(row)
@@ -787,15 +781,8 @@ def _sort_table_by_column(
     is_numeric_column = False
     for row in rows:
         if column_index < len(row):
-            cell = row[column_index]
-            cell_value = cell[0] if isinstance(cell, tuple) else cell
-            cell_str = str(cell_value).replace('%', '').replace('+', '').strip()
-            if cell_str not in ['N/A', '—', '-', '']:
-                try:
-                    float(cell_str)
-                    is_numeric_column = True
-                except (ValueError, AttributeError):
-                    is_numeric_column = False
+            if _parse_display_number(row[column_index]) is not None:
+                is_numeric_column = True
                 break
 
     # Extract sort key function
@@ -813,13 +800,10 @@ def _sort_table_by_column(
 
         if is_numeric_column:
             # Numeric sorting
-            try:
-                cell_str = str(cell_value).replace('%', '').replace('+', '').strip()
-                if cell_str in ['N/A', '—', '-', '']:
-                    return (float('inf'), original_index)
-                return (float(cell_str), original_index)
-            except (ValueError, AttributeError):
+            parsed = _parse_display_number(cell_value)
+            if parsed is None:
                 return (float('inf'), original_index)
+            return (parsed, original_index)
         else:
             # String sorting
             return (str(cell_value).lower(), original_index)

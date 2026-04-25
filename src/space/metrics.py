@@ -205,7 +205,6 @@ def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) 
 
     return _primary_numeric_metric(metrics)
 
-
 # ---------------------------------------------------------------------------
 # Format helpers
 # ---------------------------------------------------------------------------
@@ -260,12 +259,25 @@ def _format_score_1dp(value: float | None) -> str:
     return f"{normalized:.1f}"
 
 
-def _format_delta_1dp(latest: float | None, previous: float | None) -> str:
-    latest_n = _score_to_percent(latest)
-    prev_n = _score_to_percent(previous)
+def _score_display_percent_1dp(value: float | None) -> float | None:
+    normalized = _score_to_percent(value)
+    if normalized is None:
+        return None
+    return float(f"{normalized:.1f}")
+
+
+def _delta_from_display_scores(latest: float | None, previous: float | None) -> float | None:
+    latest_n = _score_display_percent_1dp(latest)
+    prev_n = _score_display_percent_1dp(previous)
     if latest_n is None or prev_n is None:
+        return None
+    return latest_n - prev_n
+
+
+def _format_delta_1dp(latest: float | None, previous: float | None) -> str:
+    delta = _delta_from_display_scores(latest, previous)
+    if delta is None:
         return "—"
-    delta = latest_n - prev_n
     sign = "+" if delta > 0 else ""
     return f"{sign}{delta:.1f}"
 
@@ -444,6 +456,8 @@ def _is_multi_choice_entry(entry: ScoreEntry) -> bool:
     task = (entry.task or "").lower()
     if "multi" in task and "choice" in task:
         return True
+    if task in {"multi_choice_plain", "multi_choice_cot"}:
+        return True
     job_hint = entry.domain in {"mmlu系列", "multi-choice系列"}
     return job_hint and _numeric_value(entry.metrics.get("accuracy")) is not None
 
@@ -496,7 +510,7 @@ def _score_for_eval_method(entry: ScoreEntry, method: str, k_metric: str) -> flo
     return fallback
 
 
-def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float]]:
+def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float | None]]:
     benchmark = _benchmark_name(entry)
     k_metric = _preferred_k_metric(entry.metrics)
     methods: list[str] = []
@@ -508,7 +522,7 @@ def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float
         else:
             methods.append("exact_match")
 
-    rows: list[tuple[str, str, str, float]] = []
+    rows: list[tuple[str, str, str, float | None]] = []
     for method in methods:
         score = _score_for_eval_method(entry, method, k_metric)
         if score is None:
