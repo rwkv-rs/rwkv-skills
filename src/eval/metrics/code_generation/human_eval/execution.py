@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import faulthandler
 import io
+import json
 import linecache
 import multiprocessing
 import os
@@ -10,6 +11,7 @@ import platform
 import signal
 import tempfile
 import traceback
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -87,7 +89,12 @@ def _build_check_program(problem: Dict, completion: str) -> str:
     return f"{prompt}{completion}\n{combined_tests}\n{check_call}"
 
 
-def unsafe_execute(check_program: str, timeout: float, result):
+def _write_result(result_path: str, value: str) -> None:
+    with Path(result_path).open("w", encoding="utf-8") as fh:
+        json.dump({"result": value}, fh, ensure_ascii=False)
+
+
+def unsafe_execute(check_program: str, timeout: float, result_path: str):
     with create_tempdir():
         import os
         import shutil
@@ -98,6 +105,7 @@ def unsafe_execute(check_program: str, timeout: float, result):
 
         reliability_guard()
 
+        result = "timed out"
         try:
             exec_globals: dict = {}
             with swallow_io():
@@ -110,44 +118,56 @@ def unsafe_execute(check_program: str, timeout: float, result):
                         filename,
                     )
                     exec(compile(check_program, filename, "exec"), exec_globals)
-            result.append("passed")
+            result = "passed"
         except TimeoutException:
-            result.append("timed out")
+            result = "timed out"
         except BaseException as exc:  # noqa: BLE001
             exc_type = type(exc).__name__
             exc_msg = str(exc).strip()
             header = f"failed: {exc_type}: {exc_msg}" if exc_msg else f"failed: {exc_type}"
             tb = traceback.format_exc().rstrip()
-            result.append(f"{header}\n{tb}" if tb else header)
-
-        shutil.rmtree = rmtree
-        os.rmdir = rmdir
-        os.chdir = chdir
+            result = f"{header}\n{tb}" if tb else header
+        finally:
+            shutil.rmtree = rmtree
+            os.rmdir = rmdir
+            os.chdir = chdir
+        _write_result(result_path, result)
 
 
 def check_correctness(
     problem: Dict, completion: str, timeout: float, completion_id: Optional[int] = None
 ) -> Dict:
     """Run provided completion against HumanEval tests."""
-    manager = multiprocessing.Manager()
-    result = manager.list()
-
     check_program = _build_check_program(problem, completion)
-    proc = multiprocessing.Process(target=unsafe_execute, args=(check_program, timeout, result))
-    proc.start()
-    proc.join(timeout=timeout + 1)
-    if proc.is_alive():
-        proc.kill()
+    with tempfile.TemporaryDirectory(prefix="rwkv_skills_humaneval_result_") as tmp_dir:
+        result_path = str(Path(tmp_dir) / "result.json")
+        proc = multiprocessing.Process(target=unsafe_execute, args=(check_program, timeout, result_path))
+        proc.start()
+        proc.join(timeout=timeout + 1)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
 
-    if not result:
-        result.append("timed out")
+        result = _read_result(result_path)
 
     return dict(
         task_id=problem["task_id"],
-        passed=result[0] == "passed",
-        result=result[0],
+        passed=result == "passed",
+        result=result,
         completion_id=completion_id,
     )
+
+
+def _read_result(result_path: str) -> str:
+    path = Path(result_path)
+    if not path.exists():
+        return "timed out"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "timed out"
+    result = payload.get("result") if isinstance(payload, dict) else None
+    return result if isinstance(result, str) and result else "timed out"
 
 
 @contextlib.contextmanager
