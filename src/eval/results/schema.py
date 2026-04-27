@@ -11,8 +11,9 @@ completions but may store additional evaluator-facing fields to enable
 downstream analysis (e.g. wrong-answer checking).
 """
 
+import json
 from dataclasses import asdict
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping, Sequence
 
 from src.eval.scheduler.dataset_utils import canonical_slug, split_benchmark_and_split
 from src.infer.sampling import SamplingConfig
@@ -63,6 +64,18 @@ def iter_stage_indices(payload: dict[str, Any]) -> list[int]:
 
 def build_context_from_completions(payload: dict[str, Any]) -> str:
     """Concatenate prompt+completion segments into the final model context."""
+    event_payload = payload.get("events") or payload.get("trace")
+    if isinstance(event_payload, list):
+        rendered = _render_agent_events(event_payload)
+        if rendered:
+            return rendered
+    context = payload.get("context")
+    if isinstance(context, Mapping):
+        context_events = context.get("events")
+        if isinstance(context_events, list):
+            rendered = _render_agent_events(context_events)
+            if rendered:
+                return rendered
     parts: list[str] = []
     for idx in iter_stage_indices(payload):
         prompt = payload.get(f"prompt{idx}")
@@ -72,6 +85,37 @@ def build_context_from_completions(payload: dict[str, Any]) -> str:
         parts.append(str(prompt))
         parts.append(str(completion))
     return "".join(parts)
+
+
+def _render_agent_events(events: Sequence[Mapping[str, Any]]) -> str:
+    parts: list[str] = []
+    for idx, event in enumerate(events, start=1):
+        kind = str(event.get("type") or event.get("kind") or "event")
+        role = str(event.get("role") or "").strip()
+        name = str(event.get("name") or "").strip()
+        title = kind
+        if role and role != kind:
+            title = f"{kind}:{role}"
+        if name:
+            title = f"{title} ({name})"
+        body_candidates = [
+            event.get("content"),
+            event.get("text"),
+            event.get("observation"),
+            event.get("result"),
+        ]
+        body = next((value for value in body_candidates if isinstance(value, str) and value), "")
+        if not body:
+            arguments = event.get("arguments")
+            if isinstance(arguments, Mapping):
+                try:
+                    body = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+                except TypeError:
+                    body = str(arguments)
+        if not body:
+            body = "—"
+        parts.append(f"[{idx}] {title}\n{body}")
+    return "\n\n".join(parts)
 
 
 def make_eval_payload(

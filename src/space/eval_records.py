@@ -422,8 +422,9 @@ def _build_context_event_payload(
             pass
 
     stages = context_obj.get("stages")
+    events = context_obj.get("events")
     sampling_config = context_obj.get("sampling_config")
-    if isinstance(stages, list) or isinstance(sampling_config, dict):
+    if isinstance(stages, list) or isinstance(events, list) or isinstance(sampling_config, dict):
         base_event["view"] = "structured"
         base_event["context"] = context_obj
         base_event["stop_tokens"] = _build_stop_tokens_mapping(sampling_config)

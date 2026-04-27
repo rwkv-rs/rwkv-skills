@@ -10,6 +10,7 @@ from typing import Sequence
 from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
+    DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
     LLMJudge,
     LLMJudgeConfig,
     compute_pass_at_k,
@@ -27,7 +28,11 @@ from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
-from src.eval.evaluators.free_response import FreeResponsePipeline
+from src.eval.evaluators.free_response import (
+    DEFAULT_COT_PROMPT,
+    DEFAULT_FINAL_PROMPT,
+    FreeResponsePipeline,
+)
 from src.infer.model import ModelLoadConfig
 
 
@@ -90,7 +95,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
     parser.add_argument("--judge-base-url", help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)")
-    parser.add_argument("--judge-max-workers", type=int, default=32, help="Max concurrent workers for LLM judge")
+    parser.add_argument(
+        "--judge-max-workers",
+        type=int,
+        help="Max concurrent workers for LLM judge (env: JUDGE_MAX_WORKERS / LLM_JUDGE_MAX_WORKERS)",
+    )
+    parser.add_argument(
+        "--judge-max-tokens",
+        type=int,
+        help="Max judge completion tokens (env: JUDGE_MAX_TOKENS / LLM_JUDGE_MAX_TOKENS)",
+    )
     return parser.parse_args(argv)
 
 
@@ -137,6 +151,29 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
+def _resolve_prompt_templates(slug: str, model_name: str) -> tuple[str, str]:
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    cot_prompt = (
+        cot_config.cot_prompt_template
+        if cot_config is not None and cot_config.cot_prompt_template
+        else DEFAULT_COT_PROMPT
+    )
+    final_prompt = (
+        final_config.final_prompt_template
+        if final_config is not None and final_config.final_prompt_template
+        else DEFAULT_FINAL_PROMPT
+    )
+    return cot_prompt, final_prompt
+
+
+def _resolve_judge_prompt_template(slug: str, model_name: str) -> str | None:
+    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    if config is None:
+        return None
+    return config.judge_prompt_template
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     _load_env_file(Path(".env"))
     args = parse_args(argv)
@@ -150,6 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_pass_k = _report_pass_k(slug, model_name, pass_k_final)
     report_avg_k = _report_avg_k(slug, model_name, avg_k_final)
     sample_limit = _resolve_max_samples(slug, model_name, args)
+    cot_prompt_template, final_prompt_template = _resolve_prompt_templates(slug, model_name)
+    judge_prompt_template = _resolve_judge_prompt_template(slug, model_name)
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -209,6 +248,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_prompt_template,
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
@@ -239,6 +280,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         or os.environ.get("LLM_JUDGE_BASE_URL")
         or os.environ.get("API_BASE")
     )
+    judge_max_workers = (
+        args.judge_max_workers
+        or int(
+            os.environ.get("JUDGE_MAX_WORKERS")
+            or os.environ.get("LLM_JUDGE_MAX_WORKERS")
+            or "16"
+        )
+    )
+    judge_max_tokens = (
+        args.judge_max_tokens
+        or int(
+            os.environ.get("JUDGE_MAX_TOKENS")
+            or os.environ.get("LLM_JUDGE_MAX_TOKENS")
+            or "16"
+        )
+    )
 
     if not judge_model or not judge_api_key:
         raise ValueError(
@@ -250,7 +307,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             api_key=judge_api_key,
             model=judge_model,
             base_url=judge_base_url,
-            max_workers=args.judge_max_workers,
+            max_workers=judge_max_workers,
+            prompt_template=judge_prompt_template or DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
+            max_completion_tokens=judge_max_tokens,
         )
     )
 
@@ -262,6 +321,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = pipeline.run(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_prompt_template,
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=max(1, args.batch_size),
@@ -295,6 +356,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_path=str(dataset_path),
         judge=judge,
     )
+    judge_stats = judge.last_run_stats
+    if judge_stats is not None and judge_stats.total > 0:
+        if judge_stats.error_count:
+            print(
+                "⚠️ LLM judge 存在异常样本："
+                f"{judge_stats.error_count}/{judge_stats.total} "
+                f"(invalid_output={judge_stats.invalid_output_count}, "
+                f"request_error={judge_stats.request_error_count})"
+            )
+            if judge_stats.request_error_examples:
+                print("⚠️ request_error 示例：")
+                for item in judge_stats.request_error_examples:
+                    print(f"  - {item}")
+            if judge_stats.invalid_output_examples:
+                print("⚠️ invalid_output 示例：")
+                for item in judge_stats.invalid_output_examples:
+                    print(f"  - {item}")
+        if judge_stats.parsed_count == 0:
+            service.update_task_status(task_id=task_id, status="failed")
+            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+            if session_task_id:
+                try:
+                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
+                except Exception:
+                    pass
+            raise RuntimeError(
+                "LLM judge 未成功解析任何样本，拒绝写入可能由 judge 故障导致的全 0 分数。"
+            )
     pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k_final)
     avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k_final)
     if evaluation.judge_accuracy is None:
@@ -311,6 +400,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if avg_payload:
         metrics_payload.update(avg_payload)
     task_details: dict[str, object] = {}
+    if judge_stats is not None:
+        task_details["judge_stats"] = judge_stats.as_dict()
     if pass_metrics_all and pass_payload != pass_metrics_all:
         task_details["pass_curve"] = pass_metrics_all
     if avg_metrics_all and avg_payload != avg_metrics_all:

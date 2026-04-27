@@ -48,16 +48,19 @@ def _get_cached_git_sha() -> str:
     if env_sha:
         _GIT_SHA_CACHE = env_sha
         return _GIT_SHA_CACHE
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(REPO_ROOT),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    sha = result.stdout.strip()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sha = result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = "unknown"
     if not sha:
-        raise RuntimeError("git rev-parse HEAD returned empty output")
+        sha = "unknown"
     _GIT_SHA_CACHE = sha
     return _GIT_SHA_CACHE
 
@@ -692,6 +695,15 @@ class EvalDbService:
                 "context": context if isinstance(context, dict) else None,
             }
             if isinstance(context, dict):
+                events = context.get("events")
+                if isinstance(events, list):
+                    payload["events"] = events
+                stats = context.get("stats")
+                if isinstance(stats, dict):
+                    payload["stats"] = stats
+                final_answer = context.get("final_answer")
+                if isinstance(final_answer, str):
+                    payload["final_answer"] = final_answer
                 stages = context.get("stages")
                 if isinstance(stages, list):
                     for idx, stage in enumerate(stages, start=1):
@@ -977,8 +989,17 @@ class EvalDbService:
                     "stop_reason": payload.get(f"stop_reason{idx}"),
                 }
             )
+        events_payload = payload.get("events") or payload.get("trace")
+        events: list[dict[str, Any]] = []
+        if isinstance(events_payload, list):
+            for item in events_payload:
+                if isinstance(item, dict):
+                    events.append(dict(item))
         context = {
             "stages": stages,
+            "events": events,
+            "stats": payload.get("stats", {}),
+            "final_answer": payload.get("final_answer", ""),
             "sampling_config": payload.get("sampling_config", {}),
         }
         sanitized = EvalDbService._sanitize_json_text(context)

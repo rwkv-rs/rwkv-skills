@@ -176,6 +176,10 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="关闭 LLM wrong-answer checker（不运行 run_llm_checker）",
     )
+    parser.add_argument(
+        "--benchmark-config-root",
+        help="临时 benchmark 配置覆盖层目录（只覆盖同名字段，未写字段继续继承 configs/）",
+    )
 
 
 def _dispatch_options_from_args(
@@ -213,6 +217,11 @@ def _dispatch_options_from_args(
         batch_cache_path=batch_cache,
         overwrite=bool(args.overwrite),
         disable_checker=bool(args.disable_checker),
+        benchmark_config_root=(
+            Path(args.benchmark_config_root)
+            if getattr(args, "benchmark_config_root", None)
+            else None
+        ),
     )
 
 

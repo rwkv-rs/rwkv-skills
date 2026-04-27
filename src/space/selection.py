@@ -414,8 +414,19 @@ def _build_detail_point_map(entries: Iterable[ScoreEntry]) -> dict[tuple[str, st
         for benchmark, method, k_metric, score in _detail_rows_for_entry(entry):
             key = (benchmark, method, k_metric)
             previous = mapped.get(key)
-            if previous is None or score > previous.score or (
-                score == previous.score and entry.created_at > previous.entry.created_at
-            ):
+            should_replace = False
+            if previous is None:
+                should_replace = True
+            elif score is None and previous.score is None:
+                should_replace = entry.created_at > previous.entry.created_at
+            elif score is not None and previous.score is None:
+                should_replace = True
+            elif score is None and previous.score is not None:
+                should_replace = entry.created_at > previous.entry.created_at
+            elif previous.score is not None and score is not None:
+                should_replace = score > previous.score or (
+                    score == previous.score and entry.created_at > previous.entry.created_at
+                )
+            if should_replace:
                 mapped[key] = DetailPoint(score=score, entry=entry)
     return mapped

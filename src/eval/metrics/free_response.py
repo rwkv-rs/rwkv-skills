@@ -21,6 +21,8 @@ from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_STRICT_JUDGE_BOOL_RE = re.compile(r"^(?:`{1,3})?\s*(True|False)\s*(?:`{1,3})?$")
 _PREFERRED_ANSWER_KEYS = (
     "expected_answer",
     "reference_answer",
@@ -87,6 +89,20 @@ def _is_exact_match(prediction: str, reference: str) -> bool:
         if pred_num is not None:
             return pred_num == ref_num
     return _normalize_text(prediction) == _normalize_text(reference)
+
+
+def _parse_judge_bool(content: str) -> bool | None:
+    """Parse strict judge booleans, allowing hidden reasoning wrappers."""
+    candidates = [content.strip()]
+    without_think = _THINK_BLOCK_RE.sub("", content).strip()
+    if without_think != candidates[0]:
+        candidates.append(without_think)
+
+    for candidate in candidates:
+        match = _STRICT_JUDGE_BOOL_RE.fullmatch(candidate)
+        if match is not None:
+            return match.group(1) == "True"
+    return None
 
 
 def resolve_reference_answer(record: FreeAnswerRecord) -> str:
@@ -209,13 +225,14 @@ class LLMJudge:
                         **request_kwargs,
                     )
                     content = (response.choices[0].message.content or "").strip()
+                    parsed = _parse_judge_bool(content)
 
-                    if content not in {"True", "False"}:
+                    if parsed is None:
                         last_error_kind = "invalid_output"
                         last_error = f"invalid output: {content!r}"
                         raise ValueError(f"LLM judge 输出非法值: {content!r}")
 
-                    return content == "True", "parsed", None
+                    return parsed, "parsed", None
 
                 except Exception as exc:
                     if not last_error:

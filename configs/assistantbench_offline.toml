@@ -1,0 +1,22 @@
+[default]
+avg_k = [1]
+
+[cot]
+template = "function_call_cot_default"
+cot_prompt_template = """User: <Q>
+
+Solve the task step by step. In this evaluation you do not have access to live browsing or external tools, so do not claim that you visited websites or checked sources. Keep track of the exact answer format requested by the user, but do not output the final answer yet.
+
+Assistant: <think"""
+
+[final]
+template = "function_call_final_default"
+final_prompt_template = """<Q><COT>
+
+Now provide only the final answer to the user's task.
+Rules:
+- Output only the answer.
+- Do not add explanation, confidence, URLs, or extra words.
+- If the task specifies a format, follow it exactly.
+
+Assistant:"""

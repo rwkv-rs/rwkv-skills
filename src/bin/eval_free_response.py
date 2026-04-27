@@ -25,7 +25,11 @@ from src.db.orm import init_orm
 from src.db.eval_db_service import EvalDbService
 from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
-from src.eval.evaluators.free_response import FreeResponsePipeline
+from src.eval.evaluators.free_response import (
+    DEFAULT_COT_PROMPT,
+    DEFAULT_FINAL_PROMPT,
+    FreeResponsePipeline,
+)
 from src.infer.model import ModelLoadConfig
 
 
@@ -128,6 +132,22 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
+def _resolve_prompt_templates(slug: str, model_name: str) -> tuple[str, str]:
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    cot_prompt = (
+        cot_config.cot_prompt_template
+        if cot_config is not None and cot_config.cot_prompt_template
+        else DEFAULT_COT_PROMPT
+    )
+    final_prompt = (
+        final_config.final_prompt_template
+        if final_config is not None and final_config.final_prompt_template
+        else DEFAULT_FINAL_PROMPT
+    )
+    return cot_prompt, final_prompt
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
@@ -142,6 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_pass_k = _report_pass_k(slug, model_name, pass_k)
     report_avg_k = _report_avg_k(slug, model_name, avg_k)
     sample_limit = _resolve_max_samples(slug, model_name, args)
+    cot_prompt_template, final_prompt_template = _resolve_prompt_templates(slug, model_name)
 
     cot_sampling = resolve_sampling_config(
         slug,
@@ -194,6 +215,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.probe_only:
         _ = pipeline.run(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_prompt_template,
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,
@@ -253,6 +276,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = pipeline.run(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_prompt_template,
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             batch_size=batch_size,

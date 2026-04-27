@@ -50,6 +50,7 @@ EVAL_CONTEXT_PREVIEW_LIMIT = 20
 # ---------------------------------------------------------------------------
 
 PRIMARY_KEYS = (
+    "success_rate",
     "judge_accuracy",
     "exact_accuracy",
     "accuracy",
@@ -89,8 +90,8 @@ DOMAIN_GROUPS = (
     {
         "key": "function_call",
         "label": "Function Call",
-        "domains": {"function_call系列", "function_call"},
-        "title": "函数调用",
+        "domains": {"function_call系列", "function_call", "agent系列"},
+        "title": "函数调用 / Agent",
     },
 )
 
@@ -234,7 +235,7 @@ class ParamLineage:
 
 @dataclass(slots=True, frozen=True)
 class DetailPoint:
-    score: float
+    score: float | None
     entry: ScoreEntry
 
 

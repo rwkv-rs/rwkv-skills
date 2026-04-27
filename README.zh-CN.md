@@ -63,6 +63,22 @@ print(result)
 ```
 自由问答与指令遵循的用法类似，分别使用 `FreeResponsePipeline` 与 `InstructionFollowingPipeline`。
 
+## 性能基准
+`src/eval/performance` 现在提供一套面向推理引擎的性能评测流水线，包含：
+- lane-aware 的 schema：`lane_spec`、`engine_spec`、`engine_profile`、`hardware_spec`、`workload_spec`
+- 进程内 RWKV 本地引擎评测
+- 面向 vLLM 这类 OpenAI-compatible 服务的评测
+- `raw_run.json`、`point_summary.json` 与按固定 lane 构建的引擎 leaderboard
+
+示例配置位于 `configs/performance/`：
+```bash
+python -m src.bin.run_perf_point --config configs/performance/local_rwkv.example.toml
+python -m src.bin.run_perf_point --config configs/performance/vllm_openai.example.toml
+python -m src.bin.run_perf_matrix --config configs/performance/vllm_openai.example.toml
+python -m src.bin.build_engine_leaderboard --input results/performance --lane-id <lane_id> --hardware-id <hardware_id> --board-scope-id <board_scope_id>
+```
+结果会写入 `results/performance/<point_id>/runs/*.json` 与 `results/performance/<point_id>/point_summary.json`。leaderboard 只允许在单一 `lane_id + hardware_id + board_scope_id` 内构建，默认拒绝跨模型总榜。
+
 ## 调度器 CLI
 `rwkv-skills-scheduler` 暴露了一组命令（队列预览、调度、状态、停止、日志轮播）：
 ```bash
@@ -76,7 +92,7 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 可以用 `--only-datasets aime24 aime25` 这类参数仅重测指定 benchmark（名称即可，不需要 `_test` 后缀），也可以用 `--skip-datasets mmlu` 排除特定集合。若想只跑部分模型，无需填写完整路径，可使用 `--model-regex '^rwkv7-.*7\\.2b$'` 等正则过滤模型文件名，配合默认的权重 glob 即可。
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器依赖的入口脚本已提供：
 `src/bin/eval_multi_choice.py`、`eval_multi_choice_cot.py`、`eval_free_response.py`、`eval_free_response_judge.py`、`eval_instruction_following.py`、`eval_code_human_eval.py`、`eval_code_mbpp.py`、`eval_code_livecodebench.py`。
-其中 `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test` 这类需要 LLM 评分的 free-response benchmark 会自动被派发到 `eval_free_response_judge.py`，其余 free-response 仍走 `eval_free_response.py` 的 exact match 逻辑。
+所有 math/free-response benchmark 正式评测都会自动派发到 `eval_free_response_judge.py`，并使用配置好的 LLM judge 进行判分。
 采样参数的网格搜索通过 param-search 流程完成：
 - runner job 会把完整网格每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
 - selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并把唯一最佳格点复制/写入到不带后缀的 `{benchmark}` 产物路径。

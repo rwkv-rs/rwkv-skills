@@ -16,6 +16,7 @@ from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
 from src.eval.metrics.free_response import (
+    DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
     LLMJudge,
     LLMJudgeConfig,
     compute_avg_at_k,
@@ -135,6 +136,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--judge-base-url",
         help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
     )
+    parser.add_argument(
+        "--judge-max-workers",
+        type=int,
+        help="Max concurrent workers for LLM judge (env: JUDGE_MAX_WORKERS / LLM_JUDGE_MAX_WORKERS)",
+    )
+    parser.add_argument(
+        "--judge-max-tokens",
+        type=int,
+        help="Max judge completion tokens (env: JUDGE_MAX_TOKENS / LLM_JUDGE_MAX_TOKENS)",
+    )
     return parser.parse_args(argv)
 
 
@@ -208,10 +219,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         or os.environ.get("LLM_JUDGE_BASE_URL")
         or os.environ.get("API_BASE")
     )
+    judge_max_workers = (
+        args.judge_max_workers
+        or int(
+            os.environ.get("JUDGE_MAX_WORKERS")
+            or os.environ.get("LLM_JUDGE_MAX_WORKERS")
+            or "16"
+        )
+    )
+    judge_max_tokens = (
+        args.judge_max_tokens
+        or int(
+            os.environ.get("JUDGE_MAX_TOKENS")
+            or os.environ.get("LLM_JUDGE_MAX_TOKENS")
+            or "16"
+        )
+    )
 
     judge: LLMJudge | None = None
     if judge_model and judge_api_key:
-        judge = LLMJudge(LLMJudgeConfig(api_key=judge_api_key, model=judge_model, base_url=judge_base_url))
+        judge = LLMJudge(
+            LLMJudgeConfig(
+                api_key=judge_api_key,
+                model=judge_model,
+                base_url=judge_base_url,
+                max_workers=judge_max_workers,
+                prompt_template=DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
+                max_completion_tokens=judge_max_tokens,
+            )
+        )
 
     total = grid_size()
     print(f"🔍 Param-search grid size: {total}")

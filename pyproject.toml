@@ -137,6 +137,7 @@ default = true
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"
 rwkv-download-weights = "src.bin.download_weights:main"
 rwkv-skills-space = "src.space.app:main"
+rwkv-skills-space-restart = "src.bin.run_space_with_restart:main"
 
 [tool.black]
 line-length = 120

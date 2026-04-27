@@ -92,6 +92,13 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
+def _resolve_direct_prompt_template(slug: str, model_name: str) -> str | None:
+    config = resolve_benchmark_model_config(slug, model_name, stage="direct")
+    if config is not None and config.direct_prompt_template:
+        return config.direct_prompt_template
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
@@ -105,6 +112,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_avg_k = _report_avg_k(slug, model_name, avg_k)
     samples_per_task = max(max_generation_k(pass_k), max_generation_k(avg_k), 1)
     sample_limit = _resolve_max_samples(slug, model_name, args)
+    prompt_template = _resolve_direct_prompt_template(slug, model_name)
 
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
@@ -148,6 +156,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = pipeline.run_direct(
             dataset_path=str(dataset_path),
+            prompt_template=prompt_template,
             sample_limit=sample_limit,
             samples_per_task=samples_per_task,
             skip_keys=skip_keys,

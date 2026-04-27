@@ -74,6 +74,7 @@ class DispatchOptions(QueueOptions):
     batch_cache_path: Path | None = None
     overwrite: bool = False
     disable_checker: bool = False
+    benchmark_config_root: Path | None = None
     # For resume: precise (dataset_slug, model_name, job_name) whitelist
     only_job_triples: frozenset[tuple[str, str, str]] | None = None
 
@@ -128,6 +129,8 @@ def action_queue(opts: QueueOptions) -> list[QueueItem]:
 
 
 def action_dispatch(opts: DispatchOptions) -> None:
+    if opts.benchmark_config_root is not None:
+        os.environ["RWKV_BENCHMARK_CONFIG_ROOT"] = str(opts.benchmark_config_root)
     ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
     if opts.clean_param_swap:
         _clean_param_swap_records(opts.log_dir)
@@ -418,6 +421,8 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     pass
             if opts.disable_checker:
                 env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
+            if opts.benchmark_config_root is not None:
+                env["RWKV_BENCHMARK_CONFIG_ROOT"] = str(opts.benchmark_config_root)
 
             questions = question_counts.get(dataset_slug)
 
@@ -869,6 +874,7 @@ def action_resume(opts: DispatchOptions, *, session_id: str | None = None) -> No
         batch_cache_path=opts.batch_cache_path,
         overwrite=True,  # Force overwrite to ignore existing scores
         disable_checker=opts.disable_checker,
+        benchmark_config_root=opts.benchmark_config_root,
         only_job_triples=frozenset(incomplete_triples),  # Precise filtering
     )
 

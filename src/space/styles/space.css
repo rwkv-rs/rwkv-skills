@@ -523,6 +523,24 @@ gradio-app,
   color: #3f3f46;
 }
 
+.bench-table td.cell-status-error {
+  background: #3f0d12 !important;
+  color: #fecaca !important;
+  font-weight: 700;
+}
+
+.bench-table td.cell-status-running {
+  background: #1e3a8a !important;
+  color: #bfdbfe !important;
+  font-weight: 700;
+}
+
+.bench-table td.cell-status-pending {
+  background: #3b2f0e !important;
+  color: #fde68a !important;
+  font-weight: 700;
+}
+
 .bench-table td.cell-delta-pos {
   background: #064e3b !important;
   color: #6ee7b7 !important;
@@ -552,6 +570,18 @@ gradio-app,
 
 .bench-table tbody tr:hover td.cell-delta-zero {
   background: #1c1c2e !important;
+}
+
+.bench-table tbody tr:hover td.cell-status-error {
+  background: #3f0d12 !important;
+}
+
+.bench-table tbody tr:hover td.cell-status-running {
+  background: #1e3a8a !important;
+}
+
+.bench-table tbody tr:hover td.cell-status-pending {
+  background: #3b2f0e !important;
 }
 
 .space-clickable-score {

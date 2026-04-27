@@ -8,6 +8,7 @@ from typing import Final, Iterable, Sequence
 
 from src.eval.datasets.data_prepper.data_manager import (
     available_code_generation_datasets,
+    available_function_call_datasets,
     available_free_answer_datasets,
     available_instruction_following_datasets,
     available_multiple_choice_datasets,
@@ -46,6 +47,9 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_cn": "test",
     "livecodebench": "test",
 }
+FUNCTION_CALL_DEFAULT_SPLITS: dict[str, str] = {
+    "assistantbench_offline": "validation",
+}
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,7 @@ def _build_dataset_catalogues() -> tuple[
     tuple[str, ...],
     tuple[str, ...],
     tuple[str, ...],
+    tuple[str, ...],
 ]:
     specs: dict[str, DatasetPrepSpec] = {}
 
@@ -112,6 +117,11 @@ def _build_dataset_catalogues() -> tuple[
         split = CODE_DEFAULT_SPLITS.get(dataset, "test")
         code_slugs.append(register(dataset, split))
 
+    function_call_slugs: list[str] = []
+    for dataset in available_function_call_datasets():
+        split = FUNCTION_CALL_DEFAULT_SPLITS.get(dataset, "test")
+        function_call_slugs.append(register(dataset, split))
+
     for alias, target in DATASET_SLUG_ALIASES.items():
         canonical = canonical_slug(target)
         if canonical in specs:
@@ -122,7 +132,8 @@ def _build_dataset_catalogues() -> tuple[
     math_tuple = tuple(sorted({canonical_slug(s) for s in math_slugs}))
     special_tuple = tuple(sorted({canonical_slug(s) for s in special_slugs}))
     code_tuple = tuple(sorted({canonical_slug(s) for s in code_slugs}))
-    return specs, multi_choice_tuple, math_tuple, special_tuple, code_tuple
+    function_call_tuple = tuple(sorted({canonical_slug(s) for s in function_call_slugs}))
+    return specs, multi_choice_tuple, math_tuple, special_tuple, code_tuple, function_call_tuple
 
 
 (
@@ -131,24 +142,12 @@ def _build_dataset_catalogues() -> tuple[
     MATH_DATASET_SLUGS,
     SPECIAL_DATASET_SLUGS,
     CODE_DATASET_SLUGS,
+    FUNCTION_CALL_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
 
-LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
-    canonical_slug(slug)
-    for slug in (
-        "gsm8k_test",
-        "math_500_test",
-        "answer_judge_test",
-        "gaokao2023en_test",
-        "comp_math_24_25_test",
-        "minerva_math_test",
-        "amc23_test",
-    )
-)
-# judge-only 数据集不再调度到 free_response，避免 math_500 反复被 free_response 拉起
-MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
-    slug for slug in MATH_DATASET_SLUGS if slug not in LLM_JUDGE_DATASET_SLUGS
-)
+# All math/free-response datasets use the same LLM-judge evaluator by default.
+LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = MATH_DATASET_SLUGS
+MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple()
 
 ifeval_related = [slug for slug in SPECIAL_DATASET_SLUGS if slug.startswith("ifeval")]
 if not ifeval_related:
@@ -274,6 +273,14 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         is_cot=False,
         domain="instruction_following",
         extra_args=("--no-param-search",),
+    ),
+    "function_call": JobSpec(
+        name="function_call",
+        module="src.bin.eval_function_call",
+        dataset_slugs=FUNCTION_CALL_DATASET_SLUGS or (canonical_slug("assistantbench_offline_validation"),),
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
     ),
 }
 

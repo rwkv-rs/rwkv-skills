@@ -54,7 +54,7 @@ DEFAULT_REVISION = os.environ.get("RWKV_WEIGHTS_REVISION", "main")
 MAX_AUTO_WORKERS = 8
 INITIAL_BACKOFF_SECONDS = 5
 MAX_BACKOFF_SECONDS = 300
-# PTH_FILENAME_KEYWORD = "g1d"
+# PTH_FILENAME_KEYWORD = "g1f"
 
 
 def discover_pth_files(api: HfApi, repo_id: str, revision: str = DEFAULT_REVISION) -> tuple[str, ...]:

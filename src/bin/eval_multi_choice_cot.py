@@ -154,6 +154,22 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
+def _resolve_prompt_templates(slug: str, model_name: str) -> tuple[str | None, str | None]:
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    cot_prompt = (
+        cot_config.cot_prompt_template
+        if cot_config is not None and cot_config.cot_prompt_template
+        else None
+    )
+    final_prompt = (
+        final_config.final_prompt_template
+        if final_config is not None and final_config.final_prompt_template
+        else None
+    )
+    return cot_prompt, final_prompt
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
@@ -167,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_avg_k = _report_avg_k(slug, model_name, avg_k)
     sample_limit = _resolve_max_samples(slug, model_name, args)
     samples_per_task = max(max_generation_k(pass_k), max_generation_k(avg_k), 1)
+    cot_prompt_template, final_answer_template = _resolve_prompt_templates(slug, model_name)
 
     # Quick validation of dataset readability before heavy model init
     records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
@@ -212,6 +229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_answer_template,
             cot_sampling=cot_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
@@ -237,6 +256,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = pipeline.run_chain_of_thought(
             dataset_path=str(dataset_path),
+            cot_prompt_template=cot_prompt_template,
+            final_answer_template=final_answer_template,
             cot_sampling=cot_sampling,
             batch_size=target_batch,
             sample_limit=sample_limit,

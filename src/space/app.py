@@ -367,6 +367,7 @@ def _build_dashboard() -> gr.Blocks:
             ) {
                 const ctx = eventObj.context;
                 const stages = Array.isArray(ctx.stages) ? ctx.stages : [];
+                const events = Array.isArray(ctx.events) ? ctx.events : [];
                 const samplingConfig = ctx.sampling_config && typeof ctx.sampling_config === 'object' ? ctx.sampling_config : null;
                 const stopTokens = eventObj.stop_tokens && typeof eventObj.stop_tokens === 'object' ? eventObj.stop_tokens : {};
 
@@ -380,6 +381,53 @@ def _build_dashboard() -> gr.Blocks:
                             const completion = stage && typeof stage.completion === 'string' ? stage.completion : '';
                             addSectionPre(card, 'prompt', prompt);
                             addSectionMarkdown(card, 'completion', completion);
+                        });
+                    });
+                } else if (events.length) {
+                    events.forEach((eventItem, idx) => {
+                        const eventType =
+                            eventItem && typeof eventItem.type === 'string' && eventItem.type
+                                ? eventItem.type
+                                : eventItem && typeof eventItem.kind === 'string' && eventItem.kind
+                                    ? eventItem.kind
+                                    : 'event';
+                        const role =
+                            eventItem && typeof eventItem.role === 'string' && eventItem.role
+                                ? ` · ${eventItem.role}`
+                                : '';
+                        const name =
+                            eventItem && typeof eventItem.name === 'string' && eventItem.name
+                                ? ` (${eventItem.name})`
+                                : '';
+                        addCard(left, `Event ${idx + 1} · ${eventType}${role}${name}`, (card) => {
+                            const content =
+                                eventItem && typeof eventItem.content === 'string'
+                                    ? eventItem.content
+                                    : eventItem && typeof eventItem.text === 'string'
+                                        ? eventItem.text
+                                        : eventItem && typeof eventItem.result === 'string'
+                                            ? eventItem.result
+                                            : '';
+                            const argumentsText =
+                                eventItem && eventItem.arguments && typeof eventItem.arguments === 'object'
+                                    ? JSON.stringify(eventItem.arguments, null, 2)
+                                    : '';
+                            const metadataText =
+                                eventItem && eventItem.metadata && typeof eventItem.metadata === 'object'
+                                    ? JSON.stringify(eventItem.metadata, null, 2)
+                                    : '';
+                            if (content) {
+                                addSectionMarkdown(card, 'content', content);
+                            }
+                            if (argumentsText) {
+                                addSectionPre(card, 'arguments', argumentsText);
+                            }
+                            if (metadataText) {
+                                addSectionPre(card, 'metadata', metadataText);
+                            }
+                            if (!content && !argumentsText && !metadataText) {
+                                addSectionPre(card, 'content', '—');
+                            }
                         });
                     });
                 } else {
@@ -681,7 +729,7 @@ def _build_dashboard() -> gr.Blocks:
                 with gr.Row():
                     model_dropdown = gr.Dropdown(
                         label="模型选择",
-                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1d）最新的模型；手动选择时展示单个模型的最新数据库分数。",
+                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1f）最新的模型；手动选择时展示单个模型的最新数据库分数。",
                         choices=model_choices,
                         value=AUTO_MODEL_LABEL,
                         scale=3,
@@ -867,6 +915,12 @@ def _build_dashboard() -> gr.Blocks:
                 update_dashboard,
                 inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state, sort_state],
                 outputs=dashboard_outputs,
+            )
+            demo.load(
+                update_dashboard,
+                inputs=[model_dropdown, table_view, wrong_only_toggle, selected_cell_state, sort_state],
+                outputs=dashboard_outputs,
+                queue=False,
             )
             refresh_btn.click(
                 update_dashboard,

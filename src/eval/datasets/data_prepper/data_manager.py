@@ -30,6 +30,7 @@ from . import common
 from .prepper_registry import (
     CODE_GENERATION_REGISTRY,
     DatasetPreparer,
+    FUNCTION_CALL_REGISTRY,
     FREE_ANSWER_REGISTRY,
     INSTRUCTION_FOLLOWING_REGISTRY,
     MULTIPLE_CHOICE_REGISTRY,
@@ -40,6 +41,7 @@ _FAMILY_MODULES = (
     "free_answer",
     "instruction_following",
     "code_generation",
+    "function_call",
 )
 _CORE_PACKAGE = __name__.rsplit(".", 1)[0]
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -88,6 +90,17 @@ def available_code_generation_datasets() -> Iterable[str]:
     return CODE_GENERATION_REGISTRY.names()
 
 
+def available_function_call_datasets() -> Iterable[str]:
+    """列出 function_call / agent 领域数据集。"""
+    _ensure_registries()
+    return FUNCTION_CALL_REGISTRY.names()
+
+
+def available_agent_datasets() -> Iterable[str]:
+    """兼容旧命名，等同于 available_function_call_datasets。"""
+    return available_function_call_datasets()
+
+
 def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[Path]:
     """执行指定数据集的准备函数，确保输出路径在 repo/data 下规范化。
 
@@ -101,6 +114,7 @@ def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[P
         or FREE_ANSWER_REGISTRY.get(key)
         or INSTRUCTION_FOLLOWING_REGISTRY.get(key)
         or CODE_GENERATION_REGISTRY.get(key)
+        or FUNCTION_CALL_REGISTRY.get(key)
     )
     if preparer is None:
         raise ValueError(f"未知的 NeMo benchmark 数据集: {name}")
@@ -139,6 +153,8 @@ __all__ = [
     "available_free_answer_datasets",
     "available_instruction_following_datasets",
     "available_code_generation_datasets",
+    "available_function_call_datasets",
+    "available_agent_datasets",
     "prepare_dataset",
     "common",
 ]

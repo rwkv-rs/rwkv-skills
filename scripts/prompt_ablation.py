@@ -139,7 +139,7 @@ def load_trials(
                 continue
             raise ValueError(f"trial {trial_name!r} needs benchmarks=... or CLI --benchmarks")
         config = _trial_config(raw_table)
-        if not any(config.values()):
+        if not any(config.values()) and not trial_name.startswith("control_"):
             raise ValueError(f"trial {trial_name!r} does not set any supported prompt/config field")
         trials.append(
             PromptTrial(

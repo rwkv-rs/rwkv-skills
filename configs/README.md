@@ -14,6 +14,7 @@ Supported keys per model table:
   alpha_presence, alpha_frequency, alpha_decay, stop_tokens, ban_tokens,
   pad_zero, no_penalty_token_ids
 - Evaluation fields: pass_k, avg_k, report_pass_k, report_avg_k, max_samples (free_response and multi_choice_cot; max_samples is also read by direct/code/instruction evaluators)
+- Prompt fields: cot_prompt_template, final_prompt_template, judge_prompt_template
 
 Notes:
 - CLI flags override config values.
@@ -22,6 +23,8 @@ Notes:
 - When `avg_k` is a ratio, the evaluator uses the first `ceil(ratio * repeats)` samples available for each problem.
 - max_samples is used as the default sample limit when CLI `--max-samples` is omitted.
 - llm_judge stays in evaluator code or CLI flags; it is not read from TOML.
+- `cot_prompt_template` / `final_prompt_template` are currently used by free_response and free_response_judge.
+- `judge_prompt_template` is currently used by free_response_judge.
 - free_response applies sampling overrides to CoT generation.
 - livecodebench applies sampling overrides to both CoT and final stages.
 - livecodebench defaults to full_code_* templates when configs/livecodebench.toml is missing.

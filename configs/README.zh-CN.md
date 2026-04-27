@@ -14,6 +14,7 @@
   alpha_presence、alpha_frequency、alpha_decay、stop_tokens、ban_tokens、
   pad_zero、no_penalty_token_ids
 - 评测字段：pass_k、avg_k、report_pass_k、report_avg_k、max_samples（free_response 与 multi_choice_cot；direct/code/instruction 入口也会读取 max_samples）
+- Prompt 字段：cot_prompt_template、final_prompt_template、judge_prompt_template
 
 备注：
 - CLI 参数会覆盖配置值。
@@ -22,6 +23,8 @@
 - 当 `avg_k` 配成比例时，评测会对每道题使用前 `ceil(比例 * repeats)` 个可用样本计算 avg。
 - 未显式传入 CLI `--max-samples` 时，会默认读取配置里的 `max_samples`。
 - llm_judge 仍由评测脚本或 CLI 控制，不从 TOML 读取。
+- cot_prompt_template / final_prompt_template 当前用于 free_response 和 free_response_judge。
+- judge_prompt_template 当前用于 free_response_judge。
 - free_response 的采样配置只用于 CoT 生成阶段。
 - livecodebench 的采样配置同时作用于 CoT 和 final 阶段。
 - 缺少 configs/livecodebench.toml 时，livecodebench 默认使用 full_code_* 模板。

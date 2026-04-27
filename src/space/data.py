@@ -32,9 +32,12 @@ DATA_VERSIONS = (
     "g1b",
     "g1c",
     "g1d",
+    "g1e",
+    "g1f",
 )
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")
+HIDDEN_DATASET_SLUGS = {"answer_judge_test"}
 
 
 def _record_error(message: str, errors: list[str] | None) -> None:
@@ -236,6 +239,8 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
         return "coding系列"
     if job == "instruction_following":
         return "instruction following系列"
+    if job in {"agent", "function_call"}:
+        return "function_call系列"
     if job in {"free_response", "free_response_judge"}:
         return "math reasoning系列"
     if job in {"multi_choice_plain", "multi_choice_cot"}:
@@ -245,6 +250,8 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
             return "coding系列"
         if "instruction" in task:
             return "instruction following系列"
+        if task in {"agent", "function_call"}:
+            return "function_call系列"
     return "其他"
 
 
@@ -252,6 +259,8 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
     dataset = canonical_slug(str(payload.get("dataset", "")).strip())
     model = str(payload.get("model", "")).strip()
     if not dataset or not model:
+        return None
+    if dataset in HIDDEN_DATASET_SLUGS:
         return None
 
     is_cot = bool(payload.get("cot", False))

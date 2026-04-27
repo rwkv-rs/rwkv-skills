@@ -63,6 +63,22 @@ print(result)
 ```
 Free-response and instruction-following work similarly via `FreeResponsePipeline` and `InstructionFollowingPipeline`.
 
+## Performance benchmarking
+`src/eval/performance` now contains an engine-oriented benchmarking pipeline with:
+- lane-aware schemas (`lane_spec`, `engine_spec`, `engine_profile`, `hardware_spec`, `workload_spec`)
+- in-process RWKV benchmarking for the local engine
+- OpenAI-compatible server benchmarking for vLLM-style deployments
+- point summaries and engine leaderboards keyed by fixed reference-model lanes
+
+Example configs are provided under `configs/performance/`:
+```bash
+python -m src.bin.run_perf_point --config configs/performance/local_rwkv.example.toml
+python -m src.bin.run_perf_point --config configs/performance/vllm_openai.example.toml
+python -m src.bin.run_perf_matrix --config configs/performance/vllm_openai.example.toml
+python -m src.bin.build_engine_leaderboard --input results/performance --lane-id <lane_id> --hardware-id <hardware_id> --board-scope-id <board_scope_id>
+```
+Outputs are written under `results/performance/<point_id>/runs/*.json` and `results/performance/<point_id>/point_summary.json`. Leaderboards are built only within a single `lane_id + hardware_id + board_scope_id`; cross-model global boards are intentionally rejected.
+
 ## Scheduler CLI
 `rwkv-skills-scheduler` provides commands for queue preview, dispatch, status, stop, and log rotation:
 ```bash
@@ -79,7 +95,7 @@ You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (na
 The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler entry scripts are provided:
 `src/bin/eval_multi_choice.py`, `eval_multi_choice_cot.py`, `eval_free_response.py`, `eval_free_response_judge.py`, `eval_instruction_following.py`, `eval_code_human_eval.py`, `eval_code_mbpp.py`, `eval_code_livecodebench.py`.
 
-Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `eval_free_response_judge.py`; other free-response tasks still use `eval_free_response.py`'s exact-match logic.
+All math/free-response benchmark runs are automatically dispatched to `eval_free_response_judge.py` and use the configured LLM judge for scoring.
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`.
