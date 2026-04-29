@@ -11,6 +11,13 @@ from src.eval.function_calling.common import (
     prepare_function_calling_run,
     repeat_probe_entries,
 )
+from src.eval.function_calling.context_budget import normalize_rwkv_text
+from src.eval.function_calling.mcp_bench import (
+    McpBenchItem,
+    McpBenchTaskSpec,
+    build_final_answer_prompt,
+    build_planning_context,
+)
 
 
 def test_build_pending_attempts_filters_skip_keys() -> None:
@@ -33,6 +40,46 @@ def test_repeat_probe_entries_repeats_to_batch_size() -> None:
     repeated = repeat_probe_entries([1, 2], batch_size=5)
 
     assert repeated == [1, 2, 1, 2, 1]
+
+
+def test_normalize_rwkv_text_strips_crlf_and_blank_lines() -> None:
+    assert normalize_rwkv_text("  Line 1\r\n\r\nLine 2\n\n\nLine 3  ") == "Line 1\nLine 2\nLine 3"
+
+
+def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
+    item = McpBenchItem(
+        task_file="tasks.json",
+        server_name="calendar",
+        combination_name="calendar_only",
+        combination_type="single",
+        servers=("calendar",),
+        task=McpBenchTaskSpec(
+            task_id="task-1",
+            task_description="Schedule the meeting",
+            fuzzy_description="Book the meeting",
+            dependency_analysis="none",
+            distraction_servers=(),
+        ),
+        runtime_root="/tmp/runtime",
+    )
+    tools = {
+        "calendar.search": {
+            "server": "calendar",
+            "name": "search",
+            "description": "Find calendar events.\n\nReturns matching IDs.",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+        }
+    }
+
+    planning = build_planning_context(item, tools, "Found A.\n\nFound B.")
+    final = build_final_answer_prompt(item, "Found A.\n\nFound B.")
+
+    assert planning.startswith("System: Tools:")
+    assert '"name": "calendar:search"' in planning
+    assert "Return only a JSON function call." in planning
+    assert "\nUser: Task:\nBook the meeting" in planning
+    assert planning.endswith("Assistant: <think><|completions_of_cot|>")
+    assert final.endswith("Assistant:")
 
 
 def test_compute_function_calling_metrics_reports_success_rate_and_avg_key() -> None:

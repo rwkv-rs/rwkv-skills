@@ -39,8 +39,7 @@ class JobSpec:
     probe_extra_args: tuple[str, ...] = ()
     # 用于探测 batch size 时估算实际样本量（例如 pass@k>1 时每题会展开多条样本）
     probe_samples_per_task: int = 1
-    # 某些 benchmark 会自动扩展到固定样本量（例如 avg@k 补到 5000 次尝试），
-    # probe 时至少按这个规模挑选候选 batch，避免小数据集只能探到过小 batch。
+    # probe 时可按较大规模挑选候选 batch，避免只用小样本探测出不代表完整评测的 batch。
     probe_question_floor: int = 0
 
     @property

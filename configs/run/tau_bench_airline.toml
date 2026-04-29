@@ -1,0 +1,24 @@
+[run]
+run_mode = "rerun"
+max_samples = 50
+batch_size = 64
+
+[dataset]
+name = "tau_bench_airline"
+split = "test"
+
+[model]
+infer_base_url = "http://127.0.0.1:18081"
+infer_model = "rwkv7-g1e-13.3b-20260309-ctx8192"
+infer_timeout_s = 600
+infer_max_workers = 64
+
+[runner]
+benchmark_kind = "tau_bench"
+avg_ks = [1]
+history_max_chars = 24000
+max_steps = 20
+max_tool_errors = 20
+cot_max_tokens = 2048
+decision_max_tokens = 1024
+

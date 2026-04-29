@@ -65,6 +65,7 @@ class QueueOptions:
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
+    remote_batch_size: int | None = None
     distributed_claims: bool = False
     scheduler_node_id: str | None = None
     lease_duration_s: int = 900
@@ -417,6 +418,8 @@ def _launch_queue_items(
         questions = question_counts.get(dataset_slug)
 
         batch_size = None
+        if item.is_remote and opts.remote_batch_size is not None and job.batch_flag:
+            batch_size = max(1, int(opts.remote_batch_size))
         if not item.is_remote and item.model_path is not None:
             batch_size = batch_profiler.determine_batch_size(
                 job=job,

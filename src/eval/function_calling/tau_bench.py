@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
-_JSON_BLOCK_RE = re.compile(r"(?s)```json\s*(?P<body>\{.*?\})\s*```")
+from .context_budget import normalize_rwkv_text as _normalize_rwkv_text
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +83,7 @@ def render_tau_user_prompt(task_payload: Mapping[str, Any]) -> str:
         if notes:
             parts.append(f"Notes:\n{notes}")
 
-    text = "\n\n".join(part for part in parts if part).strip()
+    text = _normalize_rwkv_text("\n".join(part for part in parts if part))
     if text:
         return text
     return ""
@@ -97,44 +95,53 @@ def build_tau_system_prompt(
     assistant_tools: Sequence[Mapping[str, Any]],
     user_tools: Sequence[Mapping[str, Any]],
 ) -> str:
-    lines = [
-        "You are solving a tau_bench function-calling task.",
-        "Follow the policy exactly.",
-        'When you need to execute a tool, respond with only one JSON object wrapped in a ```json fenced block.',
-        'The JSON shape is {"requestor":"assistant|user","name":"tool_name","arguments":{...}}.',
-        "Use requestor=user only when simulating a concrete customer-side action or inspection step.",
-        "When the task is complete, respond with a plain natural-language final answer and do not output JSON.",
-        "",
-        "Policy:",
-        policy.strip(),
-        "",
-        "Available assistant tools:",
+    tools = [
+        _function_call_tool_schema(item, requestor="assistant")
+        for item in assistant_tools
     ]
-    lines.extend(_render_tool_schema(item, requestor="assistant") for item in assistant_tools)
-    if user_tools:
-        lines.extend(["", "Available user tools:"])
-        lines.extend(_render_tool_schema(item, requestor="user") for item in user_tools)
-    return "\n".join(lines).strip()
+    tools.extend(_function_call_tool_schema(item, requestor="user") for item in user_tools)
+    tools.append(
+        {
+            "name": "final_answer",
+            "description": "Use this when the task is complete.",
+            "arguments": {
+                "answer": {"type": "string"},
+            },
+        }
+    )
+    lines = [
+        "Tools:",
+        json.dumps(tools, ensure_ascii=False, indent=2, sort_keys=True),
+        "Return only a JSON function call.",
+        'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+        "Use exactly one listed tool name.",
+        "Use final_answer only when the task is complete.",
+        "Policy:",
+        _normalize_rwkv_text(policy),
+    ]
+    return _normalize_rwkv_text("\n".join(lines))
 
 
 def build_expected_context(system_prompt: str, messages: Sequence[Mapping[str, str]]) -> str:
-    parts = [f"System: {system_prompt.strip()}", ""]
+    parts = [f"System: {_normalize_rwkv_text(system_prompt)}"]
     for message in messages:
         role = str(message.get("role") or "").strip().lower()
-        content = str(message.get("content") or "")
+        content = _normalize_rwkv_text(str(message.get("content") or ""))
         if not content:
             continue
         if role == "assistant":
             parts.append(f"Assistant: {content}")
         else:
             parts.append(f"User: {content}")
-        parts.append("")
     parts.append("Assistant: <think><|completions_of_cot|>")
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def build_turn_completion_prompt(cot_context: str, cot: str) -> str:
-    return cot_context.replace("<|completions_of_cot|>", cot) + "</think>\n"
+    return (
+        cot_context.replace("<|completions_of_cot|>", cot)
+        + "</think>\nReturn only a JSON function call.\n"
+    )
 
 
 def parse_tool_call_or_final_answer(response: str) -> TauDecision:
@@ -142,24 +149,28 @@ def parse_tool_call_or_final_answer(response: str) -> TauDecision:
     if not trimmed:
         raise ValueError("model returned empty response")
 
-    candidate = (
-        _JSON_BLOCK_RE.search(trimmed).group("body").strip()
-        if _JSON_BLOCK_RE.search(trimmed)
-        else trimmed if trimmed.startswith("{") and trimmed.endswith("}") else None
-    )
-    if candidate is None:
-        return TauDecision(is_tool_call=False, final_answer=trimmed)
+    if not (trimmed.startswith("{") and trimmed.endswith("}")):
+        raise ValueError(f"model response must be a JSON function call object: {trimmed}")
 
-    payload = json.loads(candidate)
+    payload = json.loads(trimmed)
     if not isinstance(payload, dict):
         raise ValueError("tool call payload must be a JSON object")
+    if set(payload.keys()) != {"name", "arguments"}:
+        raise ValueError("tool call JSON must contain exactly name and arguments")
     name = str(payload.get("name") or "").strip()
     if not name:
-        raise ValueError(f"tool call missing name: {candidate}")
-    requestor = str(payload.get("requestor") or "assistant").strip().lower() or "assistant"
+        raise ValueError(f"tool call missing name: {trimmed}")
+    requestor = "assistant"
+    if "." in name:
+        prefix, unprefixed = name.split(".", 1)
+        if prefix in {"assistant", "user"} and unprefixed.strip():
+            requestor = prefix
+            name = unprefixed.strip()
     arguments = payload.get("arguments")
     if not isinstance(arguments, dict):
         arguments = {}
+    if name == "final_answer":
+        return TauDecision(is_tool_call=False, final_answer=str(arguments.get("answer") or "").strip())
     return TauDecision(
         is_tool_call=True,
         tool_call=TauToolCall(name=name, arguments=dict(arguments), requestor=requestor),
@@ -176,16 +187,16 @@ def render_tool_result(tool_call: TauToolCall, *, ok: bool, output: Any = None, 
         payload["output"] = output
     else:
         payload["error"] = str(error or "unknown tool error")
-    return json.dumps(payload, ensure_ascii=False)
+    return "Function output:\n" + json.dumps(payload, ensure_ascii=False)
 
 
 def render_assistant_tool_message(cot: str, tool_call: TauToolCall) -> str:
+    del cot
     payload = {
-        "requestor": tool_call.requestor,
-        "name": tool_call.name,
+        "name": _prefixed_tool_name(tool_call),
         "arguments": tool_call.arguments,
     }
-    return f"<think>{cot}</think>\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def load_rwkv_rs_tau_bench_rows(
@@ -256,23 +267,41 @@ def _render_tool_schema(schema: Mapping[str, Any], *, requestor: str) -> str:
     name = str(schema.get("name") or "").strip() or "unknown_tool"
     description = str(schema.get("description") or "").strip()
     parameters = schema.get("parameters")
-    properties = {}
-    if isinstance(parameters, Mapping):
-        raw_props = parameters.get("properties")
-        if isinstance(raw_props, Mapping):
-            properties = dict(raw_props)
+    if not isinstance(parameters, Mapping):
+        parameters = {"type": "object", "properties": {}, "required": []}
+    return "\n".join(
+        [
+            f"### `{requestor}.{name}`",
+            f"**Description:** {_normalize_rwkv_text(description or 'No description available')}",
+            "**Parameters:**",
+            json.dumps(parameters, ensure_ascii=False, indent=2, sort_keys=True),
+        ]
+    )
 
-    line = f"- {requestor}.{name}: {description}".rstrip()
-    if properties:
-        args = []
-        for arg_name, arg_schema in properties.items():
-            if isinstance(arg_schema, Mapping):
-                arg_desc = str(arg_schema.get("description") or arg_schema.get("type") or "").strip()
-            else:
-                arg_desc = ""
-            args.append(f"{arg_name}={arg_desc}" if arg_desc else str(arg_name))
-        line += f" Args: {', '.join(args)}"
-    return line
+
+def _function_call_tool_schema(schema: Mapping[str, Any], *, requestor: str) -> dict[str, Any]:
+    name = str(schema.get("name") or "").strip() or "unknown_tool"
+    description = str(schema.get("description") or "").strip()
+    parameters = schema.get("parameters")
+    arguments: Any = {}
+    if isinstance(parameters, Mapping):
+        raw_properties = parameters.get("properties")
+        if isinstance(raw_properties, Mapping):
+            arguments = dict(raw_properties)
+        else:
+            arguments = dict(parameters)
+    return {
+        "name": f"{requestor}.{name}",
+        "description": _normalize_rwkv_text(description or "No description available"),
+        "arguments": arguments,
+    }
+
+
+def _prefixed_tool_name(tool_call: TauToolCall) -> str:
+    requestor = tool_call.requestor.strip().lower() or "assistant"
+    if requestor in {"assistant", "user"}:
+        return f"{requestor}.{tool_call.name}"
+    return tool_call.name
 
 
 __all__ = [

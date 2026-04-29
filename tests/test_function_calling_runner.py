@@ -11,7 +11,10 @@ from src.eval.function_calling import (
     build_bfcl_user_block,
     start_bfcl_runtime,
 )
+from src.eval.function_calling import bfcl_v3_runner
+from src.eval.function_calling.bfcl_v3 import build_bfcl_system_prompt
 from src.eval.function_calling import runner as function_calling_runner
+from src.eval.function_calling import runner_common
 from src.infer.constraints import LiteralChoiceConstraint
 
 
@@ -34,7 +37,7 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
-    plan = function_calling_runner._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0])
+    plan = runner_common._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0])
 
     assert plan.avg_k == 1.0
     assert plan.repeat_count == 1
@@ -43,7 +46,7 @@ def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
 
 def test_function_calling_runner_rejects_multiple_explicit_avg_k_values() -> None:
     try:
-        function_calling_runner._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0, 2.0])
+        runner_common._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0, 2.0])
     except ValueError as exc:
         assert "exactly one avg_k override" in str(exc)
     else:  # pragma: no cover - defensive
@@ -154,8 +157,8 @@ def test_function_calling_runner_detects_template_leak_markers() -> None:
         "<system message>You are a helpful assistant.</system message>\n"
     )
 
-    assert function_calling_runner._looks_like_template_leak(leaked) is True
-    assert function_calling_runner._looks_like_template_leak("Booked flight F1 successfully.") is False
+    assert runner_common._looks_like_template_leak(leaked) is True
+    assert runner_common._looks_like_template_leak("Booked flight F1 successfully.") is False
 
 
 def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
@@ -163,13 +166,13 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
         [
             SimpleNamespace(text="reason 1", finish_reason="stop"),
             SimpleNamespace(text="TOOL", finish_reason="stop"),
-            SimpleNamespace(text='lookup","arguments":{}}</tool_call>', finish_reason="stop"),
+            SimpleNamespace(text='{"name":"lookup","arguments":{}}', finish_reason="stop"),
             SimpleNamespace(text="reason 2", finish_reason="stop"),
             SimpleNamespace(text="HANDOFF", finish_reason="stop"),
-            SimpleNamespace(text="done with this turn", finish_reason="stop"),
+            SimpleNamespace(text='{"name":"final_answer","arguments":{"answer":"done with this turn"}}', finish_reason="stop"),
             SimpleNamespace(text="reason 3", finish_reason="stop"),
             SimpleNamespace(text="HANDOFF", finish_reason="stop"),
-            SimpleNamespace(text="final answer", finish_reason="stop"),
+            SimpleNamespace(text='{"name":"final_answer","arguments":{"answer":"final answer"}}', finish_reason="stop"),
         ]
     )
 
@@ -220,12 +223,12 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
         initial_state={"VehicleControlAPI": {"fuelLevel": 10}},
         metadata={"official_root": "/tmp/fake"},
     )
-    state = function_calling_runner._ActiveBfclEpisode(
+    state = bfcl_v3_runner._ActiveBfclEpisode(
         sample_index=0,
         repeat_index=0,
         pass_index=0,
         record=record,
-        system_prompt=function_calling_runner.build_bfcl_system_prompt(record.tools),
+        system_prompt=build_bfcl_system_prompt(record.tools),
         prompt_messages=[],
         active_tools=[dict(tool) for tool in record.tools],
         runtime_state=start_bfcl_runtime(record),
@@ -233,7 +236,7 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     state.runtime_state.official_model_name = "demo"
 
     monkeypatch.setattr(
-        function_calling_runner,
+        bfcl_v3_runner,
         "execute_bfcl_official_tool_call",
         lambda *_args, **_kwargs: BfclToolExecutionResult(
             success=True,
@@ -244,7 +247,7 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     )
 
     engine = _FakeEngine()
-    trace = function_calling_runner._run_bfcl_v3_official_episode(
+    trace = bfcl_v3_runner._run_bfcl_v3_official_episode(
         state=state,
         run=SimpleNamespace(engine=engine),
         cot_sampling=object(),
@@ -266,12 +269,12 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     assert any(call["constraint_mode"] == "strict" for call in engine.calls if "Tool" in str(call["progress_desc"]))
 
 
-def test_run_bfcl_generation_step_repairs_tool_output_after_router() -> None:
+def test_run_bfcl_generation_step_parses_json_tool_output_after_router() -> None:
     outputs = iter(
         [
             SimpleNamespace(text="<think>Need lookup.</think>", finish_reason="stop"),
             SimpleNamespace(text="TOOL", finish_reason="stop"),
-            SimpleNamespace(text='{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}', finish_reason="stop"),
+            SimpleNamespace(text='{"name":"lookup","arguments":{"id":"A1"}}', finish_reason="stop"),
         ]
     )
 
@@ -315,7 +318,7 @@ def test_run_bfcl_generation_step_repairs_tool_output_after_router() -> None:
             },
         ),
     )
-    state = function_calling_runner._start_bfcl_episode(
+    state = bfcl_v3_runner._start_bfcl_episode(
         sample_index=0,
         repeat_index=0,
         pass_index=0,
@@ -323,7 +326,7 @@ def test_run_bfcl_generation_step_repairs_tool_output_after_router() -> None:
     )
 
     engine = _FakeEngine()
-    outcome = function_calling_runner._run_bfcl_generation_step(
+    outcome = bfcl_v3_runner._run_bfcl_generation_step(
         state=state,
         run=SimpleNamespace(engine=engine),
         user_request="Find A1",
@@ -349,7 +352,7 @@ def test_run_bfcl_generation_step_repairs_tool_output_after_router() -> None:
     router_constraint = router_call["constraints"][0]
     assert isinstance(router_constraint, LiteralChoiceConstraint)
     tool_constraint = tool_call["constraints"][0]
-    assert tool_constraint.feed_text('lookup","arguments":{"id":"A1"}}</tool_call>')
+    assert tool_constraint.feed_text('{"name":"lookup","arguments":{"id":"A1"}}')
     assert tool_constraint.is_complete()
 
 
@@ -358,7 +361,7 @@ def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:
         [
             SimpleNamespace(text="<think>Need a missing id.</think>", finish_reason="stop"),
             SimpleNamespace(text="ASK", finish_reason="stop"),
-            SimpleNamespace(text="Which id should I look up?", finish_reason="stop"),
+            SimpleNamespace(text='{"name":"ask_user","arguments":{"question":"Which id should I look up?"}}', finish_reason="stop"),
         ]
     )
 
@@ -387,14 +390,14 @@ def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:
             return [next(outputs)]
 
     record = BfclTaskRecord(task_id="demo-ask", instruction="Find a record")
-    state = function_calling_runner._start_bfcl_episode(
+    state = bfcl_v3_runner._start_bfcl_episode(
         sample_index=0,
         repeat_index=0,
         pass_index=0,
         record=record,
     )
 
-    outcome = function_calling_runner._run_bfcl_generation_step(
+    outcome = bfcl_v3_runner._run_bfcl_generation_step(
         state=state,
         run=SimpleNamespace(engine=_FakeEngine()),
         user_request="Find a record",
@@ -421,7 +424,7 @@ def test_start_bfcl_episode_wraps_non_official_request_in_rwkv_user_block() -> N
         initial_state={"selected": "A1"},
     )
 
-    state = function_calling_runner._start_bfcl_episode(
+    state = bfcl_v3_runner._start_bfcl_episode(
         sample_index=0,
         repeat_index=0,
         pass_index=0,

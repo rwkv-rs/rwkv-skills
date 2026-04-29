@@ -39,9 +39,8 @@ class BenchmarkMetadata:
     dataset_name: str | None = None
     scheduler_jobs: tuple[str, ...] = ()
     n_shots: tuple[int, ...] = (0,)
-    # Empty avg_ks means "derive avg@k automatically from dataset size until
-    # the run reaches target_eval_attempts", which is the current rwkv-skills
-    # policy for all benchmarks.
+    # Empty avg_ks means "derive avg@k automatically from dataset size":
+    # run the benchmark once, unless it is larger than target_eval_attempts.
     avg_ks: tuple[float, ...] = ()
     pass_ks: tuple[int, ...] = ()
     target_eval_attempts: int = AUTO_TARGET_ATTEMPTS

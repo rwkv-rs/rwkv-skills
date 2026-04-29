@@ -16,7 +16,7 @@ dependencies = [
     "loguru>=0.7.3",
     "matplotlib>=3.10.3",
     "ninja>=1.11.1.4",
-    "numpy>=2.3.4",
+    "numpy>=2.2,<2.3",
     "optuna>=4.5.0",
     "pandas>=2.3.3",
     "plotly>=6.1.2",
@@ -95,6 +95,12 @@ torch-cpu = ["torch>=2.8.0"]
 torch-cu129 = ["torch>=2.8.0"]
 torch-cu126 = ["torch>=2.8.0"]
 torch-rocm = ["torch==2.9.1+rocm6.4", "pytorch-triton-rocm"]
+vllm-cu128 = [
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "torchvision==0.25.0",
+    "vllm==0.19.0",
+]
 dev = ["openai>=1.0.0", "requests>=2.32.5", "tqdm>=4.67.1"]
 
 [tool.uv]
@@ -104,6 +110,7 @@ conflicts = [
         { extra = "torch-cu129" },
         { extra = "torch-cu126" },
         { extra = "torch-rocm" },
+        { extra = "vllm-cu128" },
     ],
 ]
 
@@ -113,7 +120,10 @@ torch = [
     { index = "pytorch-cu129", extra = "torch-cu129" },
     { index = "pytorch-cu126", extra = "torch-cu126" },
     { index = "pytorch-rocm", extra = "torch-rocm" },
+    { index = "pytorch-cu128", extra = "vllm-cu128" },
 ]
+torchaudio = [{ index = "pytorch-cu128", extra = "vllm-cu128" }]
+torchvision = [{ index = "pytorch-cu128", extra = "vllm-cu128" }]
 pytorch-triton-rocm = { index = "pytorch-rocm" }
 
 [[tool.uv.index]]
@@ -132,6 +142,11 @@ url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
 name = "pytorch-rocm"
 url = "https://download.pytorch.org/whl/rocm6.4"
 explicit = true
@@ -145,6 +160,9 @@ default = true
 rwkv-skills = "src.main:main"
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"
 rwkv-skills-infer = "src.bin.run_infer_server:main"
+rwkv-skills-infer-fleet = "src.bin.run_infer_fleet:main"
+rwkv-skills-infer-router = "src.bin.run_infer_router:main"
+rwkv-benchmark-service-perf = "src.bin.run_perf_benchmark:main"
 rwkv-download-weights = "src.bin.download_weights:main"
 rwkv-skills-space = "src.space.app:main"
 

@@ -18,6 +18,7 @@ from .context_budget import (
     DEFAULT_TOOL_ERROR_MAX_CHARS,
     DEFAULT_TOOL_RESULT_MAX_CHARS,
     DEFAULT_TOOL_SCHEMA_MAX_CHARS,
+    normalize_rwkv_text,
     trim_message_history,
     truncate_text,
 )
@@ -34,16 +35,14 @@ BFCL_V3_MAX_COT_SUMMARY_CHARS = 600
 BFCL_ADDITIONAL_FUNCTION_PROMPT = "I have updated some more functions you can choose from. What about now?"
 BFCL_COT_STOP_SUFFIX = "</think>"
 BFCL_DECISION_STOP_SUFFIXES = (
-    "</tool_call>",
+    "\n```",
+    "```",
     "\nUser:",
     "\nSystem:",
     "\nAssistant:",
 )
 BFCL_ROUTER_LABELS = ("TOOL", "ASK", "HANDOFF")
-BFCL_TOOL_CALL_PREFIX = '<tool_call>{"requestor":"assistant","name":"'
-_BFCL_TOOL_CALL_RE = re.compile(r"(?s)<tool_call>\s*(?P<body>.*?)\s*</tool_call>")
 _BFCL_FORBIDDEN_OUTPUT_PATTERNS = (
-    "```",
     "tool_calls",
     "tool_call_id",
     "**Tool Call:**",
@@ -151,6 +150,7 @@ class _OfficialSupportAssets:
 class _OfficialRuntime:
     execute_multi_turn_func_call: Any
     multi_turn_checker: Any
+    multi_turn_irrelevance_checker: Any | None = None
 
 
 def load_bfcl_v3_rows_from_source(path: str | Path) -> list[dict[str, Any]]:
@@ -282,14 +282,19 @@ def load_bfcl_v3_manifest_records(path: str | Path) -> list[BfclTaskRecord]:
 
 
 def normalize_bfcl_rwkv_text(text: str) -> str:
-    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
-    normalized = normalized.strip()
-    return re.sub(r"\n{2,}", "\n", normalized)
+    return normalize_rwkv_text(text)
 
 
 def build_bfcl_system_block(system_prompt: str) -> str:
     return f"System: {normalize_bfcl_rwkv_text(system_prompt)}"
+
+
+def build_bfcl_assistant_json_prefix() -> str:
+    return "Assistant: ```json\n"
+
+
+def build_bfcl_assistant_json_block(json_text: str) -> str:
+    return f"{build_bfcl_assistant_json_prefix()}{normalize_bfcl_decision_output(json_text)}\n```"
 
 
 def build_bfcl_user_block(
@@ -300,7 +305,7 @@ def build_bfcl_user_block(
 ) -> str:
     parts = [f"Request:\n{normalize_bfcl_rwkv_text(user_request)}"]
     if previous_tool_result is not None:
-        parts.append(f"Previous tool result:\n{_render_bfcl_json(previous_tool_result)}")
+        parts.append(f"Function output:\n{_render_bfcl_json(previous_tool_result)}")
     if current_state_snapshot:
         parts.append(f"Current structured state snapshot:\n{render_bfcl_state(current_state_snapshot)}")
     user_body = normalize_bfcl_rwkv_text("\n".join(parts))
@@ -390,7 +395,7 @@ def _build_bfcl_action_user_block(
         if rendered_window:
             parts.append(f"Recent tool call window:\n{rendered_window}")
     if previous_tool_result is not None:
-        parts.append(f"Previous tool result:\n{_render_bfcl_json(previous_tool_result)}")
+        parts.append(f"Function output:\n{_render_bfcl_json(previous_tool_result)}")
     if current_state_snapshot is not None or previous_state_snapshot is not None:
         rendered_state = render_bfcl_state_delta(
             current_state_snapshot or {},
@@ -413,7 +418,7 @@ def build_bfcl_tool_result_message(
     current_state_snapshot: Mapping[str, Any] | None = None,
     previous_state_snapshot: Mapping[str, Any] | None = None,
 ) -> str:
-    parts = [f"Previous tool result:\n{_render_bfcl_json(previous_tool_result)}"]
+    parts = [f"Function output:\n{_render_bfcl_json(previous_tool_result)}"]
     if current_state_snapshot is not None or previous_state_snapshot is not None:
         rendered_state = render_bfcl_state_delta(
             current_state_snapshot or {},
@@ -444,13 +449,13 @@ def build_bfcl_rwkv_prompt(
         if not content:
             continue
         if role == "assistant":
-            parts.append(f"Assistant: {content}")
+            parts.append(build_bfcl_assistant_json_block(content))
             continue
         if content.startswith("User: "):
             parts.append(content)
             continue
         parts.append(build_bfcl_user_block(content))
-    parts.append("Assistant: <think>\n<|completions_of_cot|>")
+    parts.append(build_bfcl_assistant_json_prefix())
     return "\n".join(parts)
 
 
@@ -470,42 +475,6 @@ def build_bfcl_cot_prompt(
                 previous_tool_result=previous_tool_result,
             ),
             "Assistant: <think>\n",
-        ]
-    )
-
-
-def build_bfcl_decision_prompt(
-    system_prompt: str,
-    *,
-    user_request: str,
-    cot_hidden_summary: str | None = None,
-    recent_tool_window: Sequence[Mapping[str, Any]] | None = None,
-    current_state_snapshot: Mapping[str, Any] | None = None,
-    previous_state_snapshot: Mapping[str, Any] | None = None,
-    previous_tool_result: Mapping[str, Any] | None = None,
-) -> str:
-    decision_system_prompt = normalize_bfcl_rwkv_text(
-        "\n".join(
-            [
-                system_prompt,
-                "Private reasoning is already complete.",
-                "Do not output <think> tags.",
-                "Respond with exactly one <tool_call>...</tool_call> block, or one brief plain-language clarification/handoff.",
-            ]
-        )
-    )
-    return "\n".join(
-        [
-            build_bfcl_system_block(decision_system_prompt),
-            _build_bfcl_action_user_block(
-                user_request,
-                cot_hidden_summary=cot_hidden_summary,
-                recent_tool_window=recent_tool_window,
-                current_state_snapshot=current_state_snapshot,
-                previous_state_snapshot=previous_state_snapshot,
-                previous_tool_result=previous_tool_result,
-            ),
-            "Assistant:",
         ]
     )
 
@@ -566,10 +535,9 @@ def build_bfcl_tool_prompt(
                 system_prompt,
                 "Private reasoning is already complete.",
                 "The router selected TOOL.",
+                "Return only a JSON function call.",
+                'The JSON shape is {"name":"tool_name","arguments":{...}}.',
                 "Do not output <think> tags, markdown, or natural-language commentary.",
-                "Continue exactly one tool call using the fixed prefix supplied at the end of the prompt.",
-                "Do not repeat the prefix.",
-                'After the tool name, output: ","arguments":{...}}</tool_call>',
             ]
         )
     )
@@ -584,7 +552,7 @@ def build_bfcl_tool_prompt(
                 previous_state_snapshot=previous_state_snapshot,
                 previous_tool_result=previous_tool_result,
             ),
-            f"Assistant: {BFCL_TOOL_CALL_PREFIX}",
+            build_bfcl_assistant_json_prefix(),
         ]
     )
 
@@ -605,10 +573,10 @@ def build_bfcl_ask_prompt(
                 system_prompt,
                 "Private reasoning is already complete.",
                 "The router selected ASK.",
-                "Ask one brief clarification question in plain language.",
-                "Do not call a tool.",
-                "Do not output <think> tags or markdown.",
-                "Keep the response to one or two short sentences.",
+                "Return only a JSON function call.",
+                'Use {"name":"ask_user","arguments":{"question":"..."}} with one brief clarification question.',
+                "Do not call any other tool.",
+                "Do not output <think> tags, markdown, or natural-language commentary.",
             ]
         )
     )
@@ -623,7 +591,7 @@ def build_bfcl_ask_prompt(
                 previous_state_snapshot=previous_state_snapshot,
                 previous_tool_result=previous_tool_result,
             ),
-            "Assistant:",
+            build_bfcl_assistant_json_prefix(),
         ]
     )
 
@@ -644,9 +612,10 @@ def build_bfcl_handoff_prompt(
                 system_prompt,
                 "Private reasoning is already complete.",
                 "The router selected HANDOFF.",
-                "Respond in plain natural language without calling a tool.",
-                "Do not output <think> tags or markdown.",
-                "Keep the response short and direct.",
+                "Return only a JSON function call.",
+                'Use {"name":"final_answer","arguments":{"answer":"..."}} with the short direct response.',
+                "Do not call any other tool.",
+                "Do not output <think> tags, markdown, or natural-language commentary.",
             ]
         )
     )
@@ -661,65 +630,23 @@ def build_bfcl_handoff_prompt(
                 previous_state_snapshot=previous_state_snapshot,
                 previous_tool_result=previous_tool_result,
             ),
-            "Assistant:",
+            build_bfcl_assistant_json_prefix(),
         ]
     )
 
 
 def build_bfcl_system_prompt(tools: Sequence[Mapping[str, Any]]) -> str:
     lines = [
-        "You are solving a BFCL V3 multi-turn function-calling task.",
-        "At each assistant turn, do exactly one of the following:",
-        "1. Call exactly one tool.",
-        "2. Ask a brief clarification question in plain language.",
-        "3. Give a plain-language handoff when no tool should be called.",
-        "When calling a tool, output only one JSON object wrapped inside <tool_call>...</tool_call>.",
-        "Do not use markdown code fences.",
-        "Do not output tool_calls arrays.",
-        "Do not output tool_call_id.",
-        "Do not output more than one <tool_call> block.",
-        "Do not output extra commentary before or after the <tool_call> block.",
-        'The only valid tool-call JSON shape is: {"requestor":"assistant","name":"tool_name","arguments":{}}',
-        "Use only the exact tool names shown below.",
+        "Tools:",
+        render_bfcl_tool_catalog(_bfcl_tools_with_control_functions(tools)),
+        "Return only a JSON function call.",
+        'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+        "Use exactly one listed tool name.",
+        "Use ask_user only when required information is missing.",
+        "Use final_answer only when no environment tool should be called for this turn.",
         "Do not invent tool names, arguments, tool results, or state transitions.",
-        "If required information is missing, ask a short clarification question.",
-        "If no tool should be called for this turn, respond in plain natural language.",
-        "Available tools:",
-        render_bfcl_tool_catalog(tools),
     ]
     return normalize_bfcl_rwkv_text("\n".join(lines))
-
-
-def build_bfcl_turn_context(
-    system_prompt: str,
-    prompt_messages: Sequence[Mapping[str, object]],
-    runtime_state: BfclRuntimeState,
-    *,
-    history_max_chars: int = BFCL_V3_MAX_HISTORY_CHARS,
-) -> str:
-    bounded_messages = trim_message_history(prompt_messages, max_chars=history_max_chars)
-    if runtime_state.current_state:
-        last_user_index = max(
-            (index for index, message in enumerate(bounded_messages) if str(message.get("role") or "").strip().lower() == "user"),
-            default=-1,
-        )
-        if last_user_index >= 0:
-            content = normalize_bfcl_rwkv_text(str(bounded_messages[last_user_index].get("content") or ""))
-            if "Current structured state snapshot:" not in content:
-                if content.startswith("User: "):
-                    content = content.removeprefix("User: ").strip()
-                request_body = content if content else "Request:"
-                if not request_body.startswith("Request:"):
-                    request_body = f"Request:\n{request_body}"
-                bounded_messages = list(bounded_messages)
-                bounded_messages[last_user_index] = {
-                    "role": "user",
-                    "content": build_bfcl_user_block(
-                        request_body.removeprefix("Request:").strip() if request_body.startswith("Request:") else request_body,
-                        current_state_snapshot=runtime_state.current_state,
-                    ),
-                }
-    return build_bfcl_rwkv_prompt(system_prompt, bounded_messages, history_max_chars=history_max_chars)
 
 
 def start_bfcl_runtime(record: BfclTaskRecord) -> BfclRuntimeState:
@@ -732,11 +659,10 @@ def has_bfcl_official_turns(record: BfclTaskRecord) -> bool:
 
 def render_bfcl_assistant_tool_message(tool_call: TauToolCall) -> str:
     payload = {
-        "requestor": "assistant",
         "name": tool_call.name,
         "arguments": dict(tool_call.arguments),
     }
-    return "<tool_call>" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "</tool_call>"
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_bfcl_tool_result_payload(
@@ -758,7 +684,7 @@ def build_bfcl_tool_result_payload(
 
 
 def parse_bfcl_assistant_output(response: str) -> TauDecision:
-    normalized = normalize_bfcl_rwkv_text(response)
+    normalized = normalize_bfcl_decision_output(response)
     if not normalized:
         raise ValueError("model returned empty response")
 
@@ -768,40 +694,15 @@ def parse_bfcl_assistant_output(response: str) -> TauDecision:
             raise ValueError(f"forbidden BFCL output pattern detected: {pattern}")
     if "<think>" in lowered or "</think>" in lowered:
         raise ValueError("decision output must not contain <think> tags")
+    if not (normalized.startswith("{") and normalized.endswith("}")):
+        raise ValueError("BFCL decision output must be a JSON function call object")
 
-    matches = list(_BFCL_TOOL_CALL_RE.finditer(normalized))
-    if not matches:
-        if "<tool_call>" in lowered or "</tool_call>" in lowered:
-            raise ValueError("malformed <tool_call> block")
-        final_answer = _strip_bfcl_outer_think_block(normalized)
-        if len(final_answer) > BFCL_V3_MAX_HANDOFF_CHARS:
-            raise ValueError("BFCL decision handoff exceeded max length")
-        return TauDecision(is_tool_call=False, final_answer=final_answer)
-    if len(matches) != 1:
-        raise ValueError("multiple <tool_call> blocks are not allowed")
-
-    match = matches[0]
-    prefix = normalized[: match.start()].strip()
-    suffix = normalized[match.end() :].strip()
-    if prefix:
-        raise ValueError("unexpected text before <tool_call> block")
-    if suffix:
-        raise ValueError("unexpected text after <tool_call> block")
-
-    payload = json.loads(match.group("body"))
-    if isinstance(payload, list):
-        if len(payload) != 1:
-            raise ValueError("multiple tool calls are not allowed")
-        payload = payload[0]
+    payload = json.loads(normalized)
     if not isinstance(payload, Mapping):
         raise ValueError("BFCL tool call payload must be a JSON object")
-    allowed_keys = {"requestor", "name", "arguments"}
+    allowed_keys = {"name", "arguments"}
     if set(payload.keys()) != allowed_keys:
-        raise ValueError("BFCL tool call JSON must contain exactly requestor, name, and arguments")
-
-    requestor = str(payload.get("requestor") or "").strip().lower()
-    if requestor != "assistant":
-        raise ValueError("BFCL tool call requestor must be 'assistant'")
+        raise ValueError("BFCL tool call JSON must contain exactly name and arguments")
 
     name = str(payload.get("name") or "").strip()
     if not name:
@@ -809,6 +710,16 @@ def parse_bfcl_assistant_output(response: str) -> TauDecision:
     arguments = payload.get("arguments")
     if not isinstance(arguments, Mapping):
         raise ValueError("BFCL tool call arguments must be a JSON object")
+    if name == "final_answer":
+        final_answer = normalize_bfcl_rwkv_text(str(arguments.get("answer") or ""))
+        if len(final_answer) > BFCL_V3_MAX_HANDOFF_CHARS:
+            raise ValueError("BFCL final_answer exceeded max length")
+        return TauDecision(is_tool_call=False, final_answer=final_answer)
+    if name == "ask_user":
+        question = normalize_bfcl_rwkv_text(str(arguments.get("question") or ""))
+        if len(question) > BFCL_V3_MAX_HANDOFF_CHARS:
+            raise ValueError("BFCL ask_user question exceeded max length")
+        return TauDecision(is_tool_call=False, final_answer=question)
     return TauDecision(is_tool_call=True, tool_call=TauToolCall(name=name, arguments=dict(arguments), requestor="assistant"))
 
 
@@ -1109,17 +1020,35 @@ def _evaluate_bfcl_v3_official_episode(
             )
         else:
             runtime = _load_bfcl_official_runtime(str(official_root))
-            checker_result = runtime.multi_turn_checker(
-                decoded_turns,
-                expected_turns,
-                {
-                    "id": record.task_id,
-                    "initial_config": dict(record.initial_state),
-                    "involved_classes": list(record.involved_classes),
-                },
-                "multi_turn",
-                runtime_state.official_model_name or "rwkv_bfcl",
-            )
+            irrelevance_checker = getattr(runtime, "multi_turn_irrelevance_checker", None)
+            if irrelevance_checker is not None:
+                irrelevance_result = irrelevance_checker(decoded_turns, expected_turns)
+                if not bool(irrelevance_result.get("valid", False)):
+                    checker_result = irrelevance_result
+                else:
+                    checker_result = runtime.multi_turn_checker(
+                        decoded_turns,
+                        expected_turns,
+                        {
+                            "id": record.task_id,
+                            "initial_config": dict(record.initial_state),
+                            "involved_classes": list(record.involved_classes),
+                        },
+                        "multi_turn",
+                        runtime_state.official_model_name or "rwkv_bfcl",
+                    )
+            else:
+                checker_result = runtime.multi_turn_checker(
+                    decoded_turns,
+                    expected_turns,
+                    {
+                        "id": record.task_id,
+                        "initial_config": dict(record.initial_state),
+                        "involved_classes": list(record.involved_classes),
+                    },
+                    "multi_turn",
+                    runtime_state.official_model_name or "rwkv_bfcl",
+                )
             checker_error_type = str(checker_result.get("error_type") or "")
             checker_error_message = _stringify_checker_error(checker_result)
 
@@ -1128,6 +1057,7 @@ def _evaluate_bfcl_v3_official_episode(
     tool_sequence_ok = valid or checker_error_type not in {
         "multi_turn:empty_turn_model_response",
         "multi_turn:execution_response_mismatch",
+        "multi_turn:irrelevance_error:decoder_success",
     }
     details = {
         "dataset_ok": True,
@@ -1213,62 +1143,24 @@ def _bounded_bfcl_tool_payload_value(value: Any, *, max_chars: int) -> Any:
 
 def normalize_bfcl_decision_output(response: str) -> str:
     normalized = normalize_bfcl_rwkv_text(response)
-    if normalized.count("<tool_call>") == 1 and "</tool_call>" not in normalized:
-        return normalized + "</tool_call>"
+    if normalized.startswith("```"):
+        lines = normalized.split("\n")
+        if lines:
+            first = lines[0].strip().lower()
+            if first in {"```", "```json", "```javascript", "```js"}:
+                lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                normalized = normalize_bfcl_rwkv_text("\n".join(lines))
+    if normalized.endswith("```"):
+        normalized = normalize_bfcl_rwkv_text(normalized[: -len("```")])
     return normalized
-
-
-def reconstruct_bfcl_tool_output(response: str) -> str:
-    normalized = normalize_bfcl_rwkv_text(response)
-    if not normalized:
-        return BFCL_TOOL_CALL_PREFIX
-    if normalized.startswith("<tool_call>"):
-        return normalized
-    if normalized.startswith("{") or normalized.startswith("["):
-        return f"<tool_call>{normalized}"
-    return BFCL_TOOL_CALL_PREFIX + normalized
-
-
-def normalize_bfcl_tool_output_safe(response: str) -> str:
-    normalized = normalize_bfcl_decision_output(response)
-    matches = list(_BFCL_TOOL_CALL_RE.finditer(normalized))
-    if len(matches) != 1:
-        return normalized
-
-    match = matches[0]
-    try:
-        payload = json.loads(match.group("body"))
-    except json.JSONDecodeError:
-        return normalized
-    if not isinstance(payload, Mapping):
-        return normalized
-
-    changed = False
-    repaired = dict(payload)
-    if "requestor" not in repaired:
-        repaired["requestor"] = "assistant"
-        changed = True
-
-    arguments = repaired.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            decoded_arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            decoded_arguments = None
-        if isinstance(decoded_arguments, Mapping):
-            repaired["arguments"] = dict(decoded_arguments)
-            changed = True
-
-    if not changed:
-        return normalized
-    body = json.dumps(repaired, ensure_ascii=False, separators=(",", ":"))
-    return normalized[: match.start()] + f"<tool_call>{body}</tool_call>" + normalized[match.end() :]
 
 
 def render_bfcl_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
     if not tools:
-        return "No tools provided."
-    lines: list[str] = []
+        return "[]"
+    rendered_tools: list[dict[str, Any]] = []
     for tool in tools:
         name = str(tool.get("name") or "").strip() or "unknown_tool"
         description = normalize_bfcl_rwkv_text(
@@ -1277,25 +1169,60 @@ def render_bfcl_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
         schema = tool.get("parameters")
         if not isinstance(schema, Mapping):
             schema = {"type": "object", "properties": {}, "required": []}
-        rendered = _render_bfcl_json(schema)
+        arguments: Any = {}
+        raw_properties = schema.get("properties")
+        if isinstance(raw_properties, Mapping):
+            arguments = dict(raw_properties)
+        else:
+            arguments = dict(schema)
+        rendered = _render_bfcl_json(arguments)
         if len(rendered) > BFCL_V3_MAX_TOOL_SCHEMA_CHARS:
-            rendered = _render_bfcl_json(
-                {
-                    "_truncated": True,
-                    "preview": truncate_text(rendered, BFCL_V3_MAX_TOOL_SCHEMA_CHARS // 2),
-                }
-            )
-        lines.append(
-            "\n".join(
-                [
-                    f"Tool: {name}",
-                    f"Description: {description}",
-                    "Parameters JSON:",
-                    rendered,
-                ]
-            )
+            arguments = {
+                "_truncated": True,
+                "preview": truncate_text(rendered, BFCL_V3_MAX_TOOL_SCHEMA_CHARS // 2),
+            }
+        rendered_tools.append(
+            {
+                "name": name,
+                "description": description,
+                "arguments": arguments,
+            }
         )
-    return normalize_bfcl_rwkv_text("\n".join(lines))
+    return json.dumps(
+        sorted(rendered_tools, key=lambda item: str(item.get("name") or "")),
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _bfcl_tools_with_control_functions(tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    rendered = [dict(tool) for tool in tools]
+    rendered.extend(
+        [
+            {
+                "name": "ask_user",
+                "description": "Ask the user one brief clarification question when required information is missing.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"question": {"type": "string"}},
+                    "required": ["question"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "name": "final_answer",
+                "description": "Return the final short answer when no environment tool should be called for this turn.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            },
+        ]
+    )
+    return rendered
 
 
 def _read_source_items(path: Path) -> list[Any]:
@@ -1598,9 +1525,14 @@ def _resolve_possible_answer_root(source_hint: Path | None) -> Path | None:
     if env_path is not None:
         return env_path
     for base in _support_search_roots(source_hint):
-        candidate = base / "possible_answer"
-        if candidate.is_dir():
-            return candidate.resolve()
+        for candidate in (
+            base / "possible_answer",
+            base / "possible_answer_v3",
+            base / "bfcl_support" / "possible_answer",
+            base / "bfcl_support" / "possible_answer_v3",
+        ):
+            if candidate.is_dir():
+                return candidate.resolve()
     return None
 
 
@@ -1609,9 +1541,12 @@ def _resolve_func_doc_root(source_hint: Path | None) -> Path | None:
     if env_path is not None:
         return env_path
     for base in _support_search_roots(source_hint):
-        candidate = base / "multi_turn_func_doc"
-        if candidate.is_dir():
-            return candidate.resolve()
+        for candidate in (
+            base / "multi_turn_func_doc",
+            base / "bfcl_support" / "multi_turn_func_doc",
+        ):
+            if candidate.is_dir():
+                return candidate.resolve()
     return None
 
 
@@ -2238,6 +2173,7 @@ def _load_bfcl_official_runtime(root_str: str) -> _OfficialRuntime:
     return _OfficialRuntime(
         execute_multi_turn_func_call=utils_module.execute_multi_turn_func_call,
         multi_turn_checker=checker_module.multi_turn_checker,
+        multi_turn_irrelevance_checker=getattr(checker_module, "multi_turn_irrelevance_checker", None),
     )
 
 
@@ -2333,7 +2269,6 @@ __all__ = [
     "BFCL_V3_MAX_STATE_CHARS",
     "BFCL_V3_MAX_TOOL_SCHEMA_CHARS",
     "BFCL_ROUTER_LABELS",
-    "BFCL_TOOL_CALL_PREFIX",
     "BfclEvaluation",
     "BfclRuntimeState",
     "BfclTaskRecord",
@@ -2350,7 +2285,6 @@ __all__ = [
     "build_bfcl_system_block",
     "build_bfcl_system_prompt",
     "build_bfcl_tool_result_payload",
-    "build_bfcl_turn_context",
     "build_bfcl_user_block",
     "decode_bfcl_exec_response",
     "extract_bfcl_cot_hidden_summary",
@@ -2359,13 +2293,11 @@ __all__ = [
     "has_bfcl_official_turns",
     "interpret_bfcl_assistant_output",
     "load_bfcl_v3_manifest_records",
-    "normalize_bfcl_tool_output_safe",
     "load_bfcl_v3_rows_from_source",
     "parse_bfcl_router_output",
     "normalize_bfcl_rwkv_text",
     "normalize_bfcl_v3_source_row",
     "parse_bfcl_assistant_output",
-    "reconstruct_bfcl_tool_output",
     "render_bfcl_assistant_tool_message",
     "render_bfcl_official_call",
     "render_bfcl_recent_tool_window",

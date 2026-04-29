@@ -369,7 +369,7 @@ class RemoteInferenceBackend:
         _ = prefill_chunk_size
         payload: dict[str, object] = {
             "model": self.model_name,
-            "messages": [{"role": "user", "content": prompt}],
+            "prompt": prompt,
             "max_tokens": int(sampling.max_generate_tokens),
             "temperature": float(sampling.temperature),
             "top_p": float(sampling.top_p),
@@ -380,14 +380,14 @@ class RemoteInferenceBackend:
             payload["seed"] = int(seed)
         if stop_suffixes:
             payload["stop"] = list(stop_suffixes)
-        response = self._post_json(self.config.chat_completions_url(), payload)
+        response = self._post_json(self.config.completions_url(), payload)
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
             raise RuntimeError("remote infer response missing choices")
         choice0 = choices[0]
         if not isinstance(choice0, dict):
             raise RuntimeError("remote infer response choice format is invalid")
-        text = _extract_chat_choice_text(choice0)
+        text = _extract_completion_choice_text(choice0)
         return GenerationOutput(
             prompt_index=prompt_index,
             prompt=prompt,
@@ -420,6 +420,13 @@ class RemoteInferenceBackend:
         if not isinstance(data, dict):
             raise RuntimeError("remote infer response must be a JSON object")
         return data
+
+
+def _extract_completion_choice_text(choice: dict[str, object]) -> str:
+    text = choice.get("text")
+    if isinstance(text, str):
+        return text
+    raise RuntimeError("remote infer response missing completion text")
 
 
 def _extract_chat_choice_text(choice: dict[str, object]) -> str:

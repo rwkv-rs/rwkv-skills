@@ -11,6 +11,7 @@ from src.eval.benchmark_registry import (
     BenchmarkField,
     BenchmarkMetadata,
     expand_benchmark_alias,
+    resolve_benchmark_metadata,
 )
 from src.eval.scheduler.dataset_utils import make_dataset_slug
 
@@ -63,7 +64,9 @@ def collect_benchmarks(
         if not resolved_names:
             raise ValueError(f"unknown benchmark name: {raw_name}")
         for resolved_name in resolved_names:
-            metadata = _BENCHMARKS_BY_NAME[resolved_name]
+            metadata = _BENCHMARKS_BY_NAME.get(resolved_name)
+            if metadata is None:
+                metadata = resolve_benchmark_metadata(resolved_name)
             selected[metadata.name] = SelectedBenchmark(
                 metadata=metadata,
                 dataset_slug=benchmark_dataset_slug(metadata),

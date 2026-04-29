@@ -124,6 +124,8 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "http://127.0.0.1:8081",
             "--infer-models",
             "remote-demo",
+            "--remote-batch-size",
+            "64",
             "--max-concurrent-jobs",
             "4",
         ]
@@ -131,6 +133,7 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
 
     assert args.infer_base_url == "http://127.0.0.1:8081"
     assert args.infer_models == ["remote-demo"]
+    assert args.remote_batch_size == 64
     assert args.max_concurrent_jobs == 4
 
 

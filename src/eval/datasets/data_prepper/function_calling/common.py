@@ -28,17 +28,22 @@ class LocalRowsDatasetSpec(MaterializingDatasetSpec):
         *,
         required_fields: tuple[str, ...] = (),
         source_kind: str = "local_rows",
-        required_paths: Sequence[Path] = (),
+        required_paths: Sequence[Path] | Callable[[], Sequence[Path]] = (),
         load_local_records: Callable[[], Iterable[dict[str, Any]]],
         extra: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(name, output_root, split, required_fields=required_fields, source_kind=source_kind)
-        self._required_paths = tuple(path.expanduser().resolve() for path in required_paths)
+        self._required_paths = required_paths
         self._load_local_records = load_local_records
         self._extra = dict(extra or {})
 
+    def _resolve_required_paths(self) -> tuple[Path, ...]:
+        paths = self._required_paths() if callable(self._required_paths) else self._required_paths
+        return tuple(path.expanduser().resolve() for path in paths)
+
     def download(self) -> None:
-        missing = [path for path in self._required_paths if not path.exists()]
+        required_paths = self._resolve_required_paths()
+        missing = [path for path in required_paths if not path.exists()]
         if missing:
             joined = ", ".join(str(path) for path in missing)
             raise FileNotFoundError(f"missing local source paths for {self.name}: {joined}")
@@ -48,8 +53,9 @@ class LocalRowsDatasetSpec(MaterializingDatasetSpec):
 
     def manifest_extra(self) -> dict[str, Any]:
         extra = dict(self._extra)
-        if self._required_paths:
-            extra["source_paths"] = [str(path) for path in self._required_paths]
+        required_paths = self._resolve_required_paths()
+        if required_paths:
+            extra["source_paths"] = [str(path) for path in required_paths]
         return extra
 
 

@@ -58,7 +58,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_collect_ms=args.batch_collect_ms,
     )
     app = create_app(service, api_key=args.api_key)
-    uvicorn.run(app, host=args.host, port=int(args.port), log_level=str(args.log_level))
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=int(args.port),
+        log_level=str(args.log_level),
+        access_log=False,
+    )
     return 0
 
 

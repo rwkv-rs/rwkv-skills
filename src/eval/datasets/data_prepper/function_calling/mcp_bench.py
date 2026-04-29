@@ -11,6 +11,15 @@ from .common import LocalRowsDatasetSpec, rwkv_rs_datasets_root
 _REQUIRED_FIELDS = ("task_id", "instruction", "task")
 
 
+def _resolve_mcp_bench_roots() -> tuple[Path, Path]:
+    datasets_root = rwkv_rs_datasets_root()
+    runtime_root = datasets_root / "mcp_bench" / "runtime"
+    legacy_tasks_root = datasets_root / "mcp_bench" / "tasks"
+    runtime_tasks_root = runtime_root / "tasks"
+    tasks_root = legacy_tasks_root if legacy_tasks_root.exists() else runtime_tasks_root
+    return tasks_root, runtime_root
+
+
 def _rows_from_items(
     items: list[McpBenchItem],
     *,
@@ -46,9 +55,7 @@ def prepare_mcp_bench_spec(output_root: Path, split: str = "test") -> LocalRowsD
     if split != "test":
         raise ValueError("mcp_bench 仅提供 test split")
 
-    datasets_root = rwkv_rs_datasets_root()
-    tasks_root = datasets_root / "mcp_bench" / "tasks"
-    runtime_root = datasets_root / "mcp_bench" / "runtime"
+    tasks_root, runtime_root = _resolve_mcp_bench_roots()
 
     def _load() -> list[dict[str, Any]]:
         return _rows_from_items(load_mcp_bench_task_items(tasks_root, runtime_root), tasks_root=tasks_root, runtime_root=runtime_root)

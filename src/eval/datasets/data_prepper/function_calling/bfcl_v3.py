@@ -82,11 +82,9 @@ def prepare_bfcl_v3_spec(output_root: Path, split: str = "test") -> LocalRowsDat
     if split != "test":
         raise ValueError("bfcl_v3 仅提供 test split")
 
-    sources = bfcl_v3_source_paths(split)
-
     def _load() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for source in sources:
+        for source in bfcl_v3_source_paths(split):
             rows.extend(load_bfcl_v3_rows_from_source(source))
         return rows
 
@@ -96,7 +94,7 @@ def prepare_bfcl_v3_spec(output_root: Path, split: str = "test") -> LocalRowsDat
         split,
         required_fields=_REQUIRED_FIELDS,
         source_kind="local_bfcl_v3_source",
-        required_paths=sources,
+        required_paths=lambda: bfcl_v3_source_paths(split),
         load_local_records=_load,
     )
 

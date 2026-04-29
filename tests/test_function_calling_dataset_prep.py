@@ -116,6 +116,39 @@ def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch
     ]
 
 
+def test_prepare_dataset_materializes_mcp_bench_runtime_tasks_layout(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "rwkv_rs"
+    runtime_root = source_root / "mcp_bench" / "runtime"
+    tasks_root = runtime_root / "tasks"
+    tasks_root.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.mcp_bench.rwkv_rs_datasets_root",
+        lambda: source_root,
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.mcp_bench.load_mcp_bench_task_items",
+        lambda _tasks_root, _runtime_root: [
+            McpBenchItem(
+                task_file="tasks.json",
+                server_name="calendar",
+                combination_name="calendar_only",
+                combination_type="single",
+                servers=("calendar",),
+                task=McpBenchTaskSpec(task_id="task-1", task_description="Schedule the meeting"),
+                runtime_root=str(runtime_root),
+            )
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("mcp_bench", output_root, "test")
+
+    item = read_jsonl_items(paths[0])[0]
+    assert item["tasks_root"] == str(tasks_root)
+    assert item["runtime_root"] == str(runtime_root)
+
+
 def test_prepare_dataset_materializes_bfcl_v3_spec(tmp_path: Path, monkeypatch) -> None:
     source_a = tmp_path / "BFCL_v3_multi_turn_base.json"
     source_b = tmp_path / "BFCL_v3_multi_turn_miss_func.json"
@@ -211,6 +244,44 @@ def test_prepare_dataset_materializes_bfcl_v3_spec(tmp_path: Path, monkeypatch) 
             "expected_state": {"selected_flight": "F1"},
             "initial_state": {},
             "metadata": {"source_path": str(source_b)},
+        }
+    ]
+
+
+def test_prepare_dataset_materializes_tau_bench_from_vendor_test_split(tmp_path: Path, monkeypatch) -> None:
+    tau2_data_root = tmp_path / "tau2_data"
+    tau2_data_root.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.TAU_V2_DATA_ROOT",
+        tau2_data_root,
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.load_tau_v2_tasks",
+        lambda *, domain, split: [
+            {
+                "task_id": f"{domain}-{split}-0",
+                "domain": domain,
+                "index": 0,
+                "instruction": "Resolve the ticket",
+                "task": {"id": "ticket-0"},
+                "benchmark_version": "tau_v2",
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("tau_bench_airline", output_root, "test")
+
+    assert paths == [output_root / "tau_bench_airline" / "test.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "airline-test-0",
+            "domain": "airline",
+            "index": 0,
+            "instruction": "Resolve the ticket",
+            "task": {"id": "ticket-0"},
+            "benchmark_version": "tau_bench",
         }
     ]
 

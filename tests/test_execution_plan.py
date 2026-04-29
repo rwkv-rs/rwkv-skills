@@ -20,13 +20,13 @@ def test_auto_avg_k_plan_downsamples_large_datasets_to_ratio() -> None:
     assert avg_k_metric_key(plan.avg_k).startswith("avg@0.")
 
 
-def test_auto_avg_k_plan_repeats_small_datasets_until_target() -> None:
+def test_auto_avg_k_plan_uses_small_datasets_once() -> None:
     plan = build_auto_avg_k_execution_plan("math_500_test", 500)
 
-    assert plan.avg_k == 10.0
-    assert plan.repeat_count == 10
+    assert plan.avg_k == 1.0
+    assert plan.repeat_count == 1
     assert plan.sample_size == 500
-    assert plan.effective_sample_count == 5_000
+    assert plan.effective_sample_count == 500
     assert plan.sample_indices[:3] == (0, 1, 2)
 
 

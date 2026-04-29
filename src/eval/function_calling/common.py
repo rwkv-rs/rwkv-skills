@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Shared helpers for function-calling benchmark runners."""
+
+from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -16,7 +16,6 @@ from src.eval.execution_plan import AttemptKey, avg_k_metric_key
 from src.eval.field_common import build_task_sampling_config, set_task_env
 from src.eval.metrics.at_k import compute_avg_at_k
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.infer.backend import InferenceBackend, build_inference_backend_from_args
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
@@ -39,11 +38,6 @@ ScorePayloadBuilder = Callable[
     [Sequence[dict[str, object]], Sequence[dict[str, object]], dict[str, float]],
     Mapping[str, object],
 ]
-
-
-def load_function_calling_backend(args) -> tuple[str, InferenceBackend]:
-    backend = build_inference_backend_from_args(args)
-    return backend.model_name, backend
 
 
 def compute_function_calling_metrics(
@@ -183,7 +177,6 @@ __all__ = [
     "build_pending_attempts",
     "compute_function_calling_metrics",
     "finalize_function_calling_run",
-    "load_function_calling_backend",
     "prepare_function_calling_run",
     "repeat_probe_entries",
 ]

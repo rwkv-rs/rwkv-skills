@@ -18,11 +18,9 @@ def test_render_tau_user_prompt_prefers_ticket() -> None:
     assert prompt == "Customer needs a refund for order #123"
 
 
-def test_parse_tau_tool_call_from_fenced_json() -> None:
+def test_parse_tau_tool_call_from_json_function_call() -> None:
     decision = parse_tool_call_or_final_answer(
-        """```json
-{"requestor":"user","name":"inspect_order","arguments":{"order_id":"123"}}
-```"""
+        '{"name":"user.inspect_order","arguments":{"order_id":"123"}}'
     )
 
     assert decision.is_tool_call
@@ -32,11 +30,33 @@ def test_parse_tau_tool_call_from_fenced_json() -> None:
     assert decision.tool_call.arguments == {"order_id": "123"}
 
 
-def test_parse_tau_final_answer_from_plain_text() -> None:
-    decision = parse_tool_call_or_final_answer("The refund has been submitted successfully.")
+def test_parse_tau_tool_call_from_prefixed_name() -> None:
+    decision = parse_tool_call_or_final_answer(
+        '{"name":"assistant.inspect_order","arguments":{"order_id":"123"}}'
+    )
+
+    assert decision.is_tool_call
+    assert decision.tool_call is not None
+    assert decision.tool_call.requestor == "assistant"
+    assert decision.tool_call.name == "inspect_order"
+
+
+def test_parse_tau_final_answer_function_call() -> None:
+    decision = parse_tool_call_or_final_answer(
+        '{"name":"final_answer","arguments":{"answer":"Done"}}'
+    )
 
     assert not decision.is_tool_call
-    assert decision.final_answer == "The refund has been submitted successfully."
+    assert decision.final_answer == "Done"
+
+
+def test_parse_tau_rejects_plain_text_final_answer() -> None:
+    try:
+        parse_tool_call_or_final_answer("The refund has been submitted successfully.")
+    except ValueError as exc:
+        assert "JSON function call object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected strict JSON function-call validation")
 
 
 def test_build_tau_system_prompt_lists_assistant_and_user_tools() -> None:
@@ -60,4 +80,6 @@ def test_build_tau_system_prompt_lists_assistant_and_user_tools() -> None:
 
     assert "assistant.refund_order" in prompt
     assert "user.view_email" in prompt
+    assert "final_answer" in prompt
+    assert "Return only a JSON function call." in prompt
     assert "Follow the refund policy." in prompt

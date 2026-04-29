@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""avg_k-style execution planning aligned with rwkv-rs semantics."""
+"""avg_k-style execution planning with a cap for very large benchmarks."""
 
 from dataclasses import dataclass
 import math
@@ -56,10 +56,9 @@ def build_auto_avg_k_execution_plan(
         avg_k = target_attempts / dataset_len
         return build_avg_k_execution_plan(dataset_slug, dataset_len, avg_k=avg_k)
 
-    repeat_count = max(1, math.ceil(target_attempts / dataset_len))
     return AvgKExecutionPlan(
-        avg_k=float(repeat_count),
-        repeat_count=repeat_count,
+        avg_k=1.0,
+        repeat_count=1,
         sample_indices=tuple(range(dataset_len)),
     )
 

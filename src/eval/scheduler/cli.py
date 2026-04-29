@@ -7,6 +7,10 @@ import re
 from pathlib import Path
 from typing import Sequence
 
+from src.eval.env_config import load_env_file
+
+load_env_file(Path(".env"))
+
 from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARK_ALIASES, BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
 
@@ -172,6 +176,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
     parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
     parser.add_argument("--distributed-claims", action="store_true", help="启用 PostgreSQL claim/lease，允许多个 scheduler 节点协同")
     parser.add_argument("--scheduler-node-id", help="当前 scheduler 节点标识；默认取主机名")
     parser.add_argument("--lease-duration-s", type=int, default=900, help="claim/lease 有效期秒数")
@@ -261,6 +266,11 @@ def _dispatch_options_from_args(
         infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
         infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
         infer_max_workers=int(getattr(args, "infer_max_workers", 32)),
+        remote_batch_size=(
+            int(getattr(args, "remote_batch_size"))
+            if getattr(args, "remote_batch_size", None) is not None
+            else None
+        ),
         distributed_claims=bool(getattr(args, "distributed_claims", False)),
         scheduler_node_id=(str(getattr(args, "scheduler_node_id", "") or "").strip() or None),
         lease_duration_s=int(getattr(args, "lease_duration_s", 900)),

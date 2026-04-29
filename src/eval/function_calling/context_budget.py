@@ -1,7 +1,8 @@
+"""Shared prompt/history formatting and budgeting helpers for function-calling benchmarks."""
+
 from __future__ import annotations
 
-"""Shared prompt/history budgeting helpers for function-calling benchmarks."""
-
+import re
 from collections.abc import Mapping, Sequence
 
 DEFAULT_TOOL_SCHEMA_MAX_CHARS = 1200
@@ -9,6 +10,13 @@ DEFAULT_TOOL_RESULT_MAX_CHARS = 4000
 DEFAULT_TOOL_ERROR_MAX_CHARS = 1000
 DEFAULT_HISTORY_MAX_CHARS = 24000
 _TRUNCATION_NOTICE = "[Earlier conversation history truncated]"
+
+
+def normalize_rwkv_text(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    normalized = normalized.strip()
+    return re.sub(r"\n{2,}", "\n", normalized)
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -26,10 +34,10 @@ def trim_history(history: str, max_chars: int) -> str:
         return ""
     if len(history) <= max_chars:
         return history
-    keep_tail = max_chars - len(_TRUNCATION_NOTICE) - 2
+    keep_tail = max_chars - len(_TRUNCATION_NOTICE) - 1
     if keep_tail <= 0:
         return history[-max_chars:]
-    return f"{_TRUNCATION_NOTICE}\n\n{history[-keep_tail:]}"
+    return f"{_TRUNCATION_NOTICE}\n{history[-keep_tail:]}"
 
 
 def trim_message_history(
@@ -104,6 +112,7 @@ __all__ = [
     "DEFAULT_TOOL_ERROR_MAX_CHARS",
     "DEFAULT_TOOL_RESULT_MAX_CHARS",
     "DEFAULT_TOOL_SCHEMA_MAX_CHARS",
+    "normalize_rwkv_text",
     "trim_history",
     "trim_message_history",
     "truncate_text",

@@ -11,14 +11,16 @@ from .text import LiteralChoiceConstraint, LiteralConstraint
 class SingleFunctionCallConstraintSpec:
     tool_names: tuple[str, ...]
     tool_schemas: dict[str, Mapping[str, Any]]
+    prefix_literal: str = '{"name":"'
     middle_literal: str = '","arguments":'
-    suffix_literal: str = "}</tool_call>"
+    suffix_literal: str = "}"
 
 
 @dataclass(slots=True)
 class SingleFunctionCallConstraint:
     spec: SingleFunctionCallConstraintSpec
-    _phase: str = "tool_name"
+    _phase: str = "prefix"
+    _prefix_part: LiteralConstraint | None = None
     _tool_name_part: LiteralChoiceConstraint | None = None
     _middle_part: LiteralConstraint | None = None
     _json_part: JsonObjectConstraint | None = None
@@ -26,6 +28,8 @@ class SingleFunctionCallConstraint:
     _selected_tool_name: str | None = None
 
     def __post_init__(self) -> None:
+        if self._prefix_part is None:
+            self._prefix_part = LiteralConstraint(self.spec.prefix_literal)
         if self._tool_name_part is None:
             self._tool_name_part = LiteralChoiceConstraint(tuple(self.spec.tool_names))
         if self._middle_part is None:
@@ -39,6 +43,7 @@ class SingleFunctionCallConstraint:
         return SingleFunctionCallConstraint(
             self.spec,
             _phase=self._phase,
+            _prefix_part=None if self._prefix_part is None else self._prefix_part.clone(),
             _tool_name_part=None if self._tool_name_part is None else self._tool_name_part.clone(),
             _middle_part=None if self._middle_part is None else self._middle_part.clone(),
             _json_part=None if self._json_part is None else self._json_part.clone(),
@@ -48,6 +53,12 @@ class SingleFunctionCallConstraint:
 
     def feed_text(self, text: str) -> bool:
         for char in text:
+            if self._phase == "prefix":
+                if self._prefix_part is None or not self._prefix_part.feed_text(char):
+                    return False
+                if self._prefix_part.is_complete():
+                    self._phase = "tool_name"
+                continue
             if self._phase == "tool_name":
                 if self._tool_name_part is None or not self._tool_name_part.feed_text(char):
                     return False
@@ -78,6 +89,8 @@ class SingleFunctionCallConstraint:
         return True
 
     def allowed_first_bytes(self) -> set[int] | None:
+        if self._phase == "prefix" and self._prefix_part is not None:
+            return self._prefix_part.allowed_first_bytes()
         if self._phase == "tool_name" and self._tool_name_part is not None:
             return self._tool_name_part.allowed_first_bytes()
         if self._phase == "middle" and self._middle_part is not None:

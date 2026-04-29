@@ -617,7 +617,7 @@ def test_sse_payload_encoder_emits_done_marker() -> None:
     assert encode_sse_comment("ping").decode("utf-8") == ": ping\n\n"
 
 
-def test_remote_backend_uses_chat_completions_and_caches_unsupported_choice_scoring(monkeypatch) -> None:
+def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scoring(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(
             base_url="127.0.0.1:8081",
@@ -628,11 +628,11 @@ def test_remote_backend_uses_chat_completions_and_caches_unsupported_choice_scor
 
     def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
         calls.append((url, payload))
-        if url.endswith("/chat/completions"):
+        if url.endswith("/completions"):
             return {
                 "choices": [
                     {
-                        "message": {"role": "assistant", "content": "answer"},
+                        "text": "answer",
                         "finish_reason": "stop",
                     }
                 ]
@@ -657,8 +657,9 @@ def test_remote_backend_uses_chat_completions_and_caches_unsupported_choice_scor
     assert len(outputs) == 1
     assert outputs[0].text == "answer"
     assert outputs[0].finish_reason == "stop_token"
-    assert calls[0][0].endswith("/chat/completions")
-    assert calls[0][1]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert calls[0][0].endswith("/completions")
+    assert calls[0][1]["prompt"] == "prompt"
+    assert "messages" not in calls[0][1]
     assert "top_k" not in calls[0][1]
     assert "penalty_decay" not in calls[0][1]
 
@@ -667,8 +668,10 @@ def test_remote_backend_uses_chat_completions_and_caches_unsupported_choice_scor
     with pytest.raises(NotImplementedError):
         backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
 
-    completion_calls = [url for url, _payload in calls if url.endswith("/v1/completions")]
-    assert len(completion_calls) == 1
+    choice_scoring_calls = [
+        payload for _url, payload in calls if payload.get("candidate_token_texts") == [" A", " B"]
+    ]
+    assert len(choice_scoring_calls) == 1
 
 
 def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:

@@ -12,13 +12,12 @@ from src.eval.function_calling.bfcl_v3 import (
     apply_bfcl_tool_call,
     build_bfcl_ask_prompt,
     build_bfcl_cot_prompt,
-    build_bfcl_decision_prompt,
     build_bfcl_handoff_prompt,
     build_bfcl_router_prompt,
+    build_bfcl_rwkv_prompt,
     build_bfcl_system_prompt,
     build_bfcl_tool_prompt,
     build_bfcl_tool_result_message,
-    build_bfcl_turn_context,
     build_bfcl_user_block,
     collect_bfcl_dataset_issues,
     decode_bfcl_exec_response,
@@ -28,14 +27,12 @@ from src.eval.function_calling.bfcl_v3 import (
     interpret_bfcl_assistant_output,
     load_bfcl_v3_rows_from_source,
     normalize_bfcl_decision_output,
-    normalize_bfcl_tool_output_safe,
     normalize_bfcl_v3_source_row,
     parse_bfcl_assistant_output,
     parse_bfcl_router_output,
     render_bfcl_assistant_tool_message,
     render_bfcl_recent_tool_window,
     render_bfcl_state_delta,
-    reconstruct_bfcl_tool_output,
     start_bfcl_runtime,
 )
 from src.eval.function_calling.context_budget import trim_history, trim_message_history
@@ -49,10 +46,17 @@ def _write_support_assets(
     source_name: str = "BFCL_v3_multi_turn_base.json",
     task_id: str = "multi_turn_base_59",
     include_holdout: bool = False,
+    source_dir: Path | None = None,
+    support_root: Path | None = None,
+    possible_answer_dir_name: str = "possible_answer",
 ) -> Path:
-    source = tmp_path / source_name
+    source_base = source_dir or tmp_path
+    source_base.mkdir(parents=True, exist_ok=True)
+    source = source_base / source_name
     source.write_text("", encoding="utf-8")
-    possible_answer_root = tmp_path / "possible_answer"
+    support_base = support_root or tmp_path
+    support_base.mkdir(parents=True, exist_ok=True)
+    possible_answer_root = support_base / possible_answer_dir_name
     possible_answer_root.mkdir()
     possible_answer_rows = [
         {
@@ -69,7 +73,7 @@ def _write_support_assets(
         "\n".join(json.dumps(row, ensure_ascii=False) for row in possible_answer_rows) + "\n",
         encoding="utf-8",
     )
-    func_doc_root = tmp_path / "multi_turn_func_doc"
+    func_doc_root = support_base / "multi_turn_func_doc"
     func_doc_root.mkdir()
     tools = [
         {
@@ -219,6 +223,30 @@ def test_normalize_bfcl_v3_source_row_recovers_from_marshaled_instruction_and_me
     assert row["initial_state"] == {"VehicleControlAPI": {"fuelLevel": 20}}
     assert row["metadata"]["source_path"] == str(source)
     assert row["metadata"]["manifest_path"] == str(manifest_path)
+
+
+def test_normalize_bfcl_v3_source_row_finds_repo_bfcl_support_layout(tmp_path: Path) -> None:
+    source = _write_support_assets(
+        tmp_path,
+        source_dir=tmp_path / "data" / "bfcl_v3_raw",
+        support_root=tmp_path / "data" / "bfcl_support",
+        possible_answer_dir_name="possible_answer_v3",
+    )
+    row = normalize_bfcl_v3_source_row(
+        {
+            "id": "multi_turn_base_59",
+            "question": [[{"role": "user", "content": "How far is San Francisco from Rivermist?"}]],
+            "initial_config": {"VehicleControlAPI": {"fuelLevel": 20}},
+            "path": ["VehicleControlAPI.measureDistance", "VehicleControlAPI.getFuelLevel"],
+            "involved_classes": ["VehicleControlAPI"],
+        },
+        index=59,
+        source_path=source,
+    )
+
+    assert row["metadata"]["possible_answer_path"].endswith("possible_answer_v3/BFCL_v3_multi_turn_base.json")
+    assert row["metadata"]["func_doc_root"].endswith("bfcl_support/multi_turn_func_doc")
+    assert [tool["name"] for tool in row["tools"]] == ["measureDistance", "getFuelLevel"]
 
 
 def test_normalize_bfcl_v3_source_row_excludes_holdout_tools_until_turn(tmp_path: Path) -> None:
@@ -476,6 +504,56 @@ def test_evaluate_bfcl_v3_episode_uses_official_checker(monkeypatch) -> None:
     assert evaluation.details["state_ok"] is True
 
 
+def test_evaluate_bfcl_v3_episode_uses_official_irrelevance_checker(monkeypatch) -> None:
+    record = BfclTaskRecord(
+        task_id="multi_turn_miss_func_1",
+        instruction="Official task",
+        tools=(
+            {
+                "name": "getFuelLevel",
+                "description": "Get fuel level",
+                "parameters": {"type": "dict", "properties": {}},
+            },
+        ),
+        turns=(
+            BfclTurn(messages=({"role": "user", "content": "fuel?"},), ground_truth=("getFuelLevel()",)),
+            BfclTurn(messages=({"role": "user", "content": "unavailable?"},), ground_truth=()),
+        ),
+        involved_classes=("VehicleControlAPI",),
+        initial_state={"VehicleControlAPI": {"fuelLevel": 20}},
+        metadata={"official_root": "/tmp/fake-official"},
+    )
+    runtime = start_bfcl_runtime(record)
+    runtime.official_model_name = "demo-model"
+    runtime.decoded_turn_outputs = [[["getFuelLevel()"]], [["getFuelLevel()"]]]
+
+    monkeypatch.setattr(
+        bfcl_v3_mod,
+        "_load_bfcl_official_runtime",
+        lambda _root: SimpleNamespace(
+            execute_multi_turn_func_call=lambda **_kwargs: ([], {}),
+            multi_turn_checker=lambda *_args, **_kwargs: {"valid": True},
+            multi_turn_irrelevance_checker=lambda *_args, **_kwargs: {
+                "valid": False,
+                "error_type": "multi_turn:irrelevance_error:decoder_success",
+                "error_message": "tool call should be empty",
+            },
+        ),
+    )
+
+    evaluation = evaluate_bfcl_v3_episode(
+        record,
+        runtime,
+        "",
+        termination_reason="agent_stop",
+    )
+
+    assert evaluation.is_passed is False
+    assert evaluation.reward == 0.0
+    assert evaluation.details["tool_sequence_ok"] is False
+    assert evaluation.details["official_checker_error_type"] == "multi_turn:irrelevance_error:decoder_success"
+
+
 def test_collect_bfcl_dataset_issues_reports_missing_support_assets() -> None:
     issues = collect_bfcl_dataset_issues(
         [
@@ -526,12 +604,12 @@ def test_build_bfcl_user_block_uses_rwkv_style_sections() -> None:
     )
 
     assert content.startswith("User: Request:\nLine 1\nLine 2")
-    assert "Previous tool result:" in content
+    assert "Function output:" in content
     assert "Current structured state snapshot:" in content
     assert "\r" not in content
 
 
-def test_build_bfcl_cot_and_decision_prompts_are_separated() -> None:
+def test_build_bfcl_cot_and_router_prompts_are_separated() -> None:
     system_prompt = build_bfcl_system_prompt(
         (
             {
@@ -548,7 +626,7 @@ def test_build_bfcl_cot_and_decision_prompts_are_separated() -> None:
         current_state_snapshot={"selected": "A0"},
         previous_tool_result={"ok": True, "tool": "lookup", "result": {"id": "A0"}},
     )
-    decision_prompt = build_bfcl_decision_prompt(
+    router_prompt = build_bfcl_router_prompt(
         system_prompt,
         user_request="Find A1",
         current_state_snapshot={"selected": "A0"},
@@ -556,9 +634,9 @@ def test_build_bfcl_cot_and_decision_prompts_are_separated() -> None:
     )
 
     assert cot_prompt.endswith("Assistant: <think>\n")
-    assert decision_prompt.endswith("Assistant:")
-    assert "<|completions_of_cot|>" not in decision_prompt
-    assert "</think>" not in decision_prompt
+    assert router_prompt.endswith("Assistant:")
+    assert "<|completions_of_cot|>" not in router_prompt
+    assert "</think>" not in router_prompt
 
 
 def test_build_bfcl_router_and_branch_prompts_use_hidden_summary_and_tool_prefix() -> None:
@@ -603,10 +681,12 @@ def test_build_bfcl_router_and_branch_prompts_use_hidden_summary_and_tool_prefix
     assert "Private reasoning summary" in router_prompt
     assert "Current structured state delta" in router_prompt
     assert '"selected": "A1"' in router_prompt
-    assert "```" not in router_prompt
-    assert tool_prompt.endswith('Assistant: <tool_call>{"requestor":"assistant","name":"')
-    assert ask_prompt.endswith("Assistant:")
-    assert handoff_prompt.endswith("Assistant:")
+    assert '"name": "lookup"' in router_prompt
+    assert "```json" not in router_prompt
+    assert "<tool_call>" not in tool_prompt
+    assert tool_prompt.endswith("Assistant: ```json\n")
+    assert ask_prompt.endswith("Assistant: ```json\n")
+    assert handoff_prompt.endswith("Assistant: ```json\n")
 
 
 def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
@@ -614,13 +694,13 @@ def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
         {"ok": True, "tool": "lookup", "result": {"id": "A1"}},
     )
 
-    assert content.startswith("User: Previous tool result:")
+    assert content.startswith("User: Function output:")
     assert "Request:" not in content
 
 
-def test_parse_bfcl_assistant_output_accepts_single_tool_call_block() -> None:
+def test_parse_bfcl_assistant_output_accepts_json_function_call() -> None:
     decision = parse_bfcl_assistant_output(
-        '<tool_call>{"requestor":"assistant","name":"lookup","arguments":{"id":"A1"}}</tool_call>'
+        '{"name":"lookup","arguments":{"id":"A1"}}'
     )
 
     assert decision.is_tool_call is True
@@ -629,13 +709,23 @@ def test_parse_bfcl_assistant_output_accepts_single_tool_call_block() -> None:
     assert decision.tool_call.arguments == {"id": "A1"}
 
 
-def test_parse_bfcl_assistant_output_requires_explicit_requestor() -> None:
+def test_parse_bfcl_assistant_output_accepts_json_code_fence() -> None:
+    decision = parse_bfcl_assistant_output(
+        '```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```'
+    )
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+
+
+def test_parse_bfcl_assistant_output_requires_exact_json_shape() -> None:
     try:
-        parse_bfcl_assistant_output('<tool_call>{"name":"lookup","arguments":{"id":"A1"}}</tool_call>')
+        parse_bfcl_assistant_output('{"requestor":"assistant","name":"lookup","arguments":{"id":"A1"}}')
     except ValueError as exc:
-        assert "exactly requestor, name, and arguments" in str(exc)
+        assert "exactly name and arguments" in str(exc)
     else:  # pragma: no cover - defensive
-        raise AssertionError("expected strict requestor validation")
+        raise AssertionError("expected strict JSON shape validation")
 
 
 def test_parse_bfcl_router_output_accepts_only_known_labels() -> None:
@@ -653,15 +743,15 @@ def test_parse_bfcl_router_output_accepts_only_known_labels() -> None:
 def test_parse_bfcl_assistant_output_rejects_non_rwkv_tool_protocols() -> None:
     bad_outputs = [
         '```json\n{"tool_calls":[{"name":"lookup","arguments":{}}]}\n```',
-        '<tool_call>{"requestor":"assistant","name":"lookup","arguments":{}}</tool_call>\n'
-        '<tool_call>{"requestor":"assistant","name":"lookup","arguments":{"id":"B2"}}</tool_call>',
+        '<tool_call>{"name":"lookup","arguments":{}}</tool_call>',
+        'text before {"name":"lookup","arguments":{}}',
     ]
 
     for text in bad_outputs:
         try:
             parse_bfcl_assistant_output(text)
         except ValueError as exc:
-            assert any(token in str(exc) for token in ("forbidden", "unexpected", "multiple"))
+            assert any(token in str(exc) for token in ("forbidden", "JSON function call object"))
         else:  # pragma: no cover - defensive
             raise AssertionError(f"expected ValueError for {text!r}")
 
@@ -669,7 +759,7 @@ def test_parse_bfcl_assistant_output_rejects_non_rwkv_tool_protocols() -> None:
 def test_interpret_bfcl_assistant_output_rejects_unknown_tool_name() -> None:
     try:
         interpret_bfcl_assistant_output(
-            '<tool_call>{"requestor":"assistant","name":"unknown","arguments":{}}</tool_call>',
+            '{"name":"unknown","arguments":{}}',
             tools=[{"name": "lookup"}],
         )
     except ValueError as exc:
@@ -681,7 +771,7 @@ def test_interpret_bfcl_assistant_output_rejects_unknown_tool_name() -> None:
 def test_decode_bfcl_exec_response_rejects_invalid_arguments() -> None:
     try:
         decode_bfcl_exec_response(
-            '<tool_call>{"requestor":"assistant","name":"lookup","arguments":{}}</tool_call>',
+            '{"name":"lookup","arguments":{}}',
             tools=[
                 {
                     "name": "lookup",
@@ -714,31 +804,26 @@ def test_bfcl_tool_call_constraint_enforces_root_argument_schema() -> None:
     ]
 
     valid = build_bfcl_tool_call_constraint(tools)
-    assert valid.feed_text('lookup","arguments":{"id":"A1"}}</tool_call>')
+    assert valid.feed_text('{"name":"lookup","arguments":{"id":"A1"}}')
     assert valid.is_complete() is True
 
     invalid = build_bfcl_tool_call_constraint(tools)
-    assert invalid.feed_text('lookup","arguments":{"bad"') is False
+    assert invalid.feed_text('{"name":"lookup","arguments":{"bad"') is False
 
 
-def test_normalize_bfcl_decision_output_restores_tool_call_suffix() -> None:
-    normalized = normalize_bfcl_decision_output(
-        '<tool_call>{"requestor":"assistant","name":"lookup","arguments":{"id":"A1"}}'
-    )
+def test_normalize_bfcl_decision_output_only_normalizes_text() -> None:
+    normalized = normalize_bfcl_decision_output('  ```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```  ')
 
-    assert normalized.endswith("</tool_call>")
+    assert normalized == '{"name":"lookup","arguments":{"id":"A1"}}'
 
 
-def test_normalize_bfcl_tool_output_safe_repairs_missing_requestor_and_string_arguments() -> None:
-    repaired = normalize_bfcl_tool_output_safe(
-        reconstruct_bfcl_tool_output('{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}')
-    )
-    decision = parse_bfcl_assistant_output(repaired)
-
-    assert decision.is_tool_call is True
-    assert decision.tool_call is not None
-    assert decision.tool_call.requestor == "assistant"
-    assert decision.tool_call.arguments == {"id": "A1"}
+def test_parse_bfcl_assistant_output_rejects_string_arguments() -> None:
+    try:
+        parse_bfcl_assistant_output('{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}')
+    except ValueError as exc:
+        assert "arguments must be a JSON object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected strict arguments validation")
 
 
 def test_extract_hidden_summary_and_state_delta_are_compact() -> None:
@@ -770,34 +855,32 @@ def test_render_bfcl_recent_tool_window_keeps_last_call_only() -> None:
 def test_render_bfcl_assistant_tool_message_contains_only_tool_call() -> None:
     rendered = render_bfcl_assistant_tool_message(TauToolCall(name="lookup", arguments={"id": "A1"}))
 
-    assert rendered.startswith("<tool_call>")
-    assert rendered.endswith("</tool_call>")
+    assert rendered == '{"name":"lookup","arguments":{"id":"A1"}}'
     assert "<think>" not in rendered
 
 
-def test_build_bfcl_turn_context_includes_state_snapshot() -> None:
+def test_build_bfcl_cot_prompt_includes_state_snapshot() -> None:
     record = BfclTaskRecord(task_id="demo-1", instruction="Search and confirm")
     runtime = start_bfcl_runtime(record)
     runtime.current_state["selected"] = "F1"
 
-    context = build_bfcl_turn_context(
+    context = build_bfcl_cot_prompt(
         "System prompt",
-        [{"role": "user", "content": "Search and confirm"}],
-        runtime,
-        history_max_chars=500,
+        user_request="Search and confirm",
+        current_state_snapshot=runtime.current_state,
     )
 
     assert "Current structured state snapshot" in context
     assert '"selected": "F1"' in context
 
 
-def test_build_bfcl_turn_context_uses_rwkv_dialogue_skeleton() -> None:
+def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
     tool = {
         "name": "lookup",
         "description": "Lookup a record",
         "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
     }
-    context = build_bfcl_turn_context(
+    context = build_bfcl_rwkv_prompt(
         build_bfcl_system_prompt([tool]),
         [
             {"role": "user", "content": "Find A1"},
@@ -806,11 +889,11 @@ def test_build_bfcl_turn_context_uses_rwkv_dialogue_skeleton() -> None:
                 "content": render_bfcl_assistant_tool_message(TauToolCall(name="lookup", arguments={"id": "A1"})),
             },
         ],
-        start_bfcl_runtime(BfclTaskRecord(task_id="demo-1", instruction="Find A1")),
         history_max_chars=4000,
     )
 
-    assert context.startswith("System: You are solving a BFCL V3 multi-turn function-calling task.")
+    assert context.startswith("System: Tools:")
+    assert '"name": "lookup"' in context
     assert "\nUser: Request:\nFind A1\n" in context
-    assert "\nAssistant: <tool_call>" in context
-    assert context.endswith("Assistant: <think>\n<|completions_of_cot|>")
+    assert '\nAssistant: ```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```' in context
+    assert context.endswith("Assistant: ```json\n")
