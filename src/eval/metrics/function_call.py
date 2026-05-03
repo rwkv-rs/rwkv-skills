@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Metrics for function-call benchmarks."""
 
+import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
@@ -43,7 +44,7 @@ def evaluate_function_call(
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
         record = dataset[sample_index] if 0 <= sample_index < len(dataset) else None
-        prediction = _extract_final_answer(payload).strip()
+        prediction = _extract_function_call_text(payload).strip()
         passed, fail_reason, reference = _score_prediction(record, prediction)
         env_type = _record_env_type(record)
         env_totals[env_type] = env_totals.get(env_type, 0) + 1
@@ -95,7 +96,7 @@ def _extract_stats(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _extract_final_answer(payload: Mapping[str, Any]) -> str:
+def _extract_function_call_text(payload: Mapping[str, Any]) -> str:
     final_answer = payload.get("final_answer")
     if isinstance(final_answer, str):
         return final_answer
@@ -106,12 +107,12 @@ def _extract_final_answer(payload: Mapping[str, Any]) -> str:
             return context_answer
         events = context.get("events")
         if isinstance(events, list):
-            extracted = _extract_final_answer_from_events(events)
+            extracted = _extract_function_call_from_events(events)
             if extracted:
                 return extracted
     events = payload.get("events")
     if isinstance(events, list):
-        extracted = _extract_final_answer_from_events(events)
+        extracted = _extract_function_call_from_events(events)
         if extracted:
             return extracted
     completion_keys = sorted(
@@ -124,12 +125,12 @@ def _extract_final_answer(payload: Mapping[str, Any]) -> str:
     return ""
 
 
-def _extract_final_answer_from_events(events: list[Any]) -> str:
+def _extract_function_call_from_events(events: list[Any]) -> str:
     for event in reversed(events):
         if not isinstance(event, dict):
             continue
         event_type = str(event.get("type") or event.get("kind") or "")
-        if event_type == "final_answer":
+        if event_type in {"function_call", "tool_call"}:
             return str(event.get("content") or event.get("text") or "")
     for event in reversed(events):
         if not isinstance(event, dict):
@@ -143,43 +144,54 @@ def _score_prediction(record: FunctionCallTaskRecord | None, prediction: str) ->
     if record is None:
         return False, "missing_record", ""
     scorer = record.scorer or {}
-    scorer_type = str(scorer.get("type") or "normalized_text_exact")
-    reference = record.expected_answer or ""
-    if not reference:
-        return False, "missing_reference_answer", ""
-    if scorer_type == "normalized_text_exact":
-        normalized_pred = _normalize_text(
-            prediction,
-            strip=bool(scorer.get("strip", True)),
-            ignore_case=bool(scorer.get("ignore_case", True)),
-            collapse_whitespace=bool(scorer.get("collapse_whitespace", True)),
-        )
-        normalized_ref = _normalize_text(
-            reference,
-            strip=bool(scorer.get("strip", True)),
-            ignore_case=bool(scorer.get("ignore_case", True)),
-            collapse_whitespace=bool(scorer.get("collapse_whitespace", True)),
-        )
-        passed = bool(normalized_ref) and normalized_pred == normalized_ref
-        return passed, "" if passed else "answer_mismatch", reference
+    scorer_type = str(scorer.get("type") or "json_function_call_exact")
+    expected, expected_error = _normalize_call(record.expected_call)
+    reference = _call_to_json(expected) if expected is not None else ""
+    if expected is None:
+        return False, expected_error or "missing_reference_call", ""
+    if scorer_type == "json_function_call_exact":
+        actual, actual_error = _parse_function_call(prediction)
+        if actual is None:
+            return False, actual_error or "invalid_json_function_call", reference
+        if actual["name"] != expected["name"]:
+            return False, "name_mismatch", reference
+        if actual["arguments"] != expected["arguments"]:
+            return False, "arguments_mismatch", reference
+        return True, "", reference
     return False, f"unsupported_scorer:{scorer_type}", reference
 
 
-def _normalize_text(
-    value: str,
-    *,
-    strip: bool,
-    ignore_case: bool,
-    collapse_whitespace: bool,
-) -> str:
-    text = value
-    if strip:
-        text = text.strip()
-    if collapse_whitespace:
-        text = " ".join(text.split())
-    if ignore_case:
-        text = text.lower()
-    return text
+def _parse_function_call(raw: str) -> tuple[dict[str, Any] | None, str]:
+    text = raw.strip()
+    if not text:
+        return None, "empty_output"
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    if text[end:].strip():
+        return None, "invalid_json_trailing_text"
+    if not isinstance(parsed, dict):
+        return None, "json_not_object"
+    extra_keys = set(parsed) - {"name", "arguments"}
+    if extra_keys:
+        return None, "unexpected_call_fields"
+    return _normalize_call(parsed)
+
+
+def _normalize_call(call: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    name = call.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None, "missing_name"
+    arguments = call.get("arguments", {})
+    if not isinstance(arguments, dict):
+        return None, "arguments_not_object"
+    return {"name": name.strip(), "arguments": dict(arguments)}, ""
+
+
+def _call_to_json(call: Mapping[str, Any]) -> str:
+    return json.dumps(call, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _record_env_type(record: FunctionCallTaskRecord | None) -> str:

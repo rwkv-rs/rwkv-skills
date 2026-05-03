@@ -2,8 +2,9 @@ from __future__ import annotations
 
 """Function-call benchmark evaluation pipeline."""
 
+import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from src.eval.benchmark_config import BenchmarkModelConfig
 from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
@@ -11,21 +12,23 @@ from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 
 from .common import sample_repeat_seed
 
+if TYPE_CHECKING:
+    from src.infer.model import ModelLoadConfig
+
 DEFAULT_FUNCTION_CALL_SYSTEM_TEMPLATE = (
-    "You are solving a function-call benchmark task.\n"
-    "Return only the final answer.\n"
-    "Do not claim to have used tools, browsing, or files unless they are explicitly provided in the prompt."
+    "Tools:\n<TOOLS>\n"
+    "Return only a JSON function call."
 )
-DEFAULT_FUNCTION_CALL_USER_TEMPLATE = (
-    "Task:\n<INSTRUCTION>\n\n"
-    "Attachments:\n<ATTACHMENTS>\n\n"
-    "Max steps: <MAX_STEPS>\n"
-    "Available tools:\n<TOOLS>"
+DEFAULT_FUNCTION_CALL_USER_TEMPLATE = "<HISTORY>"
+SUPPORTED_FUNCTION_CALL_ENVS = (
+    "json_function_call",
+    "function_call",
+    "single_turn_function_call",
+    "multi_turn_function_call",
 )
 
 
@@ -58,6 +61,8 @@ class FunctionCallPipelineResult:
 
 class FunctionCallPipeline:
     def __init__(self, model_config: ModelLoadConfig) -> None:
+        from src.infer.model import load_rwkv_model
+
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path
@@ -113,9 +118,9 @@ class FunctionCallPipeline:
         for start in range(0, len(entries), chunk_size):
             chunk = entries[start : start + chunk_size]
             prompts = [self._make_prompt(record, config=config) for _idx, record, _sample_id in chunk]
-            env_types = [str(record.env.get("type") or "single_turn_qa") for _idx, record, _sample_id in chunk]
+            env_types = [str(record.env.get("type") or "json_function_call") for _idx, record, _sample_id in chunk]
             for env_type in env_types:
-                if env_type != "single_turn_qa":
+                if env_type not in SUPPORTED_FUNCTION_CALL_ENVS:
                     raise NotImplementedError(f"暂不支持的 function_call env.type: {env_type}")
 
             def _on_complete(output: GenerationOutput) -> None:
@@ -125,14 +130,15 @@ class FunctionCallPipeline:
                 record_idx, record, sample_id = chunk[local_idx]
                 prompt = prompts[local_idx]
                 completion = output.text or ""
-                final_answer = completion.strip()
+                function_call_text = completion.strip()
                 system_prompt = self._render_system_prompt(record, config=config)
                 user_prompt = self._render_user_prompt(record, config=config)
-                events = self._build_single_turn_events(
+                events = self._build_events(
+                    record=record,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     completion=completion,
-                    final_answer=final_answer,
+                    function_call_text=function_call_text,
                     finish_reason=output.finish_reason,
                 )
                 stats = FunctionCallRunStats(
@@ -152,11 +158,11 @@ class FunctionCallPipeline:
                     "prompt1": prompt,
                     "completion1": completion,
                     "stop_reason1": output.finish_reason,
-                    "final_answer": final_answer,
+                    "final_answer": function_call_text,
                     "events": [asdict(event) for event in events],
                     "stats": asdict(stats),
-                    "function_call_env_type": str(record.env.get("type") or "single_turn_qa"),
-                    "function_call_scorer_type": str(record.scorer.get("type") or "normalized_text_exact"),
+                    "function_call_env_type": str(record.env.get("type") or "json_function_call"),
+                    "function_call_scorer_type": str(record.scorer.get("type") or "json_function_call_exact"),
                 }
                 if on_record is not None:
                     on_record(payload)
@@ -175,19 +181,32 @@ class FunctionCallPipeline:
             )
         return FunctionCallPipelineResult(dataset_name, len(entries), payloads)
 
-    def _build_single_turn_events(
+    def _build_events(
         self,
         *,
+        record: FunctionCallTaskRecord,
         system_prompt: str,
         user_prompt: str,
         completion: str,
-        final_answer: str,
+        function_call_text: str,
         finish_reason: str,
     ) -> list[FunctionCallEvent]:
         events: list[FunctionCallEvent] = []
         if system_prompt.strip():
             events.append(FunctionCallEvent(type="system", role="system", content=system_prompt))
-        events.append(FunctionCallEvent(type="user", role="user", content=user_prompt))
+        if record.messages:
+            for message in record.messages:
+                role = str(message.get("role") or "user").strip().lower()
+                events.append(
+                    FunctionCallEvent(
+                        type=role,
+                        role="user" if role in {"tool", "function"} else role,
+                        content=self._message_content(message),
+                        name=self._message_name(message),
+                    )
+                )
+        elif user_prompt.strip():
+            events.append(FunctionCallEvent(type="user", role="user", content=user_prompt))
         events.append(
             FunctionCallEvent(
                 type="assistant",
@@ -196,7 +215,9 @@ class FunctionCallPipeline:
                 metadata={"stop_reason": finish_reason},
             )
         )
-        events.append(FunctionCallEvent(type="final_answer", role="assistant", content=final_answer))
+        events.append(
+            FunctionCallEvent(type="function_call", role="assistant", content=function_call_text)
+        )
         return events
 
     def _make_prompt(self, record: FunctionCallTaskRecord, *, config: BenchmarkModelConfig | None) -> str:
@@ -205,7 +226,8 @@ class FunctionCallPipeline:
         parts: list[str] = []
         if system_prompt.strip():
             parts.append(f"System: {system_prompt.strip()}")
-        parts.append(f"User: {user_prompt.strip()}")
+        if user_prompt.strip():
+            parts.append(user_prompt.strip())
         prompt = "\n\n".join(parts).rstrip()
         if not prompt.endswith("Assistant:"):
             prompt = f"{prompt}\n\nAssistant:"
@@ -239,13 +261,57 @@ class FunctionCallPipeline:
 
     def _render_template(self, template: str, record: FunctionCallTaskRecord) -> str:
         attachments = self._format_named_items(record.attachments)
-        tools = self._format_named_items(record.tools)
+        tools = self._format_tools(record.tools)
+        history = self._format_history(record)
         return (
             template.replace("<INSTRUCTION>", record.instruction)
             .replace("<ATTACHMENTS>", attachments)
             .replace("<TOOLS>", tools)
+            .replace("<HISTORY>", history)
+            .replace("<MESSAGES>", history)
             .replace("<MAX_STEPS>", str(record.max_steps or 1))
         )
+
+    @staticmethod
+    def _format_tools(tools: list[dict[str, Any]]) -> str:
+        return json.dumps(tools, ensure_ascii=False, indent=2)
+
+    def _format_history(self, record: FunctionCallTaskRecord) -> str:
+        messages = record.messages or [{"role": "user", "content": record.instruction}]
+        rendered: list[str] = []
+        for message in messages:
+            role = str(message.get("role") or "user").strip().lower()
+            content = self._message_content(message)
+            if role == "assistant":
+                rendered.append(f"Assistant: {content}")
+            elif role in {"tool", "function"}:
+                rendered.append(f"User: Function output:\n{content}")
+            elif role == "system":
+                rendered.append(f"System: {content}")
+            else:
+                rendered.append(f"User: {content}")
+        return "\n\n".join(item for item in rendered if item.strip())
+
+    @staticmethod
+    def _message_content(message: dict[str, Any]) -> str:
+        for key in ("content", "text", "observation", "result", "output"):
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        for key in ("tool_call", "function_call", "call"):
+            value = message.get(key)
+            if isinstance(value, dict):
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return ""
+
+    @staticmethod
+    def _message_name(message: dict[str, Any]) -> str | None:
+        name = message.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return None
 
     @staticmethod
     def _format_named_items(items: list[dict[str, Any]]) -> str:

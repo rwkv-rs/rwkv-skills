@@ -63,6 +63,10 @@ class InferenceEngine:
         )
 
 
+def _normalize_prompt(prompt: str) -> str:
+    return prompt.strip()
+
+
 @dataclass(slots=True)
 class _ActiveTask:
     prompt_index: int
@@ -141,11 +145,12 @@ def _continuous_batching(
 
     encoded = deque()
     for idx, prompt in enumerate(prompts):
-        tokens = tokenizer.encode(prompt)
+        normalized_prompt = _normalize_prompt(prompt)
+        tokens = tokenizer.encode(normalized_prompt)
         if sampling.pad_zero:
             tokens = [0] + tokens
         seed = int(prompt_seeds[idx]) if prompt_seeds is not None else None
-        encoded.append((idx, prompt, tokens, seed))
+        encoded.append((idx, normalized_prompt, tokens, seed))
 
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())

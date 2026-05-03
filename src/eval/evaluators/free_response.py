@@ -16,7 +16,7 @@ from .common import SampleRecord, StageRecord, sample_repeat_seed
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
-Assistant: <think"""
+Assistant:<think"""
 
 DEFAULT_FINAL_PROMPT = """<Q><COT>
 Therefore, the answer is \\(\\boxed{"""

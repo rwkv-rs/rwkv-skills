@@ -154,7 +154,7 @@ direct_prompt_template = """User: 选唯一正确项，只输出选项字母。
 <Q>
 <CHOICES>
 
-Assistant: 答案是"""
+Assistant:答案是"""
 
 [trial.multi_choice_zh_nocot_v2]
 description = "Chinese direct: shorter answer prefix."
@@ -163,7 +163,7 @@ benchmarks = ["ceval_nocot", "cmmlu_nocot"]
 direct_prompt_template = """User: <Q>
 <CHOICES>
 
-Assistant: 正确选项："""
+Assistant:正确选项："""
 
 [trial.control_en_avg1_nocot]
 description = "Control: original English avg@1 direct prompt."
@@ -178,7 +178,7 @@ direct_prompt_template = """User: Choose the single best option. Answer only wit
 <Q>
 <CHOICES>
 
-Assistant: Answer:"""
+Assistant:Answer:"""
 
 [trial.multi_choice_en_avg1_nocot_v2]
 description = "English direct: minimal answer prefix."
@@ -188,7 +188,7 @@ direct_prompt_template = """User: Pick one option.
 <Q>
 <CHOICES>
 
-Assistant: Option:"""
+Assistant:Option:"""
 
 [trial.control_gpqa_nocot]
 description = "Control: original GPQA direct prompt."
@@ -203,7 +203,7 @@ direct_prompt_template = """User: Choose the single best option. Answer only wit
 <Q>
 <CHOICES>
 
-Assistant: Answer:"""
+Assistant:Answer:"""
 
 [trial.multi_choice_gpqa_nocot_v2]
 description = "GPQA direct: minimal answer prefix."
@@ -213,7 +213,7 @@ direct_prompt_template = """User: Pick one option.
 <Q>
 <CHOICES>
 
-Assistant: Option:"""
+Assistant:Option:"""
 
 [trial.control_format_light]
 description = "Control: original prompt for low/medium-k free-response datasets."
@@ -428,7 +428,7 @@ direct_prompt_template = """User: 选一个最佳选项。
 <Q>
 <CHOICES>
 
-Assistant: 选项："""
+Assistant:选项："""
 
 [trial.multi_choice_en_avg1_cot_v4]
 description = "English avg@1 CoT: exact-one option with tracked letter."
@@ -450,7 +450,7 @@ direct_prompt_template = """User: Choose one option.
 <Q>
 <CHOICES>
 
-Assistant: Answer:"""
+Assistant:Answer:"""
 
 [trial.multi_choice_gpqa_cot_v4]
 description = "GPQA CoT: exact-one option with tracked letter."
@@ -472,7 +472,7 @@ direct_prompt_template = """User: Choose one best option.
 <Q>
 <CHOICES>
 
-Assistant: Answer:"""
+Assistant:Answer:"""
 
 [trial.free_response_format_light_v4]
 description = "Free-response: combine exact-form emphasis with short answer final."

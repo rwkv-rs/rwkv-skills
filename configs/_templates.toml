@@ -78,12 +78,12 @@ no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
 [function_call_cot_default]
 max_generate_tokens = 2048
-temperature = 0.3
+temperature = 1.0
 top_k = 200
-top_p = 0.5
-alpha_presence = 0.3
-alpha_frequency = 0.05
-alpha_decay = 0.995
+top_p = 0.0
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
 stop_tokens = [0, 261, 24281]
 pad_zero = true
 ban_tokens = []
@@ -95,8 +95,8 @@ template = "function_call_cot_default"
 [function_call_final_default]
 max_generate_tokens = 256
 temperature = 1.0
-top_k = 1
-top_p = 0.3
+top_k = 200
+top_p = 0.0
 alpha_presence = 0.0
 alpha_frequency = 0.0
 alpha_decay = 0.99
@@ -107,12 +107,12 @@ no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
 [agent_cot_default]
 max_generate_tokens = 2048
-temperature = 0.3
+temperature = 1.0
 top_k = 200
-top_p = 0.5
-alpha_presence = 0.3
-alpha_frequency = 0.05
-alpha_decay = 0.995
+top_p = 0.0
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
 stop_tokens = [0, 261, 24281]
 pad_zero = true
 ban_tokens = []
@@ -124,8 +124,8 @@ template = "agent_cot_default"
 [agent_final_default]
 max_generate_tokens = 256
 temperature = 1.0
-top_k = 1
-top_p = 0.3
+top_k = 200
+top_p = 0.0
 alpha_presence = 0.0
 alpha_frequency = 0.0
 alpha_decay = 0.99

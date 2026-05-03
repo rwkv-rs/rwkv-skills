@@ -23,13 +23,13 @@ EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>
 <Q>
 <CHOICES>
 
-Assistant: The answer is"""
+Assistant:The answer is"""
 
 EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
-Assistant: <think"""
+Assistant:<think"""
 
 EN_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 Therefore, the answer is"""
@@ -37,7 +37,7 @@ Therefore, the answer is"""
 ZH_DIRECT_PROMPT_TEMPLATE = """User: <Q>
 <CHOICES>
 
-Assistant: 正确答案是"""
+Assistant:正确答案是"""
 
 ZH_COT_PROMPT_TEMPLATE = """User: <Q>
 <CHOICES>

@@ -21,7 +21,7 @@ def _format_prompt_no_echo(prompt: str) -> str:
     clean = _compress_newlines(prompt).strip()
     return (
         "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant: <think></think>\n```python"
+        f"{clean}\n\nAssistant:<think></think>\n```python"
     )
 
 
@@ -75,7 +75,7 @@ _LCB_FINAL_ANSWER_PREFIX = "\n</think>\n```python\n"
 
 def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
     body = _format_lcb_body(question, starter_code)
-    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think"
+    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant:<think"
 
 
 def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:

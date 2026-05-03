@@ -80,7 +80,7 @@ class WKV_7_ONE(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_one(1, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@torch.library.custom_op("mylib::RWKV7_ONE_OP", mutates_args=())
+@torch.library.custom_op("mylib::RWKV7_ONE_OP", mutates_args=("state",))
 # @MyDisable
 def RWKV7_ONE_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_ONE.apply(state, r, w, k, v, a, b, elapsed_t)
@@ -98,7 +98,7 @@ class WKV_7_SEQ(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_seq(1, T, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@torch.library.custom_op("mylib::RWKV7_SEQ_OP", mutates_args=())
+@torch.library.custom_op("mylib::RWKV7_SEQ_OP", mutates_args=("state",))
 # @MyDisable
 def RWKV7_SEQ_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_SEQ.apply(state, r, w, k, v, a, b, elapsed_t)
@@ -116,7 +116,7 @@ class WKV_7_BATCH(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_one(B, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@torch.library.custom_op("mylib::RWKV7_ONE_BATCH_OP", mutates_args=())
+@torch.library.custom_op("mylib::RWKV7_ONE_BATCH_OP", mutates_args=("state",))
 # @MyDisable
 def RWKV7_ONE_BATCH_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_BATCH.apply(state, r, w, k, v, a, b, elapsed_t)
@@ -135,7 +135,7 @@ class WKV_7_SEQ_BATCH(torch.autograd.Function):
             torch.ops.rwkv7_state_fwd_fp16.forward_seq(B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t)
             return y
 
-@torch.library.custom_op("mylib::RWKV7_BATCH_OP", mutates_args=())
+@torch.library.custom_op("mylib::RWKV7_BATCH_OP", mutates_args=("state",))
 # @MyDisable
 def RWKV7_BATCH_OP(state:torch.Tensor, r:torch.Tensor, w:torch.Tensor, k:torch.Tensor, v:torch.Tensor, a:torch.Tensor, b:torch.Tensor, elapsed_t:torch.Tensor) -> torch.Tensor:
     return WKV_7_SEQ_BATCH.apply(state, r, w, k, v, a, b, elapsed_t)

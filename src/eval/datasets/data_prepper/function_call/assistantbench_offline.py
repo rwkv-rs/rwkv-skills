@@ -51,16 +51,35 @@ def prepare_assistantbench_offline(output_root: Path, split: str = "validation")
             {
                 "task_id": str(payload.get("id") or ""),
                 "instruction": task.strip(),
-                "expected_answer": answer.strip(),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": task.strip(),
+                    }
+                ],
+                "expected_call": {
+                    "name": "submit_answer",
+                    "arguments": {
+                        "answer": answer.strip(),
+                    },
+                },
                 "env": {
-                    "type": "single_turn_qa",
+                    "type": "json_function_call",
                 },
                 "scorer": {
-                    "type": "normalized_text_exact",
-                    "ignore_case": True,
-                    "strip": True,
+                    "type": "json_function_call_exact",
                 },
-                "tools": [],
+                "tools": [
+                    {
+                        "name": "submit_answer",
+                        "description": "Submit the final answer to the user task.",
+                        "arguments": {
+                            "answer": {
+                                "type": "string",
+                            },
+                        },
+                    }
+                ],
                 "attachments": [],
                 "max_steps": 1,
                 "time_limit_s": 60,

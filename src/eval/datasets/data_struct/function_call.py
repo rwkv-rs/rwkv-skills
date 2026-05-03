@@ -11,8 +11,9 @@ from .base import JsonlDataset, RecordBase
 @dataclass(slots=True)
 class FunctionCallTaskRecord(RecordBase):
     task_id: str
-    instruction: str
-    expected_answer: str | None = None
+    instruction: str = ""
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    expected_call: dict[str, Any] = field(default_factory=dict)
     env: dict[str, Any] = field(default_factory=dict)
     scorer: dict[str, Any] = field(default_factory=dict)
     tools: list[dict[str, Any]] = field(default_factory=list)

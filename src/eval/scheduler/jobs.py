@@ -145,9 +145,37 @@ def _build_dataset_catalogues() -> tuple[
     FUNCTION_CALL_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
 
-# All math/free-response datasets use the same LLM-judge evaluator by default.
-LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = MATH_DATASET_SLUGS
-MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple()
+MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "aime24_test",
+        "aime25_test",
+        "algebra222_test",
+        "asdiv_test",
+        "beyond_aime_test",
+        "brumo25_test",
+        "college_math_test",
+        "gsm_plus_test",
+        "hendrycks_math_test",
+        "hmmt_feb25_test",
+        "math_odyssey_test",
+        "mawps_test",
+        "olympiadbench_test",
+        "omni_math_test",
+        "svamp_test",
+    )
+)
+LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "amc23_test",
+        "comp_math_24_25_test",
+        "gaokao2023en_test",
+        "gsm8k_test",
+        "math_500_test",
+        "minerva_math_test",
+    )
+)
 
 ifeval_related = [slug for slug in SPECIAL_DATASET_SLUGS if slug.startswith("ifeval")]
 if not ifeval_related:

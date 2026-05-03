@@ -8,13 +8,13 @@ Prompt-set TOML example:
     jobs = ["free_response"]
     benchmarks = ["asdiv_cot", "svamp_cot"]
     max_samples = 80
-    cot_prompt_template = "User: Solve the problem. Preserve the requested answer form.\\n<Q>\\n\\nAssistant: <think"
+    cot_prompt_template = "User: Solve the problem. Preserve the requested answer form.\\n<Q>\\n\\nAssistant:<think"
     final_prompt_template = "<Q><COT>\\nAnswer only with the final answer:"
 
     [trial.gpqa_short_v1]
     jobs = ["multi_choice_cot"]
     benchmarks = ["gpqa_main_cot"]
-    cot_prompt_template = "User: Choose the single best option.\\n<Q>\\n<CHOICES>\\n\\nAssistant: <think"
+    cot_prompt_template = "User: Choose the single best option.\\n<Q>\\n<CHOICES>\\n\\nAssistant:<think"
     final_prompt_template = "<Q><COT>\\nTherefore, the answer is"
 
 The script writes one config overlay per trial and a commands.sh file. The
