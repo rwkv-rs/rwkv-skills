@@ -26,12 +26,13 @@ def _compress_newlines(text: str) -> str:
 
 
 def _format_prompt(prompt: str) -> str:
-    """Match the rwkv_mmlu HumanEval prompt: duplicate code after Assistant."""
+    """HumanEval prompt: code block after think tags."""
 
     clean = _compress_newlines(prompt).strip()
     return (
         "User:You are a top-level code master. Complete the following code without any additional text or explanation:\n"
-        f"{clean}\n\nAssistant:{clean}"
+        f"{clean}\n\n"
+        "A: <think>\n</think>\n```python"
     )
 
 

@@ -553,7 +553,25 @@ gradio-app,
 
 .bench-table td.cell-delta-zero {
   background: #1c1c2e !important;
-  color: #ffffff !important;
+  color: #6b7280 !important;
+}
+
+.bench-table td.cell-delta-warn-pos {
+  background: #064e3b !important;
+  color: #fbbf24 !important;
+  font-weight: 700;
+}
+
+.bench-table td.cell-delta-warn-neg {
+  background: #7f1d1d !important;
+  color: #fbbf24 !important;
+  font-weight: 700;
+}
+
+.bench-table td.cell-delta-suspect {
+  background: #78350f !important;
+  color: #fde68a !important;
+  font-weight: 700;
 }
 
 .bench-table tbody tr:hover td {
@@ -570,6 +588,18 @@ gradio-app,
 
 .bench-table tbody tr:hover td.cell-delta-zero {
   background: #1c1c2e !important;
+}
+
+.bench-table tbody tr:hover td.cell-delta-warn-pos {
+  background: #064e3b !important;
+}
+
+.bench-table tbody tr:hover td.cell-delta-warn-neg {
+  background: #7f1d1d !important;
+}
+
+.bench-table tbody tr:hover td.cell-delta-suspect {
+  background: #78350f !important;
 }
 
 .bench-table tbody tr:hover td.cell-status-error {

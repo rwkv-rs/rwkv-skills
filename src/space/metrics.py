@@ -331,20 +331,45 @@ def _styled_score_cell_norm(value: float | None, min_v: float | None, max_v: flo
     return _format_score_1dp(value)
 
 
-def _styled_delta_cell(delta_value: float | None) -> tuple[str, str]:
+def _styled_delta_cell(delta_value: float | None, *, warn: bool = False) -> tuple[str, str]:
     """Return ``(formatted_text, css_class)`` for a delta cell.
 
     css_class is one of ``"cell-delta-pos"``, ``"cell-delta-neg"``,
-    ``"cell-delta-zero"``, or ``"cell-na"``.
+    ``"cell-delta-zero"``, ``"cell-delta-warn-pos"``, ``"cell-delta-warn-neg"``,
+    ``"cell-delta-suspect"``, or ``"cell-na"``.
+
+    When the displayed value rounds to 0.0, always use gray (cell-delta-zero)
+    regardless of the raw sign.  When ``|delta| >= 5`` or ``warn=True``, use
+    a warning style.
     """
     text = _format_delta_value(delta_value)
     if delta_value is None:
         return text, "cell-na"
+
+    rounded = round(delta_value, 1)
+
+    # Display rounds to 0.0 → always gray, no misleading green/red
+    if abs(rounded) < 1e-6:
+        return "0.0", "cell-delta-zero"
+
+    # |delta| >= 5 or explicit warn → warning style
+    large_delta = abs(rounded) >= 5.0 - 1e-6
+    if large_delta or warn:
+        if rounded > 0:
+            return f"⚠ {text}", "cell-delta-warn-pos"
+        return f"⚠ {text}", "cell-delta-warn-neg"
+
     if delta_value > 1e-6:
         return text, "cell-delta-pos"
     if delta_value < -1e-6:
         return text, "cell-delta-neg"
     return text, "cell-delta-zero"
+
+
+def _styled_suspect_cell(delta_value: float | None, reason: str) -> tuple[str, str]:
+    """Return ``(formatted_text, css_class)`` for a suspect anomaly cell."""
+    text = _format_delta_value(delta_value)
+    return f"⚠ {text} {reason}", "cell-delta-suspect"
 
 
 # ---------------------------------------------------------------------------

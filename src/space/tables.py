@@ -41,9 +41,11 @@ from .metrics import (
     _numeric_value,
     _parse_display_number,
     _primary_metric,
+    _score_display_percent_1dp,
     _score_to_percent,
     _styled_delta_cell,
     _styled_score_cell,
+    _styled_suspect_cell,
 )
 from .selection import (
     _build_detail_point_map,
@@ -467,9 +469,32 @@ def _build_benchmark_detail_delta_table(
             if p is not None and p.entry.samples
         ]
         sample_count = max(all_samples) if all_samples else 0
-        row = [row_key[0], str(sample_count) if sample_count else "—", row_key[1], row_key[2]]
+        benchmark_name = row_key[0]
+        is_minerva = "minerva" in benchmark_name.lower()
+        row_label = benchmark_name
+        if is_minerva:
+            row_label = f"⚠ {benchmark_name}"
+
+        row = [row_label, str(sample_count) if sample_count else "—", row_key[1], row_key[2]]
         delta_values: list[float] = []
         row_cell_meta: dict[int, TableCellMeta] = {}
+
+        # Collect latest scores per lineage for cross-param anomaly detection
+        latest_pcts: list[tuple[str, float | None]] = []
+        for item in lineages:
+            lp = latest_by_param.get(item.param, {}).get(row_key)
+            pct = _score_display_percent_1dp(lp.score) if lp and lp.score is not None else None
+            latest_pcts.append((item.param, pct))
+
+        # Detect param ordering anomaly: smaller param > larger param
+        suspect_params: set[str] = set()
+        for i in range(len(latest_pcts)):
+            for j in range(i + 1, len(latest_pcts)):
+                s_pct = latest_pcts[i][1]
+                l_pct = latest_pcts[j][1]
+                if s_pct is not None and l_pct is not None and s_pct > l_pct + 0.05:
+                    suspect_params.add(latest_pcts[j][0])
+
         for item in lineages:
             latest_point = latest_by_param.get(item.param, {}).get(row_key)
             prev_point = prev_by_param.get(item.param, {}).get(row_key)
@@ -479,13 +504,24 @@ def _build_benchmark_detail_delta_table(
             if delta_value is not None:
                 delta_values.append(delta_value)
 
+            is_suspect = item.param in suspect_params
+
             prev_col_idx = len(row)
             latest_col_idx = prev_col_idx + 1
+
+            # Choose delta cell style based on anomaly flags
+            if is_suspect:
+                delta_cell = _styled_suspect_cell(delta_value, "异常")
+            elif is_minerva:
+                delta_cell = _styled_suspect_cell(delta_value, "待调参")
+            else:
+                delta_cell = _styled_delta_cell(delta_value)
+
             row.extend(
                 [
                     _styled_score_cell(prev_score),
                     _styled_score_cell(latest_score),
-                    _styled_delta_cell(delta_value),
+                    delta_cell,
                 ]
             )
 
