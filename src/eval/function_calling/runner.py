@@ -16,6 +16,12 @@ from typing import TYPE_CHECKING, Sequence
 from src.eval.benchmark_registry import BenchmarkField, resolve_benchmark_metadata
 from src.eval.env_config import load_env_file
 from src.eval.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS
+from src.eval.function_calling.rwkv_prompt import (
+    DEFAULT_FUNCTION_PROMPT_STYLE,
+    DEFAULT_TOOL_CATALOG_FORMAT,
+    FUNCTION_PROMPT_STYLE_CHOICES,
+    FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
+)
 from src.eval.function_calling.bfcl_v3_runner import _run_bfcl_v3
 from src.eval.function_calling.browsecomp import _run_browsecomp
 from src.eval.function_calling.mcp_bench import _run_mcp_bench
@@ -23,6 +29,7 @@ from src.eval.function_calling.runner_common import (
     FunctionCallingBenchmarkKind,
     ResolvedFunctionCallingRun,
 )
+from src.eval.function_calling.simple_tool_call import _run_simple_tool_call
 from src.eval.function_calling.tau_runner import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOOL_ERRORS,
@@ -63,6 +70,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--db-close-timeout-s", type=float, default=30.0, help="DB close timeout")
     parser.add_argument("--probe-only", action="store_true", help="Run a minimal probe and skip scoring")
     parser.add_argument(
+        "--prompt-style",
+        choices=FUNCTION_PROMPT_STYLE_CHOICES,
+        default=DEFAULT_FUNCTION_PROMPT_STYLE,
+        help="Function-calling prompt serialization style",
+    )
+    parser.add_argument(
+        "--tool-catalog-format",
+        choices=FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
+        default=DEFAULT_TOOL_CATALOG_FORMAT,
+        help="Function-calling tool catalog serialization format",
+    )
+    parser.add_argument(
         "--history-max-chars",
         type=int,
         default=DEFAULT_HISTORY_MAX_CHARS,
@@ -95,8 +114,12 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         return FunctionCallingBenchmarkKind.BROWSECOMP
     if "function_mcp_bench" in job_names:
         return FunctionCallingBenchmarkKind.MCP_BENCH
+    if "function_bfcl_ast" in job_names:
+        return FunctionCallingBenchmarkKind.BFCL_AST
     if "function_bfcl_v3" in job_names:
         return FunctionCallingBenchmarkKind.BFCL_V3
+    if "function_toolalpaca" in job_names:
+        return FunctionCallingBenchmarkKind.TOOLALPACA
     if "function_tau2_bench" in job_names:
         return FunctionCallingBenchmarkKind.TAU2_BENCH
     if "function_tau_bench" in job_names:
@@ -147,6 +170,10 @@ def main(
         return _run_mcp_bench(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_V3:
         return _run_bfcl_v3(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_AST:
+        return _run_simple_tool_call(args, run, default_job_name="function_bfcl_ast", run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.TOOLALPACA:
+        return _run_simple_tool_call(args, run, default_job_name="function_toolalpaca", run_context=run_context)
     return _run_tau(args, run, run_context=run_context)
 
 

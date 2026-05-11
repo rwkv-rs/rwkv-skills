@@ -129,6 +129,8 @@ MBPP_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
 LCB_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_livecodebench")
 FUNCTION_BROWSECOMP_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_browsecomp")
 FUNCTION_MCP_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_mcp_bench")
+FUNCTION_BFCL_AST_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_bfcl_ast")
+FUNCTION_TOOLALPACA_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_toolalpaca")
 FUNCTION_TAU_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau_bench")
 FUNCTION_TAU2_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau2_bench")
 
