@@ -6,6 +6,10 @@ report_avg_k = [64]
 
 [cot]
 template = "free_response_cot_default"
+alpha_frequency = 0.25
+alpha_decay = 0.99
+cot_prompt_template = "User: Solve the problem using one clean solution path. Keep each step concise. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)\n<Q>\nAssistant: <think>"
 
 [final]
 template = "free_response_final_default"
+final_prompt_template = "<Q><COT>\n</think>\nTherefore, the final answer is \\(\\boxed{"
