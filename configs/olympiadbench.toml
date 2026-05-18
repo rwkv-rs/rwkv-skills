@@ -5,14 +5,19 @@ report_pass_k = []
 report_avg_k = [8]
 
 [cot]
-template = "free_response_cot_default"
-max_generate_tokens = 3072
+max_generate_tokens = 4096
 temperature = 0.3
 top_k = 500
-top_p = 0.3
+top_p = 0.4
 alpha_presence = 1.0
 alpha_frequency = 0.3
 alpha_decay = 0.99
+cot_prompt_template = """User: Solve carefully. Preserve exact values and units.
+
+<Q>
+
+Assistant:<think"""
 
 [final]
-template = "free_response_final_default"
+final_prompt_template = """<Q><COT>
+Final answer:"""
