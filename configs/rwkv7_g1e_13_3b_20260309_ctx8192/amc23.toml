@@ -1,0 +1,14 @@
+[default]
+pass_k = []
+avg_k = [64]
+report_pass_k = []
+report_avg_k = [64]
+
+[cot]
+template = "free_response_cot_default"
+alpha_frequency = 0.25
+cot_prompt_template = "User: Solve the problem. Think step by step, but keep each step concise. Do not repeat, restart, or re-check the same case. If stuck, finish with the best final answer. (think)\n<Q>\nAssistant: <think>"
+
+[final]
+template = "free_response_final_default"
+final_prompt_template = "<Q><COT>\n</think>\nTherefore, the final answer is \\(\\boxed{"
