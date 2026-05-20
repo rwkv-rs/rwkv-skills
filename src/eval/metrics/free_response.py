@@ -20,9 +20,17 @@ from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 _WHITESPACE_RE = re.compile(r"\s+")
-_NUM_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
 _STRICT_JUDGE_BOOL_RE = re.compile(r"^(?:`{1,3})?\s*(True|False)\s*(?:`{1,3})?$")
+_ANSWER_DELIMITERS = (
+    ("{", "}"),
+    (r"\(", r"\)"),
+    (r"\[", r"\]"),
+    ("(", ")"),
+    ("[", "]"),
+    ("\uff08", "\uff09"),
+)
 _PREFERRED_ANSWER_KEYS = (
     "expected_answer",
     "reference_answer",
@@ -31,10 +39,17 @@ _PREFERRED_ANSWER_KEYS = (
 )
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
-    "You are a rigorous AI judge. Your task is to evaluate whether a student's "
-    "answer is semantically completely equivalent to the reference answer, based on "
-    "the provided question and reference answer.\\n\\nInput:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
-    "Student's Answer: <A>\\n\\nOutput Format:\\nStrictly adhere to the output format: Only output 'True' or 'False'."
+    "You are a rigorous math answer judge.\\n\\n"
+    "Decide whether the student's answer is mathematically equivalent to the "
+    "reference answer for the given question. Use the question only to understand "
+    "what mathematical object, value, expression, equation, condition, or set is "
+    "being asked for.\\n\\n"
+    "Return True when the student's answer and the reference answer have the same "
+    "mathematical meaning. Return False when the student's answer is incomplete, "
+    "changes the mathematical meaning, gives an incompatible extra answer, omits "
+    "a required part, or cannot be interpreted as equivalent.\\n\\n"
+    "Input:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
+    "Student's Answer: <A>\\n\\nOutput: Only output 'True' or 'False'."
 )
 
 
@@ -64,30 +79,54 @@ def _normalize_answer_value(value: Any) -> str | None:
     return normalized or None
 
 
-def _extract_number(text: str) -> str | None:
-    if not text:
-        return None
-    matches = _NUM_RE.findall(text)
-    if not matches:
-        return None
-    value = matches[-1].replace(",", "")
-    return value or None
+def _strip_thinking_for_answer(text: str) -> str:
+    stripped = _THINK_BLOCK_RE.sub("", text).strip()
+    match = _THINK_OPEN_RE.search(stripped)
+    if match is not None:
+        stripped = stripped[: match.start()].strip()
+    return stripped
 
 
-def _format_answer_for_storage(prediction: str, reference: str) -> str:
-    ref_num = _extract_number(reference)
-    if ref_num is not None:
-        pred_num = _extract_number(prediction)
-        return pred_num or ""
-    return _normalize_text(prediction)
+def _answer_delimiter_from_prompt(prompt: str) -> tuple[str, str] | None:
+    stripped = prompt.rstrip()
+    for opener, closer in _ANSWER_DELIMITERS:
+        if stripped.endswith(opener):
+            return opener, closer
+    return None
+
+
+def _extract_balanced_answer(text: str, opener: str, closer: str) -> str:
+    depth = 1
+    output: list[str] = []
+    idx = 0
+    while idx < len(text):
+        if text.startswith(opener, idx):
+            depth += 1
+            output.append(opener)
+            idx += len(opener)
+            continue
+        if text.startswith(closer, idx):
+            depth -= 1
+            if depth == 0:
+                return "".join(output).strip()
+            output.append(closer)
+            idx += len(closer)
+            continue
+        output.append(text[idx])
+        idx += 1
+    return "".join(output).strip()
+
+
+def _extract_answer_from_final_stage(prompt: str, completion: str) -> str:
+    stripped = _strip_thinking_for_answer(completion)
+    delimiter = _answer_delimiter_from_prompt(prompt)
+    if delimiter is None:
+        return stripped
+    opener, closer = delimiter
+    return _extract_balanced_answer(stripped, opener, closer)
 
 
 def _is_exact_match(prediction: str, reference: str) -> bool:
-    ref_num = _extract_number(reference)
-    if ref_num is not None:
-        pred_num = _extract_number(prediction)
-        if pred_num is not None:
-            return pred_num == ref_num
     return _normalize_text(prediction) == _normalize_text(reference)
 
 
@@ -302,15 +341,18 @@ def evaluate_free_response(
             question = record.question
             reference = resolve_reference_answer(record)
             last_stage = _max_stage_index(payload)
-            prediction = str(payload.get(f"completion{last_stage}", "")).strip()
+            prompt = str(payload.get(f"prompt{last_stage}", ""))
+            raw_prediction = str(payload.get(f"completion{last_stage}", "")).strip()
+            prediction = _extract_answer_from_final_stage(prompt, raw_prediction)
             exact = _is_exact_match(prediction, reference)
 
         payloads.append(payload)
         exact_flags.append(bool(exact))
-        answers.append(_format_answer_for_storage(prediction, reference))
+        answer = _normalize_text(prediction)
+        answers.append(answer)
         ref_answers.append(reference)
         if judge is not None:
-            judge_inputs.append((question, reference, prediction))
+            judge_inputs.append((question, reference, answer))
 
     judge_flags: list[bool] | None = None
     if judge is not None:
