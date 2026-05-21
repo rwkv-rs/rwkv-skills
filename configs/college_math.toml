@@ -23,8 +23,7 @@ no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 [final]
 final_prompt_template = """<Q><COT>
 </think>
-Give only the final answer in compact notation. Preserve equation signs, radicals, fractions, intervals, units, and negative signs. Do not explain.
-Final answer:"""
+Therefore, the final answer is \\(\\boxed{"""
 max_generate_tokens = 96
 temperature = 1.0
 top_k = 1

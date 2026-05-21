@@ -40,12 +40,12 @@ _PREFERRED_ANSWER_KEYS = (
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
     "You are a rigorous math answer judge.\\n\\n"
-    "Decide whether the student's answer is mathematically equivalent to the "
+    "Decide whether the student's answer is mathematically and logically equivalent to the "
     "reference answer for the given question. Use the question only to understand "
     "what mathematical object, value, expression, equation, condition, or set is "
     "being asked for.\\n\\n"
     "Return True when the student's answer and the reference answer have the same "
-    "mathematical meaning. Return False when the student's answer is incomplete, "
+    "mathematical and logical meaning. Return False when the student's answer is incomplete, "
     "changes the mathematical meaning, gives an incompatible extra answer, omits "
     "a required part, or cannot be interpreted as equivalent.\\n\\n"
     "Input:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import unittest
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 from src.eval.metrics.free_response import LLMJudge, LLMJudgeConfig
+from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import (
     JOB_CATALOGUE,
     LLM_JUDGE_DATASET_SLUGS,
@@ -17,6 +20,7 @@ class LLMJudgeConfigTest(unittest.TestCase):
     def test_default_prompt_template_is_string(self) -> None:
         cfg = LLMJudgeConfig(api_key="k", model="m")
         self.assertIsInstance(cfg.prompt_template, str)
+        self.assertIn("mathematically and logically equivalent", cfg.prompt_template)
         self.assertIn("Only output 'True' or 'False'", cfg.prompt_template)
 
     def test_judge_accepts_strict_boolean_responses(self) -> None:
@@ -85,16 +89,43 @@ class LLMJudgeConfigTest(unittest.TestCase):
 
 
 class MathJudgeRoutingTest(unittest.TestCase):
-    def test_all_math_datasets_route_to_free_response_judge(self) -> None:
-        self.assertEqual(LLM_JUDGE_DATASET_SLUGS, MATH_DATASET_SLUGS)
-        self.assertEqual(MATH_DATASET_SLUGS_FOR_FREE_RESPONSE, ())
-        self.assertEqual(JOB_CATALOGUE["free_response"].dataset_slugs, ())
+    def test_math_datasets_split_between_exact_and_judge(self) -> None:
+        expected_judge = tuple(
+            slug
+            for slug in (
+                canonical_slug("gsm8k_test"),
+                canonical_slug("math_500_test"),
+                canonical_slug("answer_judge_test"),
+                canonical_slug("gaokao2023en_test"),
+                canonical_slug("college_math_test"),
+                canonical_slug("comp_math_24_25_test"),
+                canonical_slug("minerva_math_test"),
+                canonical_slug("amc23_test"),
+                canonical_slug("olympiadbench_test"),
+            )
+            if slug in MATH_DATASET_SLUGS
+        )
+        expected_exact = tuple(slug for slug in MATH_DATASET_SLUGS if slug not in expected_judge)
+
+        self.assertEqual(LLM_JUDGE_DATASET_SLUGS, expected_judge)
+        self.assertEqual(MATH_DATASET_SLUGS_FOR_FREE_RESPONSE, expected_exact)
+        self.assertEqual(JOB_CATALOGUE["free_response"].dataset_slugs, expected_exact)
         self.assertEqual(
             JOB_CATALOGUE["free_response_judge"].dataset_slugs,
-            MATH_DATASET_SLUGS,
+            expected_judge,
         )
-        for slug in MATH_DATASET_SLUGS:
+
+        for slug in expected_judge:
             self.assertEqual(detect_job_from_dataset(slug, True), "free_response_judge")
+        for slug in expected_exact:
+            self.assertEqual(detect_job_from_dataset(slug, True), "free_response")
+
+    def test_college_math_and_olympiadbench_use_boxed_final_prompt_for_judge(self) -> None:
+        for config_name in ("college_math", "olympiadbench"):
+            data = tomllib.loads(Path(f"configs/{config_name}.toml").read_text())
+            final_prompt = data["final"]["final_prompt_template"]
+            self.assertTrue(final_prompt.rstrip().endswith(r"\(\boxed{"))
+            self.assertEqual(detect_job_from_dataset(f"{config_name}_test", True), "free_response_judge")
 
 
 class _FakeJudgeClient:

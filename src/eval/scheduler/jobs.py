@@ -143,8 +143,26 @@ def _build_dataset_catalogues() -> tuple[
     FUNCTION_CALL_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
 
-MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = ()
-LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = MATH_DATASET_SLUGS
+_LLM_JUDGE_DATASET_CANDIDATES: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "gsm8k_test",
+        "math_500_test",
+        "answer_judge_test",
+        "gaokao2023en_test",
+        "college_math_test",
+        "comp_math_24_25_test",
+        "minerva_math_test",
+        "amc23_test",
+        "olympiadbench_test",
+    )
+)
+LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    slug for slug in _LLM_JUDGE_DATASET_CANDIDATES if slug in MATH_DATASET_SLUGS
+)
+MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
+    slug for slug in MATH_DATASET_SLUGS if slug not in LLM_JUDGE_DATASET_SLUGS
+)
 
 ifeval_related = [slug for slug in SPECIAL_DATASET_SLUGS if slug.startswith("ifeval")]
 if not ifeval_related:

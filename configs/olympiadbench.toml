@@ -20,4 +20,5 @@ Assistant:<think"""
 
 [final]
 final_prompt_template = """<Q><COT>
-Final answer:"""
+</think>
+Therefore, the final answer is \\(\\boxed{"""
