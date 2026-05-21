@@ -15,10 +15,11 @@ infer_max_workers = 64
 
 [runner]
 benchmark_kind = "tau_bench"
+prompt_style = "rwkv_official_json"
+tool_catalog_format = "json"
 avg_ks = [1]
 history_max_chars = 24000
 max_steps = 20
 max_tool_errors = 20
 cot_max_tokens = 2048
 decision_max_tokens = 1024
-

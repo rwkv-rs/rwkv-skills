@@ -13,7 +13,14 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "browsecomp" in names
     assert "browsecomp_zh" in names
     assert "mcp_bench" in names
+    assert "bfcl_simple_python" in names
+    assert "bfcl_exec_multiple_ast" in names
+    assert "bfcl_exec_multiple" in names
+    assert "bfcl_exec_parallel" in names
+    assert "bfcl_exec_parallel_multiple" in names
     assert "bfcl_v3" in names
+    assert "toolalpaca_eval_simulated" in names
+    assert "toolalpaca_eval_real" in names
     assert "tau_bench_retail" in names
     assert "tau2_bench_airline" in names
 
@@ -244,6 +251,159 @@ def test_prepare_dataset_materializes_bfcl_v3_spec(tmp_path: Path, monkeypatch) 
             "expected_state": {"selected_flight": "F1"},
             "initial_state": {},
             "metadata": {"source_path": str(source_b)},
+        }
+    ]
+
+
+def test_bfcl_v3_source_root_prefers_repo_raw_source(tmp_path: Path, monkeypatch) -> None:
+    import src.eval.datasets.data_prepper.function_calling.bfcl_v3 as bfcl_v3_prepper
+
+    repo_raw_root = tmp_path / "data" / "bfcl_v3_raw"
+    reference_root = tmp_path / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+    repo_raw_root.mkdir(parents=True)
+    reference_root.mkdir(parents=True)
+    for name in ("RWKV_BFCL_V3_SOURCE", "RWKV_BFCL_V3_ROOT", "BFCL_V3_SOURCE", "BFCL_V3_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(bfcl_v3_prepper, "REPO_ROOT", tmp_path)
+
+    assert bfcl_v3_prepper.bfcl_v3_source_root() == repo_raw_root
+
+
+def test_bfcl_v3_source_root_falls_back_to_reference_clone(tmp_path: Path, monkeypatch) -> None:
+    import src.eval.datasets.data_prepper.function_calling.bfcl_v3 as bfcl_v3_prepper
+
+    reference_root = tmp_path / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+    reference_root.mkdir(parents=True)
+    for name in ("RWKV_BFCL_V3_SOURCE", "RWKV_BFCL_V3_ROOT", "BFCL_V3_SOURCE", "BFCL_V3_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(bfcl_v3_prepper, "REPO_ROOT", tmp_path)
+
+    assert bfcl_v3_prepper.bfcl_v3_source_root() == reference_root
+
+
+def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "bfcl_data"
+    possible_root = source_root / "possible_answer"
+    possible_root.mkdir(parents=True)
+    question_path = source_root / "BFCL_v4_simple_python.json"
+    answer_path = possible_root / "BFCL_v4_simple_python.json"
+    question_path.write_text(
+        '{"id":"simple_python_0","question":[[{"role":"user","content":"Find the area."}]],'
+        '"function":[{"name":"calculate_area","description":"Calculate area",'
+        '"parameters":{"type":"dict","properties":{"base":{"type":"integer"},"height":{"type":"integer"}},'
+        '"required":["base","height"]}}]}\n',
+        encoding="utf-8",
+    )
+    answer_path.write_text(
+        '{"id":"simple_python_0","ground_truth":[{"calculate_area":{"base":[10],"height":[5],"unit":["units",""]}}]}\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.bfcl_small.bfcl_small_source_root",
+        lambda: source_root,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("bfcl_simple_python", output_root, "test")
+
+    assert paths == [output_root / "bfcl_simple_python" / "test.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "simple_python_0",
+            "instruction": "User: Find the area.",
+            "tools": [
+                {
+                    "name": "calculate_area",
+                    "description": "Calculate area",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"base": {"type": "integer"}, "height": {"type": "integer"}},
+                        "required": ["base", "height"],
+                    },
+                }
+            ],
+            "expected_tool_calls": [
+                {
+                    "name": "calculate_area",
+                    "arguments": {"base": 10, "height": 5, "unit": "units"},
+                    "argument_options": {"base": [10], "height": [5], "unit": ["units", ""]},
+                }
+            ],
+            "metadata": {
+                "source_format": "official_bfcl_v4_ast",
+                "category": "simple_python",
+                "source_path": str(question_path.resolve()),
+                "possible_answer_path": str(answer_path.resolve()),
+                "execution_result_type": [],
+            },
+        }
+    ]
+
+
+def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "toolalpaca"
+    source_root.mkdir(parents=True)
+    source = source_root / "eval_simulated.json"
+    source.write_text(
+        """[
+  {
+    "Name": "DemoAPI",
+    "Function_Projection": {"lookup": ["/lookup", "get"]},
+    "Function_Description": {
+      "lookup": "Lookup a value.\\nParameters: {\\"query\\": \\"Required. String. Search query.\\"}\\nOutput: object",
+      "components": ""
+    },
+    "Instructions": ["Look up alpha"],
+    "Golden_Answers": [[{"Action": "lookup", "Action_Input": "{\\"query\\": \\"alpha\\"}"}]]
+  }
+]""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.toolalpaca.toolalpaca_source_root",
+        lambda: source_root,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("toolalpaca_eval_simulated", output_root, "test")
+
+    assert paths == [output_root / "toolalpaca_eval_simulated" / "test.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "toolalpaca_eval_simulated__demoapi_000",
+            "instruction": "Look up alpha",
+            "tools": [
+                {
+                    "name": "lookup",
+                    "description": (
+                        "Lookup a value.\n"
+                        'Parameters: {"query": "Required. String. Search query."}\n'
+                        "Output: object"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string", "description": "Required. String. Search query."}},
+                        "required": ["query"],
+                    },
+                    "metadata": {"path": "/lookup", "method": "get"},
+                }
+            ],
+            "expected_tool_calls": [
+                {
+                    "name": "lookup",
+                    "arguments": {"query": "alpha"},
+                    "argument_options": {"query": ["alpha"]},
+                }
+            ],
+            "metadata": {
+                "source_format": "official_toolalpaca",
+                "api_name": "DemoAPI",
+                "api_index": 0,
+                "question_index": 0,
+                "source_path": str(source),
+            },
         }
     ]
 

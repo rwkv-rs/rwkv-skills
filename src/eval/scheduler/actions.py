@@ -43,6 +43,7 @@ from .state import (
 )
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.evaluating import RunMode
+from src.eval.runner_registry import RunnerGroup
 
 
 @dataclass(slots=True)
@@ -66,6 +67,17 @@ class QueueOptions:
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
     remote_batch_size: int | None = None
+    function_prompt_style: str | None = None
+    function_tool_catalog_format: str | None = None
+    function_cot_max_tokens: int | None = None
+    function_decision_max_tokens: int | None = None
+    function_planning_max_tokens: int | None = None
+    function_final_max_tokens: int | None = None
+    function_answer_max_tokens: int | None = None
+    function_history_max_chars: int | None = None
+    function_max_rounds: int | None = None
+    function_max_steps: int | None = None
+    function_max_tool_errors: int | None = None
     distributed_claims: bool = False
     scheduler_node_id: str | None = None
     lease_duration_s: int = 900
@@ -432,7 +444,7 @@ def _launch_queue_items(
                 dataset_questions=questions,
             )
 
-        extra_args = item.extra_args
+        extra_args = item.extra_args + _function_calling_extra_args(opts, job)
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
 
@@ -823,6 +835,34 @@ def build_command(
     if extra_args:
         args.extend(extra_args)
     return base + args
+
+
+def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.FUNCTION_CALLING:
+        return ()
+
+    args: list[str] = []
+
+    def _append(flag: str, value: int | None) -> None:
+        if value is not None:
+            args.extend([flag, str(max(1, int(value)))])
+
+    def _append_str(flag: str, value: str | None) -> None:
+        if value:
+            args.extend([flag, str(value)])
+
+    _append_str("--prompt-style", opts.function_prompt_style)
+    _append_str("--tool-catalog-format", opts.function_tool_catalog_format)
+    _append("--cot-max-tokens", opts.function_cot_max_tokens)
+    _append("--decision-max-tokens", opts.function_decision_max_tokens)
+    _append("--planning-max-tokens", opts.function_planning_max_tokens)
+    _append("--final-max-tokens", opts.function_final_max_tokens)
+    _append("--answer-max-tokens", opts.function_answer_max_tokens)
+    _append("--history-max-chars", opts.function_history_max_chars)
+    _append("--max-rounds", opts.function_max_rounds)
+    _append("--max-steps", opts.function_max_steps)
+    _append("--max-tool-errors", opts.function_max_tool_errors)
+    return tuple(args)
 
 
 def action_status(opts: StatusOptions) -> dict[str, RunningEntry]:

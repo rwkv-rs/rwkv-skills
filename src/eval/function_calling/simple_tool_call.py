@@ -5,7 +5,7 @@ import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
@@ -93,13 +93,13 @@ def normalize_simple_tool_call_manifest_row(
     metadata = dict(payload.get("metadata") or {})
     if source_path is not None:
         metadata.setdefault("manifest_path", str(Path(source_path)))
+    tool_payloads = _coerce_list(payload.get("tools"))
+    expected_tool_calls = _coerce_list(payload.get("expected_tool_calls"))
     return SimpleToolCallRecord(
         task_id=task_id,
         instruction=instruction,
-        tools=tuple(_normalize_tool_schema(tool) for tool in _coerce_list(payload.get("tools"))),
-        expected_tool_calls=tuple(
-            _normalize_tool_expectation(item) for item in _coerce_list(payload.get("expected_tool_calls"))
-        ),
+        tools=tuple(_normalize_tool_schema(tool) for tool in tool_payloads),
+        expected_tool_calls=tuple(_normalize_tool_expectation(item) for item in expected_tool_calls),
         metadata=metadata,
     )
 
@@ -145,54 +145,21 @@ def load_bfcl_ast_rows_from_sources(
     return rows
 
 
-def load_toolalpaca_rows_from_source(path: str | Path, *, dataset_name: str) -> list[dict[str, Any]]:
-    source = Path(path)
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(payload, list):
-        raise ValueError(f"ToolAlpaca source must be a JSON array: {source}")
-
-    rows: list[dict[str, Any]] = []
-    for api_index, api_info in enumerate(payload):
-        if not isinstance(api_info, Mapping):
-            continue
-        api_name = str(api_info.get("Name") or api_info.get("API") or f"api_{api_index}")
-        instructions = _coerce_list(api_info.get("Instructions"))
-        golden_answers = _coerce_list(api_info.get("Golden_Answers"))
-        tools = _toolalpaca_tools(api_info)
-        for question_index, instruction in enumerate(instructions):
-            if question_index >= len(golden_answers):
-                continue
-            instruction_text = str(instruction or "").strip()
-            if not instruction_text:
-                continue
-            rows.append(
-                {
-                    "task_id": f"{dataset_name}__{_slug(api_name)}_{question_index:03d}",
-                    "instruction": instruction_text,
-                    "tools": tools,
-                    "expected_tool_calls": _normalize_toolalpaca_golden_answer(golden_answers[question_index]),
-                    "metadata": {
-                        "source_format": "official_toolalpaca",
-                        "api_name": api_name,
-                        "api_index": api_index,
-                        "question_index": question_index,
-                        "source_path": str(source),
-                    },
-                }
-            )
-    return rows
-
-
 def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_chars: int) -> str:
     system_prompt = normalize_rwkv_text(
         "\n".join(
             [
                 "Tools:",
                 _render_tool_catalog(record.tools),
-                "Return only a JSON function call.",
-                'The JSON shape is {"name":"tool_name","arguments":{...}}.',
-                "If multiple tool calls are required, return a JSON array of those objects in execution order.",
+                "Output JSON schema:",
+                _render_output_schema(),
+                "Return exactly one JSON value that validates against the schema.",
+                "For one tool call, return one JSON object.",
+                "For multiple required tool calls, return a JSON array containing every required call in execution order; do not stop after the first call.",
+                "Each arguments object must contain only final argument values for that tool.",
+                "Do not copy tool schemas, descriptions, type/items/properties/required/default fields, or wrapper objects like {\"type\":...,\"value\":...} into arguments.",
                 "Use only listed tool names.",
+                "Return no prose, no markdown, and no extra text outside the JSON value.",
             ]
         )
     )
@@ -205,7 +172,10 @@ def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_c
 
 def decode_simple_tool_call_response(response: str) -> list[dict[str, Any]]:
     candidate = extract_json_call_value_text(response)
-    payload = json.loads(candidate)
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        payload = _literal_from_ast(ast.parse(candidate, mode="eval").body)
     if payload == []:
         return []
     calls = coerce_json_function_call_payloads(payload, context_label="tool-call selection")
@@ -294,6 +264,7 @@ def _run_simple_tool_call(
     run: ResolvedFunctionCallingRun,
     *,
     default_job_name: str,
+    evaluator: Callable[..., SimpleToolCallEvaluation] = evaluate_simple_tool_calls,
     run_context: "RunContext | None" = None,
 ) -> int:
     records = load_simple_tool_call_manifest_records(run.dataset_path)
@@ -383,7 +354,7 @@ def _run_simple_tool_call(
                         decoded_calls = decode_simple_tool_call_response(output.text)
                     except Exception as exc:  # noqa: BLE001
                         parse_error = str(exc)
-                    evaluation = evaluate_simple_tool_calls(record, decoded_calls, parse_error=parse_error)
+                    evaluation = evaluator(record, decoded_calls, parse_error=parse_error)
                     stage = StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason)
                     payload = SampleRecord(
                         benchmark_name=run.benchmark_name,
@@ -616,6 +587,13 @@ def _render_ast_call_name(node: ast.AST) -> str:
 def _literal_from_ast(node: ast.AST) -> Any:
     if isinstance(node, ast.Constant):
         return node.value
+    if isinstance(node, ast.Name):
+        if node.id in {"true", "True"}:
+            return True
+        if node.id in {"false", "False"}:
+            return False
+        if node.id in {"null", "None"}:
+            return None
     if isinstance(node, ast.List):
         return [_literal_from_ast(item) for item in node.elts]
     if isinstance(node, ast.Tuple):
@@ -625,95 +603,21 @@ def _literal_from_ast(node: ast.AST) -> Any:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         value = _literal_from_ast(node.operand)
         return -value if isinstance(value, (int, float)) else value
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+    if isinstance(node, ast.BinOp):
         left = _literal_from_ast(node.left)
         right = _literal_from_ast(node.right)
         if isinstance(left, (int, float)) and isinstance(right, (int, float)):
-            return left / right
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                return left**right
     return ast.literal_eval(node)
-
-
-def _normalize_toolalpaca_golden_answer(raw: Any) -> list[dict[str, Any]]:
-    calls: list[dict[str, Any]] = []
-    for item in _coerce_list(raw):
-        if not isinstance(item, Mapping):
-            continue
-        action = str(item.get("Action") or item.get("action") or "").strip()
-        action_input = item.get("Action_Input", item.get("action_input", {}))
-        arguments: Any = action_input
-        if isinstance(arguments, str):
-            try:
-                parsed = json.loads(arguments.strip() or "{}")
-                arguments = parsed if isinstance(parsed, Mapping) else {}
-            except json.JSONDecodeError:
-                arguments = {}
-        if not isinstance(arguments, Mapping):
-            arguments = {}
-        calls.append(
-            {
-                "name": action,
-                "arguments": dict(arguments),
-                "argument_options": {key: [value] for key, value in dict(arguments).items()},
-            }
-        )
-    return calls
-
-
-def _toolalpaca_tools(api_info: Mapping[str, Any]) -> list[dict[str, Any]]:
-    descriptions = api_info.get("Function_Description")
-    projection = api_info.get("Function_Projection")
-    tools: list[dict[str, Any]] = []
-    if isinstance(descriptions, Mapping):
-        for name, description in descriptions.items():
-            name_text = str(name).strip()
-            if not name_text or name_text == "components":
-                continue
-            method = ""
-            path = ""
-            if isinstance(projection, Mapping):
-                projected = projection.get(name)
-                if isinstance(projected, Sequence) and not isinstance(projected, (str, bytes, bytearray)):
-                    path = str(projected[0]) if len(projected) > 0 else ""
-                    method = str(projected[1]) if len(projected) > 1 else ""
-            tools.append(
-                {
-                    "name": name_text,
-                    "description": normalize_rwkv_text(str(description or "")),
-                    "parameters": _toolalpaca_parameters_from_description(str(description or "")),
-                    "metadata": {"path": path, "method": method},
-                }
-            )
-    return tools
-
-
-def _toolalpaca_parameters_from_description(description: str) -> dict[str, Any]:
-    marker = "Parameters:"
-    if marker not in description:
-        return {"type": "object", "properties": {}, "required": []}
-    after = description.split(marker, 1)[1]
-    before_output = after.split("\nOutput:", 1)[0].strip()
-    try:
-        raw_params = json.loads(before_output)
-    except json.JSONDecodeError:
-        raw_params = {}
-    if not isinstance(raw_params, Mapping):
-        raw_params = {}
-    properties: dict[str, Any] = {}
-    required: list[str] = []
-    for key, value in raw_params.items():
-        description_text = str(value or "")
-        value_lower = description_text.lower()
-        param_type = "string"
-        if value_lower.startswith("integer") or ". integer" in value_lower:
-            param_type = "integer"
-        elif value_lower.startswith("number") or value_lower.startswith("float") or ". float" in value_lower:
-            param_type = "number"
-        elif value_lower.startswith("boolean") or ". boolean" in value_lower:
-            param_type = "boolean"
-        properties[str(key)] = {"type": param_type, "description": description_text}
-        if "required." in value_lower:
-            required.append(str(key))
-    return {"type": "object", "properties": properties, "required": required}
 
 
 def _render_bfcl_question(raw: Any) -> str:
@@ -751,11 +655,15 @@ def _normalize_tool_schema(raw: Any) -> dict[str, Any]:
         parameters["type"] = "object"
     parameters.setdefault("properties", {})
     parameters.setdefault("required", [])
-    return {
+    normalized = {
         "name": str(source.get("name") or raw.get("name") or "unknown_tool"),
         "description": str(source.get("description") or raw.get("description") or ""),
         "parameters": parameters,
     }
+    metadata = raw.get("metadata") or source.get("metadata")
+    if isinstance(metadata, Mapping):
+        normalized["metadata"] = dict(metadata)
+    return normalized
 
 
 def _render_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
@@ -783,6 +691,29 @@ def _render_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
             }
         )
     return json.dumps(rendered_tools, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _render_output_schema() -> str:
+    tool_call_schema = {
+        "type": "object",
+        "required": ["name", "arguments"],
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "arguments": {"type": "object"},
+        },
+    }
+    schema = {
+        "oneOf": [
+            tool_call_schema,
+            {
+                "type": "array",
+                "items": tool_call_schema,
+                "minItems": 1,
+            },
+        ]
+    }
+    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
 
 
 def _read_json_or_jsonl_items(path: Path) -> list[Any]:
@@ -824,7 +755,6 @@ __all__ = [
     "evaluate_simple_tool_calls",
     "load_bfcl_ast_rows_from_sources",
     "load_simple_tool_call_manifest_records",
-    "load_toolalpaca_rows_from_source",
     "normalize_simple_tool_call_manifest_row",
     "_run_simple_tool_call",
 ]

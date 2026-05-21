@@ -19,8 +19,14 @@ from .context_budget import (
     DEFAULT_TOOL_RESULT_MAX_CHARS,
     DEFAULT_TOOL_SCHEMA_MAX_CHARS,
     normalize_rwkv_text,
-    trim_message_history,
     truncate_text,
+)
+from .rwkv_prompt import (
+    assistant_json_prefix,
+    build_rwkv_json_call_prompt,
+    coerce_json_function_call_payloads,
+    extract_json_call_value_text,
+    render_assistant_json_block,
 )
 from .tau_bench import TauDecision, TauToolCall
 
@@ -43,8 +49,6 @@ BFCL_DECISION_STOP_SUFFIXES = (
 )
 BFCL_ROUTER_LABELS = ("TOOL", "ASK", "HANDOFF")
 _BFCL_FORBIDDEN_OUTPUT_PATTERNS = (
-    "tool_calls",
-    "tool_call_id",
     "**Tool Call:**",
     "### Tool Output",
     "<assistant>",
@@ -290,11 +294,11 @@ def build_bfcl_system_block(system_prompt: str) -> str:
 
 
 def build_bfcl_assistant_json_prefix() -> str:
-    return "Assistant: ```json\n"
+    return assistant_json_prefix()
 
 
 def build_bfcl_assistant_json_block(json_text: str) -> str:
-    return f"{build_bfcl_assistant_json_prefix()}{normalize_bfcl_decision_output(json_text)}\n```"
+    return render_assistant_json_block(normalize_bfcl_decision_output(json_text))
 
 
 def build_bfcl_user_block(
@@ -441,22 +445,11 @@ def build_bfcl_rwkv_prompt(
     *,
     history_max_chars: int,
 ) -> str:
-    bounded_messages = trim_message_history(prompt_messages, max_chars=history_max_chars)
-    parts = [build_bfcl_system_block(system_prompt)]
-    for message in bounded_messages:
-        role = str(message.get("role") or "").strip().lower()
-        content = normalize_bfcl_rwkv_text(str(message.get("content") or ""))
-        if not content:
-            continue
-        if role == "assistant":
-            parts.append(build_bfcl_assistant_json_block(content))
-            continue
-        if content.startswith("User: "):
-            parts.append(content)
-            continue
-        parts.append(build_bfcl_user_block(content))
-    parts.append(build_bfcl_assistant_json_prefix())
-    return "\n".join(parts)
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        prompt_messages,
+        history_max_chars=history_max_chars,
+    )
 
 
 def build_bfcl_cot_prompt(
@@ -684,7 +677,12 @@ def build_bfcl_tool_result_payload(
 
 
 def parse_bfcl_assistant_output(response: str) -> TauDecision:
-    normalized = normalize_bfcl_decision_output(response)
+    payloads = _parse_bfcl_assistant_payloads(response)
+    return _bfcl_payload_to_decision(payloads[0])
+
+
+def _parse_bfcl_assistant_payloads(response: str) -> list[dict[str, Any]]:
+    normalized = extract_json_call_value_text(response)
     if not normalized:
         raise ValueError("model returned empty response")
 
@@ -694,22 +692,12 @@ def parse_bfcl_assistant_output(response: str) -> TauDecision:
             raise ValueError(f"forbidden BFCL output pattern detected: {pattern}")
     if "<think>" in lowered or "</think>" in lowered:
         raise ValueError("decision output must not contain <think> tags")
-    if not (normalized.startswith("{") and normalized.endswith("}")):
-        raise ValueError("BFCL decision output must be a JSON function call object")
+    return coerce_json_function_call_payloads(json.loads(normalized), context_label="BFCL tool call")
 
-    payload = json.loads(normalized)
-    if not isinstance(payload, Mapping):
-        raise ValueError("BFCL tool call payload must be a JSON object")
-    allowed_keys = {"name", "arguments"}
-    if set(payload.keys()) != allowed_keys:
-        raise ValueError("BFCL tool call JSON must contain exactly name and arguments")
 
-    name = str(payload.get("name") or "").strip()
-    if not name:
-        raise ValueError("BFCL tool call missing name")
-    arguments = payload.get("arguments")
-    if not isinstance(arguments, Mapping):
-        raise ValueError("BFCL tool call arguments must be a JSON object")
+def _bfcl_payload_to_decision(payload: Mapping[str, Any]) -> TauDecision:
+    name = str(payload["name"]).strip()
+    arguments = payload["arguments"]
     if name == "final_answer":
         final_answer = normalize_bfcl_rwkv_text(str(arguments.get("answer") or ""))
         if len(final_answer) > BFCL_V3_MAX_HANDOFF_CHARS:
@@ -731,6 +719,9 @@ def parse_bfcl_router_output(response: str) -> str:
         raise ValueError("router output must not contain <think> tags")
     label = normalized.upper()
     if label not in BFCL_ROUTER_LABELS:
+        first_line = normalized.splitlines()[0].strip().upper()
+        if first_line in BFCL_ROUTER_LABELS:
+            return first_line
         raise ValueError(f"router output must be one of {', '.join(BFCL_ROUTER_LABELS)}")
     return label
 
@@ -754,10 +745,25 @@ def decode_bfcl_exec_response(
     *,
     tools: Sequence[Mapping[str, Any]],
 ) -> tuple[list[TauToolCall], str]:
-    decision = interpret_bfcl_assistant_output(response, tools=tools)
-    if decision.is_tool_call and decision.tool_call is not None:
-        return [decision.tool_call], ""
-    return [], decision.final_answer.strip()
+    payloads = _parse_bfcl_assistant_payloads(response)
+    decisions = [_bfcl_payload_to_decision(payload) for payload in payloads]
+    control_decisions = [decision for decision in decisions if not decision.is_tool_call]
+    if control_decisions:
+        if len(decisions) != 1:
+            raise ValueError("BFCL control calls ask_user/final_answer must be returned without tool calls")
+        return [], control_decisions[0].final_answer.strip()
+
+    decoded_calls: list[TauToolCall] = []
+    for decision in decisions:
+        tool_call = decision.tool_call
+        if tool_call is None:
+            continue
+        tool = _lookup_bfcl_tool(tools, tool_call.name)
+        if tool is None:
+            raise ValueError(f"unknown BFCL tool name: {tool_call.name}")
+        _validate_bfcl_tool_arguments(tool_call, tool)
+        decoded_calls.append(tool_call)
+    return decoded_calls, ""
 
 
 def render_bfcl_official_call(tool_call: TauToolCall) -> str:

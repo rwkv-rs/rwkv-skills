@@ -75,6 +75,8 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     mcp_bench = resolve_benchmark_metadata("mcp_bench_test")
     bfcl_ast = resolve_benchmark_metadata("bfcl_simple_python_test")
+    bfcl_exec_ast = resolve_benchmark_metadata("bfcl_exec_simple_ast_test")
+    bfcl_exec = resolve_benchmark_metadata("bfcl_exec_simple_test")
     bfcl_v3 = resolve_benchmark_metadata("bfcl_v3_test")
     toolalpaca = resolve_benchmark_metadata("toolalpaca_eval_simulated_test")
     tau_bench = resolve_benchmark_metadata("tau_bench_airline_test")
@@ -87,6 +89,12 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert mcp_bench.scheduler_jobs == ("function_mcp_bench",)
     assert bfcl_ast.field is BenchmarkField.FUNCTION_CALLING
     assert bfcl_ast.scheduler_jobs == ("function_bfcl_ast",)
+    assert bfcl_exec_ast.field is BenchmarkField.FUNCTION_CALLING
+    assert bfcl_exec_ast.scheduler_jobs == ("function_bfcl_ast",)
+    assert bfcl_exec_ast.name == "bfcl_exec_simple_ast"
+    assert bfcl_exec.field is BenchmarkField.FUNCTION_CALLING
+    assert bfcl_exec.scheduler_jobs == ("function_bfcl_exec",)
+    assert bfcl_exec.name == "bfcl_exec_simple"
     assert bfcl_v3.field is BenchmarkField.FUNCTION_CALLING
     assert bfcl_v3.scheduler_jobs == ("function_bfcl_v3",)
     assert toolalpaca.field is BenchmarkField.FUNCTION_CALLING

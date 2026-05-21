@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
-from src.eval.function_calling.simple_tool_call import load_toolalpaca_rows_from_source
+from src.eval.function_calling.toolalpaca_source import load_toolalpaca_rows_from_source
 from src.eval.scheduler.config import REPO_ROOT
 
 from .common import LocalRowsDatasetSpec

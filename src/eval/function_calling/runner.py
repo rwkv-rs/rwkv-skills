@@ -22,6 +22,7 @@ from src.eval.function_calling.rwkv_prompt import (
     FUNCTION_PROMPT_STYLE_CHOICES,
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
 )
+from src.eval.function_calling.bfcl_exec import _run_bfcl_exec
 from src.eval.function_calling.bfcl_v3_runner import _run_bfcl_v3
 from src.eval.function_calling.browsecomp import _run_browsecomp
 from src.eval.function_calling.mcp_bench import _run_mcp_bench
@@ -35,6 +36,7 @@ from src.eval.function_calling.tau_runner import (
     DEFAULT_MAX_TOOL_ERRORS,
     _run_tau,
 )
+from src.eval.function_calling.toolalpaca import _run_toolalpaca
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, split_benchmark_and_split
 from src.infer.backend import (
@@ -116,6 +118,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         return FunctionCallingBenchmarkKind.MCP_BENCH
     if "function_bfcl_ast" in job_names:
         return FunctionCallingBenchmarkKind.BFCL_AST
+    if "function_bfcl_exec" in job_names:
+        return FunctionCallingBenchmarkKind.BFCL_EXEC
     if "function_bfcl_v3" in job_names:
         return FunctionCallingBenchmarkKind.BFCL_V3
     if "function_toolalpaca" in job_names:
@@ -172,8 +176,10 @@ def main(
         return _run_bfcl_v3(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_AST:
         return _run_simple_tool_call(args, run, default_job_name="function_bfcl_ast", run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_EXEC:
+        return _run_bfcl_exec(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.TOOLALPACA:
-        return _run_simple_tool_call(args, run, default_job_name="function_toolalpaca", run_context=run_context)
+        return _run_toolalpaca(args, run, run_context=run_context)
     return _run_tau(args, run, run_context=run_context)
 
 

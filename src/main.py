@@ -171,6 +171,8 @@ class RunnerSection:
     cot_mode: str | None = None
     judge_mode: str | None = None
     benchmark_kind: str | None = None
+    prompt_style: str | None = None
+    tool_catalog_format: str | None = None
     target_token_format: str | None = None
     db_write_queue: int | None = None
     db_drain_every: int | None = None
@@ -206,6 +208,8 @@ class RunnerSection:
             cot_mode=_maybe_str(payload.get("cot_mode")),
             judge_mode=_maybe_str(payload.get("judge_mode")),
             benchmark_kind=_maybe_str(payload.get("benchmark_kind")),
+            prompt_style=_maybe_str(payload.get("prompt_style")),
+            tool_catalog_format=_maybe_str(payload.get("tool_catalog_format")),
             target_token_format=_maybe_str(payload.get("target_token_format")),
             db_write_queue=_maybe_int(payload.get("db_write_queue"), field_name="runner.db_write_queue"),
             db_drain_every=_maybe_int(payload.get("db_drain_every"), field_name="runner.db_drain_every"),
@@ -590,6 +594,8 @@ def _build_runner_argv(
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
     elif group is RunnerGroup.FUNCTION_CALLING:
         _append_flag(argv, "--benchmark-kind", runner_cfg.benchmark_kind or _function_calling_benchmark_kind(runner.name))
+        _append_flag(argv, "--prompt-style", runner_cfg.prompt_style)
+        _append_flag(argv, "--tool-catalog-format", runner_cfg.tool_catalog_format)
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
         _append_flag(argv, "--db-close-timeout-s", runner_cfg.db_close_timeout_s)
         _append_flag(argv, "--history-max-chars", runner_cfg.history_max_chars)

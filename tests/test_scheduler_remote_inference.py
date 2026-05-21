@@ -137,6 +137,53 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.max_concurrent_jobs == 4
 
 
+def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "dispatch",
+            "--function-cot-max-tokens",
+            "4096",
+            "--function-decision-max-tokens",
+            "32",
+            "--function-prompt-style",
+            "rwkv_official_json",
+            "--function-history-max-chars",
+            "32000",
+        ]
+    )
+
+    assert args.function_cot_max_tokens == 4096
+    assert args.function_decision_max_tokens == 32
+    assert args.function_prompt_style == "rwkv_official_json"
+    assert args.function_history_max_chars == 32000
+
+
+def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("function_bfcl_v3",),
+        function_prompt_style="rwkv_official_json",
+        function_cot_max_tokens=4096,
+        function_decision_max_tokens=32,
+        function_max_steps=24,
+    )
+
+    assert actions._function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"]) == (
+        "--prompt-style",
+        "rwkv_official_json",
+        "--cot-max-tokens",
+        "4096",
+        "--decision-max-tokens",
+        "32",
+        "--max-steps",
+        "24",
+    )
+    assert actions._function_calling_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
+
+
 def test_param_search_scripts_accept_remote_inference_args() -> None:
     free_response_args = parse_param_search_free_response_args(
         [

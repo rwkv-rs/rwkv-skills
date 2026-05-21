@@ -6,11 +6,7 @@ from typing import Any, Mapping, Sequence
 from .context_budget import normalize_rwkv_text, trim_message_history
 
 RWKV_OFFICIAL_JSON_PROMPT_STYLE = "rwkv_official_json"
-LEGACY_STAGED_PROMPT_STYLE = "staged_cot_router"
-FUNCTION_PROMPT_STYLE_CHOICES = (
-    RWKV_OFFICIAL_JSON_PROMPT_STYLE,
-    LEGACY_STAGED_PROMPT_STYLE,
-)
+FUNCTION_PROMPT_STYLE_CHOICES = (RWKV_OFFICIAL_JSON_PROMPT_STYLE,)
 DEFAULT_FUNCTION_PROMPT_STYLE = RWKV_OFFICIAL_JSON_PROMPT_STYLE
 
 JSON_TOOL_CATALOG_FORMAT = "json"
@@ -257,7 +253,6 @@ __all__ = [
     "FUNCTION_TOOL_CATALOG_FORMAT_CHOICES",
     "JSON_CALL_STOP_SUFFIXES",
     "JSON_TOOL_CATALOG_FORMAT",
-    "LEGACY_STAGED_PROMPT_STYLE",
     "RWKV_OFFICIAL_JSON_PROMPT_STYLE",
     "assistant_json_prefix",
     "build_rwkv_json_call_prompt",

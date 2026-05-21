@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .rwkv_prompt import (
+    build_rwkv_json_call_prompt,
+    coerce_json_function_call_payload,
+    extract_json_call_value_text,
+)
+
 from .context_budget import normalize_rwkv_text as _normalize_rwkv_text
 
 
@@ -144,31 +150,35 @@ def build_turn_completion_prompt(cot_context: str, cot: str) -> str:
     )
 
 
+def build_json_call_context(
+    system_prompt: str,
+    messages: Sequence[Mapping[str, str]],
+    *,
+    history_max_chars: int,
+) -> str:
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        messages,
+        history_max_chars=history_max_chars,
+    )
+
+
 def parse_tool_call_or_final_answer(response: str) -> TauDecision:
-    trimmed = response.strip()
-    if not trimmed:
+    if not response.strip():
         raise ValueError("model returned empty response")
 
-    if not (trimmed.startswith("{") and trimmed.endswith("}")):
-        raise ValueError(f"model response must be a JSON function call object: {trimmed}")
-
-    payload = json.loads(trimmed)
-    if not isinstance(payload, dict):
-        raise ValueError("tool call payload must be a JSON object")
-    if set(payload.keys()) != {"name", "arguments"}:
-        raise ValueError("tool call JSON must contain exactly name and arguments")
-    name = str(payload.get("name") or "").strip()
+    candidate = extract_json_call_value_text(response)
+    payload = coerce_json_function_call_payload(json.loads(candidate), context_label="tool call")
+    name = str(payload["name"]).strip()
     if not name:
-        raise ValueError(f"tool call missing name: {trimmed}")
+        raise ValueError(f"tool call missing name: {candidate}")
     requestor = "assistant"
     if "." in name:
         prefix, unprefixed = name.split(".", 1)
         if prefix in {"assistant", "user"} and unprefixed.strip():
             requestor = prefix
             name = unprefixed.strip()
-    arguments = payload.get("arguments")
-    if not isinstance(arguments, dict):
-        arguments = {}
+    arguments = payload["arguments"]
     if name == "final_answer":
         return TauDecision(is_tool_call=False, final_answer=str(arguments.get("answer") or "").strip())
     return TauDecision(
@@ -309,6 +319,7 @@ __all__ = [
     "TauManifestRecord",
     "TauToolCall",
     "build_expected_context",
+    "build_json_call_context",
     "build_tau_system_prompt",
     "build_turn_completion_prompt",
     "load_rwkv_rs_tau_bench_rows",

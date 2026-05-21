@@ -26,8 +26,17 @@ from src.eval.function_calling.runner_common import (
     _resolve_function_calling_plan,
     _resolve_job_name,
 )
+from src.eval.function_calling.rwkv_prompt import (
+    JSON_CALL_STOP_SUFFIXES,
+    build_rwkv_json_call_prompt,
+    coerce_json_function_call_payload,
+    extract_json_call_value_text,
+    normalize_function_prompt_style,
+    render_function_output_user_block,
+    render_json_function_call,
+)
 from src.eval.results.payloads import make_score_payload
-from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage, prompt_delta
+from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 from src.eval.scheduler.config import REPO_ROOT
 
 from .context_budget import (
@@ -88,6 +97,7 @@ class PlanningDecision:
     reasoning: str
     should_continue: bool
     tool_calls: tuple[PlannedToolCall, ...]
+    final_answer: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,51 +343,53 @@ def presented_task(item: McpBenchItem) -> str:
     return fuzzy or item.task.task_description.strip()
 
 
-def build_planning_context(
+def build_planning_json_call_prompt(
     item: McpBenchItem,
     available_tools: Mapping[str, Mapping[str, Any]],
-    accumulated_information: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    history_max_chars: int,
 ) -> str:
-    history = (
-        trim_history(accumulated_information, MCP_BENCH_MAX_HISTORY_CHARS)
-        if accumulated_information.strip()
-        else "No previous tool results."
-    )
     system_prompt = normalize_rwkv_text(
         "\n".join(
             [
                 "Tools:",
                 render_tool_catalog(available_tools),
-                "Return only a JSON function call.",
-                'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+                "Output JSON schema:",
+                _render_mcp_output_schema(),
+                "Return exactly one JSON value that validates against the schema.",
                 "Use final_answer when no more MCP tool calls are needed.",
                 "Do not invent tool names, arguments, or tool results.",
+                "Return no prose, no markdown, and no extra text outside the JSON value.",
             ]
         )
     )
-    user_prompt = normalize_rwkv_text(
+    if not prompt_messages:
+        prompt_messages = ({"role": "user", "content": build_mcp_task_user_message(item)},)
+    return build_rwkv_json_call_prompt(system_prompt, prompt_messages, history_max_chars=history_max_chars)
+
+
+def _render_mcp_output_schema() -> str:
+    schema = {
+        "type": "object",
+        "required": ["name", "arguments"],
+        "additionalProperties": False,
+        "properties": {
+            "name": {"type": "string"},
+            "arguments": {"type": "object"},
+        },
+    }
+    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def build_mcp_task_user_message(item: McpBenchItem) -> str:
+    return normalize_rwkv_text(
         "\n".join(
             [
                 "Task:",
                 presented_task(item),
-                "Function output history:",
-                history,
             ]
         )
-    )
-    return "\n".join(
-        [
-            f"System: {system_prompt}",
-            f"User: {user_prompt}",
-            "Assistant: <think><|completions_of_cot|>",
-        ]
-    )
-
-
-def build_planning_decision_prompt(cot_context: str, cot: str) -> str:
-    return (
-        cot_context.replace("<|completions_of_cot|>", cot)
-        + "</think>\nReturn only a JSON function call.\n"
     )
 
 
@@ -466,22 +478,20 @@ def render_trace(steps: Sequence[dict[str, Any]]) -> str:
 def parse_planning_decision(response: str) -> PlanningDecision:
     candidate = extract_json_candidate(response)
     try:
-        payload = json.loads(candidate)
+        payload = coerce_json_function_call_payload(json.loads(candidate), context_label="planning")
     except json.JSONDecodeError as exc:
         raise ValueError(f"failed to parse planning json: {exc}; json={candidate}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"planning response is not a JSON object: {candidate}")
-    if set(payload.keys()) != {"name", "arguments"}:
-        raise ValueError("planning JSON must contain exactly name and arguments")
-
-    name = str(payload.get("name") or "").strip()
+    name = str(payload["name"]).strip()
     if not name:
         raise ValueError("planning JSON missing name")
-    arguments = payload.get("arguments")
-    if not isinstance(arguments, dict):
-        raise ValueError("planning JSON arguments must be an object")
+    arguments = payload["arguments"]
     if name == "final_answer":
-        return PlanningDecision(reasoning="", should_continue=False, tool_calls=())
+        return PlanningDecision(
+            reasoning="",
+            should_continue=False,
+            tool_calls=(),
+            final_answer=str(arguments.get("answer") or "").strip(),
+        )
     server = ""
     tool = name
     if ":" in tool:
@@ -516,12 +526,9 @@ def normalize_planned_tool_call(
 
 
 def extract_json_candidate(response: str) -> str:
-    trimmed = response.strip()
-    if not trimmed:
+    if not response.strip():
         raise ValueError("model returned empty planning response")
-    if trimmed.startswith("{") and trimmed.endswith("}"):
-        return trimmed
-    raise ValueError(f"model response must be a JSON function call object: {trimmed}")
+    return extract_json_call_value_text(response)
 
 
 def collapse_mcp_bench_pass(evaluation: McpBenchEvaluation) -> bool:
@@ -561,6 +568,14 @@ def render_tool_catalog(available_tools: Mapping[str, Mapping[str, Any]]) -> str
                     400,
                 ),
                 "arguments": arguments,
+            }
+        )
+    if not any(str(item.get("name") or "") == "final_answer" for item in rendered):
+        rendered.append(
+            {
+                "name": "final_answer",
+                "description": "Use this when the task is complete.",
+                "arguments": {"answer": {"type": "string"}},
             }
         )
     return json.dumps(sorted(rendered, key=lambda item: str(item.get("name") or "")), ensure_ascii=False, indent=2)
@@ -652,7 +667,7 @@ def _run_mcp_bench(
     )
     if base_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    planning_sampling = base_sampling.clamp(args.planning_max_tokens)
+    normalize_function_prompt_style(getattr(args, "prompt_style", None))
     decision_sampling = base_sampling.clamp(args.decision_max_tokens or 2048)
     final_sampling = base_sampling.clamp(args.final_max_tokens)
 
@@ -662,12 +677,18 @@ def _run_mcp_bench(
         worker = McpBenchWorkerClient(runtime_root=runtime_root, worker_script=worker_script)
         try:
             available_tools = worker.open_task(items[0])
-            prompt = build_planning_context(items[0], available_tools, "")
+            prompt = build_planning_json_call_prompt(
+                items[0],
+                available_tools,
+                ({"role": "user", "content": build_mcp_task_user_message(items[0])},),
+                history_max_chars=int(args.history_max_chars),
+            )
             run.engine.generate(
                 [prompt],
-                sampling=planning_sampling,
+                sampling=decision_sampling,
                 batch_size=1,
                 progress_desc="MCPBench-Probe",
+                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
             )
             worker.close_task()
         finally:
@@ -680,9 +701,7 @@ def _run_mcp_bench(
         raise ValueError("MCP-Bench requires JUDGE_MODEL / judge_model_name and judge API key")
 
     job_name = _resolve_job_name("function_mcp_bench", run_context=run_context)
-    sampling_payload = normalize_sampling_config_by_stage(
-        [(1, planning_sampling), (2, decision_sampling), (3, final_sampling)]
-    )
+    sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling), (2, final_sampling)])
     ctx = prepare_function_calling_run(
         dataset_slug=str(run.dataset_slug),
         model_name=run.model_name,
@@ -734,50 +753,37 @@ def _run_mcp_bench(
                     is_passed = False
                     try:
                         available_tools = worker.open_task(item)
+                        prompt_messages: list[dict[str, str]] = [
+                            {"role": "user", "content": build_mcp_task_user_message(item)}
+                        ]
                         total_planned_tools = 0
                         valid_planned_tools = 0
                         executed_rounds = 0
                         for round_num in range(1, max_rounds + 1):
-                            cot_context = build_planning_context(item, available_tools, accumulated_information)
-                            cot_output = run.engine.generate(
-                                [cot_context],
-                                sampling=planning_sampling,
-                                batch_size=1,
-                                progress_desc="MCPBench-Plan",
-                                prompt_seeds=[
-                                    sample_repeat_seed(
-                                        sample_index,
-                                        repeat_index,
-                                        pass_index=key.pass_index,
-                                        stage=(round_num - 1) * 3 + 1,
-                                    )
-                                ],
-                            )[0]
-                            decision_prompt = build_planning_decision_prompt(cot_context, cot_output.text)
+                            decision_prompt = build_planning_json_call_prompt(
+                                item,
+                                available_tools,
+                                prompt_messages,
+                                history_max_chars=int(args.history_max_chars),
+                            )
                             decision_output = run.engine.generate(
                                 [decision_prompt],
                                 sampling=decision_sampling,
                                 batch_size=1,
                                 progress_desc="MCPBench-Decision",
+                                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
                                 prompt_seeds=[
                                     sample_repeat_seed(
                                         sample_index,
                                         repeat_index,
                                         pass_index=key.pass_index,
-                                        stage=(round_num - 1) * 3 + 2,
+                                        stage=round_num,
                                     )
                                 ],
                             )[0]
                             stages.append(
                                 StageRecord(
-                                    prompt=cot_context,
-                                    completion=cot_output.text,
-                                    stop_reason=cot_output.finish_reason,
-                                )
-                            )
-                            stages.append(
-                                StageRecord(
-                                    prompt=prompt_delta(decision_prompt, f"{cot_context}{cot_output.text}"),
+                                    prompt=decision_prompt,
                                     completion=decision_output.text,
                                     stop_reason=decision_output.finish_reason,
                                 )
@@ -789,7 +795,7 @@ def _run_mcp_bench(
                                 steps.append(
                                     {
                                         "round_num": round_num,
-                                        "cot": cot_output.text,
+                                        "cot": "",
                                         "decision": {"raw": decision_output.text, "parse_error": fail_reason},
                                         "executions": [],
                                     }
@@ -797,6 +803,28 @@ def _run_mcp_bench(
                                 break
 
                             round_executions: list[McpBenchExecutionResult] = []
+                            if decision.should_continue:
+                                for raw_call in decision.tool_calls:
+                                    prompt_messages.append(
+                                        {
+                                            "role": "assistant",
+                                            "content": render_json_function_call(
+                                                raw_call.full_name if raw_call.server.strip() else raw_call.tool,
+                                                raw_call.arguments,
+                                            ),
+                                        }
+                                    )
+                            else:
+                                final_answer = decision.final_answer.strip()
+                                prompt_messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": render_json_function_call(
+                                            "final_answer",
+                                            {"answer": final_answer},
+                                        ),
+                                    }
+                                )
                             if decision.should_continue:
                                 for planned_layer, raw_call in enumerate(decision.tool_calls):
                                     total_planned_tools += 1
@@ -830,13 +858,21 @@ def _run_mcp_bench(
                                                 error=str(exc),
                                             )
                                         )
+                            for execution in round_executions:
+                                prompt_messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": render_function_output_user_block(_execution_to_dict(execution)),
+                                    }
+                                )
                             steps.append(
                                 {
                                     "round_num": round_num,
-                                    "cot": cot_output.text,
+                                    "cot": "",
                                     "decision": {
                                         "reasoning": decision.reasoning,
                                         "should_continue": decision.should_continue,
+                                        "final_answer": decision.final_answer,
                                         "tool_calls": [
                                             {
                                                 "server": call.server,
@@ -861,7 +897,7 @@ def _run_mcp_bench(
                             if not decision.should_continue or not round_executions:
                                 break
 
-                        if not fail_reason:
+                        if not fail_reason and not final_answer:
                             final_prompt = build_final_answer_prompt(item, accumulated_information)
                             final_output = run.engine.generate(
                                 [final_prompt],
@@ -885,6 +921,34 @@ def _run_mcp_bench(
                                 )
                             )
                             final_answer = final_output.text.strip()
+                            planning_json_compliance = (
+                                valid_planned_tools / total_planned_tools if total_planned_tools > 0 else 1.0
+                            )
+                            evaluation = worker.evaluate(
+                                {
+                                    "judge_config": {
+                                        "api_key": judge_cfg.api_key,
+                                        "base_url": judge_cfg.base_url or "",
+                                        "model": judge_cfg.model_name,
+                                    },
+                                    "task": presented_task(item),
+                                    "final_solution": final_answer,
+                                    "total_rounds": executed_rounds,
+                                    "available_tools": available_tools,
+                                    "planning_json_compliance": planning_json_compliance,
+                                    "accumulated_information": accumulated_information,
+                                    "concrete_task_description": (
+                                        item.task.task_description if item.task.fuzzy_description.strip() else ""
+                                    ),
+                                    "dependency_analysis": item.task.dependency_analysis,
+                                    "execution_results": [_execution_to_dict(entry) for entry in execution_results],
+                                }
+                            )
+                            is_passed = collapse_mcp_bench_pass(evaluation)
+                            evaluation_summary = summarize_mcp_bench_evaluation(evaluation)
+                            if not is_passed:
+                                fail_reason = evaluation_summary
+                        if final_answer and not fail_reason and not evaluation_summary:
                             planning_json_compliance = (
                                 valid_planned_tools / total_planned_tools if total_planned_tools > 0 else 1.0
                             )

@@ -15,7 +15,7 @@ from src.eval.function_calling import bfcl_v3_runner
 from src.eval.function_calling.bfcl_v3 import build_bfcl_system_prompt
 from src.eval.function_calling import runner as function_calling_runner
 from src.eval.function_calling import runner_common
-from src.infer.constraints import LiteralChoiceConstraint
+from src.eval.function_calling.rwkv_prompt import RWKV_OFFICIAL_JSON_PROMPT_STYLE
 
 
 def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
@@ -27,6 +27,8 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "mcp_bench",
             "--avg-k",
             "1",
+            "--prompt-style",
+            "rwkv_official_json",
             "--model-path",
             "model.pth",
         ]
@@ -34,6 +36,7 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.dataset == "browsecomp_test.jsonl"
     assert args.benchmark_kind == "mcp_bench"
     assert args.avg_k == [1.0]
+    assert args.prompt_style == RWKV_OFFICIAL_JSON_PROMPT_STYLE
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
@@ -61,6 +64,22 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     assert (
         function_calling_runner._infer_benchmark_kind("bfcl_v3_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_V3
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("bfcl_simple_python_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_AST
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("bfcl_exec_simple_ast_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_AST
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("bfcl_exec_simple_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_EXEC
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("toolalpaca_eval_simulated_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.TOOLALPACA
     )
     assert (
         function_calling_runner._infer_benchmark_kind("tau2_bench_airline_base.jsonl")
@@ -151,6 +170,61 @@ def test_function_calling_runner_main_dispatches_bfcl_v3(monkeypatch) -> None:
     assert called == ["bfcl_v3"]
 
 
+def test_function_calling_runner_main_dispatches_simple_tool_call_runner(monkeypatch) -> None:
+    called: list[tuple[str, str]] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.BFCL_AST,
+        dataset_path=Path("/tmp/bfcl_simple_python_test.jsonl"),
+        dataset_slug="bfcl_simple_python_test",
+        benchmark_name="bfcl_simple_python",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_simple_tool_call",
+        lambda _args, _run, *, default_job_name, run_context=None: called.append(
+            (default_job_name, _run.dataset_slug)
+        )
+        or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "bfcl_simple_python_test.jsonl", "--model-path", "model.pth"])
+
+    assert rc == 0
+    assert called == [("function_bfcl_ast", "bfcl_simple_python_test")]
+
+
+def test_function_calling_runner_main_dispatches_bfcl_exec(monkeypatch) -> None:
+    called: list[str] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.BFCL_EXEC,
+        dataset_path=Path("/tmp/bfcl_exec_simple_test.jsonl"),
+        dataset_slug="bfcl_exec_simple_test",
+        benchmark_name="bfcl_exec_simple",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_bfcl_exec",
+        lambda _args, _run, *, run_context=None: called.append(_run.dataset_slug) or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "bfcl_exec_simple_test.jsonl", "--model-path", "model.pth"])
+
+    assert rc == 0
+    assert called == ["bfcl_exec_simple_test"]
+
+
 def test_function_calling_runner_detects_template_leak_markers() -> None:
     leaked = (
         "<system message>You are a helpful assistant.</system message>\n"
@@ -164,14 +238,8 @@ def test_function_calling_runner_detects_template_leak_markers() -> None:
 def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     outputs = iter(
         [
-            SimpleNamespace(text="reason 1", finish_reason="stop"),
-            SimpleNamespace(text="TOOL", finish_reason="stop"),
             SimpleNamespace(text='{"name":"lookup","arguments":{}}', finish_reason="stop"),
-            SimpleNamespace(text="reason 2", finish_reason="stop"),
-            SimpleNamespace(text="HANDOFF", finish_reason="stop"),
             SimpleNamespace(text='{"name":"final_answer","arguments":{"answer":"done with this turn"}}', finish_reason="stop"),
-            SimpleNamespace(text="reason 3", finish_reason="stop"),
-            SimpleNamespace(text="HANDOFF", finish_reason="stop"),
             SimpleNamespace(text='{"name":"final_answer","arguments":{"answer":"final answer"}}', finish_reason="stop"),
         ]
     )
@@ -250,11 +318,7 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     trace = bfcl_v3_runner._run_bfcl_v3_official_episode(
         state=state,
         run=SimpleNamespace(engine=engine),
-        cot_sampling=object(),
-        router_sampling=object(),
         tool_sampling=object(),
-        ask_sampling=object(),
-        handoff_sampling=object(),
         max_steps=4,
         max_tool_errors=2,
         history_max_chars=4000,
@@ -265,16 +329,21 @@ def test_run_bfcl_v3_official_episode_executes_per_turn(monkeypatch) -> None:
     assert state.turn_count == 2
     assert state.step_count == 3
     assert any(entry.get("tool_calls", [{}])[0].get("name") == "lookup" for entry in trace if entry.get("tool_calls"))
-    assert any(call["constraint_mode"] == "strict" for call in engine.calls if "Router" in str(call["progress_desc"]))
-    assert any(call["constraint_mode"] == "strict" for call in engine.calls if "Tool" in str(call["progress_desc"]))
+    assert all("Decision" in str(call["progress_desc"]) for call in engine.calls)
+    assert all(call["constraint_mode"] == "strict" for call in engine.calls)
 
 
-def test_run_bfcl_generation_step_parses_json_tool_output_after_router() -> None:
+def test_run_bfcl_v3_official_episode_keeps_multi_call_json_output(monkeypatch) -> None:
     outputs = iter(
         [
-            SimpleNamespace(text="<think>Need lookup.</think>", finish_reason="stop"),
-            SimpleNamespace(text="TOOL", finish_reason="stop"),
-            SimpleNamespace(text='{"name":"lookup","arguments":{"id":"A1"}}', finish_reason="stop"),
+            SimpleNamespace(
+                text='[{"name":"lookup","arguments":{}},{"name":"lookup","arguments":{"id":"B2"}}]',
+                finish_reason="stop",
+            ),
+            SimpleNamespace(
+                text='{"name":"final_answer","arguments":{"answer":"done"}}',
+                finish_reason="stop",
+            ),
         ]
     )
 
@@ -295,6 +364,7 @@ def test_run_bfcl_generation_step_parses_json_tool_output_after_router() -> None
         ):
             self.calls.append(
                 {
+                    "prompts": list(prompts),
                     "progress_desc": progress_desc,
                     "constraints": constraints,
                     "constraint_mode": constraint_mode,
@@ -303,7 +373,93 @@ def test_run_bfcl_generation_step_parses_json_tool_output_after_router() -> None
             return [next(outputs)]
 
     record = BfclTaskRecord(
-        task_id="demo-1",
+        task_id="multi_turn_base_1",
+        instruction="Official task",
+        tools=(
+            {
+                "name": "lookup",
+                "description": "Lookup state",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+        turns=(BfclTurn(messages=({"role": "user", "content": "first"},), ground_truth=("lookup()", "lookup(id='B2')")),),
+        metadata={"official_root": "/tmp/fake"},
+    )
+    state = bfcl_v3_runner._ActiveBfclEpisode(
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        record=record,
+        system_prompt=build_bfcl_system_prompt(record.tools),
+        prompt_messages=[],
+        active_tools=[dict(tool) for tool in record.tools],
+        runtime_state=start_bfcl_runtime(record),
+    )
+
+    monkeypatch.setattr(
+        bfcl_v3_runner,
+        "execute_bfcl_official_tool_call",
+        lambda *_args, **_kwargs: BfclToolExecutionResult(
+            success=True,
+            result={"ok": True},
+            state_snapshot={"ok": True},
+            matched_expectation=True,
+        ),
+    )
+
+    trace = bfcl_v3_runner._run_bfcl_v3_official_episode(
+        state=state,
+        run=SimpleNamespace(engine=_FakeEngine()),
+        tool_sampling=object(),
+        max_steps=4,
+        max_tool_errors=2,
+        history_max_chars=4000,
+        prompt_style=RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+    )
+
+    assert state.termination_reason == "agent_stop"
+    assert state.runtime_state.decoded_turn_outputs == [[["lookup()", "lookup(id='B2')"]]]
+    assert trace[0]["tool_calls"] == [
+        {"name": "lookup", "arguments": {}},
+        {"name": "lookup", "arguments": {"id": "B2"}},
+    ]
+    assert len(trace[0]["tool_results"]) == 2
+
+
+def test_run_bfcl_generation_step_uses_official_json_prompt_style() -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate(
+            self,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            prompt_seeds=None,
+            prompt_stop_suffixes=None,
+            constraints=None,
+            constraint_mode="off",
+        ):
+            self.calls.append(
+                {
+                    "prompts": list(prompts),
+                    "progress_desc": progress_desc,
+                    "prompt_stop_suffixes": prompt_stop_suffixes,
+                    "constraints": constraints,
+                    "constraint_mode": constraint_mode,
+                }
+            )
+            return [SimpleNamespace(text='{"name":"lookup","arguments":{"id":"A1"}}', finish_reason="stop")]
+
+    record = BfclTaskRecord(
+        task_id="demo-official-json",
         instruction="Find A1",
         tools=(
             {
@@ -324,43 +480,35 @@ def test_run_bfcl_generation_step_parses_json_tool_output_after_router() -> None
         pass_index=0,
         record=record,
     )
-
     engine = _FakeEngine()
+
     outcome = bfcl_v3_runner._run_bfcl_generation_step(
         state=state,
         run=SimpleNamespace(engine=engine),
-        user_request="Find A1",
-        cot_sampling=object(),
-        router_sampling=object(),
         tool_sampling=object(),
-        ask_sampling=object(),
-        handoff_sampling=object(),
         progress_suffix="sample 0 step 1",
-        recent_tool_result=None,
-        previous_state_snapshot=None,
+        prompt_style=RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+        history_max_chars=4000,
     )
 
     assert outcome.ok is True
     assert outcome.action_type == "TOOL"
     assert outcome.tool_call is not None
     assert outcome.tool_call.name == "lookup"
-    assert outcome.tool_call.arguments == {"id": "A1"}
-    router_call = next(call for call in engine.calls if "Router" in str(call["progress_desc"]))
-    tool_call = next(call for call in engine.calls if "Tool" in str(call["progress_desc"]))
-    assert router_call["constraint_mode"] == "strict"
-    assert tool_call["constraint_mode"] == "strict"
-    router_constraint = router_call["constraints"][0]
-    assert isinstance(router_constraint, LiteralChoiceConstraint)
-    tool_constraint = tool_call["constraints"][0]
-    assert tool_constraint.feed_text('{"name":"lookup","arguments":{"id":"A1"}}')
-    assert tool_constraint.is_complete()
+    assert len(engine.calls) == 1
+    call = engine.calls[0]
+    assert "Decision" in str(call["progress_desc"])
+    assert call["constraint_mode"] == "strict"
+    assert call["prompt_stop_suffixes"] == [list(bfcl_v3_runner.BFCL_DECISION_STOP_SUFFIXES)]
+    prompt = str(call["prompts"][0])
+    assert prompt.startswith("System: Tools:")
+    assert "\n\nUser: Find A1\n\nAssistant: ```json\n" in prompt
+    assert "Assistant: <think>" not in prompt
 
 
 def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:
     outputs = iter(
         [
-            SimpleNamespace(text="<think>Need a missing id.</think>", finish_reason="stop"),
-            SimpleNamespace(text="ASK", finish_reason="stop"),
             SimpleNamespace(text='{"name":"ask_user","arguments":{"question":"Which id should I look up?"}}', finish_reason="stop"),
         ]
     )
@@ -400,15 +548,8 @@ def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:
     outcome = bfcl_v3_runner._run_bfcl_generation_step(
         state=state,
         run=SimpleNamespace(engine=_FakeEngine()),
-        user_request="Find a record",
-        cot_sampling=object(),
-        router_sampling=object(),
         tool_sampling=object(),
-        ask_sampling=object(),
-        handoff_sampling=object(),
         progress_suffix="sample 0 step 1",
-        recent_tool_result=None,
-        previous_state_snapshot=None,
     )
 
     assert outcome.ok is True

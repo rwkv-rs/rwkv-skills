@@ -22,6 +22,7 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
         "function_mcp_bench",
         "function_bfcl_v3",
         "function_bfcl_ast",
+        "function_bfcl_exec",
         "function_toolalpaca",
         "function_tau_bench",
         "function_tau2_bench",

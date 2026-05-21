@@ -719,18 +719,21 @@ def test_parse_bfcl_assistant_output_accepts_json_code_fence() -> None:
     assert decision.tool_call.name == "lookup"
 
 
-def test_parse_bfcl_assistant_output_requires_exact_json_shape() -> None:
-    try:
-        parse_bfcl_assistant_output('{"requestor":"assistant","name":"lookup","arguments":{"id":"A1"}}')
-    except ValueError as exc:
-        assert "exactly name and arguments" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("expected strict JSON shape validation")
+def test_parse_bfcl_assistant_output_ignores_tool_call_metadata() -> None:
+    decision = parse_bfcl_assistant_output(
+        '{"requestor":"assistant","id":"call-1","name":"lookup","arguments":{"id":"A1"}}'
+    )
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+    assert decision.tool_call.arguments == {"id": "A1"}
 
 
 def test_parse_bfcl_router_output_accepts_only_known_labels() -> None:
     assert parse_bfcl_router_output("tool") == "TOOL"
     assert parse_bfcl_router_output("ASK") == "ASK"
+    assert parse_bfcl_router_output("HANDOFF\nextra text") == "HANDOFF"
 
     try:
         parse_bfcl_router_output("TOOL NOW")
@@ -742,7 +745,6 @@ def test_parse_bfcl_router_output_accepts_only_known_labels() -> None:
 
 def test_parse_bfcl_assistant_output_rejects_non_rwkv_tool_protocols() -> None:
     bad_outputs = [
-        '```json\n{"tool_calls":[{"name":"lookup","arguments":{}}]}\n```',
         '<tool_call>{"name":"lookup","arguments":{}}</tool_call>',
         'text before {"name":"lookup","arguments":{}}',
     ]
@@ -754,6 +756,97 @@ def test_parse_bfcl_assistant_output_rejects_non_rwkv_tool_protocols() -> None:
             assert any(token in str(exc) for token in ("forbidden", "JSON function call object"))
         else:  # pragma: no cover - defensive
             raise AssertionError(f"expected ValueError for {text!r}")
+
+
+def test_parse_bfcl_assistant_output_accepts_openai_tool_calls_shape() -> None:
+    decision = parse_bfcl_assistant_output(
+        '{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}}]}'
+    )
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+    assert decision.tool_call.arguments == {"id": "A1"}
+
+
+def test_decode_bfcl_exec_response_accepts_json_array_multi_call() -> None:
+    calls, final_answer = decode_bfcl_exec_response(
+        '[{"name":"lookup","arguments":{"id":"A1"}},{"name":"lookup","arguments":{"id":"B2"}}]',
+        tools=[
+            {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    )
+
+    assert final_answer == ""
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("lookup", {"id": "A1"}),
+        ("lookup", {"id": "B2"}),
+    ]
+
+
+def test_decode_bfcl_exec_response_accepts_openai_tool_calls_multi_call() -> None:
+    calls, final_answer = decode_bfcl_exec_response(
+        (
+            '{"tool_calls":['
+            '{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}},'
+            '{"id":"call-2","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":\\"B2\\"}"}}'
+            ']}'
+        ),
+        tools=[
+            {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+    )
+
+    assert final_answer == ""
+    assert [call.arguments for call in calls] == [{"id": "A1"}, {"id": "B2"}]
+
+
+def test_decode_bfcl_exec_response_rejects_mixed_control_and_tool_calls() -> None:
+    try:
+        decode_bfcl_exec_response(
+            '[{"name":"lookup","arguments":{"id":"A1"}},{"name":"final_answer","arguments":{"answer":"done"}}]',
+            tools=[
+                {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"],
+                    },
+                }
+            ],
+        )
+    except ValueError as exc:
+        assert "must be returned without tool calls" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected mixed-control rejection")
+
+
+def test_parse_bfcl_assistant_output_accepts_openai_response_function_call_shape() -> None:
+    decision = parse_bfcl_assistant_output(
+        '[{"id":"fc_1","call_id":"call_1","type":"function_call","name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}]'
+    )
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+    assert decision.tool_call.arguments == {"id": "A1"}
 
 
 def test_interpret_bfcl_assistant_output_rejects_unknown_tool_name() -> None:
@@ -817,13 +910,12 @@ def test_normalize_bfcl_decision_output_only_normalizes_text() -> None:
     assert normalized == '{"name":"lookup","arguments":{"id":"A1"}}'
 
 
-def test_parse_bfcl_assistant_output_rejects_string_arguments() -> None:
-    try:
-        parse_bfcl_assistant_output('{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}')
-    except ValueError as exc:
-        assert "arguments must be a JSON object" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("expected strict arguments validation")
+def test_parse_bfcl_assistant_output_accepts_stringified_json_arguments() -> None:
+    decision = parse_bfcl_assistant_output('{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}')
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.arguments == {"id": "A1"}
 
 
 def test_extract_hidden_summary_and_state_delta_are_compact() -> None:
@@ -894,6 +986,6 @@ def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
 
     assert context.startswith("System: Tools:")
     assert '"name": "lookup"' in context
-    assert "\nUser: Request:\nFind A1\n" in context
+    assert "\nUser: Find A1\n" in context
     assert '\nAssistant: ```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```' in context
     assert context.endswith("Assistant: ```json\n")

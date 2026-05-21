@@ -17,7 +17,7 @@ top_p = 0.2
 
 [tool]
 template = "instruction_following_default"
-max_generate_tokens = 192
+max_generate_tokens = 1024
 temperature = 0.2
 top_k = 20
 top_p = 0.2

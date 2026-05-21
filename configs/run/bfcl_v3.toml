@@ -15,6 +15,8 @@ infer_max_workers = 64
 
 [runner]
 benchmark_kind = "bfcl_v3"
+prompt_style = "rwkv_official_json"
+tool_catalog_format = "json"
 avg_ks = [1]
 history_max_chars = 24000
 max_steps = 20

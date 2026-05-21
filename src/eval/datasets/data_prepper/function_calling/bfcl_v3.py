@@ -6,6 +6,7 @@ from typing import Any
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 from src.eval.function_calling import load_bfcl_v3_rows_from_source
+from src.eval.scheduler.config import REPO_ROOT
 
 from .common import LocalRowsDatasetSpec
 
@@ -21,7 +22,13 @@ def bfcl_v3_source_root() -> Path:
     )
     if override:
         return Path(override).expanduser().resolve()
-    return (Path(__file__).resolve().parents[6] / "gorilla" / "berkeley-function-call-leaderboard").resolve()
+    repo_raw_root = REPO_ROOT / "data" / "bfcl_v3_raw"
+    if repo_raw_root.exists():
+        return repo_raw_root.resolve()
+    reference_root = REPO_ROOT / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+    if reference_root.exists():
+        return reference_root.resolve()
+    return (REPO_ROOT.parent / "gorilla" / "berkeley-function-call-leaderboard").resolve()
 
 
 def bfcl_v3_source_paths(split: str) -> tuple[Path, ...]:
@@ -57,9 +64,18 @@ def bfcl_v3_source_paths(split: str) -> tuple[Path, ...]:
     for base in candidate_roots:
         if not base.exists():
             continue
-        for pattern in ("*bfcl*v3*.json", "*bfcl*v3*.jsonl", "*multi*turn*.json", "*multi*turn*.jsonl"):
+        for pattern in ("*.json", "*.jsonl"):
             fuzzy.extend(sorted(base.rglob(pattern)))
-    deduped = tuple(dict.fromkeys(path.resolve() for path in fuzzy if path.is_file()))
+    deduped = tuple(
+        dict.fromkeys(
+            path.resolve()
+            for path in fuzzy
+            if path.is_file()
+            and "bfcl" in path.name.lower()
+            and "v3" in path.name.lower()
+            and "possible_answer" not in {part.lower() for part in path.parts}
+        )
+    )
     if deduped:
         return deduped
     raise FileNotFoundError(

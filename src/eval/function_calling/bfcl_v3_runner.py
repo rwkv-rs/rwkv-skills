@@ -13,19 +13,12 @@ from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.bfcl_v3 import (
     BFCL_ADDITIONAL_FUNCTION_PROMPT,
-    BFCL_COT_STOP_SUFFIX,
     BFCL_DECISION_STOP_SUFFIXES,
-    BFCL_ROUTER_LABELS,
-    BFCL_V3_MAX_COT_CHARS,
     BfclTaskRecord,
     apply_bfcl_tool_call,
-    build_bfcl_ask_prompt,
-    build_bfcl_cot_prompt,
-    build_bfcl_handoff_prompt,
     build_bfcl_ref_answer,
-    build_bfcl_router_prompt,
+    build_bfcl_rwkv_prompt,
     build_bfcl_system_prompt,
-    build_bfcl_tool_prompt,
     build_bfcl_tool_result_message,
     build_bfcl_tool_result_payload,
     build_bfcl_user_block,
@@ -33,16 +26,14 @@ from src.eval.function_calling.bfcl_v3 import (
     decode_bfcl_exec_response,
     evaluate_bfcl_v3_episode,
     execute_bfcl_official_tool_call,
-    extract_bfcl_cot_hidden_summary,
     has_bfcl_official_turns,
     load_bfcl_v3_manifest_records,
     normalize_bfcl_decision_output,
-    parse_bfcl_assistant_output,
-    parse_bfcl_router_output,
     render_bfcl_assistant_tool_message,
     render_bfcl_official_call,
     render_bfcl_turn_request,
     start_bfcl_runtime,
+    _bfcl_tools_with_control_functions,
 )
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
@@ -57,10 +48,16 @@ from src.eval.function_calling.runner_common import (
     _resolve_function_calling_plan,
     _resolve_job_name,
 )
+from src.eval.function_calling.rwkv_prompt import (
+    RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+    coerce_json_function_call_payloads,
+    extract_json_call_value_text,
+    normalize_function_prompt_style,
+)
 from src.eval.function_calling.tau_bench import TauToolCall
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
-from src.infer.constraints import LiteralChoiceConstraint, build_bfcl_tool_call_constraint
+from src.infer.constraints import build_bfcl_tool_call_constraint
 from src.infer.backend import RemoteInferenceBackend
 
 if TYPE_CHECKING:
@@ -92,6 +89,7 @@ class _BfclGenerationStepOutcome:
     trace_entry: dict[str, object]
     action_type: str | None = None
     tool_call: TauToolCall | None = None
+    tool_calls: list[TauToolCall] = field(default_factory=list)
     final_answer: str = ""
 
 
@@ -217,212 +215,141 @@ def _failed_bfcl_step(
     return _BfclGenerationStepOutcome(ok=False, trace_entry=trace_entry)
 
 
-def _run_bfcl_generation_step(
+def _bfcl_decision_error_type(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if "unknown bfcl tool name" in message:
+        return "unknown_tool"
+    if "invalid arguments for bfcl tool" in message:
+        return "schema_mismatch"
+    if "arguments must be a json object" in message:
+        return "invalid_arguments"
+    if "empty response" in message:
+        return "empty_response"
+    if "max length" in message or "max_length" in message:
+        return "max_length"
+    return "invalid_json_tool_call"
+
+
+def _outcome_tool_calls(outcome: _BfclGenerationStepOutcome) -> list[TauToolCall]:
+    if outcome.tool_calls:
+        return list(outcome.tool_calls)
+    if outcome.tool_call is not None:
+        return [outcome.tool_call]
+    return []
+
+
+def _trace_tool_calls(tool_calls: Sequence[TauToolCall]) -> list[dict[str, object]]:
+    return [{"name": tool_call.name, "arguments": dict(tool_call.arguments)} for tool_call in tool_calls]
+
+
+def _bfcl_action_type_from_decision_text(text: str) -> str:
+    try:
+        import json
+
+        payloads = coerce_json_function_call_payloads(
+            json.loads(extract_json_call_value_text(text)),
+            context_label="BFCL tool call",
+        )
+    except Exception:
+        return "TOOL"
+    name = str(payloads[0].get("name") or "").strip() if payloads else ""
+    if name == "ask_user":
+        return "ASK"
+    if name == "final_answer":
+        return "HANDOFF"
+    return "TOOL"
+
+
+def _bfcl_official_prompt_messages(
+    messages: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    official_messages: list[dict[str, object]] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip().lower()
+        content = str(message.get("content") or "")
+        if role == "user":
+            if content.startswith("User: Request:\n"):
+                content = content[len("User: Request:\n") :]
+            elif content.startswith("Request:\n"):
+                content = content[len("Request:\n") :]
+        official_messages.append({"role": role, "content": content})
+    return official_messages
+
+
+def _run_bfcl_official_json_generation_step(
     *,
     state: _ActiveBfclEpisode,
     run: ResolvedFunctionCallingRun,
-    user_request: str,
-    cot_sampling: Any,
-    router_sampling: Any,
     tool_sampling: Any,
-    ask_sampling: Any,
-    handoff_sampling: Any,
     progress_suffix: str,
-    recent_tool_result: dict[str, Any] | None,
-    previous_state_snapshot: Mapping[str, Any] | None,
+    history_max_chars: int,
 ) -> _BfclGenerationStepOutcome:
-    cot_prompt = build_bfcl_cot_prompt(
+    prompt = build_bfcl_rwkv_prompt(
         state.system_prompt,
-        user_request=user_request,
-        current_state_snapshot=state.runtime_state.current_state,
-        previous_tool_result=recent_tool_result,
+        _bfcl_official_prompt_messages(state.prompt_messages),
+        history_max_chars=history_max_chars,
     )
-    cot_output = _generate_bfcl_stage(
+    output = _generate_bfcl_stage(
         state=state,
         run=run,
-        prompt=cot_prompt,
-        sampling=cot_sampling,
-        progress_desc=f"BFCLV3-CoT {progress_suffix}",
-        stop_suffixes=[BFCL_COT_STOP_SUFFIX],
-    )
-    trace_entry: dict[str, object] = {
-        "cot": cot_output.text,
-        "cot_stop_reason": cot_output.finish_reason,
-    }
-    if _looks_like_template_leak(cot_output.text):
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="template_leak",
-            error="cot stage leaked internal template/control tokens",
-        )
-    if cot_output.finish_reason == "max_length":
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="cot_max_length",
-            error="cot stage reached max_length before a bounded decision handoff",
-        )
-    if len(cot_output.text) > BFCL_V3_MAX_COT_CHARS:
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="cot_too_long",
-            error="cot stage exceeded bounded reasoning budget",
-        )
-
-    cot_hidden_summary = extract_bfcl_cot_hidden_summary(cot_output.text)
-    prompt_kwargs = {
-        "user_request": user_request,
-        "cot_hidden_summary": cot_hidden_summary,
-        "recent_tool_window": state.runtime_state.executed_tool_calls,
-        "current_state_snapshot": state.runtime_state.current_state,
-        "previous_state_snapshot": previous_state_snapshot,
-        "previous_tool_result": recent_tool_result,
-    }
-    router_prompt = build_bfcl_router_prompt(state.system_prompt, **prompt_kwargs)
-    router_output = _generate_bfcl_stage(
-        state=state,
-        run=run,
-        prompt=router_prompt,
-        sampling=router_sampling,
-        progress_desc=f"BFCLV3-Router {progress_suffix}",
-        stop_suffixes=["\n"],
-        constraint=LiteralChoiceConstraint(tuple(BFCL_ROUTER_LABELS)),
+        prompt=prompt,
+        sampling=tool_sampling,
+        progress_desc=f"BFCLV3-Decision {progress_suffix}",
+        stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
+        constraint=build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(state.active_tools)),
         constraint_mode="strict",
     )
-    trace_entry["router_text"] = router_output.text
-    trace_entry["router_stop_reason"] = router_output.finish_reason
-    if _looks_like_template_leak(router_output.text):
+    decision_text = normalize_bfcl_decision_output(output.text)
+    trace_entry: dict[str, object] = {
+        "prompt_style": RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+        "decision_completion": output.text,
+        "decision_text": decision_text,
+        "decision_stop_reason": output.finish_reason,
+    }
+    if _looks_like_template_leak(decision_text):
         return _failed_bfcl_step(
             state,
             trace_entry,
             termination_reason="template_leak",
-            error="router stage leaked internal template/control tokens",
+            error="decision stage leaked internal template/control tokens",
         )
-    if router_output.finish_reason == "max_length":
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="router_max_length",
-            error="router stage reached max_length before producing TOOL/ASK/HANDOFF",
-        )
-    try:
-        action_type = parse_bfcl_router_output(router_output.text)
-    except Exception as exc:
-        trace_entry["parse_error"] = str(exc)
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="invalid_router_output",
-            error=str(exc),
-        )
-
-    trace_entry["action_type"] = action_type
-    state.step_count += 1
-    if action_type == "TOOL":
-        tool_prompt = build_bfcl_tool_prompt(state.system_prompt, **prompt_kwargs)
-        tool_output = _generate_bfcl_stage(
-            state=state,
-            run=run,
-            prompt=tool_prompt,
-            sampling=tool_sampling,
-            progress_desc=f"BFCLV3-Tool {progress_suffix}",
-            stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
-            constraint=build_bfcl_tool_call_constraint(state.active_tools),
-            constraint_mode="strict",
-        )
-        tool_text = normalize_bfcl_decision_output(tool_output.text)
-        trace_entry["tool_completion"] = tool_output.text
-        trace_entry["tool_text"] = tool_text
-        if _looks_like_template_leak(tool_text):
-            return _failed_bfcl_step(
-                state,
-                trace_entry,
-                termination_reason="template_leak",
-                error="tool stage leaked internal template/control tokens",
-            )
-        if tool_output.finish_reason == "max_length":
-            return _failed_bfcl_step(
-                state,
-                trace_entry,
-                termination_reason="decision_max_length",
-                error="tool stage reached max_length before producing a bounded tool call",
-            )
-        try:
-            decoded_calls, turn_handoff = decode_bfcl_exec_response(
-                tool_text,
-                tools=state.active_tools,
-            )
-        except Exception as exc:
-            trace_entry["parse_error"] = str(exc)
-            return _failed_bfcl_step(
-                state,
-                trace_entry,
-                termination_reason="invalid_tool_call",
-                error=str(exc),
-            )
-        if not decoded_calls:
-            trace_entry["tool_handoff"] = turn_handoff
-            return _failed_bfcl_step(
-                state,
-                trace_entry,
-                termination_reason="invalid_tool_call",
-                error="router selected TOOL but model returned plain text",
-            )
-        return _BfclGenerationStepOutcome(
-            ok=True,
-            trace_entry=trace_entry,
-            action_type=action_type,
-            tool_call=decoded_calls[0],
-        )
-
-    branch_prompt_builder = build_bfcl_ask_prompt if action_type == "ASK" else build_bfcl_handoff_prompt
-    branch_sampling = ask_sampling if action_type == "ASK" else handoff_sampling
-    branch_progress = "BFCLV3-Ask" if action_type == "ASK" else "BFCLV3-Handoff"
-    branch_prompt = branch_prompt_builder(state.system_prompt, **prompt_kwargs)
-    branch_output = _generate_bfcl_stage(
-        state=state,
-        run=run,
-        prompt=branch_prompt,
-        sampling=branch_sampling,
-        progress_desc=f"{branch_progress} {progress_suffix}",
-        stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
-    )
-    branch_text = normalize_bfcl_decision_output(branch_output.text)
-    trace_entry["branch_text"] = branch_text
-    if _looks_like_template_leak(branch_text):
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="template_leak",
-            error=f"{action_type.lower()} stage leaked internal template/control tokens",
-        )
-    if branch_output.finish_reason == "max_length":
+    if output.finish_reason == "max_length":
         return _failed_bfcl_step(
             state,
             trace_entry,
             termination_reason="decision_max_length",
-            error=f"{action_type.lower()} stage reached max_length before producing a bounded reply",
+            error="decision stage reached max_length before producing a bounded JSON function call",
         )
+
     try:
-        decision = parse_bfcl_assistant_output(branch_text)
+        decoded_calls, final_answer = decode_bfcl_exec_response(
+            decision_text,
+            tools=state.active_tools,
+        )
     except Exception as exc:
+        trace_entry["parse_error_type"] = _bfcl_decision_error_type(exc)
         trace_entry["parse_error"] = str(exc)
         return _failed_bfcl_step(
             state,
             trace_entry,
-            termination_reason="invalid_plain_response",
+            termination_reason="invalid_decision_output",
             error=str(exc),
         )
-    if decision.is_tool_call:
-        return _failed_bfcl_step(
-            state,
-            trace_entry,
-            termination_reason="invalid_plain_response",
-            error=f"router selected {action_type} but model returned a tool call",
+
+    action_type = _bfcl_action_type_from_decision_text(decision_text)
+    trace_entry["action_type"] = action_type
+    state.step_count += 1
+    if decoded_calls:
+        tool_call = decoded_calls[0]
+        return _BfclGenerationStepOutcome(
+            ok=True,
+            trace_entry=trace_entry,
+            action_type="TOOL",
+            tool_call=tool_call,
+            tool_calls=list(decoded_calls),
         )
-    final_answer = decision.final_answer.strip()
+
+    final_answer = final_answer.strip()
     trace_entry["final_answer"] = final_answer
     return _BfclGenerationStepOutcome(
         ok=True,
@@ -432,19 +359,36 @@ def _run_bfcl_generation_step(
     )
 
 
+def _run_bfcl_generation_step(
+    *,
+    state: _ActiveBfclEpisode,
+    run: ResolvedFunctionCallingRun,
+    tool_sampling: Any,
+    progress_suffix: str,
+    prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+    history_max_chars: int = 0,
+) -> _BfclGenerationStepOutcome:
+    normalize_function_prompt_style(prompt_style)
+    return _run_bfcl_official_json_generation_step(
+        state=state,
+        run=run,
+        tool_sampling=tool_sampling,
+        progress_suffix=progress_suffix,
+        history_max_chars=history_max_chars,
+    )
+
+
 def _run_bfcl_v3_official_episode(
     *,
     state: _ActiveBfclEpisode,
     run: ResolvedFunctionCallingRun,
-    cot_sampling: Any,
-    router_sampling: Any,
     tool_sampling: Any,
-    ask_sampling: Any,
-    handoff_sampling: Any,
     max_steps: int,
     max_tool_errors: int,
     history_max_chars: int,
+    prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
 ) -> list[dict[str, object]]:
+    prompt_style = normalize_function_prompt_style(prompt_style)
     trace: list[dict[str, object]] = []
 
     for turn_index, turn in enumerate(state.record.turns):
@@ -466,23 +410,16 @@ def _run_bfcl_v3_official_episode(
         current_turn_outputs: list[list[str]] = []
         step_in_turn = 0
         turn_finished = False
-        recent_tool_result: dict[str, Any] | None = None
-        previous_state_snapshot: dict[str, Any] | None = None
 
         while step_in_turn < max_steps:
             progress_suffix = f"sample {state.sample_index} turn {turn_index + 1} step {step_in_turn + 1}"
             outcome = _run_bfcl_generation_step(
                 state=state,
                 run=run,
-                user_request=turn_request,
-                cot_sampling=cot_sampling,
-                router_sampling=router_sampling,
                 tool_sampling=tool_sampling,
-                ask_sampling=ask_sampling,
-                handoff_sampling=handoff_sampling,
                 progress_suffix=progress_suffix,
-                recent_tool_result=recent_tool_result,
-                previous_state_snapshot=previous_state_snapshot,
+                prompt_style=prompt_style,
+                history_max_chars=history_max_chars,
             )
             trace_entry = {
                 "turn_index": turn_index,
@@ -494,21 +431,59 @@ def _run_bfcl_v3_official_episode(
                 trace.append(trace_entry)
                 break
 
-            if outcome.tool_call is not None:
-                tool_call = outcome.tool_call
-                previous_state_snapshot = dict(state.runtime_state.current_state)
-                state.tool_calls.append(tool_call)
-                state.prompt_messages.append(
-                    {"role": "assistant", "content": render_bfcl_assistant_tool_message(tool_call)}
-                )
-                try:
-                    execution = execute_bfcl_official_tool_call(state.record, state.runtime_state, tool_call)
-                except Exception as exc:
-                    state.tool_errors += 1
+            outcome_tool_calls = _outcome_tool_calls(outcome)
+            if outcome_tool_calls:
+                current_turn_outputs.append([render_bfcl_official_call(tool_call) for tool_call in outcome_tool_calls])
+                trace_entry["tool_calls"] = _trace_tool_calls(outcome_tool_calls)
+                tool_results: list[dict[str, object]] = []
+
+                for tool_call in outcome_tool_calls:
+                    state_before_tool = dict(state.runtime_state.current_state)
+                    state.tool_calls.append(tool_call)
+                    state.prompt_messages.append(
+                        {"role": "assistant", "content": render_bfcl_assistant_tool_message(tool_call)}
+                    )
+                    try:
+                        execution = execute_bfcl_official_tool_call(state.record, state.runtime_state, tool_call)
+                    except Exception as exc:
+                        state.tool_errors += 1
+                        recent_tool_result = build_bfcl_tool_result_payload(
+                            tool_call,
+                            ok=False,
+                            error=str(exc),
+                        )
+                        state.prompt_messages.append(
+                            {
+                                "role": "user",
+                                "content": build_bfcl_tool_result_message(
+                                    recent_tool_result,
+                                    current_state_snapshot=state.runtime_state.current_state,
+                                    previous_state_snapshot=state_before_tool,
+                                ),
+                            }
+                        )
+                        tool_results.append(
+                            {
+                                "name": tool_call.name,
+                                "arguments": dict(tool_call.arguments),
+                                "success": False,
+                                "matched_expectation": False,
+                                "result": None,
+                                "error": str(exc),
+                                "state_snapshot": dict(state.runtime_state.current_state),
+                            }
+                        )
+                        if state.tool_errors >= max_tool_errors:
+                            state.termination_reason = "too_many_errors"
+                            state.error = str(exc)
+                            break
+                        continue
+
                     recent_tool_result = build_bfcl_tool_result_payload(
                         tool_call,
-                        ok=False,
-                        error=str(exc),
+                        ok=execution.success,
+                        output=execution.result,
+                        error=execution.error,
                     )
                     state.prompt_messages.append(
                         {
@@ -516,57 +491,39 @@ def _run_bfcl_v3_official_episode(
                             "content": build_bfcl_tool_result_message(
                                 recent_tool_result,
                                 current_state_snapshot=state.runtime_state.current_state,
-                                previous_state_snapshot=previous_state_snapshot,
+                                previous_state_snapshot=state_before_tool,
                             ),
                         }
                     )
-                    trace_entry["tool_call"] = {
-                        "name": tool_call.name,
-                        "arguments": dict(tool_call.arguments),
-                    }
-                    trace_entry["tool_error"] = str(exc)
-                    trace.append(trace_entry)
+                    if not execution.matched_expectation:
+                        state.tool_errors += 1
+                    tool_results.append(
+                        {
+                            "name": tool_call.name,
+                            "arguments": dict(tool_call.arguments),
+                            "success": execution.success,
+                            "matched_expectation": execution.matched_expectation,
+                            "result": execution.result,
+                            "error": execution.error,
+                            "state_snapshot": dict(execution.state_snapshot),
+                        }
+                    )
                     if state.tool_errors >= max_tool_errors:
                         state.termination_reason = "too_many_errors"
-                        state.error = str(exc)
+                        state.error = "too many BFCL tool execution errors"
                         break
-                    step_in_turn += 1
-                    continue
-                recent_tool_result = build_bfcl_tool_result_payload(
-                    tool_call,
-                    ok=execution.success,
-                    output=execution.result,
-                    error=execution.error,
-                )
-                state.prompt_messages.append(
-                    {
-                        "role": "user",
-                        "content": build_bfcl_tool_result_message(
-                            recent_tool_result,
-                            current_state_snapshot=state.runtime_state.current_state,
-                            previous_state_snapshot=previous_state_snapshot,
-                        ),
-                    }
-                )
-                current_turn_outputs.append([render_bfcl_official_call(tool_call)])
-                if not execution.matched_expectation:
-                    state.tool_errors += 1
-                trace_entry["tool_calls"] = [
-                    {
-                        "name": tool_call.name,
-                        "arguments": dict(tool_call.arguments),
-                    }
-                ]
-                trace_entry["tool_success"] = execution.success
-                trace_entry["tool_result"] = execution.result
-                trace_entry["tool_error"] = execution.error
-                trace_entry["state_snapshot"] = dict(execution.state_snapshot)
+
+                trace_entry["tool_results"] = tool_results
+                if tool_results:
+                    first_result = tool_results[0]
+                    trace_entry["tool_success"] = first_result.get("success")
+                    trace_entry["tool_result"] = first_result.get("result")
+                    trace_entry["tool_error"] = first_result.get("error")
+                    trace_entry["state_snapshot"] = first_result.get("state_snapshot")
                 trace.append(trace_entry)
-                if state.tool_errors >= max_tool_errors:
-                    state.termination_reason = "too_many_errors"
-                    state.error = "too many BFCL tool execution errors"
-                    break
                 step_in_turn += 1
+                if state.termination_reason is not None:
+                    break
                 continue
 
             state.final_answer = outcome.final_answer.strip()
@@ -574,7 +531,11 @@ def _run_bfcl_v3_official_episode(
                 state.prompt_messages.append(
                     {
                         "role": "assistant",
-                        "content": str(outcome.trace_entry.get("branch_text") or state.final_answer).strip(),
+                        "content": str(
+                            outcome.trace_entry.get("branch_text")
+                            or outcome.trace_entry.get("decision_text")
+                            or state.final_answer
+                        ).strip(),
                     }
                 )
             trace_entry["turn_handoff"] = state.final_answer
@@ -611,58 +572,17 @@ def _run_bfcl_v3(
 
     plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
-    cot_sampling = resolve_sampling_config(
-        run.dataset_slug,
-        run.model_name,
-        stage="cot",
-        fallback_templates="free_response_cot_default",
-    )
-    router_sampling = resolve_sampling_config(
-        run.dataset_slug,
-        run.model_name,
-        stage="router",
-        fallback_templates="instruction_following_default",
-    )
     tool_sampling = resolve_sampling_config(
         run.dataset_slug,
         run.model_name,
         stage="tool",
         fallback_templates="instruction_following_default",
     )
-    ask_sampling = resolve_sampling_config(
-        run.dataset_slug,
-        run.model_name,
-        stage="ask",
-        fallback_templates="instruction_following_default",
-    )
-    handoff_sampling = resolve_sampling_config(
-        run.dataset_slug,
-        run.model_name,
-        stage="handoff",
-        fallback_templates="instruction_following_default",
-    )
-    if (
-        cot_sampling is None
-        or router_sampling is None
-        or tool_sampling is None
-        or ask_sampling is None
-        or handoff_sampling is None
-    ):
+    if tool_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
-    router_sampling = router_sampling.clamp(min(int(args.decision_max_tokens or 8), 8))
-    tool_sampling = tool_sampling.clamp(min(int(args.decision_max_tokens or 192), 192))
-    ask_sampling = ask_sampling.clamp(min(int(args.decision_max_tokens or 96), 96))
-    handoff_sampling = handoff_sampling.clamp(min(int(args.decision_max_tokens or 96), 96))
-    sampling_payload = normalize_sampling_config_by_stage(
-        [
-            (1, cot_sampling),
-            (2, router_sampling),
-            (3, tool_sampling),
-            (4, ask_sampling),
-            (5, handoff_sampling),
-        ]
-    )
+    prompt_style = normalize_function_prompt_style(getattr(args, "prompt_style", None))
+    tool_sampling = tool_sampling.clamp(max(1, int(args.decision_max_tokens or 1024)))
+    sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     dataset_issues = collect_bfcl_dataset_issues([record for _index, record in selected_entries])
@@ -691,101 +611,50 @@ def _run_bfcl_v3(
             )
             for sample_index, record in repeated
         ]
-        cot_prompts = [
-            build_bfcl_cot_prompt(
-                build_bfcl_system_prompt(
-                    state.active_tools
-                    if not has_bfcl_official_turns(state.record)
-                    else _merge_bfcl_tools(
-                        state.active_tools,
-                        state.record.turns[0].tool_additions if state.record.turns else (),
-                    )
-                ),
-                user_request=(
+        for state in probe_states:
+            if has_bfcl_official_turns(state.record):
+                additions = state.record.turns[0].tool_additions if state.record.turns else ()
+                state.active_tools = _merge_bfcl_tools(state.active_tools, additions)
+                state.system_prompt = build_bfcl_system_prompt(state.active_tools)
+                turn_request = (
                     render_bfcl_turn_request(state.record.turns[0].messages)
                     if state.record.turns
                     else state.record.instruction.strip()
-                ),
-                current_state_snapshot=state.runtime_state.current_state,
+                )
+                if not turn_request and additions:
+                    turn_request = BFCL_ADDITIONAL_FUNCTION_PROMPT
+                state.prompt_messages.append(
+                    {
+                        "role": "user",
+                        "content": build_bfcl_user_block(turn_request),
+                    }
+                )
+        decision_prompts = [
+            build_bfcl_rwkv_prompt(
+                state.system_prompt,
+                _bfcl_official_prompt_messages(state.prompt_messages),
+                history_max_chars=history_max_chars,
             )
             for state in probe_states
         ]
-        cot_outputs = run.engine.generate(
-            cot_prompts,
-            sampling=cot_sampling,
-            batch_size=len(cot_prompts),
-            progress_desc="BFCLV3-Probe-CoT",
-            prompt_stop_suffixes=[[BFCL_COT_STOP_SUFFIX] for _ in cot_prompts],
+        constraints = (
+            None
+            if isinstance(run.engine, RemoteInferenceBackend)
+            else [
+                build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(state.active_tools))
+                for state in probe_states
+            ]
+        )
+        run.engine.generate(
+            decision_prompts,
+            sampling=tool_sampling,
+            batch_size=len(decision_prompts),
+            progress_desc="BFCLV3-Probe-Decision",
+            prompt_stop_suffixes=[list(BFCL_DECISION_STOP_SUFFIXES) for _ in decision_prompts],
+            constraints=constraints,
+            constraint_mode="off" if constraints is None else "strict",
             prompt_seeds=[
                 sample_repeat_seed(state.sample_index, state.repeat_index, stage=1)
-                for state in probe_states
-            ],
-        )
-        cot_summaries = [extract_bfcl_cot_hidden_summary(output.text) for output in cot_outputs]
-        probe_tool_sets = [
-            (
-                state.active_tools
-                if not has_bfcl_official_turns(state.record)
-                else _merge_bfcl_tools(
-                    state.active_tools,
-                    state.record.turns[0].tool_additions if state.record.turns else (),
-                )
-            )
-            for state in probe_states
-        ]
-        router_prompts = [
-            build_bfcl_router_prompt(
-                build_bfcl_system_prompt(
-                    probe_tool_sets[index]
-                ),
-                user_request=(
-                    render_bfcl_turn_request(state.record.turns[0].messages)
-                    if state.record.turns
-                    else state.record.instruction.strip()
-                ),
-                cot_hidden_summary=cot_summaries[index],
-                current_state_snapshot=state.runtime_state.current_state,
-            )
-            for index, state in enumerate(probe_states)
-        ]
-        run.engine.generate(
-            router_prompts,
-            sampling=router_sampling,
-            batch_size=len(router_prompts),
-            progress_desc="BFCLV3-Probe-Router",
-            prompt_stop_suffixes=[["\n"] for _ in router_prompts],
-            constraints=[LiteralChoiceConstraint(tuple(BFCL_ROUTER_LABELS)) for _ in router_prompts],
-            constraint_mode="strict",
-            prompt_seeds=[
-                sample_repeat_seed(state.sample_index, state.repeat_index, stage=2)
-                for state in probe_states
-            ],
-        )
-        tool_prompts = [
-            build_bfcl_tool_prompt(
-                build_bfcl_system_prompt(
-                    probe_tool_sets[index]
-                ),
-                user_request=(
-                    render_bfcl_turn_request(state.record.turns[0].messages)
-                    if state.record.turns
-                    else state.record.instruction.strip()
-                ),
-                cot_hidden_summary=cot_summaries[index],
-                current_state_snapshot=state.runtime_state.current_state,
-            )
-            for index, state in enumerate(probe_states)
-        ]
-        run.engine.generate(
-            tool_prompts,
-            sampling=tool_sampling,
-            batch_size=len(tool_prompts),
-            progress_desc="BFCLV3-Probe-Tool",
-            prompt_stop_suffixes=[list(BFCL_DECISION_STOP_SUFFIXES) for _ in tool_prompts],
-            constraints=[build_bfcl_tool_call_constraint(tool_set) for tool_set in probe_tool_sets],
-            constraint_mode="strict",
-            prompt_seeds=[
-                sample_repeat_seed(state.sample_index, state.repeat_index, stage=3)
                 for state in probe_states
             ],
         )
@@ -834,33 +703,22 @@ def _run_bfcl_v3(
                         trace = _run_bfcl_v3_official_episode(
                             state=state,
                             run=run,
-                            cot_sampling=cot_sampling,
-                            router_sampling=router_sampling,
                             tool_sampling=tool_sampling,
-                            ask_sampling=ask_sampling,
-                            handoff_sampling=handoff_sampling,
                             max_steps=max_steps,
                             max_tool_errors=max_tool_errors,
                             history_max_chars=history_max_chars,
+                            prompt_style=prompt_style,
                         )
                     else:
-                        current_request = record.instruction.strip()
-                        recent_tool_result: dict[str, Any] | None = None
-                        previous_state_snapshot: dict[str, Any] | None = None
                         for _ in range(max_steps):
                             progress_suffix = f"sample {state.sample_index} step {state.turn_count + 1}"
                             outcome = _run_bfcl_generation_step(
                                 state=state,
                                 run=run,
-                                user_request=current_request,
-                                cot_sampling=cot_sampling,
-                                router_sampling=router_sampling,
                                 tool_sampling=tool_sampling,
-                                ask_sampling=ask_sampling,
-                                handoff_sampling=handoff_sampling,
                                 progress_suffix=progress_suffix,
-                                recent_tool_result=recent_tool_result,
-                                previous_state_snapshot=previous_state_snapshot,
+                                prompt_style=prompt_style,
+                                history_max_chars=history_max_chars,
                             )
                             state.turn_count += 1
                             trace_entry = {
@@ -872,60 +730,79 @@ def _run_bfcl_v3(
                                 trace.append(trace_entry)
                                 break
 
-                            if outcome.tool_call is not None:
-                                tool_call = outcome.tool_call
-                                previous_state_snapshot = dict(state.runtime_state.current_state)
-                                state.tool_calls.append(tool_call)
-                                state.prompt_messages.append(
-                                    {
-                                        "role": "assistant",
-                                        "content": render_bfcl_assistant_tool_message(tool_call),
-                                    }
-                                )
-                                execution = apply_bfcl_tool_call(record, state.runtime_state, tool_call)
-                                recent_tool_result = build_bfcl_tool_result_payload(
-                                    tool_call,
-                                    ok=execution.success,
-                                    output=execution.result,
-                                    error=execution.error,
-                                )
-                                state.prompt_messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": build_bfcl_tool_result_message(
-                                            recent_tool_result,
-                                            current_state_snapshot=state.runtime_state.current_state,
-                                            previous_state_snapshot=previous_state_snapshot,
-                                        ),
-                                    }
-                                )
-                                if not execution.matched_expectation:
-                                    state.tool_errors += 1
-                                trace_entry["tool_calls"] = [
-                                    {
-                                        "name": tool_call.name,
-                                        "arguments": dict(tool_call.arguments),
-                                    }
-                                ]
-                                trace_entry["matched_expectation"] = execution.matched_expectation
-                                trace_entry["tool_success"] = execution.success
-                                trace_entry["tool_result"] = execution.result
-                                trace_entry["tool_error"] = execution.error
-                                trace_entry["state_snapshot"] = dict(execution.state_snapshot)
+                            outcome_tool_calls = _outcome_tool_calls(outcome)
+                            if outcome_tool_calls:
+                                trace_entry["tool_calls"] = _trace_tool_calls(outcome_tool_calls)
+                                tool_results: list[dict[str, object]] = []
+
+                                for tool_call in outcome_tool_calls:
+                                    state_before_tool = dict(state.runtime_state.current_state)
+                                    state.tool_calls.append(tool_call)
+                                    state.prompt_messages.append(
+                                        {
+                                            "role": "assistant",
+                                            "content": render_bfcl_assistant_tool_message(tool_call),
+                                        }
+                                    )
+                                    execution = apply_bfcl_tool_call(record, state.runtime_state, tool_call)
+                                    tool_result_payload = build_bfcl_tool_result_payload(
+                                        tool_call,
+                                        ok=execution.success,
+                                        output=execution.result,
+                                        error=execution.error,
+                                    )
+                                    state.prompt_messages.append(
+                                        {
+                                            "role": "user",
+                                            "content": build_bfcl_tool_result_message(
+                                                tool_result_payload,
+                                                current_state_snapshot=state.runtime_state.current_state,
+                                                previous_state_snapshot=state_before_tool,
+                                            ),
+                                        }
+                                    )
+                                    if not execution.matched_expectation:
+                                        state.tool_errors += 1
+                                    tool_results.append(
+                                        {
+                                            "name": tool_call.name,
+                                            "arguments": dict(tool_call.arguments),
+                                            "success": execution.success,
+                                            "matched_expectation": execution.matched_expectation,
+                                            "result": execution.result,
+                                            "error": execution.error,
+                                            "state_snapshot": dict(execution.state_snapshot),
+                                        }
+                                    )
+                                    if state.tool_errors >= max_tool_errors:
+                                        state.termination_reason = "too_many_errors"
+                                        state.error = "too many BFCL tool execution errors"
+                                        break
+
+                                trace_entry["tool_results"] = tool_results
+                                if tool_results:
+                                    first_result = tool_results[0]
+                                    trace_entry["matched_expectation"] = first_result.get("matched_expectation")
+                                    trace_entry["tool_success"] = first_result.get("success")
+                                    trace_entry["tool_result"] = first_result.get("result")
+                                    trace_entry["tool_error"] = first_result.get("error")
+                                    trace_entry["state_snapshot"] = first_result.get("state_snapshot")
                                 trace.append(trace_entry)
-                                if state.tool_errors >= max_tool_errors:
-                                    state.termination_reason = "too_many_errors"
-                                    state.error = "too many BFCL tool execution errors"
+                                if state.termination_reason is not None:
                                     break
                                 continue
 
                             state.final_answer = outcome.final_answer.strip()
                             state.prompt_messages.append(
-                                {
-                                    "role": "assistant",
-                                    "content": str(outcome.trace_entry.get("branch_text") or state.final_answer).strip(),
-                                }
-                            )
+                                    {
+                                        "role": "assistant",
+                                        "content": str(
+                                            outcome.trace_entry.get("branch_text")
+                                            or outcome.trace_entry.get("decision_text")
+                                            or state.final_answer
+                                        ).strip(),
+                                    }
+                                )
                             state.termination_reason = "agent_stop"
                             trace.append(trace_entry)
                             break

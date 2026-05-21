@@ -16,7 +16,13 @@ from src.eval.function_calling.mcp_bench import (
     McpBenchItem,
     McpBenchTaskSpec,
     build_final_answer_prompt,
-    build_planning_context,
+    build_planning_json_call_prompt,
+    parse_planning_decision,
+)
+from src.eval.function_calling.simple_tool_call import (
+    SimpleToolCallRecord,
+    ToolCallExpectation,
+    build_simple_tool_call_prompt,
 )
 
 
@@ -40,6 +46,48 @@ def test_repeat_probe_entries_repeats_to_batch_size() -> None:
     repeated = repeat_probe_entries([1, 2], batch_size=5)
 
     assert repeated == [1, 2, 1, 2, 1]
+
+
+def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
+    record = SimpleToolCallRecord(
+        task_id="demo",
+        instruction='Translate "Will it rain tomorrow?" into Japanese.',
+        tools=(
+            {
+                "name": "translate_text",
+                "description": "Translate text",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "target_language": {"type": "string"},
+                    },
+                    "required": ["text", "target_language"],
+                },
+            },
+        ),
+        expected_tool_calls=(
+            ToolCallExpectation(
+                name="translate_text",
+                arguments={"text": "Will it rain tomorrow?", "target_language": "Japanese"},
+                argument_options={},
+            ),
+        ),
+        metadata={},
+    )
+
+    prompt = build_simple_tool_call_prompt(record, history_max_chars=4000)
+
+    assert prompt.startswith("System: Tools:\n[")
+    assert '"name": "translate_text"' in prompt
+    assert '"arguments": {' in prompt
+    assert '"parameters"' not in prompt
+    assert "Output JSON schema:" in prompt
+    assert '"oneOf": [' in prompt
+    assert "return a JSON array containing every required call" in prompt
+    assert "Do not copy tool schemas" in prompt
+    assert "Available tools:" not in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n' in prompt
 
 
 def test_normalize_rwkv_text_strips_crlf_and_blank_lines() -> None:
@@ -71,15 +119,31 @@ def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
         }
     }
 
-    planning = build_planning_context(item, tools, "Found A.\n\nFound B.")
+    planning = build_planning_json_call_prompt(
+        item,
+        tools,
+        ({"role": "user", "content": "Task:\nBook the meeting"},),
+        history_max_chars=4000,
+    )
     final = build_final_answer_prompt(item, "Found A.\n\nFound B.")
 
     assert planning.startswith("System: Tools:")
     assert '"name": "calendar:search"' in planning
-    assert "Return only a JSON function call." in planning
+    assert "Output JSON schema:" in planning
     assert "\nUser: Task:\nBook the meeting" in planning
-    assert planning.endswith("Assistant: <think><|completions_of_cot|>")
+    assert planning.endswith("Assistant: ```json\n")
     assert final.endswith("Assistant:")
+
+
+def test_mcp_parse_planning_accepts_openai_tool_call_shape() -> None:
+    decision = parse_planning_decision(
+        '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"calendar:search","arguments":"{\\"query\\":\\"budget\\"}"}}]}'
+    )
+
+    assert decision.should_continue is True
+    assert len(decision.tool_calls) == 1
+    assert decision.tool_calls[0].full_name == "calendar:search"
+    assert decision.tool_calls[0].arguments == {"query": "budget"}
 
 
 def test_compute_function_calling_metrics_reports_success_rate_and_avg_key() -> None:

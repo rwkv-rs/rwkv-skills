@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
+from pathlib import Path
 
+from src.eval.datasets.runtime import read_jsonl_items
 from src.eval.runner_registry import RunnerGroup
+from src.eval.scheduler.datasets import refresh_dataset_index
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import (
     CODE_DATASET_SLUGS,
@@ -11,6 +15,7 @@ from src.eval.scheduler.jobs import (
     INSTRUCTION_FOLLOWING_DATASET_SLUGS,
     JOB_CATALOGUE,
     detect_job_from_dataset,
+    locate_dataset,
 )
 
 
@@ -38,6 +43,7 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_bfcl_v3"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_bfcl_ast"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_bfcl_exec"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_toolalpaca"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.function_calling.runner"
@@ -86,11 +92,64 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
 
 
+def test_locate_dataset_revalidates_registered_default_artifact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_root = tmp_path / "data"
+    dataset_dir = output_root / "bfcl_exec_simple"
+    dataset_dir.mkdir(parents=True)
+    stale_path = dataset_dir / "test.jsonl"
+    stale_path.write_text(
+        json.dumps(
+            {
+                "task_id": "exec_simple_0",
+                "instruction": "Find a probability.",
+                "tools": [],
+                "expected_tool_calls": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[str, Path, str]] = []
+
+    def _prepare_dataset(name: str, root: Path, split: str) -> list[Path]:
+        calls.append((name, root, split))
+        stale_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "exec_simple_0",
+                    "instruction": "Find a probability.",
+                    "tools": [],
+                    "expected_executable_calls": ["calc_binomial_probability(n=20, k=5, p=0.6)"],
+                    "execution_result_type": ["exact_match"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return [stale_path]
+
+    monkeypatch.setattr("src.eval.datasets.data_prepper.data_manager.prepare_dataset", _prepare_dataset)
+    monkeypatch.setattr("src.eval.scheduler.dataset_stats.record_dataset_samples", lambda *_args, **_kwargs: None)
+
+    refresh_dataset_index([output_root])
+    found = locate_dataset("bfcl_exec_simple_test", search=[output_root], output_root=output_root)
+
+    assert found == stale_path
+    assert calls == [("bfcl_exec_simple", output_root, "test")]
+    [row] = read_jsonl_items(found)
+    assert row["expected_executable_calls"] == ["calc_binomial_probability(n=20, k=5, p=0.6)"]
+
+
 def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert "function_browsecomp" in JOB_CATALOGUE
     assert "function_mcp_bench" in JOB_CATALOGUE
     assert "function_bfcl_v3" in JOB_CATALOGUE
     assert "function_bfcl_ast" in JOB_CATALOGUE
+    assert "function_bfcl_exec" in JOB_CATALOGUE
     assert "function_toolalpaca" in JOB_CATALOGUE
     assert "function_tau_bench" in JOB_CATALOGUE
     assert "function_tau2_bench" in JOB_CATALOGUE
@@ -99,6 +158,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     mcp_slugs = JOB_CATALOGUE["function_mcp_bench"].dataset_slugs
     bfcl_slugs = JOB_CATALOGUE["function_bfcl_v3"].dataset_slugs
     bfcl_ast_slugs = JOB_CATALOGUE["function_bfcl_ast"].dataset_slugs
+    bfcl_exec_slugs = JOB_CATALOGUE["function_bfcl_exec"].dataset_slugs
     toolalpaca_slugs = JOB_CATALOGUE["function_toolalpaca"].dataset_slugs
     tau_slugs = JOB_CATALOGUE["function_tau_bench"].dataset_slugs
     tau2_slugs = JOB_CATALOGUE["function_tau2_bench"].dataset_slugs
@@ -108,9 +168,13 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("mcp_bench_test") in mcp_slugs
     assert canonical_slug("bfcl_v3_test") in bfcl_slugs
     assert canonical_slug("bfcl_simple_python_test") in bfcl_ast_slugs
-    assert canonical_slug("bfcl_exec_simple_test") in bfcl_ast_slugs
+    assert canonical_slug("bfcl_exec_simple_ast_test") in bfcl_ast_slugs
     assert canonical_slug("bfcl_multiple_test") in bfcl_ast_slugs
-    assert canonical_slug("bfcl_exec_multiple_test") in bfcl_ast_slugs
+    assert canonical_slug("bfcl_exec_multiple_ast_test") in bfcl_ast_slugs
+    assert canonical_slug("bfcl_exec_simple_test") in bfcl_exec_slugs
+    assert canonical_slug("bfcl_exec_multiple_test") in bfcl_exec_slugs
+    assert canonical_slug("bfcl_exec_parallel_test") in bfcl_exec_slugs
+    assert canonical_slug("bfcl_exec_parallel_multiple_test") in bfcl_exec_slugs
     assert canonical_slug("toolalpaca_eval_simulated_test") in toolalpaca_slugs
     assert canonical_slug("toolalpaca_eval_real_test") in toolalpaca_slugs
     assert canonical_slug("tau_bench_retail_test") in tau_slugs
@@ -124,6 +188,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
     assert detect_job_from_dataset(canonical_slug("bfcl_v3_test"), is_cot=True) == "function_bfcl_v3"
     assert detect_job_from_dataset(canonical_slug("bfcl_multiple_test"), is_cot=True) == "function_bfcl_ast"
+    assert detect_job_from_dataset(canonical_slug("bfcl_exec_simple_ast_test"), is_cot=True) == "function_bfcl_ast"
+    assert detect_job_from_dataset(canonical_slug("bfcl_exec_simple_test"), is_cot=True) == "function_bfcl_exec"
     assert detect_job_from_dataset(canonical_slug("toolalpaca_eval_real_test"), is_cot=True) == "function_toolalpaca"
     assert detect_job_from_dataset(canonical_slug("tau_bench_retail_test"), is_cot=True) == "function_tau_bench"
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"

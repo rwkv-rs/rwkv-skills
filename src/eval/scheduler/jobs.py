@@ -12,6 +12,7 @@ from src.eval.runner_registry import ALL_RUNNERS, RunnerGroup, RunnerSpec as Reg
 from .dataset_utils import (
     DATASET_SLUG_ALIASES,
     canonical_slug,
+    infer_dataset_slug_from_path,
     make_dataset_slug,
     safe_slug,
 )
@@ -182,12 +183,28 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
     from .dataset_stats import record_dataset_samples
 
     canonical = canonical_slug(slug)
+    spec = DATASET_PREP_SPECS.get(canonical)
     found = find_dataset_file(canonical, search)
     if found:
+        if spec is not None:
+            expected_artifact = (output_root.expanduser().resolve() / spec.dataset / f"{spec.split}.jsonl").resolve()
+            if found.resolve() == expected_artifact:
+                from src.eval.datasets.data_prepper.data_manager import prepare_dataset
+
+                prepared_paths = prepare_dataset(spec.dataset, output_root, spec.split)
+                refresh_dataset_index(search)
+                for path in prepared_paths:
+                    detected = canonical_slug(infer_dataset_slug_from_path(str(path)))
+                    if detected == canonical:
+                        record_dataset_samples(path, dataset_slug=canonical)
+                        return path
+                refreshed = find_dataset_file(canonical, search)
+                if refreshed:
+                    record_dataset_samples(refreshed, dataset_slug=canonical)
+                    return refreshed
         record_dataset_samples(found, dataset_slug=canonical)
         return found
 
-    spec = DATASET_PREP_SPECS.get(canonical)
     if spec is None:
         locations = "\n".join(f"  - {root}" for root in search)
         raise FileNotFoundError(
@@ -199,7 +216,7 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
     prepared_paths = prepare_dataset(spec.dataset, output_root, spec.split)
     refresh_dataset_index(search)
     for path in prepared_paths:
-        detected = canonical_slug(path.stem)
+        detected = canonical_slug(infer_dataset_slug_from_path(str(path)))
         if detected == canonical:
             record_dataset_samples(path, dataset_slug=canonical)
             return path

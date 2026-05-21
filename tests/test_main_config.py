@@ -109,6 +109,7 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
             "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
             "runner": {
                 "benchmark_kind": "bfcl_v3",
+                "prompt_style": "rwkv_official_json",
                 "avg_ks": [1.0],
                 "max_steps": 20,
                 "max_tool_errors": 20,
@@ -127,6 +128,8 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert resolved.module == "src.eval.function_calling.runner"
     assert "--avg-k" in resolved.argv
     assert "1.0" in resolved.argv
+    assert "--prompt-style" in resolved.argv
+    assert "rwkv_official_json" in resolved.argv
 
 
 def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: Path) -> None:

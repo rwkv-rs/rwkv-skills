@@ -65,6 +65,7 @@ _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following",)
 _BROWSECOMP_JOBS = ("function_browsecomp",)
 _MCP_BENCH_JOBS = ("function_mcp_bench",)
 _BFCL_AST_JOBS = ("function_bfcl_ast",)
+_BFCL_EXEC_JOBS = ("function_bfcl_exec",)
 _BFCL_V3_JOBS = ("function_bfcl_v3",)
 _TOOLALPACA_JOBS = ("function_toolalpaca",)
 _TAU_BENCH_JOBS = ("function_tau_bench",)
@@ -250,9 +251,16 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("mcp_bench"): _function_calling("mcp_bench", scheduler_jobs=_MCP_BENCH_JOBS),
     canonical_slug("bfcl_simple_python"): _function_calling("bfcl_simple_python", scheduler_jobs=_BFCL_AST_JOBS),
-    canonical_slug("bfcl_exec_simple"): _function_calling("bfcl_exec_simple", scheduler_jobs=_BFCL_AST_JOBS),
+    canonical_slug("bfcl_exec_simple_ast"): _function_calling("bfcl_exec_simple_ast", scheduler_jobs=_BFCL_AST_JOBS),
     canonical_slug("bfcl_multiple"): _function_calling("bfcl_multiple", scheduler_jobs=_BFCL_AST_JOBS),
-    canonical_slug("bfcl_exec_multiple"): _function_calling("bfcl_exec_multiple", scheduler_jobs=_BFCL_AST_JOBS),
+    canonical_slug("bfcl_exec_multiple_ast"): _function_calling("bfcl_exec_multiple_ast", scheduler_jobs=_BFCL_AST_JOBS),
+    canonical_slug("bfcl_exec_simple"): _function_calling("bfcl_exec_simple", scheduler_jobs=_BFCL_EXEC_JOBS),
+    canonical_slug("bfcl_exec_multiple"): _function_calling("bfcl_exec_multiple", scheduler_jobs=_BFCL_EXEC_JOBS),
+    canonical_slug("bfcl_exec_parallel"): _function_calling("bfcl_exec_parallel", scheduler_jobs=_BFCL_EXEC_JOBS),
+    canonical_slug("bfcl_exec_parallel_multiple"): _function_calling(
+        "bfcl_exec_parallel_multiple",
+        scheduler_jobs=_BFCL_EXEC_JOBS,
+    ),
     canonical_slug("bfcl_v3"): _function_calling("bfcl_v3", scheduler_jobs=_BFCL_V3_JOBS),
     canonical_slug("toolalpaca_eval_simulated"): _function_calling(
         "toolalpaca_eval_simulated",

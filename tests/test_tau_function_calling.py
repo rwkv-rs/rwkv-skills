@@ -50,6 +50,40 @@ def test_parse_tau_final_answer_function_call() -> None:
     assert decision.final_answer == "Done"
 
 
+def test_parse_tau_tool_call_from_json_code_fence() -> None:
+    decision = parse_tool_call_or_final_answer(
+        '```json\n{"name":"assistant.inspect_order","arguments":{"order_id":"123"}}\n```'
+    )
+
+    assert decision.is_tool_call
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "inspect_order"
+
+
+def test_parse_tau_tool_call_accepts_openai_chat_tool_call_shape() -> None:
+    decision = parse_tool_call_or_final_answer(
+        '{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"assistant.inspect_order","arguments":"{\\"order_id\\":\\"123\\"}"}}]}'
+    )
+
+    assert decision.is_tool_call
+    assert decision.tool_call is not None
+    assert decision.tool_call.requestor == "assistant"
+    assert decision.tool_call.name == "inspect_order"
+    assert decision.tool_call.arguments == {"order_id": "123"}
+
+
+def test_parse_tau_tool_call_accepts_openai_response_function_call_shape() -> None:
+    decision = parse_tool_call_or_final_answer(
+        '{"id":"fc_1","call_id":"call_1","type":"function_call","name":"user.inspect_order","arguments":"{\\"order_id\\":\\"123\\"}"}'
+    )
+
+    assert decision.is_tool_call
+    assert decision.tool_call is not None
+    assert decision.tool_call.requestor == "user"
+    assert decision.tool_call.name == "inspect_order"
+    assert decision.tool_call.arguments == {"order_id": "123"}
+
+
 def test_parse_tau_rejects_plain_text_final_answer() -> None:
     try:
         parse_tool_call_or_final_answer("The refund has been submitted successfully.")

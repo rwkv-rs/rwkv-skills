@@ -13,6 +13,10 @@ load_env_file(Path(".env"))
 
 from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARK_ALIASES, BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
+from src.eval.function_calling.rwkv_prompt import (
+    FUNCTION_PROMPT_STYLE_CHOICES,
+    FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
+)
 
 from .actions import (
     DispatchOptions,
@@ -177,6 +181,25 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
     parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
+    parser.add_argument(
+        "--function-prompt-style",
+        choices=FUNCTION_PROMPT_STYLE_CHOICES,
+        help="function-calling runner 的 --prompt-style",
+    )
+    parser.add_argument(
+        "--function-tool-catalog-format",
+        choices=FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
+        help="function-calling runner 的 --tool-catalog-format",
+    )
+    parser.add_argument("--function-cot-max-tokens", type=int, help="function-calling runner 的 --cot-max-tokens")
+    parser.add_argument("--function-decision-max-tokens", type=int, help="function-calling runner 的 --decision-max-tokens")
+    parser.add_argument("--function-planning-max-tokens", type=int, help="function-calling runner 的 --planning-max-tokens")
+    parser.add_argument("--function-final-max-tokens", type=int, help="function-calling runner 的 --final-max-tokens")
+    parser.add_argument("--function-answer-max-tokens", type=int, help="function-calling runner 的 --answer-max-tokens")
+    parser.add_argument("--function-history-max-chars", type=int, help="function-calling runner 的 --history-max-chars")
+    parser.add_argument("--function-max-rounds", type=int, help="function-calling runner 的 --max-rounds")
+    parser.add_argument("--function-max-steps", type=int, help="function-calling runner 的 --max-steps")
+    parser.add_argument("--function-max-tool-errors", type=int, help="function-calling runner 的 --max-tool-errors")
     parser.add_argument("--distributed-claims", action="store_true", help="启用 PostgreSQL claim/lease，允许多个 scheduler 节点协同")
     parser.add_argument("--scheduler-node-id", help="当前 scheduler 节点标识；默认取主机名")
     parser.add_argument("--lease-duration-s", type=int, default=900, help="claim/lease 有效期秒数")
@@ -271,6 +294,17 @@ def _dispatch_options_from_args(
             if getattr(args, "remote_batch_size", None) is not None
             else None
         ),
+        function_prompt_style=getattr(args, "function_prompt_style", None),
+        function_tool_catalog_format=getattr(args, "function_tool_catalog_format", None),
+        function_cot_max_tokens=getattr(args, "function_cot_max_tokens", None),
+        function_decision_max_tokens=getattr(args, "function_decision_max_tokens", None),
+        function_planning_max_tokens=getattr(args, "function_planning_max_tokens", None),
+        function_final_max_tokens=getattr(args, "function_final_max_tokens", None),
+        function_answer_max_tokens=getattr(args, "function_answer_max_tokens", None),
+        function_history_max_chars=getattr(args, "function_history_max_chars", None),
+        function_max_rounds=getattr(args, "function_max_rounds", None),
+        function_max_steps=getattr(args, "function_max_steps", None),
+        function_max_tool_errors=getattr(args, "function_max_tool_errors", None),
         distributed_claims=bool(getattr(args, "distributed_claims", False)),
         scheduler_node_id=(str(getattr(args, "scheduler_node_id", "") or "").strip() or None),
         lease_duration_s=int(getattr(args, "lease_duration_s", 900)),

@@ -27,12 +27,15 @@ from src.eval.function_calling.runner_common import (
     _resolve_function_calling_plan,
     _resolve_job_name,
 )
+from src.eval.function_calling.rwkv_prompt import (
+    JSON_CALL_STOP_SUFFIXES,
+    normalize_function_prompt_style,
+)
 from src.eval.function_calling.tau_bench import (
     TauManifestRecord,
     TauToolCall,
-    build_expected_context,
+    build_json_call_context,
     build_tau_system_prompt,
-    build_turn_completion_prompt,
     load_tau_manifest_records,
     parse_tool_call_or_final_answer,
     render_assistant_tool_message,
@@ -40,7 +43,7 @@ from src.eval.function_calling.tau_bench import (
     render_tool_result,
 )
 from src.eval.results.payloads import make_score_payload
-from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage, prompt_delta
+from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
@@ -279,23 +282,17 @@ def _run_tau(
 
     plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
-    cot_sampling = resolve_sampling_config(
-        run.dataset_slug,
-        run.model_name,
-        stage="cot",
-        fallback_templates="free_response_cot_default",
-    )
     decision_sampling = resolve_sampling_config(
         run.dataset_slug,
         run.model_name,
         stage="final",
         fallback_templates="instruction_following_default",
     )
-    if cot_sampling is None or decision_sampling is None:
+    if decision_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
+    normalize_function_prompt_style(getattr(args, "prompt_style", None))
     decision_sampling = decision_sampling.clamp(args.decision_max_tokens or 1024)
-    sampling_payload = normalize_sampling_config_by_stage([(1, cot_sampling), (2, decision_sampling)])
+    sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     batch_size = max(1, int(args.batch_size or 16))
@@ -324,36 +321,23 @@ def _run_tau(
             )
             for sample_index, record in repeated
         ]
-        cot_prompts = [
-            build_expected_context(
+        decision_prompts = [
+            build_json_call_context(
                 state.system_prompt,
                 trim_message_history(
                     state.prompt_messages,
                     max_chars=history_max_chars,
                 ),
+                history_max_chars=history_max_chars,
             )
             for state in probe_states
-        ]
-        cot_outputs = run.engine.generate(
-            cot_prompts,
-            sampling=cot_sampling,
-            batch_size=len(cot_prompts),
-            progress_desc="TauBench-Probe-CoT",
-            prompt_seeds=[
-                sample_repeat_seed(state.sample_index, state.repeat_index, stage=1)
-                for state in probe_states
-            ],
-        )
-        by_index = {int(item.prompt_index): item for item in cot_outputs}
-        decision_prompts = [
-            build_turn_completion_prompt(cot_prompts[idx], by_index[idx].text if idx in by_index else "")
-            for idx in range(len(cot_prompts))
         ]
         run.engine.generate(
             decision_prompts,
             sampling=decision_sampling,
             batch_size=len(decision_prompts),
             progress_desc="TauBench-Probe-Decision",
+            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in decision_prompts],
             prompt_seeds=[
                 sample_repeat_seed(state.sample_index, state.repeat_index, stage=2)
                 for state in probe_states
@@ -415,44 +399,23 @@ def _run_tau(
                     if not active:
                         break
 
-                    cot_prompts = [
-                        build_expected_context(
+                    decision_prompts = [
+                        build_json_call_context(
                             state.system_prompt,
                             trim_message_history(
                                 state.prompt_messages,
                                 max_chars=history_max_chars,
                             ),
+                            history_max_chars=history_max_chars,
                         )
                         for state in active
                     ]
-                    cot_outputs = run.engine.generate(
-                        cot_prompts,
-                        sampling=cot_sampling,
-                        batch_size=len(cot_prompts),
-                        progress_desc="TauBench-CoT",
-                        prompt_seeds=[
-                            sample_repeat_seed(
-                                state.sample_index,
-                                state.repeat_index,
-                                pass_index=state.pass_index,
-                                stage=state.turn_count * 2 + 1,
-                            )
-                            for state in active
-                        ],
-                    )
-                    cot_by_index = {int(item.prompt_index): item for item in cot_outputs}
-
-                    decision_prompts: list[str] = []
-                    for idx, cot_prompt in enumerate(cot_prompts):
-                        cot_output = cot_by_index.get(idx)
-                        decision_prompts.append(
-                            build_turn_completion_prompt(cot_prompt, cot_output.text if cot_output is not None else "")
-                        )
                     decision_outputs = run.engine.generate(
                         decision_prompts,
                         sampling=decision_sampling,
                         batch_size=len(decision_prompts),
                         progress_desc="TauBench-Decision",
+                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in decision_prompts],
                         prompt_seeds=[
                             sample_repeat_seed(
                                 state.sample_index,
@@ -467,24 +430,17 @@ def _run_tau(
 
                     finished_slots: list[int] = []
                     for slot_index, state in enumerate(active):
-                        cot_output = cot_by_index.get(slot_index)
                         decision_output = decision_by_index.get(slot_index)
-                        cot_text = cot_output.text if cot_output is not None else ""
+                        cot_text = ""
                         decision_text = decision_output.text if decision_output is not None else ""
-                        prior_context = cot_prompts[slot_index].replace("<|completions_of_cot|>", cot_text)
                         state.stages.append(
                             StageRecord(
-                                prompt=cot_prompts[slot_index],
-                                completion=cot_text,
-                                stop_reason=cot_output.finish_reason if cot_output is not None else "missing_output",
-                            )
-                        )
-                        state.stages.append(
-                            StageRecord(
-                                prompt=prompt_delta(decision_prompts[slot_index], prior_context),
+                                prompt=decision_prompts[slot_index],
                                 completion=decision_text,
                                 stop_reason=(
-                                    decision_output.finish_reason if decision_output is not None else "missing_output"
+                                    decision_output.finish_reason
+                                    if decision_output is not None
+                                    else "missing_output"
                                 ),
                             )
                         )
