@@ -28,7 +28,18 @@ from .simple_tool_call import SimpleToolCallEvaluation
 if TYPE_CHECKING:
     from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 
-load_dotenv()
+_ENV_LOADED = False
+
+
+def _load_env_once() -> None:
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+    load_dotenv()
+    _ENV_LOADED = True
+
+
+_load_env_once()
 
 OFFICIAL_TOOLALPACA_SOURCE = "tangqiaoyu/ToolAlpaca@main"
 
@@ -197,7 +208,7 @@ def judge_toolalpaca_solution(
     record: FunctionCallTaskRecord,
     execution_steps: Sequence[ToolAlpacaExecutionStep],
 ) -> dict[str, Any]:
-    load_dotenv()
+    _load_env_once()
     api_key = os.environ.get("JUDGE_API_KEY")
     if not api_key:
         raise ValueError("toolalpaca official judge requires JUDGE_API_KEY")
@@ -365,7 +376,7 @@ def _render_solution(
 
 
 def _judge_chat_completion(prompt: str, *, api_key: str, model: str, temperature: float) -> str:
-    load_dotenv()
+    _load_env_once()
     base_url = str(os.environ.get("JUDGE_BASE_URL") or "").rstrip("/")
     if not base_url:
         raise ValueError("toolalpaca official judge requires JUDGE_BASE_URL")

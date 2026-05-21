@@ -5,9 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 
-DEFAULT_TOOL_SCHEMA_MAX_CHARS = 1200
-DEFAULT_TOOL_RESULT_MAX_CHARS = 4000
-DEFAULT_TOOL_ERROR_MAX_CHARS = 1000
 DEFAULT_HISTORY_MAX_CHARS = 24000
 _TRUNCATION_NOTICE = "[Earlier conversation history truncated]"
 
@@ -27,17 +24,6 @@ def truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= 3:
         return text[:max_chars]
     return text[: max_chars - 3] + "..."
-
-
-def trim_history(history: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    if len(history) <= max_chars:
-        return history
-    keep_tail = max_chars - len(_TRUNCATION_NOTICE) - 1
-    if keep_tail <= 0:
-        return history[-max_chars:]
-    return f"{_TRUNCATION_NOTICE}\n{history[-keep_tail:]}"
 
 
 def trim_message_history(
@@ -109,11 +95,7 @@ def _fit_message_tail(message: Mapping[str, str], budget: int) -> dict[str, str]
 
 __all__ = [
     "DEFAULT_HISTORY_MAX_CHARS",
-    "DEFAULT_TOOL_ERROR_MAX_CHARS",
-    "DEFAULT_TOOL_RESULT_MAX_CHARS",
-    "DEFAULT_TOOL_SCHEMA_MAX_CHARS",
     "normalize_rwkv_text",
-    "trim_history",
     "trim_message_history",
     "truncate_text",
 ]

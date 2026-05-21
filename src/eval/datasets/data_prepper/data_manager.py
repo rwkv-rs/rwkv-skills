@@ -91,14 +91,9 @@ def available_code_generation_datasets() -> Iterable[str]:
 
 
 def available_function_call_datasets() -> Iterable[str]:
-    """列出 function_call / agent 领域数据集。"""
+    """列出 function_call 领域数据集。"""
     _ensure_registries()
     return FUNCTION_CALL_REGISTRY.names()
-
-
-def available_agent_datasets() -> Iterable[str]:
-    """兼容旧命名，等同于 available_function_call_datasets。"""
-    return available_function_call_datasets()
 
 
 def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[Path]:
@@ -154,7 +149,6 @@ __all__ = [
     "available_instruction_following_datasets",
     "available_code_generation_datasets",
     "available_function_call_datasets",
-    "available_agent_datasets",
     "prepare_dataset",
     "common",
 ]

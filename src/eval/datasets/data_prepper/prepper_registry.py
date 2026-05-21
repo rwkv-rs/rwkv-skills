@@ -43,7 +43,6 @@ FREE_ANSWER_REGISTRY = DatasetRegistry("free_answer")
 INSTRUCTION_FOLLOWING_REGISTRY = DatasetRegistry("instruction_following")
 CODE_GENERATION_REGISTRY = DatasetRegistry("code_generation")
 FUNCTION_CALL_REGISTRY = DatasetRegistry("function_call")
-AGENT_REGISTRY = FUNCTION_CALL_REGISTRY
 
 __all__ = [
     "DatasetRegistry",
@@ -53,5 +52,4 @@ __all__ = [
     "INSTRUCTION_FOLLOWING_REGISTRY",
     "CODE_GENERATION_REGISTRY",
     "FUNCTION_CALL_REGISTRY",
-    "AGENT_REGISTRY",
 ]

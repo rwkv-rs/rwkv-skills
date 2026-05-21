@@ -38,11 +38,6 @@ _STRING_FIELDS = {
     "cot_prompt_template",
     "final_prompt_template",
     "judge_prompt_template",
-    "function_call_system_template",
-    "function_call_user_template",
-    "function_call_assistant_prefix",
-    "agent_system_template",
-    "agent_user_template",
 }
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
@@ -61,11 +56,6 @@ class BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
-    function_call_system_template: str | None = None
-    function_call_user_template: str | None = None
-    function_call_assistant_prefix: str | None = None
-    agent_system_template: str | None = None
-    agent_user_template: str | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -319,11 +309,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
-    function_call_system_template: str | None = None
-    function_call_user_template: str | None = None
-    function_call_assistant_prefix: str | None = None
-    agent_system_template: str | None = None
-    agent_user_template: str | None = None
 
     for key, raw in table.items():
         if key in _INT_FIELDS:
@@ -361,30 +346,10 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "judge_prompt_template":
             judge_prompt_template = _coerce_str(raw)
             continue
-        elif key == "function_call_system_template":
-            function_call_system_template = _coerce_str(raw)
-            continue
-        elif key == "function_call_user_template":
-            function_call_user_template = _coerce_str(raw)
-            continue
-        elif key == "function_call_assistant_prefix":
-            function_call_assistant_prefix = _coerce_str(raw)
-            continue
-        elif key == "agent_system_template":
-            agent_system_template = _coerce_str(raw)
-            continue
-        elif key == "agent_user_template":
-            agent_user_template = _coerce_str(raw)
-            continue
         else:
             continue
         if value is not None:
             sampling_overrides[key] = value
-
-    if function_call_system_template is None:
-        function_call_system_template = agent_system_template
-    if function_call_user_template is None:
-        function_call_user_template = agent_user_template
 
     return BenchmarkModelConfig(
         sampling_overrides=sampling_overrides,
@@ -397,11 +362,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         cot_prompt_template=cot_prompt_template,
         final_prompt_template=final_prompt_template,
         judge_prompt_template=judge_prompt_template,
-        function_call_system_template=function_call_system_template,
-        function_call_user_template=function_call_user_template,
-        function_call_assistant_prefix=function_call_assistant_prefix,
-        agent_system_template=agent_system_template,
-        agent_user_template=agent_user_template,
     )
 
 

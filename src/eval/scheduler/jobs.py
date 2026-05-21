@@ -47,9 +47,7 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_cn": "test",
     "livecodebench": "test",
 }
-FUNCTION_CALL_DEFAULT_SPLITS: dict[str, str] = {
-    "assistantbench_offline": "validation",
-}
+FUNCTION_CALL_DEFAULT_SPLITS: dict[str, str] = {}
 
 
 @dataclass(frozen=True)

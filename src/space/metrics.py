@@ -48,7 +48,7 @@ def _normalize_subject_label(text: str) -> str:
 
 def _method_tag(is_cot: bool, *, domain: str | None = None, task: str | None = None) -> str:
     task_key = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(task or "")).strip("_")
-    if domain in {"function_call系列", "function_call", "agent系列"} or task_key in FUNCTION_CALL_JOBS:
+    if domain in {"function_call系列", "function_call"} or task_key in FUNCTION_CALL_JOBS:
         return "nocot"
     return "cot" if is_cot else "nocot"
 

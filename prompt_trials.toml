@@ -372,38 +372,6 @@ Assistant:<think"""
 final_prompt_template = """<Q><COT>
 Final answer:"""
 
-[trial.control_function_call]
-description = "Control: original function-call prompt."
-jobs = ["function_call"]
-benchmarks = ["assistantbench_offline_nocot"]
-
-[trial.function_call_v1]
-description = "Function-call single-turn QA: concise no-tools guard."
-jobs = ["function_call"]
-benchmarks = ["assistantbench_offline_nocot"]
-function_call_system_template = "Answer the task. Use only the provided text. Return only the final answer."
-function_call_user_template = """Task:
-<INSTRUCTION>
-
-Attachments:
-<ATTACHMENTS>
-
-Available tools:
-<TOOLS>"""
-
-[trial.function_call_v2]
-description = "Function-call single-turn QA: exact format guard."
-jobs = ["function_call"]
-benchmarks = ["assistantbench_offline_nocot"]
-function_call_system_template = "Give the exact final answer. Do not mention tools, browsing, or files unless provided."
-function_call_user_template = """<INSTRUCTION>
-
-Attachments:
-<ATTACHMENTS>
-
-Tools:
-<TOOLS>"""
-
 # Round 02 full benchmark prompts generated from prompt_1p5b_g1f_round01 winners.
 # All trials omit max_samples so they inherit the complete benchmark size from
 # configs/*.toml. Historical pilot results remain in the prompt database.

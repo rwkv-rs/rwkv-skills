@@ -39,15 +39,11 @@ NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")
 HIDDEN_DATASET_SLUGS = {"answer_judge_test"}
 FUNCTION_CALL_JOBS = {
-    "agent",
-    "eval_agent",
     "eval_function_call",
     "function_bfcl_ast",
-    "function_call",
     "function_toolalpaca",
 }
 FUNCTION_CALL_DATASET_PREFIXES = (
-    "assistantbench",
     "bfcl_",
     "toolalpaca_",
 )

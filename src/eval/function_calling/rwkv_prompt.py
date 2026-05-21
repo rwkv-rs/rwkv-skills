@@ -5,18 +5,6 @@ from typing import Any, Mapping, Sequence
 
 from .context_budget import normalize_rwkv_text, trim_message_history
 
-RWKV_OFFICIAL_JSON_PROMPT_STYLE = "rwkv_official_json"
-LEGACY_STAGED_PROMPT_STYLE = "staged_cot_router"
-FUNCTION_PROMPT_STYLE_CHOICES = (
-    RWKV_OFFICIAL_JSON_PROMPT_STYLE,
-    LEGACY_STAGED_PROMPT_STYLE,
-)
-DEFAULT_FUNCTION_PROMPT_STYLE = RWKV_OFFICIAL_JSON_PROMPT_STYLE
-
-JSON_TOOL_CATALOG_FORMAT = "json"
-FUNCTION_TOOL_CATALOG_FORMAT_CHOICES = (JSON_TOOL_CATALOG_FORMAT,)
-DEFAULT_TOOL_CATALOG_FORMAT = JSON_TOOL_CATALOG_FORMAT
-
 JSON_CALL_STOP_SUFFIXES = (
     "\n```",
     "```",
@@ -26,44 +14,12 @@ JSON_CALL_STOP_SUFFIXES = (
 )
 
 
-def normalize_function_prompt_style(value: str | None) -> str:
-    normalized = str(value or DEFAULT_FUNCTION_PROMPT_STYLE).strip().lower()
-    if normalized not in FUNCTION_PROMPT_STYLE_CHOICES:
-        raise ValueError(
-            f"unsupported function prompt style {value!r}; "
-            f"expected one of {', '.join(FUNCTION_PROMPT_STYLE_CHOICES)}"
-        )
-    return normalized
-
-
-def normalize_tool_catalog_format(value: str | None) -> str:
-    normalized = str(value or DEFAULT_TOOL_CATALOG_FORMAT).strip().lower()
-    if normalized not in FUNCTION_TOOL_CATALOG_FORMAT_CHOICES:
-        raise ValueError(
-            f"unsupported function tool catalog format {value!r}; "
-            f"expected one of {', '.join(FUNCTION_TOOL_CATALOG_FORMAT_CHOICES)}"
-        )
-    return normalized
-
-
 def assistant_json_prefix() -> str:
     return "Assistant: ```json\n"
 
 
-def render_json_function_call(name: str, arguments: Mapping[str, Any] | None = None) -> str:
-    payload = {
-        "name": str(name).strip(),
-        "arguments": dict(arguments or {}),
-    }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
 def render_assistant_json_block(json_text: str) -> str:
     return f"{assistant_json_prefix()}{normalize_rwkv_text(json_text)}\n```"
-
-
-def render_function_output_user_block(payload: Any) -> str:
-    return "User: Function output:\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_rwkv_json_call_prompt(
@@ -95,13 +51,6 @@ def build_rwkv_json_call_prompt(
     return "\n\n".join(parts)
 
 
-def extract_json_call_object_text(response: str) -> str:
-    candidate = extract_json_call_value_text(response)
-    if not candidate.startswith("{"):
-        raise ValueError(f"model response must be a JSON function call object: {candidate}")
-    return candidate
-
-
 def extract_json_call_value_text(response: str) -> str:
     normalized = _strip_assistant_prefix(normalize_rwkv_text(response))
     normalized = _strip_json_fence(normalized)
@@ -116,13 +65,6 @@ def extract_json_call_value_text(response: str) -> str:
     if trailing and trailing != "```":
         raise ValueError(f"model response has extra text after JSON function call object or array: {trailing}")
     return candidate
-
-
-def coerce_json_function_call_payload(payload: Any, *, context_label: str = "tool call") -> dict[str, Any]:
-    calls = _coerce_json_function_call_payloads(payload, context_label=context_label)
-    if not calls:
-        raise ValueError(f"{context_label} payload did not contain a function call")
-    return calls[0]
 
 
 def coerce_json_function_call_payloads(payload: Any, *, context_label: str = "tool call") -> list[dict[str, Any]]:
@@ -251,23 +193,8 @@ def _find_leading_json_value_end(text: str) -> int | None:
 
 
 __all__ = [
-    "DEFAULT_FUNCTION_PROMPT_STYLE",
-    "DEFAULT_TOOL_CATALOG_FORMAT",
-    "FUNCTION_PROMPT_STYLE_CHOICES",
-    "FUNCTION_TOOL_CATALOG_FORMAT_CHOICES",
     "JSON_CALL_STOP_SUFFIXES",
-    "JSON_TOOL_CATALOG_FORMAT",
-    "LEGACY_STAGED_PROMPT_STYLE",
-    "RWKV_OFFICIAL_JSON_PROMPT_STYLE",
-    "assistant_json_prefix",
     "build_rwkv_json_call_prompt",
-    "coerce_json_function_call_payload",
     "coerce_json_function_call_payloads",
-    "extract_json_call_object_text",
     "extract_json_call_value_text",
-    "normalize_function_prompt_style",
-    "normalize_tool_catalog_format",
-    "render_assistant_json_block",
-    "render_function_output_user_block",
-    "render_json_function_call",
 ]

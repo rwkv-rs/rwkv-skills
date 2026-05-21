@@ -54,10 +54,6 @@ PROMPT_FIELDS_BY_SECTION: dict[str, tuple[str, ...]] = {
 }
 DEFAULT_FIELDS = {
     "avg_k",
-    "agent_system_template",
-    "agent_user_template",
-    "function_call_system_template",
-    "function_call_user_template",
     "judge_prompt_template",
     "max_samples",
     "pass_k",

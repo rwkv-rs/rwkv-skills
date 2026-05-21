@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.eval.evaluators.coding_prompts import _format_lcb_cot_prompt, _format_prompt_no_echo
+from src.eval.evaluators.coding import _format_lcb_cot_prompt, _format_prompt_no_echo
 from src.infer.engine import _normalize_prompt
 
 
@@ -38,8 +38,6 @@ def test_formal_generation_prompts_do_not_insert_space_after_assistant_colon() -
         ROOT / "src/eval/evaluators/multi_choice.py",
         ROOT / "src/eval/evaluators/instruction_following.py",
         ROOT / "src/eval/evaluators/function_call.py",
-        ROOT / "configs/assistantbench.toml",
-        ROOT / "configs/assistantbench_offline.toml",
     ]
     prompts = [_format_prompt_no_echo("Write a function that returns 1.")]
     prompts.append(_format_lcb_cot_prompt("Write a program that prints 1.", None))

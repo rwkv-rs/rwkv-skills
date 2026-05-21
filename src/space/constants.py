@@ -90,8 +90,8 @@ DOMAIN_GROUPS = (
     {
         "key": "function_call",
         "label": "Function Call",
-        "domains": {"function_call系列", "function_call", "agent系列"},
-        "title": "函数调用 / Agent",
+        "domains": {"function_call系列", "function_call"},
+        "title": "函数调用",
     },
 )
 
