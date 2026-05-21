@@ -22,6 +22,8 @@ from src.eval.function_calling.rwkv_prompt import (
     FUNCTION_PROMPT_STYLE_CHOICES,
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
 )
+from src.eval.function_calling.agentbench import _run_agentbench
+from src.eval.function_calling.api_bank import _run_api_bank
 from src.eval.function_calling.bfcl_exec import _run_bfcl_exec
 from src.eval.function_calling.bfcl_v3_runner import _run_bfcl_v3
 from src.eval.function_calling.browsecomp import _run_browsecomp
@@ -102,6 +104,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MAX_TOOL_ERRORS,
         help="Abort one tau task after this many tool-call errors",
     )
+    parser.add_argument(
+        "--agentbench-controller-url",
+        help="AgentBench/AgentRL controller API URL, default AGENTBENCH_CONTROLLER_URL or http://127.0.0.1:5020/api",
+    )
     return parser.parse_args(argv)
 
 
@@ -116,6 +122,10 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         return FunctionCallingBenchmarkKind.BROWSECOMP
     if "function_mcp_bench" in job_names:
         return FunctionCallingBenchmarkKind.MCP_BENCH
+    if "function_api_bank" in job_names:
+        return FunctionCallingBenchmarkKind.API_BANK
+    if "function_agentbench" in job_names:
+        return FunctionCallingBenchmarkKind.AGENTBENCH
     if "function_bfcl_ast" in job_names:
         return FunctionCallingBenchmarkKind.BFCL_AST
     if "function_bfcl_exec" in job_names:
@@ -172,6 +182,10 @@ def main(
         return _run_browsecomp(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.MCP_BENCH:
         return _run_mcp_bench(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.API_BANK:
+        return _run_api_bank(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.AGENTBENCH:
+        return _run_agentbench(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_V3:
         return _run_bfcl_v3(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_AST:

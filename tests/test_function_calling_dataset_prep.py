@@ -13,6 +13,10 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "browsecomp" in names
     assert "browsecomp_zh" in names
     assert "mcp_bench" in names
+    assert "apibank_level1" in names
+    assert "apibank_level2" in names
+    assert "agentbench_db" in names
+    assert "agentbench_kg" in names
     assert "bfcl_simple_python" in names
     assert "bfcl_exec_multiple_ast" in names
     assert "bfcl_exec_multiple" in names
@@ -23,6 +27,74 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "toolalpaca_eval_real" in names
     assert "tau_bench_retail" in names
     assert "tau2_bench_airline" in names
+
+
+def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monkeypatch) -> None:
+    source_dir = tmp_path / "api-bank" / "lv1-lv2-samples" / "level-1-given-desc"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Demo-level-1-1.jsonl").write_text(
+        "\n".join(
+            [
+                '{"role":"User","text":"What is 2 plus 2?"}',
+                '{"role":"API","api_name":"Calculator","param_dict":{"formula":"2+2"},'
+                '"result":{"api_name":"Calculator","input":{"formula":"2+2"},"output":"4","exception":null}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.api_bank.api_bank_lv1_lv2_dir",
+        lambda: source_dir,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("apibank_level1", output_root, "test")
+
+    assert paths == [output_root / "apibank_level1" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "apibank_level1__Demo-level-1-1_001"
+    assert row["expected_tool_calls"] == [
+        {
+            "name": "Calculator",
+            "arguments": {"formula": "2+2"},
+            "argument_options": {"formula": ["2+2"]},
+        }
+    ]
+    assert row["metadata"]["source_format"] == "official_api_bank"
+
+
+def test_prepare_dataset_materializes_agentbench_specs(tmp_path: Path, monkeypatch) -> None:
+    db_file = tmp_path / "standard.jsonl"
+    db_file.write_text('{"description":"q1"}\n{"description":"q2"}\n', encoding="utf-8")
+    kg_file = tmp_path / "std.json"
+    kg_file.write_text('[{"question":"q","entities":[],"answer":[]}]', encoding="utf-8")
+
+    def _data_file(dataset_name: str) -> Path:
+        return db_file if dataset_name == "agentbench_db" else kg_file
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.agentbench.agentbench_data_file",
+        _data_file,
+    )
+
+    output_root = tmp_path / "prepared"
+    db_paths = prepare_dataset("agentbench_db", output_root, "test")
+    kg_paths = prepare_dataset("agentbench_kg", output_root, "test")
+
+    assert len(read_jsonl_items(db_paths[0])) == 2
+    assert read_jsonl_items(db_paths[0])[0]["task_name"] == "dbbench-std"
+    assert read_jsonl_items(kg_paths[0]) == [
+        {
+            "task_id": "agentbench_kg__00000",
+            "task_name": "kg-std",
+            "index": 0,
+            "metadata": {
+                "source_format": "official_agentbench_controller",
+                "source_path": str(kg_file),
+                "task_name": "kg-std",
+            },
+        }
+    ]
 
 
 def test_prepare_dataset_materializes_browsecomp_spec(tmp_path: Path, monkeypatch) -> None:

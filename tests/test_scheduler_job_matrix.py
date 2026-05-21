@@ -147,6 +147,8 @@ def test_locate_dataset_revalidates_registered_default_artifact(
 def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert "function_browsecomp" in JOB_CATALOGUE
     assert "function_mcp_bench" in JOB_CATALOGUE
+    assert "function_api_bank" in JOB_CATALOGUE
+    assert "function_agentbench" in JOB_CATALOGUE
     assert "function_bfcl_v3" in JOB_CATALOGUE
     assert "function_bfcl_ast" in JOB_CATALOGUE
     assert "function_bfcl_exec" in JOB_CATALOGUE
@@ -156,6 +158,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
 
     browsecomp_slugs = JOB_CATALOGUE["function_browsecomp"].dataset_slugs
     mcp_slugs = JOB_CATALOGUE["function_mcp_bench"].dataset_slugs
+    api_bank_slugs = JOB_CATALOGUE["function_api_bank"].dataset_slugs
+    agentbench_slugs = JOB_CATALOGUE["function_agentbench"].dataset_slugs
     bfcl_slugs = JOB_CATALOGUE["function_bfcl_v3"].dataset_slugs
     bfcl_ast_slugs = JOB_CATALOGUE["function_bfcl_ast"].dataset_slugs
     bfcl_exec_slugs = JOB_CATALOGUE["function_bfcl_exec"].dataset_slugs
@@ -166,6 +170,10 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("browsecomp_test") in browsecomp_slugs
     assert canonical_slug("browsecomp_zh_test") in browsecomp_slugs
     assert canonical_slug("mcp_bench_test") in mcp_slugs
+    assert canonical_slug("apibank_level1_test") in api_bank_slugs
+    assert canonical_slug("apibank_level2_test") in api_bank_slugs
+    assert canonical_slug("agentbench_db_test") in agentbench_slugs
+    assert canonical_slug("agentbench_kg_test") in agentbench_slugs
     assert canonical_slug("bfcl_v3_test") in bfcl_slugs
     assert canonical_slug("bfcl_simple_python_test") in bfcl_ast_slugs
     assert canonical_slug("bfcl_exec_simple_ast_test") in bfcl_ast_slugs
@@ -186,6 +194,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
 
     assert detect_job_from_dataset(canonical_slug("browsecomp_test"), is_cot=True) == "function_browsecomp"
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
+    assert detect_job_from_dataset(canonical_slug("apibank_level1_test"), is_cot=True) == "function_api_bank"
+    assert detect_job_from_dataset(canonical_slug("agentbench_db_test"), is_cot=True) == "function_agentbench"
     assert detect_job_from_dataset(canonical_slug("bfcl_v3_test"), is_cot=True) == "function_bfcl_v3"
     assert detect_job_from_dataset(canonical_slug("bfcl_multiple_test"), is_cot=True) == "function_bfcl_ast"
     assert detect_job_from_dataset(canonical_slug("bfcl_exec_simple_ast_test"), is_cot=True) == "function_bfcl_ast"

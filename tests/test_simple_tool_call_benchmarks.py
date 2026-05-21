@@ -24,6 +24,7 @@ from src.eval.function_calling.bfcl_exec import (
     BfclExecSandbox,
     evaluate_bfcl_exec_calls,
 )
+from src.eval.function_calling.api_bank import ApiBankCallResult, evaluate_api_bank_calls
 from src.eval.function_calling.toolalpaca import ToolAlpacaSandbox, evaluate_toolalpaca_actions
 
 
@@ -38,6 +39,10 @@ def test_simple_tool_call_benchmarks_are_registered() -> None:
     assert "bfcl_exec_multiple" in names
     assert "bfcl_exec_parallel" in names
     assert "bfcl_exec_parallel_multiple" in names
+    assert "apibank_level1" in names
+    assert "apibank_level2" in names
+    assert "agentbench_db" in names
+    assert "agentbench_kg" in names
     assert "toolalpaca_eval_simulated" in names
     assert "toolalpaca_eval_real" in names
 
@@ -100,6 +105,41 @@ def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkey
             },
         }
     ]
+
+
+def test_api_bank_evaluator_executes_official_style_sandbox() -> None:
+    class _FakeSandbox:
+        def api_call(self, api_name, arguments):
+            assert api_name == "Calculator"
+            assert arguments == {"formula": "2+2"}
+            return ApiBankCallResult(True, {"output": "4"})
+
+        def check_api_call_correctness(self, api_name, actual, expected):
+            assert api_name == "Calculator"
+            return actual == expected
+
+    record = SimpleToolCallRecord(
+        task_id="api-bank-0",
+        instruction="Return next API call",
+        tools=(),
+        expected_tool_calls=(
+            ToolCallExpectation(
+                name="Calculator",
+                arguments={"formula": "2+2"},
+                argument_options={"formula": ("2+2",)},
+            ),
+        ),
+        metadata={"expected_result": {"output": "4"}, "source_dir": "/tmp/api-bank/lv1-lv2-samples/level-1-given-desc"},
+    )
+
+    evaluation = evaluate_api_bank_calls(
+        record,
+        [{"name": "Calculator", "arguments": {"formula": "2+2"}}],
+        sandbox=_FakeSandbox(),
+    )
+
+    assert evaluation.is_passed is True
+    assert evaluation.reward == 1.0
 
 
 def test_prepare_dataset_materializes_bfcl_exec_ast_spec(tmp_path: Path, monkeypatch) -> None:

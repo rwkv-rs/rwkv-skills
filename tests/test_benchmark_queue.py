@@ -23,6 +23,8 @@ def test_detect_job_from_dataset_prioritizes_judge_and_agent_benchmarks() -> Non
     assert jobs.detect_job_from_dataset("bfcl_v3_test", True) == "function_bfcl_v3"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_ast_test", True) == "function_bfcl_ast"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_test", True) == "function_bfcl_exec"
+    assert jobs.detect_job_from_dataset("apibank_level2_test", True) == "function_api_bank"
+    assert jobs.detect_job_from_dataset("agentbench_kg_test", True) == "function_agentbench"
     assert jobs.detect_job_from_dataset("toolalpaca_eval_simulated_test", True) == "function_toolalpaca"
     assert jobs.detect_job_from_dataset("tau_bench_retail_test", True) == "function_tau_bench"
     assert jobs.detect_job_from_dataset("tau2_bench_telecom_base", True) == "function_tau2_bench"

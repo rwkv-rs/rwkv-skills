@@ -66,6 +66,14 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
         is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_V3
     )
     assert (
+        function_calling_runner._infer_benchmark_kind("apibank_level1_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.API_BANK
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("agentbench_db_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.AGENTBENCH
+    )
+    assert (
         function_calling_runner._infer_benchmark_kind("bfcl_simple_python_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_AST
     )

@@ -80,6 +80,19 @@ from .bfcl_exec import (
     normalize_bfcl_exec_manifest_row,
     render_bfcl_exec_call,
 )
+from .agentbench import (
+    AgentBenchControllerClient,
+    AgentBenchRecord,
+    build_agentbench_prompt,
+    load_agentbench_manifest_records,
+    load_agentbench_rows_from_source,
+)
+from .api_bank import (
+    ApiBankCallResult,
+    ApiBankSandbox,
+    evaluate_api_bank_calls,
+    load_api_bank_rows_from_source,
+)
 from .context_budget import (
     DEFAULT_HISTORY_MAX_CHARS,
     normalize_rwkv_text,
@@ -138,6 +151,10 @@ from .toolalpaca import evaluate_toolalpaca_actions
 
 __all__ = [
     "BFCL_COT_STOP_SUFFIX",
+    "AgentBenchControllerClient",
+    "AgentBenchRecord",
+    "ApiBankCallResult",
+    "ApiBankSandbox",
     "BFCL_DECISION_STOP_SUFFIXES",
     "BFCL_ROUTER_LABELS",
     "BFCL_V3_MAX_COT_CHARS",
@@ -191,6 +208,7 @@ __all__ = [
     "build_bfcl_tool_result_message",
     "build_bfcl_user_block",
     "build_bfcl_exec_prompt",
+    "build_agentbench_prompt",
     "build_simple_tool_call_prompt",
     "collect_bfcl_dataset_issues",
     "decode_bfcl_exec_response",
@@ -202,6 +220,7 @@ __all__ = [
     "decode_simple_tool_call_response",
     "execute_bfcl_official_tool_call",
     "evaluate_bfcl_exec_calls",
+    "evaluate_api_bank_calls",
     "evaluate_bfcl_v3_episode",
     "evaluate_simple_tool_calls",
     "evaluate_toolalpaca_actions",
@@ -210,6 +229,9 @@ __all__ = [
     "interpret_bfcl_assistant_output",
     "judge_browsecomp_answers",
     "load_bfcl_ast_rows_from_sources",
+    "load_agentbench_manifest_records",
+    "load_agentbench_rows_from_source",
+    "load_api_bank_rows_from_source",
     "load_bfcl_exec_manifest_records",
     "load_bfcl_exec_rows_from_sources",
     "load_bfcl_v3_manifest_records",

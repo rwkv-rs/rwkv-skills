@@ -26,6 +26,8 @@ class FunctionCallingBenchmarkKind(str, Enum):
     AUTO = "auto"
     BROWSECOMP = "browsecomp"
     MCP_BENCH = "mcp_bench"
+    API_BANK = "api_bank"
+    AGENTBENCH = "agentbench"
     BFCL_AST = "bfcl_ast"
     BFCL_EXEC = "bfcl_exec"
     BFCL_V3 = "bfcl_v3"

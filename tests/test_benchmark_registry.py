@@ -74,6 +74,8 @@ def test_human_eval_family_is_no_cot_only() -> None:
 def test_function_calling_benchmarks_are_cot_only() -> None:
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     mcp_bench = resolve_benchmark_metadata("mcp_bench_test")
+    apibank = resolve_benchmark_metadata("apibank_level1_test")
+    agentbench = resolve_benchmark_metadata("agentbench_db_test")
     bfcl_ast = resolve_benchmark_metadata("bfcl_simple_python_test")
     bfcl_exec_ast = resolve_benchmark_metadata("bfcl_exec_simple_ast_test")
     bfcl_exec = resolve_benchmark_metadata("bfcl_exec_simple_test")
@@ -87,6 +89,10 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)
     assert mcp_bench.field is BenchmarkField.FUNCTION_CALLING
     assert mcp_bench.scheduler_jobs == ("function_mcp_bench",)
+    assert apibank.field is BenchmarkField.FUNCTION_CALLING
+    assert apibank.scheduler_jobs == ("function_api_bank",)
+    assert agentbench.field is BenchmarkField.FUNCTION_CALLING
+    assert agentbench.scheduler_jobs == ("function_agentbench",)
     assert bfcl_ast.field is BenchmarkField.FUNCTION_CALLING
     assert bfcl_ast.scheduler_jobs == ("function_bfcl_ast",)
     assert bfcl_exec_ast.field is BenchmarkField.FUNCTION_CALLING
