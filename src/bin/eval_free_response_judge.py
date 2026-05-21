@@ -373,17 +373,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("⚠️ invalid_output 示例：")
                 for item in judge_stats.invalid_output_examples:
                     print(f"  - {item}")
-        if judge_stats.parsed_count == 0:
-            service.update_task_status(task_id=task_id, status="failed")
-            session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
-            if session_task_id:
-                try:
-                    service.update_task_session_status(task_id=session_task_id, session_status="failed")
-                except Exception:
-                    pass
-            raise RuntimeError(
-                "LLM judge 未成功解析任何样本，拒绝写入可能由 judge 故障导致的全 0 分数。"
-            )
     pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k_final)
     avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k_final)
     if evaluation.judge_accuracy is None:

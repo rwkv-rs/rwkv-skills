@@ -20,7 +20,7 @@ class LLMJudgeConfigTest(unittest.TestCase):
     def test_default_prompt_template_is_string(self) -> None:
         cfg = LLMJudgeConfig(api_key="k", model="m")
         self.assertIsInstance(cfg.prompt_template, str)
-        self.assertIn("mathematically and logically equivalent", cfg.prompt_template)
+        self.assertIn("semantically completely equivalent", cfg.prompt_template)
         self.assertIn("Only output 'True' or 'False'", cfg.prompt_template)
 
     def test_judge_accepts_strict_boolean_responses(self) -> None:
@@ -44,7 +44,7 @@ class LLMJudgeConfigTest(unittest.TestCase):
 
         self.assertEqual(result, [True, False])
 
-    def test_judge_accepts_boolean_after_think_block(self) -> None:
+    def test_judge_rejects_boolean_after_think_block(self) -> None:
         judge = LLMJudge(
             LLMJudgeConfig(
                 api_key="k",
@@ -68,10 +68,10 @@ class LLMJudgeConfigTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(result, [True, False])
+        self.assertEqual(result, [False, False])
         self.assertIsNotNone(judge.last_run_stats)
-        self.assertEqual(judge.last_run_stats.parsed_count, 2)
-        self.assertEqual(judge.last_run_stats.invalid_output_count, 0)
+        self.assertEqual(judge.last_run_stats.parsed_count, 0)
+        self.assertEqual(judge.last_run_stats.invalid_output_count, 2)
 
     def test_judge_rejects_non_strict_boolean_responses(self) -> None:
         judge = LLMJudge(

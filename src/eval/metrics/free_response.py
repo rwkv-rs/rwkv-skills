@@ -22,7 +22,6 @@ from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 _WHITESPACE_RE = re.compile(r"\s+")
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _THINK_OPEN_RE = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
-_STRICT_JUDGE_BOOL_RE = re.compile(r"^(?:`{1,3})?\s*(True|False)\s*(?:`{1,3})?$")
 _ANSWER_DELIMITERS = (
     ("{", "}"),
     (r"\(", r"\)"),
@@ -39,17 +38,10 @@ _PREFERRED_ANSWER_KEYS = (
 )
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
-    "You are a rigorous math answer judge.\\n\\n"
-    "Decide whether the student's answer is mathematically and logically equivalent to the "
-    "reference answer for the given question. Use the question only to understand "
-    "what mathematical object, value, expression, equation, condition, or set is "
-    "being asked for.\\n\\n"
-    "Return True when the student's answer and the reference answer have the same "
-    "mathematical and logical meaning. Return False when the student's answer is incomplete, "
-    "changes the mathematical meaning, gives an incompatible extra answer, omits "
-    "a required part, or cannot be interpreted as equivalent.\\n\\n"
-    "Input:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
-    "Student's Answer: <A>\\n\\nOutput: Only output 'True' or 'False'."
+    "You are a rigorous AI judge. Your task is to evaluate whether a student's "
+    "answer is semantically completely equivalent to the reference answer, based on "
+    "the provided question and reference answer.\\n\\nInput:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
+    "Student's Answer: <A>\\n\\nOutput Format:\\nStrictly adhere to the output format: Only output 'True' or 'False'."
 )
 
 
@@ -130,20 +122,6 @@ def _extract_answer_from_final_stage(prompt: str, completion: str) -> str:
 
 def _is_exact_match(prediction: str, reference: str) -> bool:
     return _normalize_text(prediction) == _normalize_text(reference)
-
-
-def _parse_judge_bool(content: str) -> bool | None:
-    """Parse strict judge booleans, allowing hidden reasoning wrappers."""
-    candidates = [content.strip()]
-    without_think = _THINK_BLOCK_RE.sub("", content).strip()
-    if without_think != candidates[0]:
-        candidates.append(without_think)
-
-    for candidate in candidates:
-        match = _STRICT_JUDGE_BOOL_RE.fullmatch(candidate)
-        if match is not None:
-            return match.group(1) == "True"
-    return None
 
 
 def resolve_reference_answer(record: FreeAnswerRecord) -> str:
@@ -266,14 +244,13 @@ class LLMJudge:
                         **request_kwargs,
                     )
                     content = (response.choices[0].message.content or "").strip()
-                    parsed = _parse_judge_bool(content)
 
-                    if parsed is None:
+                    if content not in {"True", "False"}:
                         last_error_kind = "invalid_output"
                         last_error = f"invalid output: {content!r}"
                         raise ValueError(f"LLM judge 输出非法值: {content!r}")
 
-                    return parsed, "parsed", None
+                    return content == "True", "parsed", None
 
                 except Exception as exc:
                     if not last_error:
