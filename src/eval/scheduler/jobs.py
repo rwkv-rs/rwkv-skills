@@ -145,37 +145,8 @@ def _build_dataset_catalogues() -> tuple[
     FUNCTION_CALL_DATASET_SLUGS,
 ) = _build_dataset_catalogues()
 
-MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = tuple(
-    canonical_slug(slug)
-    for slug in (
-        "aime24_test",
-        "aime25_test",
-        "algebra222_test",
-        "asdiv_test",
-        "beyond_aime_test",
-        "brumo25_test",
-        "college_math_test",
-        "gsm_plus_test",
-        "hendrycks_math_test",
-        "hmmt_feb25_test",
-        "math_odyssey_test",
-        "mawps_test",
-        "olympiadbench_test",
-        "omni_math_test",
-        "svamp_test",
-    )
-)
-LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
-    canonical_slug(slug)
-    for slug in (
-        "amc23_test",
-        "comp_math_24_25_test",
-        "gaokao2023en_test",
-        "gsm8k_test",
-        "math_500_test",
-        "minerva_math_test",
-    )
-)
+MATH_DATASET_SLUGS_FOR_FREE_RESPONSE: Final[tuple[str, ...]] = ()
+LLM_JUDGE_DATASET_SLUGS: Final[tuple[str, ...]] = MATH_DATASET_SLUGS
 
 ifeval_related = [slug for slug in SPECIAL_DATASET_SLUGS if slug.startswith("ifeval")]
 if not ifeval_related:
@@ -191,8 +162,27 @@ MBPP_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
 LCB_CODE_SLUGS: Final[tuple[str, ...]] = tuple(
     sorted(slug for slug in CODE_DATASET_SLUGS if slug.startswith("livecodebench"))
 )
-
-
+BFCL_AST_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "bfcl_simple_python_test",
+        "bfcl_multiple_test",
+    )
+)
+BFCL_EXEC_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "bfcl_exec_simple_test",
+        "bfcl_exec_multiple_test",
+    )
+)
+TOOLALPACA_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "toolalpaca_eval_simulated_test",
+        "toolalpaca_eval_real_test",
+    )
+)
 JOB_CATALOGUE: dict[str, JobSpec] = {
     "multi_choice_plain": JobSpec(
         name="multi_choice_plain",
@@ -302,10 +292,26 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         domain="instruction_following",
         extra_args=("--no-param-search",),
     ),
-    "function_call": JobSpec(
-        name="function_call",
+    "function_bfcl_ast": JobSpec(
+        name="function_bfcl_ast",
         module="src.bin.eval_function_call",
-        dataset_slugs=FUNCTION_CALL_DATASET_SLUGS or (canonical_slug("assistantbench_offline_validation"),),
+        dataset_slugs=BFCL_AST_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
+    "function_bfcl_exec": JobSpec(
+        name="function_bfcl_exec",
+        module="src.bin.eval_function_call",
+        dataset_slugs=BFCL_EXEC_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
+    "function_toolalpaca": JobSpec(
+        name="function_toolalpaca",
+        module="src.bin.eval_function_call",
+        dataset_slugs=TOOLALPACA_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
         batch_flag="--batch-size",

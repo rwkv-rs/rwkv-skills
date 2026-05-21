@@ -38,6 +38,19 @@ DATA_VERSIONS = (
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")
 HIDDEN_DATASET_SLUGS = {"answer_judge_test"}
+FUNCTION_CALL_JOBS = {
+    "agent",
+    "eval_agent",
+    "eval_function_call",
+    "function_bfcl_ast",
+    "function_call",
+    "function_toolalpaca",
+}
+FUNCTION_CALL_DATASET_PREFIXES = (
+    "assistantbench",
+    "bfcl_",
+    "toolalpaca_",
+)
 
 
 def _record_error(message: str, errors: list[str] | None) -> None:
@@ -232,6 +245,8 @@ def _parse_int(
 
 def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
     slug = canonical_slug(dataset_slug)
+    if slug.startswith(FUNCTION_CALL_DATASET_PREFIXES):
+        return "function_call系列"
     if slug.startswith("mmlu"):
         return "mmlu系列"
     job = detect_job_from_dataset(slug, is_cot=is_cot)
@@ -239,18 +254,19 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
         return "coding系列"
     if job == "instruction_following":
         return "instruction following系列"
-    if job in {"agent", "function_call"}:
+    if job in FUNCTION_CALL_JOBS:
         return "function_call系列"
     if job in {"free_response", "free_response_judge"}:
         return "math reasoning系列"
     if job in {"multi_choice_plain", "multi_choice_cot"}:
         return "multi-choice系列"
     if task:
+        task_slug = canonical_slug(task)
         if "code" in task:
             return "coding系列"
         if "instruction" in task:
             return "instruction following系列"
-        if task in {"agent", "function_call"}:
+        if task_slug in FUNCTION_CALL_JOBS or task_slug.startswith("function_"):
             return "function_call系列"
     return "其他"
 

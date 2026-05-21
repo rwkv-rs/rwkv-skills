@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from typing import Any
 
 from src.eval.datasets.data_struct.function_call import (
-    AgentTaskDataset,
-    AgentTaskRecord,
     FunctionCallTaskDataset,
     FunctionCallTaskRecord,
 )
@@ -27,14 +24,6 @@ INSTRUCTION_KEYS: tuple[str, ...] = (
     "query",
     "problem",
 )
-ANSWER_KEYS: tuple[str, ...] = (
-    "expected_call",
-    "expected_tool_call",
-    "target_call",
-    "tool_call",
-    "function_call",
-    "answer",
-)
 MESSAGES_KEYS: tuple[str, ...] = (
     "messages",
     "conversation",
@@ -45,7 +34,7 @@ MESSAGES_KEYS: tuple[str, ...] = (
 class JsonlFunctionCallTaskLoader(
     JsonlDatasetLoader[FunctionCallTaskRecord, FunctionCallTaskDataset]
 ):
-    """Load canonical function-call tasks from JSONL."""
+    """Load simple tool-call tasks from JSONL."""
 
     dataset_cls = FunctionCallTaskDataset
 
@@ -96,33 +85,18 @@ class JsonlFunctionCallTaskLoader(
             return [{"role": "user", "content": instruction}]
         raise ValueError(f"{self.path}: messages 或 instruction 字段缺失, payload={payload}")
 
-    def _extract_expected_call(self, payload: dict) -> dict[str, Any]:
-        for key in ANSWER_KEYS:
-            value = payload.get(key)
-            if isinstance(value, dict):
-                return self._normalize_call(value)
-            if isinstance(value, str) and value.strip():
-                try:
-                    parsed = json.loads(value)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"{self.path}: {key} 必须是 JSON function call 对象, payload={payload}"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise ValueError(
-                        f"{self.path}: {key} 必须是 JSON object, payload={payload}"
-                    )
-                return self._normalize_call(parsed)
-        raise ValueError(f"{self.path}: expected_call 字段缺失, payload={payload}")
-
-    def _normalize_call(self, call: dict[str, Any]) -> dict[str, Any]:
-        name = call.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError(f"{self.path}: expected_call.name 字段缺失或类型错误, call={call}")
-        arguments = call.get("arguments", {})
-        if not isinstance(arguments, dict):
-            raise ValueError(f"{self.path}: expected_call.arguments 必须是 object, call={call}")
-        return {"name": name.strip(), "arguments": dict(arguments)}
+    def _extract_expected_tool_calls(self, payload: dict) -> list[dict[str, Any]]:
+        value = payload.get("expected_tool_calls")
+        if not isinstance(value, list):
+            raise ValueError(f"{self.path}: expected_tool_calls 字段缺失或类型错误, payload={payload}")
+        calls: list[dict[str, Any]] = []
+        for call in value:
+            if not isinstance(call, dict):
+                raise ValueError(f"{self.path}: expected_tool_calls 必须只包含 object, call={call}")
+            calls.append(dict(call))
+        if not calls:
+            raise ValueError(f"{self.path}: expected_tool_calls 不能为空")
+        return calls
 
     @staticmethod
     def _coerce_positive_int(value: Any) -> int | None:
@@ -148,7 +122,7 @@ class JsonlFunctionCallTaskLoader(
         task_id = self._extract_str(payload, TASK_ID_KEYS, "task_id")
         instruction = self._extract_str(payload, INSTRUCTION_KEYS, "instruction", required=False) or ""
         messages = self._extract_messages(payload)
-        expected_call = self._extract_expected_call(payload)
+        expected_tool_calls = self._extract_expected_tool_calls(payload)
 
         env = self._extract_dict(payload, ("env", "environment", "env_spec"))
         scorer = self._extract_dict(payload, ("scorer", "scorer_spec", "evaluation"))
@@ -160,16 +134,28 @@ class JsonlFunctionCallTaskLoader(
         merged_metadata = dict(base_metadata) if isinstance(base_metadata, dict) else {}
 
         if not env:
-            env = {"type": "json_function_call"}
+            env = {"type": "simple_tool_call"}
+        if str(env.get("type") or "") != "simple_tool_call":
+            raise ValueError(f"{self.path}: function_call 仅支持 simple_tool_call env, payload={payload}")
+
         if not scorer:
-            scorer = {"type": "json_function_call_exact"}
+            scorer = {
+                "type": "simple_tool_call",
+                "expected_tool_calls": expected_tool_calls,
+            }
+        scorer_type = str(scorer.get("type") or "simple_tool_call")
+        if scorer_type not in {"simple_tool_call", "bfcl_exec", "toolalpaca_official"}:
+            raise ValueError(
+                f"{self.path}: function_call 仅支持 simple_tool_call/bfcl_exec/toolalpaca_official scorer, "
+                f"payload={payload}"
+            )
 
         used_keys = {
             key
             for key in (
                 *TASK_ID_KEYS,
                 *INSTRUCTION_KEYS,
-                *ANSWER_KEYS,
+                "expected_tool_calls",
                 "env",
                 "environment",
                 "env_spec",
@@ -194,7 +180,7 @@ class JsonlFunctionCallTaskLoader(
             task_id=str(task_id),
             instruction=instruction,
             messages=messages,
-            expected_call=expected_call,
+            expected_tool_calls=expected_tool_calls,
             env=env,
             scorer=scorer,
             tools=tools,
@@ -205,10 +191,6 @@ class JsonlFunctionCallTaskLoader(
         )
 
 
-JsonlAgentTaskLoader = JsonlFunctionCallTaskLoader
-
-
 __all__ = [
     "JsonlFunctionCallTaskLoader",
-    "JsonlAgentTaskLoader",
 ]

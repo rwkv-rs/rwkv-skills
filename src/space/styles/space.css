@@ -564,14 +564,16 @@ gradio-app,
 
 .bench-table td.cell-delta-warn-neg {
   background: #7f1d1d !important;
-  color: #fbbf24 !important;
+  color: #fff !important;
   font-weight: 700;
 }
 
 .bench-table td.cell-delta-suspect {
-  background: #78350f !important;
-  color: #fde68a !important;
+  background: #d97706 !important;
+  color: #fff !important;
+  font-size: 0.78rem;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .bench-table tbody tr:hover td {
@@ -599,7 +601,7 @@ gradio-app,
 }
 
 .bench-table tbody tr:hover td.cell-delta-suspect {
-  background: #78350f !important;
+  background: #d97706 !important;
 }
 
 .bench-table tbody tr:hover td.cell-status-error {

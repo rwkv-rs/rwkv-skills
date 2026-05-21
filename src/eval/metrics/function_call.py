@@ -143,71 +143,97 @@ def _extract_function_call_from_events(events: list[Any]) -> str:
 def _score_prediction(record: FunctionCallTaskRecord | None, prediction: str) -> tuple[bool, str, str]:
     if record is None:
         return False, "missing_record", ""
-    scorer = record.scorer or {}
-    scorer_type = str(scorer.get("type") or "json_function_call_exact")
-    expected, expected_error = _normalize_call(record.expected_call)
-    reference = _call_to_json(expected) if expected is not None else ""
-    if expected is None:
-        return False, expected_error or "missing_reference_call", ""
-    if scorer_type == "json_function_call_exact":
-        actual, actual_error = _parse_function_call(prediction)
-        if actual is None:
-            return False, actual_error or "invalid_json_function_call", reference
-        if actual["name"] != expected["name"]:
-            return False, "name_mismatch", reference
-        if actual["arguments"] != expected["arguments"]:
-            return False, "arguments_mismatch", reference
-        return True, "", reference
-    return False, f"unsupported_scorer:{scorer_type}", reference
+    if not record.expected_tool_calls:
+        return False, "missing_expected_tool_calls", ""
+    if _looks_like_template_leak(prediction):
+        return False, "decision stage leaked internal template/control tokens", ""
+    from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response
 
-
-def _parse_function_call(raw: str) -> tuple[dict[str, Any] | None, str]:
-    text = raw.strip()
-    if not text:
-        return None, "empty_output"
-    decoder = json.JSONDecoder()
+    parse_error: str | None = None
+    decoded_calls: list[dict[str, Any]] = []
     try:
-        parsed, end = decoder.raw_decode(text)
-    except json.JSONDecodeError:
-        return None, "invalid_json"
-    if text[end:].strip():
-        return None, "invalid_json_trailing_text"
-    if not isinstance(parsed, dict):
-        return None, "json_not_object"
-    extra_keys = set(parsed) - {"name", "arguments"}
-    if extra_keys:
-        return None, "unexpected_call_fields"
-    return _normalize_call(parsed)
+        decoded_calls = decode_simple_tool_call_response(prediction)
+    except Exception as exc:  # noqa: BLE001
+        parse_error = str(exc)
+    if _uses_bfcl_exec_scorer(record):
+        from src.eval.function_calling.bfcl_exec import evaluate_bfcl_executable_calls
+
+        result = evaluate_bfcl_executable_calls(record, decoded_calls, parse_error=parse_error)
+    elif _uses_toolalpaca_official_scorer(record):
+        from src.eval.function_calling.toolalpaca_official import evaluate_toolalpaca_official_calls
+
+        result = evaluate_toolalpaca_official_calls(record, decoded_calls, parse_error=parse_error)
+    else:
+        from src.eval.function_calling.simple_tool_call import (
+            evaluate_simple_tool_calls,
+            normalize_simple_tool_call_manifest_row,
+        )
+
+        simple_record = normalize_simple_tool_call_manifest_row(
+            {
+                "task_id": record.task_id,
+                "instruction": record.instruction,
+                "tools": record.tools,
+                "expected_tool_calls": record.expected_tool_calls,
+                "metadata": record.metadata,
+            },
+            index=0,
+        )
+        result = evaluate_simple_tool_calls(simple_record, decoded_calls, parse_error=parse_error)
+    reference = json.dumps(
+        result.details.get("expected_tool_calls") or [],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return bool(result.is_passed), result.fail_reason, reference
 
 
-def _normalize_call(call: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    name = call.get("name")
-    if not isinstance(name, str) or not name.strip():
-        return None, "missing_name"
-    arguments = call.get("arguments", {})
-    if not isinstance(arguments, dict):
-        return None, "arguments_not_object"
-    return {"name": name.strip(), "arguments": dict(arguments)}, ""
+def _uses_bfcl_exec_scorer(record: FunctionCallTaskRecord) -> bool:
+    scorer_type = str((record.scorer or {}).get("type") or "")
+    if scorer_type == "bfcl_exec":
+        return True
+    category = str((record.metadata or {}).get("category") or "")
+    if category in {"exec_simple", "exec_multiple"}:
+        return True
+    return str(record.task_id or "").startswith(("exec_simple_", "exec_multiple_"))
 
 
-def _call_to_json(call: Mapping[str, Any]) -> str:
-    return json.dumps(call, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def _uses_toolalpaca_official_scorer(record: FunctionCallTaskRecord) -> bool:
+    scorer_type = str((record.scorer or {}).get("type") or "")
+    if scorer_type == "toolalpaca_official":
+        return True
+    source_format = str((record.metadata or {}).get("source_format") or "")
+    return source_format == "official_toolalpaca" and str(record.task_id or "").startswith("toolalpaca_")
 
 
 def _record_env_type(record: FunctionCallTaskRecord | None) -> str:
     if record is None:
         return "unknown"
     env = record.env or {}
-    return str(env.get("type") or "unknown")
+    return str(env.get("type") or "simple_tool_call")
 
 
-AgentMetrics = FunctionCallMetrics
-evaluate_agent = evaluate_function_call
+_TEMPLATE_LEAK_MARKERS = (
+    "<system message>",
+    "</system message>",
+    "<assistant>",
+    "</assistant>",
+    "<user_input>",
+    "</user_input>",
+)
+
+
+def _looks_like_template_leak(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    if "<system message>" in lowered and "you are a helpful assistant" in lowered:
+        return True
+    marker_hits = sum(lowered.count(marker) for marker in _TEMPLATE_LEAK_MARKERS)
+    return marker_hits >= 3
 
 
 __all__ = [
     "FunctionCallMetrics",
     "evaluate_function_call",
-    "AgentMetrics",
-    "evaluate_agent",
 ]

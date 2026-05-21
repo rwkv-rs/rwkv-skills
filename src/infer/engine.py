@@ -48,7 +48,9 @@ class InferenceEngine:
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         prompt_seeds: Sequence[int] | None = None,
+        preserve_prompt_whitespace: bool = False,
     ) -> list[GenerationOutput]:
         return _continuous_batching(
             self.model,
@@ -59,7 +61,9 @@ class InferenceEngine:
             progress_desc,
             probe_only,
             on_complete,
+            prompt_stop_suffixes,
             prompt_seeds,
+            preserve_prompt_whitespace,
         )
 
 
@@ -73,6 +77,7 @@ class _ActiveTask:
     prompt: str
     pending_tokens: deque[int]
     generated_tokens: list[int]
+    stop_suffixes: tuple[str, ...]
     new_token: int | None
     finish_reason: str | None
 
@@ -86,12 +91,16 @@ def _continuous_batching(
     progress_desc: str,
     probe_only: bool = False,
     on_complete: Callable[[GenerationOutput], None] | None = None,
+    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
     prompt_seeds: Sequence[int] | None = None,
+    preserve_prompt_whitespace: bool = False,
 ) -> list[GenerationOutput]:
     if not prompts:
         return []
     if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
         raise ValueError("prompt_seeds 长度必须与 prompts 一致")
+    if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
+        raise ValueError("prompt_stop_suffixes 长度必须与 prompts 一致")
     batch_size = max(1, min(batch_size, len(prompts)))
 
     vocab_size = _infer_vocab_size(model)
@@ -145,12 +154,13 @@ def _continuous_batching(
 
     encoded = deque()
     for idx, prompt in enumerate(prompts):
-        normalized_prompt = _normalize_prompt(prompt)
+        normalized_prompt = prompt if preserve_prompt_whitespace else _normalize_prompt(prompt)
         tokens = tokenizer.encode(normalized_prompt)
         if sampling.pad_zero:
             tokens = [0] + tokens
         seed = int(prompt_seeds[idx]) if prompt_seeds is not None else None
-        encoded.append((idx, normalized_prompt, tokens, seed))
+        stop_suffixes = () if prompt_stop_suffixes is None else _normalize_stop_suffixes(prompt_stop_suffixes[idx])
+        encoded.append((idx, normalized_prompt, tokens, seed, stop_suffixes))
 
     stop_tokens = set(sampling.stop_tokens)
     ban_tokens = tuple(sampling.ban_tokens or ())
@@ -173,9 +183,9 @@ def _continuous_batching(
 
     active_tasks: list[_ActiveTask] = []
     for slot_idx in range(batch_size):
-        prompt_idx, prompt, tokens, seed = encoded.popleft()
+        prompt_idx, prompt, tokens, seed, stop_suffixes = encoded.popleft()
         pending = deque(tokens)
-        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], None, None))
+        active_tasks.append(_ActiveTask(prompt_idx, prompt, pending, [], stop_suffixes, None, None))
         if seed is not None:
             _set_sampler_seed(slot_idx, seed)
 
@@ -231,17 +241,22 @@ def _continuous_batching(
             if new_token is None:
                 continue
             reached_stop = new_token in stop_tokens
-            reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
+            matched_stop_suffix = False
             if not reached_stop:
                 task.pending_tokens.append(new_token)
                 task.generated_tokens.append(new_token)
-            if reached_stop or reached_length:
+                matched_stop_suffix = _matches_stop_suffix(
+                    _decode_tokens(tokenizer, task.generated_tokens),
+                    task.stop_suffixes,
+                )
+            reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
+            if reached_stop or matched_stop_suffix or reached_length:
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
                     text="",
-                    finish_reason="stop_token" if reached_stop else "max_length",
+                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
                 )
                 if on_complete is not None and not probe_only:
                     output.text = _decode_tokens(tokenizer, output.token_ids)
@@ -249,9 +264,9 @@ def _continuous_batching(
                 outputs.append(output)
                 pbar.update(1)
                 if encoded:
-                    prompt_idx, prompt, tokens, seed = encoded.popleft()
+                    prompt_idx, prompt, tokens, seed, stop_suffixes = encoded.popleft()
                     pending = deque(tokens)
-                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], None, None)
+                    active_tasks[idx] = _ActiveTask(prompt_idx, prompt, pending, [], stop_suffixes, None, None)
                     _reset_slot(idx)
                     if seed is not None:
                         _set_sampler_seed(idx, seed)
@@ -370,6 +385,16 @@ def _decode_tokens(tokenizer: TokenizerProtocol, token_ids: Sequence[int]) -> st
         except Exception:
             tokens = tokens[:-1]
     return text
+
+
+def _normalize_stop_suffixes(stop_suffixes: Sequence[str] | None) -> tuple[str, ...]:
+    return tuple(str(item) for item in (stop_suffixes or ()) if str(item))
+
+
+def _matches_stop_suffix(text: str, stop_suffixes: Sequence[str]) -> bool:
+    if not text or not stop_suffixes:
+        return False
+    return any(suffix in text for suffix in stop_suffixes)
 
 
 __all__ = ["InferenceEngine", "GenerationOutput"]

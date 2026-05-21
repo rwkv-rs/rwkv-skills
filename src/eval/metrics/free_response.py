@@ -114,6 +114,8 @@ def _extract_balanced_answer(text: str, opener: str, closer: str) -> str:
             continue
         output.append(text[idx])
         idx += 1
+    if depth > 1:
+        output.extend(closer for _ in range(depth - 1))
     return "".join(output).strip()
 
 

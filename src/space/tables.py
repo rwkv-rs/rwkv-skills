@@ -110,7 +110,12 @@ def _render_summary(
         )
 
     normalized_view = _normalize_table_view(view_mode)
-    benchmark_count = len({(_dataset_base(entry.dataset), _method_tag(entry.cot)) for entry in visible})
+    benchmark_count = len(
+        {
+            (_dataset_base(entry.dataset), _method_tag(entry.cot, domain=entry.domain, task=entry.task))
+            for entry in visible
+        }
+    )
     lines = [
         f"- 数据源：PostgreSQL (`{db_host}:{db_port}/{db_name}`)",
         "- 数据范围：仅正式评测（已过滤 param-search）",
@@ -140,7 +145,7 @@ def _build_pivot_table(selection: SelectionState, entries: Iterable[ScoreEntry] 
 
     for entry in target_entries:
         base = _dataset_base(entry.dataset)
-        method = _method_tag(entry.cot)
+        method = _method_tag(entry.cot, domain=entry.domain, task=entry.task)
         row_key = (base, method)
         meta = row_meta.get(row_key)
         if meta is None:

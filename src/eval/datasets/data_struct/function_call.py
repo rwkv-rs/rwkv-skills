@@ -13,7 +13,7 @@ class FunctionCallTaskRecord(RecordBase):
     task_id: str
     instruction: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
-    expected_call: dict[str, Any] = field(default_factory=dict)
+    expected_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     env: dict[str, Any] = field(default_factory=dict)
     scorer: dict[str, Any] = field(default_factory=dict)
     tools: list[dict[str, Any]] = field(default_factory=list)
@@ -26,13 +26,7 @@ class FunctionCallTaskDataset(JsonlDataset[FunctionCallTaskRecord]):
     """Immutable dataset wrapper for function-call benchmark tasks."""
 
 
-AgentTaskRecord = FunctionCallTaskRecord
-AgentTaskDataset = FunctionCallTaskDataset
-
-
 __all__ = [
     "FunctionCallTaskRecord",
     "FunctionCallTaskDataset",
-    "AgentTaskRecord",
-    "AgentTaskDataset",
 ]

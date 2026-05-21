@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Function-call benchmark evaluation pipeline."""
+"""Simple tool-call benchmark evaluation pipeline."""
 
 import json
 from dataclasses import asdict, dataclass, field
@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from src.eval.benchmark_config import BenchmarkModelConfig
 from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
 from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
+from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
@@ -19,17 +20,7 @@ from .common import sample_repeat_seed
 if TYPE_CHECKING:
     from src.infer.model import ModelLoadConfig
 
-DEFAULT_FUNCTION_CALL_SYSTEM_TEMPLATE = (
-    "Tools:\n<TOOLS>\n"
-    "Return only a JSON function call."
-)
-DEFAULT_FUNCTION_CALL_USER_TEMPLATE = "<HISTORY>"
-SUPPORTED_FUNCTION_CALL_ENVS = (
-    "json_function_call",
-    "function_call",
-    "single_turn_function_call",
-    "multi_turn_function_call",
-)
+SUPPORTED_FUNCTION_CALL_ENVS = ("simple_tool_call",)
 
 
 @dataclass(slots=True)
@@ -81,6 +72,7 @@ class FunctionCallPipeline:
         config: BenchmarkModelConfig | None = None,
         on_record: Callable[[dict[str, Any]], None] | None = None,
     ) -> FunctionCallPipelineResult:
+        _ = config
         records, resolved_name = self._load_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
@@ -111,17 +103,18 @@ class FunctionCallPipeline:
         if skipped > 0:
             print(f"⏩ Function-call 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
 
-        chunk_size = max(1, int(batch_size))
+        _ = batch_size
+        chunk_size = 1
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict[str, Any]] = []
 
         for start in range(0, len(entries), chunk_size):
             chunk = entries[start : start + chunk_size]
-            prompts = [self._make_prompt(record, config=config) for _idx, record, _sample_id in chunk]
-            env_types = [str(record.env.get("type") or "json_function_call") for _idx, record, _sample_id in chunk]
+            prompts = [self._make_prompt(record) for _idx, record, _sample_id in chunk]
+            env_types = [str(record.env.get("type") or "simple_tool_call") for _idx, record, _sample_id in chunk]
             for env_type in env_types:
                 if env_type not in SUPPORTED_FUNCTION_CALL_ENVS:
-                    raise NotImplementedError(f"暂不支持的 function_call env.type: {env_type}")
+                    raise NotImplementedError(f"不支持的 function_call env.type: {env_type}")
 
             def _on_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
@@ -129,14 +122,10 @@ class FunctionCallPipeline:
                     return
                 record_idx, record, sample_id = chunk[local_idx]
                 prompt = prompts[local_idx]
-                completion = output.text or ""
+                completion = _trim_stop_suffixes(output.text or "", JSON_CALL_STOP_SUFFIXES)
                 function_call_text = completion.strip()
-                system_prompt = self._render_system_prompt(record, config=config)
-                user_prompt = self._render_user_prompt(record, config=config)
                 events = self._build_events(
                     record=record,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
                     completion=completion,
                     function_call_text=function_call_text,
                     finish_reason=output.finish_reason,
@@ -161,8 +150,8 @@ class FunctionCallPipeline:
                     "final_answer": function_call_text,
                     "events": [asdict(event) for event in events],
                     "stats": asdict(stats),
-                    "function_call_env_type": str(record.env.get("type") or "json_function_call"),
-                    "function_call_scorer_type": str(record.scorer.get("type") or "json_function_call_exact"),
+                    "function_call_env_type": str(record.env.get("type") or "simple_tool_call"),
+                    "function_call_scorer_type": str(record.scorer.get("type") or "simple_tool_call"),
                 }
                 if on_record is not None:
                     on_record(payload)
@@ -174,10 +163,12 @@ class FunctionCallPipeline:
                 batch_size=min(chunk_size, len(prompts)),
                 progress_desc="Generating function-call responses",
                 on_complete=_on_complete,
+                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
                 prompt_seeds=[
                     sample_repeat_seed(record_idx, sample_id, stage=1)
                     for record_idx, _record, sample_id in chunk
                 ],
+                preserve_prompt_whitespace=True,
             )
         return FunctionCallPipelineResult(dataset_name, len(entries), payloads)
 
@@ -185,28 +176,21 @@ class FunctionCallPipeline:
         self,
         *,
         record: FunctionCallTaskRecord,
-        system_prompt: str,
-        user_prompt: str,
         completion: str,
         function_call_text: str,
         finish_reason: str,
     ) -> list[FunctionCallEvent]:
         events: list[FunctionCallEvent] = []
-        if system_prompt.strip():
-            events.append(FunctionCallEvent(type="system", role="system", content=system_prompt))
-        if record.messages:
-            for message in record.messages:
-                role = str(message.get("role") or "user").strip().lower()
-                events.append(
-                    FunctionCallEvent(
-                        type=role,
-                        role="user" if role in {"tool", "function"} else role,
-                        content=self._message_content(message),
-                        name=self._message_name(message),
-                    )
+        for message in record.messages:
+            role = str(message.get("role") or "user").strip().lower()
+            events.append(
+                FunctionCallEvent(
+                    type=role,
+                    role="user" if role in {"tool", "function"} else role,
+                    content=self._message_content(message),
+                    name=self._message_name(message),
                 )
-        elif user_prompt.strip():
-            events.append(FunctionCallEvent(type="user", role="user", content=user_prompt))
+            )
         events.append(
             FunctionCallEvent(
                 type="assistant",
@@ -220,61 +204,27 @@ class FunctionCallPipeline:
         )
         return events
 
-    def _make_prompt(self, record: FunctionCallTaskRecord, *, config: BenchmarkModelConfig | None) -> str:
-        system_prompt = self._render_system_prompt(record, config=config)
-        user_prompt = self._render_user_prompt(record, config=config)
-        parts: list[str] = []
-        if system_prompt.strip():
-            parts.append(f"System: {system_prompt.strip()}")
-        if user_prompt.strip():
-            parts.append(user_prompt.strip())
-        prompt = "\n\n".join(parts).rstrip()
-        if not prompt.endswith("Assistant:"):
-            prompt = f"{prompt}\n\nAssistant:"
-        return prompt
-
-    def _render_system_prompt(
-        self,
-        record: FunctionCallTaskRecord,
-        *,
-        config: BenchmarkModelConfig | None,
-    ) -> str:
-        template = (
-            (config.function_call_system_template if config is not None else None)
-            or (config.agent_system_template if config is not None else None)
-            or DEFAULT_FUNCTION_CALL_SYSTEM_TEMPLATE
-        )
-        return self._render_template(template, record)
-
-    def _render_user_prompt(
-        self,
-        record: FunctionCallTaskRecord,
-        *,
-        config: BenchmarkModelConfig | None,
-    ) -> str:
-        template = (
-            (config.function_call_user_template if config is not None else None)
-            or (config.agent_user_template if config is not None else None)
-            or DEFAULT_FUNCTION_CALL_USER_TEMPLATE
-        )
-        return self._render_template(template, record)
-
-    def _render_template(self, template: str, record: FunctionCallTaskRecord) -> str:
-        attachments = self._format_named_items(record.attachments)
-        tools = self._format_tools(record.tools)
-        history = self._format_history(record)
-        return (
-            template.replace("<INSTRUCTION>", record.instruction)
-            .replace("<ATTACHMENTS>", attachments)
-            .replace("<TOOLS>", tools)
-            .replace("<HISTORY>", history)
-            .replace("<MESSAGES>", history)
-            .replace("<MAX_STEPS>", str(record.max_steps or 1))
+    def _make_prompt(self, record: FunctionCallTaskRecord) -> str:
+        from src.eval.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS
+        from src.eval.function_calling.simple_tool_call import (
+            build_simple_tool_call_prompt,
+            normalize_simple_tool_call_manifest_row,
         )
 
-    @staticmethod
-    def _format_tools(tools: list[dict[str, Any]]) -> str:
-        return json.dumps(tools, ensure_ascii=False, indent=2)
+        simple_record = normalize_simple_tool_call_manifest_row(
+            {
+                "task_id": record.task_id,
+                "instruction": record.instruction or self._format_history(record),
+                "tools": record.tools,
+                "expected_tool_calls": record.expected_tool_calls,
+                "metadata": record.metadata,
+            },
+            index=0,
+        )
+        return build_simple_tool_call_prompt(
+            simple_record,
+            history_max_chars=DEFAULT_HISTORY_MAX_CHARS,
+        )
 
     def _format_history(self, record: FunctionCallTaskRecord) -> str:
         messages = record.messages or [{"role": "user", "content": record.instruction}]
@@ -313,20 +263,6 @@ class FunctionCallPipeline:
             return name.strip()
         return None
 
-    @staticmethod
-    def _format_named_items(items: list[dict[str, Any]]) -> str:
-        if not items:
-            return "None"
-        lines: list[str] = []
-        for item in items:
-            name = str(item.get("name") or item.get("path") or item.get("type") or "item").strip()
-            desc = str(item.get("description") or item.get("summary") or item.get("value") or "").strip()
-            if desc:
-                lines.append(f"- {name}: {desc}")
-            else:
-                lines.append(f"- {name}")
-        return "\n".join(lines)
-
     def _load_records(
         self,
         dataset_path: str,
@@ -339,19 +275,12 @@ class FunctionCallPipeline:
         return records, infer_dataset_slug_from_path(dataset_path)
 
 
-AgentEvent = FunctionCallEvent
-AgentRunStats = FunctionCallRunStats
-AgentPipelineResult = FunctionCallPipelineResult
-AgentPipeline = FunctionCallPipeline
-
-
-__all__ = [
-    "FunctionCallEvent",
-    "FunctionCallRunStats",
-    "FunctionCallPipeline",
-    "FunctionCallPipelineResult",
-    "AgentEvent",
-    "AgentRunStats",
-    "AgentPipeline",
-    "AgentPipelineResult",
-]
+def _trim_stop_suffixes(text: str, stop_suffixes: tuple[str, ...]) -> str:
+    earliest: int | None = None
+    for suffix in stop_suffixes:
+        index = text.find(suffix)
+        if index >= 0 and (earliest is None or index < earliest):
+            earliest = index
+    if earliest is None:
+        return text
+    return text[:earliest]

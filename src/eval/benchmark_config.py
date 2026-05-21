@@ -40,6 +40,7 @@ _STRING_FIELDS = {
     "judge_prompt_template",
     "function_call_system_template",
     "function_call_user_template",
+    "function_call_assistant_prefix",
     "agent_system_template",
     "agent_user_template",
 }
@@ -62,6 +63,7 @@ class BenchmarkModelConfig:
     judge_prompt_template: str | None = None
     function_call_system_template: str | None = None
     function_call_user_template: str | None = None
+    function_call_assistant_prefix: str | None = None
     agent_system_template: str | None = None
     agent_user_template: str | None = None
 
@@ -319,6 +321,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     judge_prompt_template: str | None = None
     function_call_system_template: str | None = None
     function_call_user_template: str | None = None
+    function_call_assistant_prefix: str | None = None
     agent_system_template: str | None = None
     agent_user_template: str | None = None
 
@@ -364,6 +367,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "function_call_user_template":
             function_call_user_template = _coerce_str(raw)
             continue
+        elif key == "function_call_assistant_prefix":
+            function_call_assistant_prefix = _coerce_str(raw)
+            continue
         elif key == "agent_system_template":
             agent_system_template = _coerce_str(raw)
             continue
@@ -393,6 +399,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         judge_prompt_template=judge_prompt_template,
         function_call_system_template=function_call_system_template,
         function_call_user_template=function_call_user_template,
+        function_call_assistant_prefix=function_call_assistant_prefix,
         agent_system_template=agent_system_template,
         agent_user_template=agent_user_template,
     )

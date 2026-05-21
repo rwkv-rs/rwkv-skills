@@ -53,7 +53,8 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
 
         formatted = _format_prompt(prompt)
 
-        self.assertIn("Assistant:from typing import List", formatted)
+        self.assertTrue(formatted.endswith("Assistant: <think>\n</think>\n```python"))
+        self.assertNotIn("```python\n\n\n", formatted)
         self.assertIn("def has_close_elements(numbers: List[float], threshold: float) -> bool:", formatted)
         self.assertNotIn("Function signature:", formatted)
 

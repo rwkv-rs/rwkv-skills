@@ -32,7 +32,7 @@ def _format_prompt(prompt: str) -> str:
     return (
         "User:You are a top-level code master. Complete the following code without any additional text or explanation:\n"
         f"{clean}\n\n"
-        "A: <think>\n</think>\n```python"
+        "Assistant: <think>\n</think>\n```python"
     )
 
 
@@ -146,14 +146,12 @@ class CodingPipeline:
         if not records:
             return CodingPipelineResult(dataset_name, 0, 0, [])
 
-        is_human_eval_fix = "human_eval_fix" in dataset_path.lower()
-
         if probe_only:
             prompts = []
             probe_seeds: list[int] = []
             for idx in range(batch_size):
                 record = records[idx % len(records)]
-                prompt_text = _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
+                prompt_text = _format_prompt(record.prompt)
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(idx % len(records), idx // len(records), stage=1))
             _ = self.engine.generate(
@@ -169,9 +167,7 @@ class CodingPipeline:
         entries: list[tuple[str, CodeGenerationRecord, int, int]] = []
         for rec_idx, record in enumerate(records):
             for sample_idx in range(samples_per_task):
-                prompt_text = (
-                    _format_prompt_no_echo(record.prompt) if is_human_eval_fix else _format_prompt(record.prompt)
-                )
+                prompt_text = _format_prompt(record.prompt)
                 entries.append((prompt_text, record, rec_idx, sample_idx))
 
         skip_keys = skip_keys or set()

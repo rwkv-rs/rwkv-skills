@@ -35,10 +35,11 @@ def test_extract_answer_uses_final_prompt_boxed_brace_format() -> None:
     assert _extract_answer_from_final_stage(prompt, completion) == r"C=\dfrac{\pi}{3}"
 
 
-def test_extract_answer_keeps_final_stage_text_when_wrapper_is_unclosed() -> None:
+def test_extract_answer_closes_unclosed_inner_wrapper() -> None:
     prompt = "\n</think>\nTherefore, the final answer is \\(\\boxed{"
 
-    assert _extract_answer_from_final_stage(prompt, r"-1-\sqrt{3") == r"-1-\sqrt{3"
+    assert _extract_answer_from_final_stage(prompt, r"-1-\sqrt{3") == r"-1-\sqrt{3}"
+    assert _extract_answer_from_final_stage(prompt, r"3") == "3"
 
 
 def test_extract_answer_supports_original_latex_paren_stage_format() -> None:

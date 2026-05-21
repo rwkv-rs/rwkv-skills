@@ -1,0 +1,14 @@
+[default]
+template = "instruction_following_default"
+avg_k = [1]
+report_avg_k = [1]
+
+[tool]
+template = "function_call_default"
+max_generate_tokens = 1024
+temperature = 1.0
+top_k = 200
+top_p = 0.0
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99

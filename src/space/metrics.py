@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Sequence
 
-from .data import ScoreEntry
+from .data import FUNCTION_CALL_JOBS, ScoreEntry
 from .constants import (
     AIME_BASES,
     IFEVAL_BASES,
@@ -46,12 +46,15 @@ def _normalize_subject_label(text: str) -> str:
     return text.replace("_", " ").strip().lower()
 
 
-def _method_tag(is_cot: bool) -> str:
+def _method_tag(is_cot: bool, *, domain: str | None = None, task: str | None = None) -> str:
+    task_key = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(task or "")).strip("_")
+    if domain in {"function_call系列", "function_call", "agent系列"} or task_key in FUNCTION_CALL_JOBS:
+        return "nocot"
     return "cot" if is_cot else "nocot"
 
 
 def _benchmark_name(entry: ScoreEntry) -> str:
-    return f"{_dataset_base(entry.dataset)}_{_method_tag(entry.cot)}"
+    return f"{_dataset_base(entry.dataset)}_{_method_tag(entry.cot, domain=entry.domain, task=entry.task)}"
 
 
 def _format_param(token: str | None) -> str:
@@ -356,8 +359,8 @@ def _styled_delta_cell(delta_value: float | None, *, warn: bool = False) -> tupl
     large_delta = abs(rounded) >= 5.0 - 1e-6
     if large_delta or warn:
         if rounded > 0:
-            return f"⚠ {text}", "cell-delta-warn-pos"
-        return f"⚠ {text}", "cell-delta-warn-neg"
+            return text, "cell-delta-warn-pos"
+        return text, "cell-delta-warn-neg"
 
     if delta_value > 1e-6:
         return text, "cell-delta-pos"
@@ -368,8 +371,9 @@ def _styled_delta_cell(delta_value: float | None, *, warn: bool = False) -> tupl
 
 def _styled_suspect_cell(delta_value: float | None, reason: str) -> tuple[str, str]:
     """Return ``(formatted_text, css_class)`` for a suspect anomaly cell."""
+    _ = reason
     text = _format_delta_value(delta_value)
-    return f"⚠ {text} {reason}", "cell-delta-suspect"
+    return text, "cell-delta-suspect"
 
 
 # ---------------------------------------------------------------------------

@@ -66,17 +66,36 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
+def _simple_tool_call_job_name(slug: str) -> str | None:
+    benchmark = str(slug).rsplit("_", 1)[0]
+    if benchmark in {"bfcl_exec_simple", "bfcl_exec_multiple"}:
+        return "function_bfcl_exec"
+    if benchmark in {"bfcl_simple_python", "bfcl_multiple"}:
+        return "function_bfcl_ast"
+    if benchmark in {"toolalpaca_eval_simulated", "toolalpaca_eval_real"}:
+        return "function_toolalpaca"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    records = JsonlFunctionCallTaskLoader(str(dataset_path)).load()
+    if any(not record.expected_tool_calls for record in records):
+        raise ValueError(f"{slug} 不是 simple tool-call 数据集")
+    job_name = _simple_tool_call_job_name(str(slug))
+    if job_name is None:
+        raise ValueError(f"function_call 仅支持 BFCL/ToolAlpaca 数据集: {slug}")
     sampling = resolve_sampling_config(
         slug,
         model_name,
-        fallback_templates=("function_call_cot_default", "agent_cot_default"),
+        stage="tool",
+        fallback_templates="instruction_following_default",
     )
+    if sampling is not None:
+        sampling = sampling.clamp(768)
     if sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
@@ -85,7 +104,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_avg_k = _report_avg_k(slug, model_name, avg_k)
     sample_limit = _resolve_max_samples(slug, model_name, args)
     samples_per_task = max(max_generation_k(avg_k), 1)
-    records = JsonlFunctionCallTaskLoader(str(dataset_path)).load()
 
     init_orm(DEFAULT_DB_CONFIG)
     service = EvalDbService()
@@ -98,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     task_id = service.create_task_from_context(
         ctx=ctx,
-        job_name="eval_function_call",
+        job_name=job_name,
         dataset=str(slug),
         model=model_name,
         is_param_search=False,
@@ -128,7 +146,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             sample_limit=sample_limit,
             samples_per_task=samples_per_task,
             skip_keys=skip_keys,
-            config=config,
             on_record=writer.enqueue,
         )
     except BaseException:
@@ -166,7 +183,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             **avg_payload,
         },
         samples=metrics.samples,
-        task="function_call",
+        task=job_name,
         task_details={
             "env_breakdown": metrics.env_breakdown or {},
             **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
