@@ -391,8 +391,8 @@ def test_toolalpaca_official_scorer_executes_and_judges_local_json(tmp_path) -> 
     }
     path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
     with (
-        patch("src.eval.function_calling.toolalpaca_official.requests.request") as mocked_request,
-        patch("src.eval.function_calling.toolalpaca_official.judge_toolalpaca_solution") as mocked_judge,
+        patch("src.eval.function_calling.one_step.toolalpaca.requests.request") as mocked_request,
+        patch("src.eval.function_calling.one_step.toolalpaca.judge_toolalpaca_solution") as mocked_judge,
     ):
         mocked_request.return_value.status_code = 200
         mocked_request.return_value.text = '{"temperature":21}'
@@ -516,11 +516,311 @@ def test_function_call_loader_rejects_legacy_env_and_scorer(tmp_path) -> None:
 
 
 def test_function_call_scheduler_exposes_only_bfcl_and_toolalpaca_jobs() -> None:
+    from src.eval.scheduler.cli import _resolve_job_list
+    from src.eval.scheduler.jobs import FUNCTION_CALL_FUTURE_BENCHMARK_JOBS, JOB_ORDER
+
     assert "function_call" not in JOB_CATALOGUE
     assert JOB_CATALOGUE["function_bfcl_ast"].is_cot is False
     assert JOB_CATALOGUE["function_bfcl_exec"].is_cot is False
     assert JOB_CATALOGUE["function_toolalpaca"].is_cot is False
+    assert JOB_CATALOGUE["function_one_step_bfcl_ast"].is_cot is False
+    assert JOB_CATALOGUE["function_one_step_bfcl_exec"].is_cot is False
+    assert JOB_CATALOGUE["function_one_step_toolalpaca"].is_cot is False
+    assert "function_one_step_bfcl_ast" not in JOB_ORDER
+    assert _resolve_job_list(("function_one_step_bfcl_ast",), None, None) == ("function_one_step_bfcl_ast",)
+    for job_name in FUNCTION_CALL_FUTURE_BENCHMARK_JOBS:
+        assert JOB_CATALOGUE[job_name].domain == "function_call"
+        if job_name not in {"function_one_step_apibank_l1", "function_agent_apibank_l2"}:
+            assert JOB_CATALOGUE[job_name].dataset_slugs == ()
+        assert job_name not in JOB_ORDER
+        assert _resolve_job_list((job_name,), None, None) == (job_name,)
+    assert detect_job_from_dataset("apibank_l1_test", is_cot=False) == "function_one_step_apibank_l1"
+    assert detect_job_from_dataset("apibank_l2_test", is_cot=False) == "function_agent_apibank_l2"
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=False) == "function_bfcl_exec"
     assert detect_job_from_dataset("bfcl_multiple_test", is_cot=False) == "function_bfcl_ast"
     assert detect_job_from_dataset("toolalpaca_eval_real_test", is_cot=False) == "function_toolalpaca"
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=True) is None
+
+
+def test_function_call_eval_preserves_legacy_job_unless_one_step_alias_is_scheduled(monkeypatch) -> None:
+    from src.eval.function_calling.one_step.jobs import simple_tool_call_job_name
+
+    monkeypatch.delenv("RWKV_SKILLS_JOB_NAME", raising=False)
+    assert simple_tool_call_job_name("bfcl_multiple_test") == "function_bfcl_ast"
+
+    monkeypatch.setenv("RWKV_SKILLS_JOB_NAME", "function_one_step_bfcl_ast")
+    assert simple_tool_call_job_name("bfcl_multiple_test") == "function_one_step_bfcl_ast"
+
+    monkeypatch.setenv("RWKV_SKILLS_JOB_NAME", "function_one_step_bfcl_exec")
+    assert simple_tool_call_job_name("bfcl_multiple_test") == "function_bfcl_ast"
+    assert simple_tool_call_job_name("apibank_l1_test") == "function_one_step_apibank_l1"
+
+
+def test_one_step_modules_preserve_legacy_imports() -> None:
+    from src.eval.evaluators.function_call import FunctionCallPipeline as LegacyPipeline
+    from src.eval.function_calling.bfcl_exec import evaluate_bfcl_executable_calls as legacy_bfcl_exec
+    from src.eval.function_calling.one_step.bfcl_exec import evaluate_bfcl_executable_calls as one_step_bfcl_exec
+    from src.eval.function_calling.one_step.pipeline import FunctionCallPipeline as OneStepPipeline
+    from src.eval.function_calling.one_step.simple_tool_call import (
+        decode_simple_tool_call_response as one_step_decode,
+    )
+    from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response as legacy_decode
+
+    assert LegacyPipeline is OneStepPipeline
+    assert legacy_decode is one_step_decode
+    assert legacy_bfcl_exec is one_step_bfcl_exec
+
+
+def test_agent_runner_records_full_trajectory() -> None:
+    from src.eval.function_calling.agent.env import AgentObservation, AgentStepResult
+    from src.eval.function_calling.agent.runner import run_function_calling_agent
+
+    class FakeEnv:
+        def __init__(self) -> None:
+            self.actions = []
+
+        def reset(self) -> AgentObservation:
+            return AgentObservation("ready", {"source": "fake"})
+
+        def step(self, action) -> AgentStepResult:
+            self.actions.append(action)
+            return AgentStepResult(
+                AgentObservation("done", {"rows": 1}),
+                done=True,
+                score=1.0,
+                success=True,
+                details={"ok": True},
+            )
+
+    env = FakeEnv()
+
+    def generate_action(events, observation, step):
+        assert step == 0
+        assert observation.content == "ready"
+        assert events[-1]["type"] == "observation"
+        return '{"name":"query","arguments":{"sql":"select 1"}}'
+
+    result = run_function_calling_agent(env, generate_action)
+
+    assert result.success is True
+    assert result.score == 1.0
+    assert env.actions[0].name == "query"
+    assert [event["type"] for event in result.events] == [
+        "observation",
+        "model_output",
+        "action",
+        "env_result",
+        "final_score",
+    ]
+    assert result.events[-1]["metadata"]["finish_reason"] == "done"
+
+
+def test_agent_runner_records_parse_error() -> None:
+    from src.eval.function_calling.agent.env import AgentObservation
+    from src.eval.function_calling.agent.runner import run_function_calling_agent
+
+    class FakeEnv:
+        def reset(self) -> AgentObservation:
+            return AgentObservation("ready")
+
+        def step(self, action):  # pragma: no cover - parse error should stop first
+            raise AssertionError("env.step should not be called")
+
+    result = run_function_calling_agent(FakeEnv(), lambda _events, _observation, _step: "not json")
+
+    assert result.success is False
+    assert result.details["finish_reason"] == "parse_error"
+    assert result.details["parse_error_count"] == 1
+    assert [event["type"] for event in result.events] == [
+        "observation",
+        "model_output",
+        "error",
+        "final_score",
+    ]
+
+
+def test_future_official_adapter_boundaries_are_declared(tmp_path) -> None:
+    from src.eval.function_calling.agent.adapters.agentbench import (
+        AgentBenchAdapterConfig,
+        require_agentbench_assets,
+    )
+    from src.eval.function_calling.agent.adapters.apibank import (
+        ApiBankLevel2AdapterConfig,
+        require_apibank_level2_assets,
+    )
+    from src.eval.function_calling.common.action import ToolAction
+    from src.eval.function_calling.one_step.apibank import (
+        apibank_action_text,
+        require_official_apibank_root,
+    )
+
+    apibank_root = tmp_path / "api-bank"
+    apibank_root.mkdir()
+    (apibank_root / "evaluator.py").write_text("", encoding="utf-8")
+    (apibank_root / "lv1-lv2-samples" / "level-2-toolsearcher").mkdir(parents=True)
+    agentbench_root = tmp_path / "AgentBench"
+    (agentbench_root / "src" / "server" / "tasks" / "dbbench").mkdir(parents=True)
+    (agentbench_root / "src" / "server" / "tasks" / "knowledgegraph").mkdir(parents=True)
+
+    assert require_official_apibank_root(apibank_root) == apibank_root
+    assert require_apibank_level2_assets(ApiBankLevel2AdapterConfig(official_root=apibank_root)) == apibank_root
+    assert require_agentbench_assets(AgentBenchAdapterConfig(task="db", official_root=agentbench_root)) == agentbench_root
+    assert require_agentbench_assets(AgentBenchAdapterConfig(task="kg", official_root=agentbench_root)) == agentbench_root
+    assert apibank_action_text(ToolAction(name="Calculator", arguments={"formula": "1+1"})) == (
+        "[Calculator(formula='1+1')]"
+    )
+
+
+def test_apibank_level2_env_runs_expected_trace(monkeypatch, tmp_path) -> None:
+    from src.eval.function_calling.agent.adapters import apibank as apibank_agent
+
+    history = [
+        {"role": "User", "text": "Can you calculate 1+1?"},
+        {
+            "role": "API",
+            "api_name": "ToolSearcher",
+            "param_dict": {"keywords": "calculator"},
+            "result": {
+                "api_name": "ToolSearcher",
+                "input": {"keywords": "calculator"},
+                "output": {"name": "Calculator"},
+                "exception": None,
+            },
+        },
+        {
+            "role": "API",
+            "api_name": "Calculator",
+            "param_dict": {"formula": "1+1"},
+            "result": {
+                "api_name": "Calculator",
+                "input": {"formula": "1+1"},
+                "output": 2,
+                "exception": None,
+            },
+        },
+    ]
+
+    class FakeApi:
+        def check_api_call_correctness(self, result, ground_truth) -> bool:
+            return result == ground_truth
+
+    class FakeToolManager:
+        def api_call(self, name, **kwargs):
+            return {
+                "api_name": name,
+                "input": kwargs,
+                "output": 2,
+                "exception": None,
+            }
+
+        def init_tool(self, name):
+            return FakeApi()
+
+    root = tmp_path / "api-bank"
+    root.mkdir()
+    (root / "evaluator.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(apibank_agent, "_official_tool_manager", lambda _root, **_kwargs: FakeToolManager())
+    row = {
+        "task_id": "apibank_l2__fake",
+        "env": {"type": "apibank_level2", "official_root": str(root)},
+        "metadata": {
+            "apibank_official_root": str(root),
+            "apibank_history": history,
+            "apibank_expected_api_steps": [item for item in history if item["role"] == "API"],
+        },
+    }
+
+    env = apibank_agent.ApiBankLevel2Env(row)
+    observation = env.reset()
+    results = [env.step(action) for action in apibank_agent.expected_apibank_level2_actions(row)]
+
+    assert observation.content == "User: Can you calculate 1+1?"
+    assert results[0].done is False
+    assert results[-1].done is True
+    assert results[-1].score == 1.0
+    assert results[-1].success is True
+
+
+def test_agent_metrics_use_trajectory_payload() -> None:
+    from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
+
+    metrics = evaluate_function_call_agent(
+        [
+            {
+                "benchmark_name": "apibank_l2",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "final_answer": '{"name":"Calculator","arguments":{"formula":"1+1"}}',
+                "success": True,
+                "official_score": 1.0,
+                "stats": {"steps": 2, "tool_calls": 2},
+                "agent_details": {
+                    "steps": 2,
+                    "invalid_action_count": 0,
+                    "parse_error_count": 0,
+                    "timeout": False,
+                    "finish_reason": "done",
+                },
+                "events": [{"type": "final_score", "metadata": {"success": True}}],
+            }
+        ]
+    )
+
+    assert metrics.success_rate == 1.0
+    assert metrics.official_score == 1.0
+    assert metrics.avg_steps == 2.0
+    assert metrics.invalid_action_rate == 0.0
+    assert metrics.timeout_rate == 0.0
+    assert metrics.parse_error_rate == 0.0
+    assert metrics.payloads and metrics.payloads[0]["is_passed"] is True
+
+
+def test_apibank_official_scorer_uses_adapter_boundary(monkeypatch, tmp_path) -> None:
+    from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
+    from src.eval.function_calling.one_step import apibank as apibank_adapter
+
+    class FakeApi:
+        def check_api_call_correctness(self, result, ground_truth) -> bool:
+            return result == ground_truth
+
+    class FakeToolManager:
+        def api_call(self, name, **kwargs):
+            return {"api_name": name, "input": kwargs, "output": 2, "exception": None}
+
+        def init_tool(self, name):
+            return FakeApi()
+
+    monkeypatch.setattr(apibank_adapter, "require_official_apibank_root", lambda _root=None: tmp_path)
+    monkeypatch.setattr(apibank_adapter, "_official_tool_manager", lambda _root, **_kwargs: FakeToolManager())
+
+    record = FunctionCallTaskRecord(
+        task_id="apibank_l1__fake__000",
+        instruction="calculate",
+        expected_tool_calls=[
+            {
+                "name": "Calculator",
+                "arguments": {"formula": "1+1"},
+                "argument_options": {"formula": ["1+1"]},
+            }
+        ],
+        scorer={"type": "apibank_official"},
+        metadata={
+            "source_format": "official_apibank",
+            "apibank_official_root": str(tmp_path),
+            "apibank_ground_truth_result": {
+                "api_name": "Calculator",
+                "input": {"formula": "1+1"},
+                "output": 2,
+                "exception": None,
+            },
+        },
+    )
+
+    result = apibank_adapter.evaluate_apibank_official_calls(
+        record,
+        [{"name": "Calculator", "arguments": {"formula": "1+1"}}],
+    )
+
+    assert result.is_passed is True
+    assert result.reward == 1.0

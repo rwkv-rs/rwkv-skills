@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALL_REGISTRY
-from src.eval.function_calling.simple_tool_call import (
+from src.eval.function_calling.one_step.simple_tool_call import (
     load_bfcl_ast_rows_from_sources,
     load_toolalpaca_rows_from_source,
 )

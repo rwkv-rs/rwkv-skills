@@ -10,6 +10,10 @@ from typing import Any, Iterable, Mapping
 
 from src.db.eval_db_service import EvalDbService
 from src.db.orm import init_orm
+from src.eval.function_calling.common.benchmarks import (
+    FUNCTION_CALLING_DATASET_PREFIXES,
+    FUNCTION_CALLING_JOB_NAMES,
+)
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import detect_job_from_dataset
@@ -38,15 +42,8 @@ DATA_VERSIONS = (
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")
 HIDDEN_DATASET_SLUGS = {"answer_judge_test"}
-FUNCTION_CALL_JOBS = {
-    "eval_function_call",
-    "function_bfcl_ast",
-    "function_toolalpaca",
-}
-FUNCTION_CALL_DATASET_PREFIXES = (
-    "bfcl_",
-    "toolalpaca_",
-)
+FUNCTION_CALL_JOBS = {"eval_function_call", *FUNCTION_CALLING_JOB_NAMES}
+FUNCTION_CALL_DATASET_PREFIXES = FUNCTION_CALLING_DATASET_PREFIXES
 
 
 def _record_error(message: str, errors: list[str] | None) -> None:

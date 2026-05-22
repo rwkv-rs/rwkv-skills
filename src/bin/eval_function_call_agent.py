@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Run function-call evaluation for RWKV models."""
+"""Run multi-turn function-calling agent evaluation for RWKV models."""
 
 import argparse
 import os
@@ -11,13 +11,9 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
 from src.db.orm import init_orm
-from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
-from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
-from src.eval.function_calling.common.benchmarks import function_calling_benchmark_spec
-from src.eval.function_calling.one_step.jobs import simple_tool_call_job_name
-from src.eval.function_calling.one_step.pipeline import FunctionCallPipeline
-from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
-from src.eval.metrics.function_call import evaluate_function_call
+from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline, load_agent_records
+from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -25,51 +21,21 @@ from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.model import ModelLoadConfig
 
-DEFAULT_AVG_K: tuple[NumericK, ...] = ()
+
+AGENT_JOB_BY_DATASET: dict[str, str] = {
+    "apibank_l2_test": "function_agent_apibank_l2",
+}
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RWKV function-call evaluator")
+    parser = argparse.ArgumentParser(description="RWKV function-calling agent evaluator")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
-    parser.add_argument("--dataset", required=True, help="Function-call dataset JSONL path")
+    parser.add_argument("--dataset", required=True, help="Agent function-calling dataset path or registered slug")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for single-turn function-call runs")
+    parser.add_argument("--batch-size", type=int, default=1, help="Reserved for scheduler compatibility")
     parser.add_argument("--max-samples", type=int, help="Limit number of tasks for quick runs")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="avg@k values to compute from generated function-call samples",
-    )
+    parser.add_argument("--db-write-queue", type=int, default=1024, help="DB completion write queue max size")
     return parser.parse_args(argv)
-
-
-def _resolve_avg_k(slug: str, model_name: str, args: argparse.Namespace) -> tuple[NumericK, ...]:
-    if args.avg_k:
-        return tuple(args.avg_k)
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    if config is not None and config.avg_k is not None:
-        return config.avg_k
-    return DEFAULT_AVG_K
-
-
-def _report_avg_k(slug: str, model_name: str, avg_k: tuple[NumericK, ...]) -> tuple[NumericK, ...]:
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    if config is not None and config.report_avg_k is not None:
-        return config.report_avg_k
-    return avg_k
-
-
-def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -> int | None:
-    if args.max_samples is not None:
-        return args.max_samples
-    config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    return config.max_samples if config is not None else None
-
-
-def _simple_tool_call_job_name(slug: str) -> str | None:
-    return simple_tool_call_job_name(slug)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -77,12 +43,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = Path(args.model_path).stem
-    records = JsonlFunctionCallTaskLoader(str(dataset_path)).load()
-    if any(not record.expected_tool_calls for record in records):
-        raise ValueError(f"{slug} 不是 simple tool-call 数据集")
-    job_name = _simple_tool_call_job_name(str(slug))
+    records, _resolved = load_agent_records(str(dataset_path), args.max_samples)
+    if not records:
+        raise ValueError(f"{slug} 没有可运行的 function-calling agent 样本")
+    job_name = AGENT_JOB_BY_DATASET.get(str(slug))
     if job_name is None:
-        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank L1 数据集: {slug}")
+        raise ValueError(f"function_call agent 暂不支持数据集: {slug}")
     sampling = resolve_sampling_config(
         slug,
         model_name,
@@ -94,11 +60,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
-    pipeline = FunctionCallPipeline(ModelLoadConfig(weights_path=args.model_path, device=args.device))
-    avg_k = _resolve_avg_k(slug, model_name, args)
-    report_avg_k = _report_avg_k(slug, model_name, avg_k)
-    sample_limit = _resolve_max_samples(slug, model_name, args)
-    samples_per_task = max(max_generation_k(avg_k), 1)
+    pipeline = FunctionCallAgentPipeline(ModelLoadConfig(weights_path=args.model_path, device=args.device))
 
     init_orm(DEFAULT_DB_CONFIG)
     service = EvalDbService()
@@ -117,8 +79,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         is_param_search=False,
         sampling_config=sampling_config_to_dict(sampling),
     )
-    skip_keys = ctx.completed_keys
-
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
     writer = CompletionWriteWorker(
@@ -128,19 +88,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     expected_count = service.expected_completion_count(
         dataset=str(slug),
-        sample_limit=sample_limit,
-        repeats_per_problem=samples_per_task,
+        sample_limit=args.max_samples,
+        repeats_per_problem=1,
     )
     if expected_count is None:
-        expected_count = (min(len(records), sample_limit) if sample_limit else len(records)) * samples_per_task
+        expected_count = len(records)
     try:
         result = pipeline.run(
             dataset_path=str(dataset_path),
             sampling=sampling,
             batch_size=max(1, args.batch_size),
-            sample_limit=sample_limit,
-            samples_per_task=samples_per_task,
-            skip_keys=skip_keys,
+            sample_limit=args.max_samples,
+            samples_per_task=1,
+            skip_keys=ctx.completed_keys,
             on_record=writer.enqueue,
         )
     except BaseException:
@@ -160,32 +120,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     writer.close()
 
     completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
-    metrics = evaluate_function_call(
-        completions_payloads,
-        dataset_path=str(dataset_path),
-        avg_k=avg_k,
-    )
+    metrics = evaluate_function_call_agent(completions_payloads)
     service.ingest_eval_payloads(payloads=metrics.payloads or [], task_id=task_id)
-    avg_payload = filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
-    benchmark_spec = function_calling_benchmark_spec(job_name)
     score_payload = make_score_payload(
         slug,
         is_cot=False,
         model_name=model_name,
         metrics={
             "success_rate": metrics.success_rate,
+            "official_score": metrics.official_score,
             "avg_steps": metrics.avg_steps,
-            "avg_tool_calls": metrics.avg_tool_calls,
-            **avg_payload,
+            "invalid_action_rate": metrics.invalid_action_rate,
+            "timeout_rate": metrics.timeout_rate,
+            "parse_error_rate": metrics.parse_error_rate,
         },
         samples=metrics.samples,
         task=job_name,
-        task_details={
-            "subtype": benchmark_spec.subtype if benchmark_spec else "one_step",
-            "benchmark": benchmark_spec.benchmark if benchmark_spec else "",
-            "env_breakdown": metrics.env_breakdown or {},
-            **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
-        },
+        task_details={"subtype": "agent", "benchmark": "apibank"},
     )
     service.record_score_payload(payload=score_payload, task_id=task_id)
     session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
@@ -195,7 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception:
             pass
     export_version_results(service, task_id=task_id)
-    print(f"✅ function_call done: {result.sample_count} samples")
+    print(f"✅ function_call agent done: {result.sample_count} samples")
     return 0
 
 

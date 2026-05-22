@@ -38,15 +38,19 @@ def build_rwkv_json_call_prompt(
         if role == "assistant":
             if content.startswith("Assistant: "):
                 parts.append(content)
+            elif content.startswith("Assistant:"):
+                assistant_content = normalize_rwkv_text(content[len("Assistant:") :])
+                parts.append(f"Assistant: {assistant_content}" if assistant_content else "Assistant:")
             elif _looks_like_json_call(content):
                 parts.append(render_assistant_json_block(_strip_json_fence(content)))
             else:
                 parts.append(f"Assistant: {content}")
             continue
-        if content.startswith("User: "):
-            parts.append(content)
+        if content.startswith("User:"):
+            user_content = normalize_rwkv_text(content[len("User:") :])
+            parts.append(f"User:{user_content}" if user_content else "User:")
         else:
-            parts.append(f"User: {content}")
+            parts.append(f"User:{content}")
     parts.append(assistant_json_prefix())
     return "\n\n".join(parts)
 

@@ -320,15 +320,12 @@ def _resolve_job_list(
     exclude: Sequence[str] | None,
     domains: Sequence[str] | None,
 ) -> tuple[str, ...]:
-    order = list(JOB_ORDER)
+    order = list(include) if include else list(JOB_ORDER)
 
     if domains:
         allowed_domains = set(domains)
         order = [job for job in order if JOB_CATALOGUE[job].domain in allowed_domains]
 
-    if include:
-        allowed = {job for job in include}
-        order = [job for job in order if job in allowed]
     if exclude:
         blocked = {job for job in exclude}
         order = [job for job in order if job not in blocked]

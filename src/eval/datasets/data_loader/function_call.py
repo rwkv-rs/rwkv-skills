@@ -144,9 +144,9 @@ class JsonlFunctionCallTaskLoader(
                 "expected_tool_calls": expected_tool_calls,
             }
         scorer_type = str(scorer.get("type") or "simple_tool_call")
-        if scorer_type not in {"simple_tool_call", "bfcl_exec", "toolalpaca_official"}:
+        if scorer_type not in {"simple_tool_call", "bfcl_exec", "toolalpaca_official", "apibank_official"}:
             raise ValueError(
-                f"{self.path}: function_call 仅支持 simple_tool_call/bfcl_exec/toolalpaca_official scorer, "
+                f"{self.path}: function_call 仅支持 simple_tool_call/bfcl_exec/toolalpaca_official/apibank_official scorer, "
                 f"payload={payload}"
             )
 
