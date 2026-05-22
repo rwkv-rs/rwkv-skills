@@ -103,7 +103,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-max-tokens",
         type=int,
-        help="Max judge completion tokens (env: JUDGE_MAX_TOKENS / LLM_JUDGE_MAX_TOKENS)",
+        help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
     return parser.parse_args(argv)
 
@@ -288,14 +288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or "16"
         )
     )
-    judge_max_tokens = (
-        args.judge_max_tokens
-        or int(
-            os.environ.get("JUDGE_MAX_TOKENS")
-            or os.environ.get("LLM_JUDGE_MAX_TOKENS")
-            or "16"
-        )
-    )
+    judge_max_tokens = args.judge_max_tokens
 
     if not judge_model or not judge_api_key:
         raise ValueError(

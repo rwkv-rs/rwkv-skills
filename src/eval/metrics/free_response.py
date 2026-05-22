@@ -238,6 +238,10 @@ class LLMJudge:
                         "temperature": 0.0,
                         "messages": [{"role": "user", "content": prompt}],
                     }
+                    if "qwen3" in self.config.model.lower():
+                        request_kwargs["extra_body"] = {
+                            "chat_template_kwargs": {"enable_thinking": False}
+                        }
                     if self.config.max_completion_tokens is not None:
                         request_kwargs["max_tokens"] = self.config.max_completion_tokens
                     response = self.client.chat.completions.create(

@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-import torch
-
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -19,30 +17,30 @@ from .common import SampleRecord, StageRecord, sample_repeat_seed
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
 
-EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
+EN_DIRECT_PROMPT_TEMPLATE = """User:You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
-Assistant:The answer is"""
+Assistant: The answer is"""
 
-EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
+EN_COT_PROMPT_TEMPLATE = """User:You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
-Assistant:<think"""
+Assistant: <think"""
 
 EN_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 Therefore, the answer is"""
 
-ZH_DIRECT_PROMPT_TEMPLATE = """User: <Q>
+ZH_DIRECT_PROMPT_TEMPLATE = """User:<Q>
 <CHOICES>
 
-Assistant:正确答案是"""
+Assistant: 正确答案是"""
 
-ZH_COT_PROMPT_TEMPLATE = """User: <Q>
+ZH_COT_PROMPT_TEMPLATE = """User:<Q>
 <CHOICES>
 
-Assistant:"""
+Assistant: <think"""
 
 ZH_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 综上所述，答案是"""
@@ -321,26 +319,14 @@ class MultipleChoicePipeline:
         return self._choice_token_cache[num_choices]
 
     def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
-        tokens = [0] + self.tokenizer.encode(prompt.strip())
-        state = self._blank_state()
-        logits = self.model.forward(tokens, state, full_output=False)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        logits = logits.to(torch.float32)
         choice_tokens = self._choice_tokens(len(record.choices))
-        slice_values = logits[choice_tokens]
+        slice_values = self.engine.score_next_token(prompt, choice_tokens, pad_zero=True)
         logits_map = {
             ALPHABET[i]: float(value)
-            for i, value in enumerate(slice_values.cpu())
+            for i, value in enumerate(slice_values)
         }
-        pred_idx = torch.argmax(slice_values).item()
+        pred_idx = max(range(len(slice_values)), key=lambda idx: slice_values[idx])
         return logits_map, ALPHABET[pred_idx]
-
-    def _blank_state(self):
-        try:
-            return self.model.generate_zero_state(0)
-        except TypeError:
-            return self.model.generate_zero_state()
 
 
 __all__ = ["MultipleChoicePipeline", "MultipleChoicePipelineResult"]

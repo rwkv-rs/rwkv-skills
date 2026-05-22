@@ -28,7 +28,8 @@ class LiveCodeBenchPromptFormatTest(unittest.TestCase):
     def test_livecodebench_final_stage_matches_rwkv_code_fence_style(self) -> None:
         mbpp_prompt = _format_prompt_no_echo("Write a function that returns 1.")
 
-        self.assertTrue(mbpp_prompt.endswith("Assistant:<think></think>\n```python"))
+        self.assertTrue(mbpp_prompt.endswith("Assistant: <think></think>\n```python"))
+        self.assertTrue(mbpp_prompt.startswith("User:"))
         self.assertIn("You are a top-level code master", mbpp_prompt)
         self.assertIn("Complete the following code without any additional text or explanation", mbpp_prompt)
 
@@ -41,7 +42,7 @@ assert find_star_num(3) == 37
         formatted = _format_prompt_no_echo(prompt)
 
         self.assertIn("assert find_star_num(3) == 37", formatted)
-        self.assertTrue(formatted.endswith("Assistant:<think></think>\n```python"))
+        self.assertTrue(formatted.endswith("Assistant: <think></think>\n```python"))
 
     def test_humaneval_prompt_uses_legacy_echo_format(self) -> None:
         prompt = '''

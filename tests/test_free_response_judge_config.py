@@ -87,6 +87,25 @@ class LLMJudgeConfigTest(unittest.TestCase):
 
         self.assertEqual(judge.judge([("q1", "ref1", "pred1")]), [False])
 
+    def test_qwen3_judge_disables_thinking_in_vllm_chat_template(self) -> None:
+        judge = LLMJudge(
+            LLMJudgeConfig(
+                api_key="k",
+                model="Qwen/Qwen3-4B",
+                max_workers=1,
+                max_retries=0,
+                backoff_base=0.0,
+            )
+        )
+        fake = _FakeJudgeClient(["True"])
+        judge.client = fake
+
+        self.assertEqual(judge.judge([("q1", "ref1", "pred1")]), [True])
+        self.assertEqual(
+            fake.calls[0]["extra_body"],
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+
 
 class MathJudgeRoutingTest(unittest.TestCase):
     def test_math_datasets_split_between_exact_and_judge(self) -> None:
@@ -132,9 +151,11 @@ class _FakeJudgeClient:
     def __init__(self, responses: list[object]) -> None:
         self._responses = list(responses)
         self._index = 0
+        self.calls: list[dict[str, object]] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
-    def create(self, **_: object) -> SimpleNamespace:
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        self.calls.append(dict(kwargs))
         response = self._responses[self._index]
         self._index += 1
         if isinstance(response, Exception):

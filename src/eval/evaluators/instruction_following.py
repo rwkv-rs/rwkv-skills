@@ -133,7 +133,9 @@ class InstructionFollowingPipeline:
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:
         suffix = "<think" if enable_think else ""
-        return f"User: {prompt}\n\nAssistant:{suffix}"
+        if suffix:
+            return f"User:{prompt}\n\nAssistant: {suffix}"
+        return f"User:{prompt}\n\nAssistant:"
 
     def _load_records(
         self, dataset_path: str, sample_limit: int | None
