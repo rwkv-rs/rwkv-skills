@@ -11,6 +11,7 @@ import os
 import ast
 import re
 import sys
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib
@@ -21,7 +22,16 @@ from src.eval.function_calling.common.action import ToolAction
 from src.eval.function_calling.one_step.simple_tool_call import SimpleToolCallEvaluation
 
 DEFAULT_OFFICIAL_APIBANK_ROOT = Path("/tmp/ref-DAMO-ConvAI/api-bank")
+DEFAULT_OFFICIAL_APIBANK_ROOT_CANDIDATES = (
+    Path("references/API-Bank"),
+    Path("../API-Bank"),
+    DEFAULT_OFFICIAL_APIBANK_ROOT,
+)
 OFFICIAL_APIBANK_SOURCE = "DAMO-ConvAI/API-Bank"
+_APIBANK_ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
+    "CancelTimedSwitch": {"device_id": "name"},
+    "TimedSwitch": {"device_id": "name"},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,14 +40,35 @@ class ApiBankOneStepAdapterConfig:
 
 
 def official_apibank_root() -> Path:
-    return Path(os.environ.get("APIBANK_OFFICIAL_ROOT") or DEFAULT_OFFICIAL_APIBANK_ROOT)
+    override = (
+        os.environ.get("API_BANK_SOURCE_ROOT")
+        or os.environ.get("RWKV_API_BANK_SOURCE_ROOT")
+        or os.environ.get("RWKV_APIBANK_SOURCE_ROOT")
+        or os.environ.get("APIBANK_SOURCE_ROOT")
+        or os.environ.get("APIBANK_OFFICIAL_ROOT")
+    )
+    if override:
+        return Path(override).expanduser().resolve()
+    for candidate in DEFAULT_OFFICIAL_APIBANK_ROOT_CANDIDATES:
+        resolved = candidate.expanduser().resolve()
+        if (resolved / "evaluator.py").exists() or (resolved / "apis").is_dir():
+            return resolved
+    return DEFAULT_OFFICIAL_APIBANK_ROOT.expanduser().resolve()
 
 
 def require_official_apibank_root(root: str | Path | None = None) -> Path:
     resolved = Path(root) if root is not None else official_apibank_root()
-    if not (resolved / "evaluator.py").exists():
+    if not (resolved / "evaluator.py").exists() and not (resolved / "apis").is_dir():
         raise FileNotFoundError(f"API-Bank official evaluator not found under {resolved}")
     return resolved
+
+
+def load_api_bank_rows_from_source(source_dir: str | Path, *, dataset_name: str, level: int) -> list[dict[str, Any]]:
+    root = Path(source_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"API-Bank source directory not found: {root}")
+    official_root = _api_bank_root_from_source_dir(root)
+    return _load_apibank_rows(root, official_root=official_root, dataset_name=dataset_name, level=level)
 
 
 def apibank_action_text(action: ToolAction) -> str:
@@ -57,11 +88,26 @@ def load_apibank_level1_rows_from_source_dir(
 ) -> list[dict[str, Any]]:
     root = require_official_apibank_root(official_root)
     source_dir = Path(samples_dir)
+    return _load_apibank_rows(source_dir, official_root=root, dataset_name=dataset_name, level=1)
+
+
+def _load_apibank_rows(
+    source_dir: Path,
+    *,
+    official_root: Path,
+    dataset_name: str,
+    level: int,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for path in sorted(source_dir.glob("*level-1*.jsonl")):
+    for path in sorted(source_dir.glob("*.jsonl")):
+        if _api_bank_level_from_name(path.name) != int(level):
+            continue
         history = _read_apibank_history(path)
         api_names = sorted({str(item.get("api_name")) for item in history if item.get("role") == "API"})
-        tools = [_api_description_to_tool_schema(_api_description_from_source(root, api_name)) for api_name in api_names]
+        tools = [
+            _api_description_to_tool_schema(_api_description_from_source(official_root, api_name))
+            for api_name in api_names
+        ]
         for item_index, item in enumerate(history):
             if item.get("role") != "API":
                 continue
@@ -79,13 +125,19 @@ def load_apibank_level1_rows_from_source_dir(
                             "argument_options": {key: [value] for key, value in arguments.items()},
                         }
                     ],
-                    "scorer": {"type": "apibank_official", "level": 1},
+                    "scorer": {"type": "apibank_official", "level": int(level)},
                     "metadata": {
-                        "source_format": "official_apibank",
-                        "apibank_level": 1,
+                        "source_format": "official_api_bank",
+                        "apibank_level": int(level),
                         "apibank_official_source": OFFICIAL_APIBANK_SOURCE,
-                        "apibank_official_root": str(root),
+                        "apibank_official_root": str(official_root),
                         "apibank_source_path": str(path),
+                        "source_dir": str(source_dir),
+                        "source_path": str(path),
+                        "level": int(level),
+                        "turn_index": item_index,
+                        "api_name": api_name,
+                        "expected_result": item.get("result"),
                         "apibank_ground_truth_result": item.get("result"),
                     },
                 }
@@ -104,7 +156,10 @@ def evaluate_apibank_official_calls(
         "official_apibank_source": OFFICIAL_APIBANK_SOURCE,
         "expected_tool_calls": expected,
         "decoded_tool_calls": [
-            {"name": str(item.get("name") or ""), "arguments": dict(item.get("arguments") or {})}
+            {
+                "name": str(item.get("name") or ""),
+                "arguments": dict(item.get("arguments") or {}),
+            }
             for item in decoded_calls
         ],
         "parse_error": parse_error or "",
@@ -125,9 +180,12 @@ def evaluate_apibank_official_calls(
     if not isinstance(arguments, Mapping):
         arguments = {}
     try:
-        result = tool_manager.api_call(api_name, **dict(arguments))
+        result = tool_manager.api_call(api_name, **_normalize_apibank_arguments(api_name, dict(arguments)))
         api = tool_manager.init_tool(api_name)
-        ground_truth = metadata.get("apibank_ground_truth_result")
+        ground_truth = _normalize_apibank_expected_result(
+            api_name,
+            metadata.get("apibank_ground_truth_result", metadata.get("expected_result")),
+        )
         correct = api.check_api_call_correctness(result, ground_truth)
     except Exception as exc:  # noqa: BLE001
         details["exception"] = repr(exc)
@@ -140,6 +198,41 @@ def evaluate_apibank_official_calls(
         "" if passed else "apibank_official:result_mismatch",
         details,
     )
+
+
+def _api_bank_level_from_name(file_name: str) -> int | None:
+    if "level-1" in file_name:
+        return 1
+    if "level-2" in file_name:
+        return 2
+    return None
+
+
+def _api_bank_root_from_source_dir(source_dir: Path) -> Path:
+    parts = set(source_dir.parts)
+    if source_dir.name.startswith("level-") and "lv1-lv2-samples" in parts:
+        return source_dir.parent.parent.resolve()
+    if (source_dir / "apis").is_dir():
+        return source_dir.resolve()
+    return official_apibank_root()
+
+
+def _normalize_apibank_arguments(api_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    aliases = _APIBANK_ARGUMENT_ALIASES.get(str(api_name), {})
+    normalized: dict[str, Any] = {}
+    for key, value in dict(arguments).items():
+        normalized[aliases.get(str(key), str(key))] = value
+    return normalized
+
+
+def _normalize_apibank_expected_result(api_name: str, expected: Any) -> Any:
+    if not isinstance(expected, Mapping):
+        return expected
+    normalized = copy.deepcopy(dict(expected))
+    input_payload = normalized.get("input")
+    if isinstance(input_payload, Mapping):
+        normalized["input"] = _normalize_apibank_arguments(api_name, input_payload)
+    return normalized
 
 
 def _official_arg_repr(value: Any) -> str:
@@ -178,7 +271,9 @@ def _render_apibank_history(history: Sequence[Mapping[str, Any]]) -> str:
     return "\n".join(rendered).strip()
 
 
-def _api_description_to_tool_schema(description: str | Mapping[str, Any]) -> dict[str, Any]:
+def _api_description_to_tool_schema(
+    description: str | Mapping[str, Any],
+) -> dict[str, Any]:
     payload = json.loads(description) if isinstance(description, str) else dict(description)
     input_parameters = payload.get("input_parameters")
     if not isinstance(input_parameters, Mapping):
@@ -237,9 +332,7 @@ class _ApiBankToolManager:
                 names = {str(name) for name in api_names}
                 names.add("CheckToken")
                 api_paths = sorted(
-                    path
-                    for name in names
-                    for path in (root / "apis").glob(f"{_camel_to_snake(name)}.py")
+                    path for name in names for path in (root / "apis").glob(f"{_camel_to_snake(name)}.py")
                 )
             for path in api_paths:
                 if path.name in {"__init__.py", "api.py", "tool_search.py"}:
@@ -288,7 +381,11 @@ class _ApiBankToolManager:
         init_args: list[Any] = []
         if "init_database" in api_info:
             init_args.append(api_info["init_database"])
-        if tool_name != "CheckToken" and "token" in api_info.get("input_parameters", {}) and self.token_checker is not None:
+        if (
+            tool_name != "CheckToken"
+            and "token" in api_info.get("input_parameters", {})
+            and self.token_checker is not None
+        ):
             init_args.append(self.token_checker)
         tool = api_class(*init_args, *args, **kwargs)
         self.inited_tools[tool_name] = tool
@@ -307,7 +404,9 @@ class _ApiBankToolManager:
             elif required_type == "float":
                 processed_parameters[input_key] = float(input_value)
             elif required_type == "bool":
-                processed_parameters[input_key] = input_value if isinstance(input_value, bool) else input_value == "True"
+                processed_parameters[input_key] = (
+                    input_value if isinstance(input_value, bool) else input_value == "True"
+                )
             elif required_type.startswith("list"):
                 if isinstance(input_value, str):
                     try:
@@ -381,6 +480,7 @@ __all__ = [
     "apibank_action_text",
     "apibank_actions_text",
     "evaluate_apibank_official_calls",
+    "load_api_bank_rows_from_source",
     "load_apibank_level1_rows_from_source_dir",
     "official_apibank_root",
     "require_official_apibank_root",

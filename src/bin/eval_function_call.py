@@ -11,7 +11,10 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
 from src.db.orm import init_orm
-from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
+from src.eval.benchmark_config import (
+    resolve_benchmark_model_config,
+    resolve_sampling_config,
+)
 from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
 from src.eval.function_calling.common.benchmarks import function_calling_benchmark_spec
 from src.eval.function_calling.one_step.jobs import simple_tool_call_job_name
@@ -33,9 +36,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument("--dataset", required=True, help="Function-call dataset JSONL path")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for single-turn function-call runs")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Batch size for single-turn function-call runs",
+    )
     parser.add_argument("--max-samples", type=int, help="Limit number of tasks for quick runs")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument(
+        "--db-write-queue",
+        type=int,
+        default=4096,
+        help="DB completion write queue max size",
+    )
     parser.add_argument(
         "--avg-k",
         type=float,
@@ -82,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"{slug} 不是 simple tool-call 数据集")
     job_name = _simple_tool_call_job_name(str(slug))
     if job_name is None:
-        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank L1 数据集: {slug}")
+        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank 数据集: {slug}")
     sampling = resolve_sampling_config(
         slug,
         model_name,

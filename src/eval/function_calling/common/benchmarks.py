@@ -31,15 +31,12 @@ class FunctionCallingBenchmarkSpec:
 
 
 FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
-    "function_bfcl_ast": FunctionCallingBenchmarkSpec(
-        "function_bfcl_ast", "one_step", "bfcl", ONE_STEP_METRIC_KEYS
-    ),
-    "function_bfcl_exec": FunctionCallingBenchmarkSpec(
-        "function_bfcl_exec", "one_step", "bfcl", ONE_STEP_METRIC_KEYS
-    ),
+    "function_bfcl_ast": FunctionCallingBenchmarkSpec("function_bfcl_ast", "one_step", "bfcl", ONE_STEP_METRIC_KEYS),
+    "function_bfcl_exec": FunctionCallingBenchmarkSpec("function_bfcl_exec", "one_step", "bfcl", ONE_STEP_METRIC_KEYS),
     "function_toolalpaca": FunctionCallingBenchmarkSpec(
         "function_toolalpaca", "one_step", "toolalpaca", ONE_STEP_METRIC_KEYS
     ),
+    "function_api_bank": FunctionCallingBenchmarkSpec("function_api_bank", "one_step", "apibank", ONE_STEP_METRIC_KEYS),
     "function_one_step_bfcl_ast": FunctionCallingBenchmarkSpec(
         "function_one_step_bfcl_ast", "one_step", "bfcl", ONE_STEP_METRIC_KEYS
     ),
@@ -87,7 +84,9 @@ FUNCTION_CALLING_EXPLICIT_ONLY_JOBS: tuple[str, ...] = (
 )
 
 
-def function_calling_benchmark_spec(job_name: str | None) -> FunctionCallingBenchmarkSpec | None:
+def function_calling_benchmark_spec(
+    job_name: str | None,
+) -> FunctionCallingBenchmarkSpec | None:
     if not job_name:
         return None
     return FUNCTION_CALLING_BENCHMARK_SPECS.get(str(job_name))

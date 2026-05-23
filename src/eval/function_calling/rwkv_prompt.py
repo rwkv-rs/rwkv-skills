@@ -13,13 +13,38 @@ JSON_CALL_STOP_SUFFIXES = (
     "\nAssistant:",
 )
 
+USER_HEADER = "User:"
+ASSISTANT_HEADER = "Assistant:"
+SYSTEM_HEADER = "System:"
+
 
 def assistant_json_prefix() -> str:
-    return "Assistant: ```json\n"
+    return "Assistant: <think>\n</think>\n```json\n"
+
+
+def render_system_block(content: str) -> str:
+    return f"{SYSTEM_HEADER} {normalize_rwkv_text(content)}"
+
+
+def render_user_block(content: str) -> str:
+    return f"{USER_HEADER}{_strip_role_prefix(content, USER_HEADER)}"
+
+
+def render_assistant_text_block(content: str) -> str:
+    return f"{ASSISTANT_HEADER} {_strip_role_prefix(content, ASSISTANT_HEADER)}"
+
+
+def render_json_function_call(name: str, arguments: Mapping[str, Any] | None = None) -> str:
+    payload = {"name": str(name).strip(), "arguments": dict(arguments or {})}
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def render_assistant_json_block(json_text: str) -> str:
     return f"{assistant_json_prefix()}{normalize_rwkv_text(json_text)}\n```"
+
+
+def render_function_output_user_block(payload: Any) -> str:
+    return render_user_block("Function output:\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def build_rwkv_json_call_prompt(
@@ -29,34 +54,36 @@ def build_rwkv_json_call_prompt(
     history_max_chars: int,
 ) -> str:
     bounded_messages = trim_message_history(messages, max_chars=max(0, int(history_max_chars)))
-    parts = [f"System: {normalize_rwkv_text(system_prompt)}"]
+    parts = [render_system_block(system_prompt)]
     for message in bounded_messages:
         role = str(message.get("role") or "").strip().lower()
         content = normalize_rwkv_text(str(message.get("content") or ""))
         if not content:
             continue
         if role == "assistant":
-            if content.startswith("Assistant: "):
-                parts.append(content)
-            elif content.startswith("Assistant:"):
-                assistant_content = normalize_rwkv_text(content[len("Assistant:") :])
-                parts.append(f"Assistant: {assistant_content}" if assistant_content else "Assistant:")
+            assistant_content = _strip_role_prefix(content, ASSISTANT_HEADER)
+            if _looks_like_json_call(assistant_content):
+                parts.append(render_assistant_json_block(_strip_json_fence(assistant_content)))
             elif _looks_like_json_call(content):
                 parts.append(render_assistant_json_block(_strip_json_fence(content)))
             else:
-                parts.append(f"Assistant: {content}")
+                parts.append(render_assistant_text_block(content))
             continue
-        if content.startswith("User:"):
-            user_content = normalize_rwkv_text(content[len("User:") :])
-            parts.append(f"User:{user_content}" if user_content else "User:")
-        else:
-            parts.append(f"User:{content}")
+        parts.append(render_user_block(content))
     parts.append(assistant_json_prefix())
     return "\n\n".join(parts)
 
 
+def extract_json_call_object_text(response: str) -> str:
+    candidate = extract_json_call_value_text(response)
+    if not candidate.startswith("{"):
+        raise ValueError(f"model response must be a JSON function call object: {candidate}")
+    return candidate
+
+
 def extract_json_call_value_text(response: str) -> str:
     normalized = _strip_assistant_prefix(normalize_rwkv_text(response))
+    normalized = _strip_leading_think_block(normalized)
     normalized = _strip_json_fence(normalized)
     if not (normalized.startswith("{") or normalized.startswith("[")):
         raise ValueError(f"model response must be a JSON function call object or array: {normalized}")
@@ -69,6 +96,13 @@ def extract_json_call_value_text(response: str) -> str:
     if trailing and trailing != "```":
         raise ValueError(f"model response has extra text after JSON function call object or array: {trailing}")
     return candidate
+
+
+def coerce_json_function_call_payload(payload: Any, *, context_label: str = "tool call") -> dict[str, Any]:
+    calls = _coerce_json_function_call_payloads(payload, context_label=context_label)
+    if not calls:
+        raise ValueError(f"{context_label} payload did not contain a function call")
+    return calls[0]
 
 
 def coerce_json_function_call_payloads(payload: Any, *, context_label: str = "tool call") -> list[dict[str, Any]]:
@@ -143,6 +177,23 @@ def _strip_assistant_prefix(text: str) -> str:
     return stripped
 
 
+def _strip_role_prefix(text: str, prefix: str) -> str:
+    stripped = normalize_rwkv_text(text)
+    if stripped.startswith(prefix):
+        return normalize_rwkv_text(stripped[len(prefix) :])
+    return stripped
+
+
+def _strip_leading_think_block(text: str) -> str:
+    normalized = normalize_rwkv_text(text)
+    if not normalized.startswith("<think>"):
+        return normalized
+    close = normalized.find("</think>")
+    if close < 0:
+        return normalized
+    return normalize_rwkv_text(normalized[close + len("</think>") :])
+
+
 def _strip_json_fence(text: str) -> str:
     normalized = normalize_rwkv_text(text)
     if normalized.startswith("```"):
@@ -197,8 +248,19 @@ def _find_leading_json_value_end(text: str) -> int | None:
 
 
 __all__ = [
+    "ASSISTANT_HEADER",
     "JSON_CALL_STOP_SUFFIXES",
+    "SYSTEM_HEADER",
+    "USER_HEADER",
     "build_rwkv_json_call_prompt",
+    "coerce_json_function_call_payload",
     "coerce_json_function_call_payloads",
+    "extract_json_call_object_text",
     "extract_json_call_value_text",
+    "render_assistant_json_block",
+    "render_assistant_text_block",
+    "render_function_output_user_block",
+    "render_json_function_call",
+    "render_system_block",
+    "render_user_block",
 ]

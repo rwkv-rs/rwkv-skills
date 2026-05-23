@@ -5,10 +5,20 @@ import os
 FUNCTION_CALL_JOB_NAMES_BY_BENCHMARK: dict[str, tuple[str, ...]] = {
     "bfcl_exec_simple": ("function_bfcl_exec", "function_one_step_bfcl_exec"),
     "bfcl_exec_multiple": ("function_bfcl_exec", "function_one_step_bfcl_exec"),
+    "bfcl_exec_parallel": ("function_bfcl_exec", "function_one_step_bfcl_exec"),
+    "bfcl_exec_parallel_multiple": (
+        "function_bfcl_exec",
+        "function_one_step_bfcl_exec",
+    ),
     "bfcl_simple_python": ("function_bfcl_ast", "function_one_step_bfcl_ast"),
     "bfcl_multiple": ("function_bfcl_ast", "function_one_step_bfcl_ast"),
-    "toolalpaca_eval_simulated": ("function_toolalpaca", "function_one_step_toolalpaca"),
+    "toolalpaca_eval_simulated": (
+        "function_toolalpaca",
+        "function_one_step_toolalpaca",
+    ),
     "toolalpaca_eval_real": ("function_toolalpaca", "function_one_step_toolalpaca"),
+    "apibank_level1": ("function_api_bank", "function_one_step_apibank_l1"),
+    "apibank_level2": ("function_api_bank",),
     "apibank_l1": ("function_one_step_apibank_l1",),
 }
 

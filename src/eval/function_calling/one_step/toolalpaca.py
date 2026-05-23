@@ -1,92 +1,63 @@
 from __future__ import annotations
 
-"""ToolAlpaca official-format adapter and scorer.
-
-The RWKV evaluator keeps a local JSON output contract:
-
-    {"name": "tool_name", "arguments": {...}}
-
-ToolAlpaca's official scripts use Action / Action_Input steps, execute the
-selected API function, then ask a GPT judge to compare the process and final
-response against the standard answer.  This module keeps RWKV's local output
-format and converts it at the scorer boundary.
-"""
-
+import hashlib
 import json
 import os
 import re
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any, Mapping, Sequence
+from urllib.parse import quote, urljoin
 
 import requests
-from dotenv import load_dotenv
 
-from .simple_tool_call import SimpleToolCallEvaluation
+from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
+from src.eval.function_calling.simple_tool_call import (
+    SimpleToolCallEvaluation,
+    SimpleToolCallRecord,
+    normalize_simple_tool_call_manifest_row,
+)
+from src.eval.function_calling.toolalpaca_source import (
+    _TOOLALPACA_OPTIONAL_KEY,
+    _TOOLALPACA_REF_KEY,
+    load_toolalpaca_api_info_from_source,
+)
 
-if TYPE_CHECKING:
-    from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
-
-_ENV_LOADED = False
-
-
-def _load_env_once() -> None:
-    global _ENV_LOADED
-    if _ENV_LOADED:
-        return
-    load_dotenv()
-    _ENV_LOADED = True
-
-
-_load_env_once()
-
+_HTTP_BODY_METHODS = {"post", "put", "patch"}
 OFFICIAL_TOOLALPACA_SOURCE = "tangqiaoyu/ToolAlpaca@main"
-
-_AUTH_ENV_CANDIDATES: dict[tuple[str, str], tuple[str, ...]] = {
-    ("apilayer weatherstack", "access_key"): (
-        "TOOLALPACA_WEATHERSTACK_ACCESS_KEY",
-        "WEATHERSTACK_ACCESS_KEY",
-    ),
-    ("WolframAlpha", "appid"): (
-        "TOOLALPACA_WOLFRAMALPHA_APPID",
-        "WOLFRAMALPHA_APPID",
-        "WOLFRAM_ALPHA_APPID",
-    ),
-    ("CurrencyBeacon", "api_key"): (
-        "TOOLALPACA_CURRENCYBEACON_API_KEY",
-        "CURRENCYBEACON_API_KEY",
-    ),
+_TOOLALPACA_SECRET_PREFIX = "__toolalpaca_secret__:"
+_TOOLALPACA_AUTH_ENV_BY_API = {
+    "apilayer weatherstack": {
+        "access_key": ("TOOLALPACA_WEATHERSTACK_API_KEY", "WEATHERSTACK_API_KEY"),
+    },
+    "wolframalpha": {
+        "appid": (
+            "TOOLALPACA_WOLFRAMALPHA_APP_ID",
+            "WOLFRAMALPHA_APP_ID",
+            "WOLFRAM_ALPHA_APP_ID",
+            "WOLFRAM_APP_ID",
+        ),
+    },
+    "currencybeacon": {
+        "api_key": (
+            "TOOLALPACA_CURRENCYBEACON_API_KEY",
+            "CURRENCYBEACON_API_KEY",
+            "CURRENCY_BEACON_API_KEY",
+        ),
+    },
 }
-_PLACEHOLDER_AUTH_VALUES = {"", "***", "REDACTED", "REDACTED_API_KEY", "null", "none"}
 
-_OFFICIAL_EVALUATION_TEMPLATE = """Given the documentation of a REST API and a task instruction, I need you to evaluate whether the solution provided by my AI assistant aligns with the standard answer. Follow these guidelines:
-1. You need to assess both the process and final response of the AI assistant's solution.
-2. For the process, refer to the standard answer:
-- The standard answer only includes function names and parameters, while the AI assistant's solution also includes function returns.
-Therefore, it is acceptable to adjust the call situation based on the function return, such as retrying when the function errors, calling function `getDetails` for more information, calling function `retrievalDataFromFile` when function's return is too long.
-- Random calls to unrelated functions are not allowed.
-- The solution must contain all the steps in the standard answer.
-- The necessary parameters of the function need to be consistent with the standard answer.
-Parameters not mentioned in the instruction can be inconsistent.
-3. You need to comprehensively judge whether the final response of the solution accurately summarizes the entire call process and provides a reasonable response to the initial instruction.
-4. You need to first analyze the entire solution according to the guidelines, then give your answer.
-Your output should adhere to the format:
-## Analysis
-{some analysis}
-## Results
-Process Correctness: one of [Yes, No, Uncertain]
-Final Response Correctness: one of [Yes, No, Uncertain]
-## Documentation
-${documentation}
-## Task Instruction
-${instruction}
-## Standard Answer
-${standard}
-## AI Assistant's Solution
-${solution}
-## Analysis
-"""
+
+@dataclass(frozen=True, slots=True)
+class ToolAlpacaActionResult:
+    action: str
+    action_input: dict[str, Any]
+    success: bool
+    optional: bool = False
+    request: dict[str, Any] = field(default_factory=dict)
+    response: Any = None
+    error: str | None = None
+    status_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,41 +78,14 @@ def evaluate_toolalpaca_official_calls(
     *,
     parse_error: str | None = None,
 ) -> SimpleToolCallEvaluation:
-    details: dict[str, Any] = {
-        "official_toolalpaca_source": OFFICIAL_TOOLALPACA_SOURCE,
-        "expected_tool_calls": list(record.expected_tool_calls or []),
-        "decoded_tool_calls": _sanitize_calls(decoded_calls),
-        "official_actions": [],
-        "execution_steps": [],
-        "judge": {},
-    }
-    if parse_error:
-        details["parse_error"] = parse_error
-        return SimpleToolCallEvaluation(0.0, False, parse_error, details)
-
-    actions = local_calls_to_official_actions(decoded_calls)
-    details["official_actions"] = [_official_action_payload(item) for item in actions]
-
-    try:
-        execution_steps = execute_toolalpaca_actions(record, actions)
-    except Exception as exc:  # noqa: BLE001
-        details["execution_error"] = str(exc)
-        return SimpleToolCallEvaluation(0.0, False, f"toolalpaca_official:execution_failed:{exc}", details)
-    details["execution_steps"] = [_execution_step_payload(item) for item in execution_steps]
-
-    try:
-        judge = judge_toolalpaca_solution(record, execution_steps)
-    except Exception as exc:  # noqa: BLE001
-        details["judge_error"] = str(exc)
-        return SimpleToolCallEvaluation(0.0, False, f"toolalpaca_official:judge_failed:{exc}", details)
-    details["judge"] = judge
-    process_ok = str(judge.get("process_correctness") or "").strip().lower() == "yes"
-    passed = process_ok
-    fail_reason = "" if passed else f"toolalpaca_official:process_{judge.get('process_correctness') or 'missing'}"
-    return SimpleToolCallEvaluation(1.0 if passed else 0.0, passed, fail_reason, details)
+    result = evaluate_toolalpaca_actions(_to_simple_record(record), decoded_calls, parse_error=parse_error)
+    result.details.setdefault("official_toolalpaca_source", OFFICIAL_TOOLALPACA_SOURCE)
+    return result
 
 
-def local_calls_to_official_actions(calls: Sequence[Mapping[str, Any]]) -> list[ToolAlpacaOfficialAction]:
+def local_calls_to_official_actions(
+    calls: Sequence[Mapping[str, Any]],
+) -> list[ToolAlpacaOfficialAction]:
     actions: list[ToolAlpacaOfficialAction] = []
     for call in calls:
         name = str(call.get("name") or "").strip()
@@ -156,311 +100,1189 @@ def execute_toolalpaca_actions(
     record: FunctionCallTaskRecord,
     actions: Sequence[ToolAlpacaOfficialAction],
 ) -> list[ToolAlpacaExecutionStep]:
-    metadata = dict(record.metadata or {})
-    openapi_spec = _load_openapi_spec(metadata)
-    function_projection = metadata.get("toolalpaca_function_projection")
-    if not isinstance(function_projection, Mapping):
-        raise ValueError("missing toolalpaca_function_projection metadata")
-    api_name = str(metadata.get("api_name") or metadata.get("toolalpaca_api_name") or "").strip()
-    if not api_name:
-        raise ValueError("missing ToolAlpaca api_name metadata")
-    dataset_kind = str(metadata.get("toolalpaca_dataset") or "").strip().lower()
-    base_url = None
-    if dataset_kind == "simulated":
-        simulator_url = os.environ.get("TOOLALPACA_SIMULATOR_URL", "http://127.0.0.1:5678").rstrip("/")
-        base_url = f"{simulator_url}/{api_name}"
-
-    timeout = float(os.environ.get("TOOLALPACA_REQUEST_TIMEOUT", "30"))
-    steps: list[ToolAlpacaExecutionStep] = []
-    for action in actions:
-        projected = function_projection.get(action.action)
-        if not isinstance(projected, Sequence) or isinstance(projected, (str, bytes, bytearray)) or len(projected) < 2:
-            observation = f"`{action.action}` is not a valid action."
-            steps.append(ToolAlpacaExecutionStep(action=action, observation=observation))
-            continue
-        path = str(projected[0])
-        method = str(projected[1]).lower()
-        input_params = _inject_authentication(api_name, action.action_input, metadata)
-        try:
-            response = _call_api_function(
-                input_params=input_params,
-                openapi_spec=openapi_spec,
-                path=path,
-                method=method,
-                base_url=base_url,
-                timeout=timeout,
-            )
-            observation = f"Status Code: {response.status_code}. Response: {response.text}"
-            if not 200 <= int(response.status_code) < 300:
-                observation += (
-                    ". You should choose one of: (1) change the input and retry; "
-                    "(2) return the 'Final Answer' and explain what happened; "
-                    "(You must choose this one when the error occurs more than 3 times.) "
-                    "(3) call another function."
-                )
-        except Exception as exc:  # noqa: BLE001
-            observation = str(exc)
-        steps.append(ToolAlpacaExecutionStep(action=action, observation=observation))
-    return steps
+    simple_record = _to_simple_record(record)
+    calls = [{"name": action.action, "arguments": dict(action.action_input)} for action in actions]
+    results = _default_toolalpaca_sandbox(simple_record).execute_sequence(simple_record, calls)
+    return [
+        ToolAlpacaExecutionStep(
+            action=ToolAlpacaOfficialAction(result.action, dict(result.action_input)),
+            observation=_toolalpaca_observation_text(result),
+        )
+        for result in results
+    ]
 
 
 def judge_toolalpaca_solution(
     record: FunctionCallTaskRecord,
     execution_steps: Sequence[ToolAlpacaExecutionStep],
 ) -> dict[str, Any]:
-    _load_env_once()
-    api_key = os.environ.get("JUDGE_API_KEY")
-    if not api_key:
-        raise ValueError("toolalpaca official judge requires JUDGE_API_KEY")
-    model = os.environ.get("JUDGE_MODEL")
-    if not model:
-        raise ValueError("toolalpaca official judge requires JUDGE_MODEL")
-    prompt = build_toolalpaca_judge_prompt(record, execution_steps)
-    output = _judge_chat_completion(
-        prompt,
-        api_key=api_key,
-        model=model,
-        temperature=float(os.environ.get("JUDGE_TEMPERATURE", "0.2")),
-    )
-    return {
-        "prompt": prompt,
-        "output": output,
-        "process_correctness": _extract_judge_label(output, "Process Correctness"),
-        "final_response_correctness": _extract_judge_label(output, "Final Response Correctness"),
-    }
+    _ = record, execution_steps
+    raise NotImplementedError("ToolAlpaca now uses execution-result comparison instead of an LLM judge")
 
 
-def build_toolalpaca_judge_prompt(
-    record: FunctionCallTaskRecord,
-    execution_steps: Sequence[ToolAlpacaExecutionStep],
-) -> str:
+def _to_simple_record(record: FunctionCallTaskRecord) -> SimpleToolCallRecord:
     metadata = dict(record.metadata or {})
-    final_response = str(metadata.get("toolalpaca_final_response") or "No final response was generated.")
-    return (
-        _OFFICIAL_EVALUATION_TEMPLATE.replace("${documentation}", str(metadata.get("toolalpaca_nl_documentation") or ""))
-        .replace("${instruction}", str(record.instruction or ""))
-        .replace("${standard}", _render_standard_answer(record.expected_tool_calls or []))
-        .replace("${solution}", _render_solution(execution_steps, final_response=final_response))
+    tools = _toolalpaca_tools_with_legacy_metadata(record.tools, metadata)
+    if "api_server_url" not in metadata:
+        server_url = _legacy_toolalpaca_server_url(metadata)
+        if server_url:
+            metadata["api_server_url"] = server_url
+    return normalize_simple_tool_call_manifest_row(
+        {
+            "task_id": record.task_id,
+            "instruction": record.instruction,
+            "tools": tools,
+            "expected_tool_calls": record.expected_tool_calls,
+            "metadata": metadata,
+        },
+        index=0,
     )
 
 
-def _load_openapi_spec(metadata: Mapping[str, Any]) -> dict[str, Any]:
+def _toolalpaca_tools_with_legacy_metadata(
+    tools: Sequence[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    projection = metadata.get("toolalpaca_function_projection")
+    projection = projection if isinstance(projection, Mapping) else {}
+    api_name = str(metadata.get("api_name") or metadata.get("toolalpaca_api_name") or "")
+    server_url = _legacy_toolalpaca_server_url(metadata)
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        rendered = dict(tool)
+        name = str(rendered.get("name") or "")
+        tool_metadata = dict(rendered.get("metadata") or {})
+        projected = projection.get(name)
+        if isinstance(projected, Sequence) and not isinstance(projected, (str, bytes, bytearray)):
+            tool_metadata.setdefault("path", str(projected[0]) if len(projected) > 0 else "")
+            tool_metadata.setdefault("method", str(projected[1]) if len(projected) > 1 else "")
+        for key in ("path", "method", "server_url", "operation"):
+            if key in metadata:
+                tool_metadata.setdefault(key, metadata[key])
+        if api_name:
+            tool_metadata.setdefault("api_name", api_name)
+        if server_url:
+            tool_metadata.setdefault("server_url", server_url)
+        if "operation" not in tool_metadata:
+            operation = _legacy_toolalpaca_operation(
+                metadata,
+                path=str(tool_metadata.get("path") or ""),
+                method=str(tool_metadata.get("method") or ""),
+            )
+            if operation:
+                tool_metadata["operation"] = operation
+        if tool_metadata:
+            rendered["metadata"] = tool_metadata
+        result.append(rendered)
+    return result
+
+
+def _legacy_toolalpaca_openapi_spec(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
     raw = metadata.get("toolalpaca_documentation")
     if isinstance(raw, Mapping):
-        return dict(raw)
+        return raw
     if isinstance(raw, str) and raw.strip():
-        parsed = json.loads(raw)
-        if isinstance(parsed, Mapping):
-            return dict(parsed)
-    raise ValueError("missing ToolAlpaca OpenAPI documentation metadata")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+    return {}
 
 
-def _call_api_function(
+def _legacy_toolalpaca_server_url(metadata: Mapping[str, Any]) -> str:
+    spec = _legacy_toolalpaca_openapi_spec(metadata)
+    servers = spec.get("servers")
+    if isinstance(servers, Sequence) and not isinstance(servers, (str, bytes, bytearray)):
+        for server in servers:
+            if isinstance(server, Mapping) and server.get("url"):
+                return str(server.get("url") or "").strip()
+    return str(metadata.get("api_server_url") or "")
+
+
+def _legacy_toolalpaca_operation(metadata: Mapping[str, Any], *, path: str, method: str) -> Mapping[str, Any]:
+    spec = _legacy_toolalpaca_openapi_spec(metadata)
+    paths = spec.get("paths") if isinstance(spec.get("paths"), Mapping) else {}
+    path_doc = paths.get(path) if isinstance(paths, Mapping) else {}
+    operation = path_doc.get(str(method or "").lower()) if isinstance(path_doc, Mapping) else {}
+    return dict(operation) if isinstance(operation, Mapping) else {}
+
+
+def evaluate_toolalpaca_actions(
+    record: SimpleToolCallRecord,
+    decoded_calls: Sequence[Mapping[str, Any]],
     *,
-    input_params: Mapping[str, Any],
-    openapi_spec: Mapping[str, Any],
-    path: str,
-    method: str,
-    base_url: str | None,
-    timeout: float,
-) -> requests.Response:
-    function_doc = openapi_spec["paths"][path][method]
-    params: dict[str, dict[str, Any]] = {"query": {}, "header": {}, "path": {}, "cookie": {}}
-    required_params: set[tuple[str, str]] = set()
-    for param_doc in function_doc.get("parameters", []):
-        if not isinstance(param_doc, Mapping):
-            continue
-        param_name = str(param_doc.get("name") or "")
-        param_in = str(param_doc.get("in") or "query")
-        if param_doc.get("required"):
-            required_params.add((param_in, param_name))
-        if param_name in input_params:
-            required_params.discard((param_in, param_name))
-            params.setdefault(param_in, {})[param_name] = input_params[param_name]
-    body_data: dict[str, Any] | None = None
-    required_body_params: set[str] = set()
-    if isinstance(function_doc.get("requestBody"), Mapping):
-        body_data = {}
-        request_body = function_doc["requestBody"]
-        schema = request_body.get("content", {}).get("application/json", {}).get("schema", {})
-        if isinstance(schema, Mapping) and isinstance(schema.get("properties"), Mapping):
-            required_body_params = set(str(item) for item in schema.get("required", []))
-            for property_name in schema["properties"]:
-                if property_name in input_params:
-                    body_data[str(property_name)] = input_params[property_name]
-                    required_body_params.discard(str(property_name))
-    if required_params or required_body_params:
-        missing = [item[1] for item in sorted(required_params)] + sorted(required_body_params)
-        raise ValueError(f"Missing required parameters: {', '.join(missing)}. You need to change the input and try again.")
-    resolved_base_url = base_url or str((openapi_spec.get("servers") or [{}])[0].get("url") or "")
-    url = f"{resolved_base_url.rstrip('/')}{path.format(**params['path'])}"
-    headers = {"Content-Type": "application/json"}
-    headers.update(params.get("header") or {})
-    return requests.request(
-        method=method.upper(),
-        url=url,
-        params=params.get("query") or {},
-        json=body_data,
-        headers=headers,
-        cookies=params.get("cookie") or {},
-        timeout=timeout,
-    )
-
-
-def _inject_authentication(
-    api_name: str,
-    arguments: Mapping[str, Any],
-    metadata: Mapping[str, Any],
-) -> dict[str, Any]:
-    params = dict(arguments)
-    auth = metadata.get("toolalpaca_authentication")
-    if not isinstance(auth, Mapping):
-        return params
-    for key, raw_value in auth.items():
-        key_text = str(key)
-        env_value = _auth_env_value(api_name, key_text)
-        if env_value:
-            params[key_text] = env_value
-            continue
-        if _is_placeholder_auth(raw_value):
-            continue
-        if key_text not in params or _is_placeholder_auth(params.get(key_text)):
-            params[key_text] = raw_value
-    return params
-
-
-def _auth_env_value(api_name: str, key: str) -> str:
-    for candidate in _AUTH_ENV_CANDIDATES.get((api_name, key), ()):
-        value = os.environ.get(candidate)
-        if value:
-            return value
-    generic = os.environ.get(f"TOOLALPACA_{_env_token(api_name)}_{_env_token(key)}")
-    return generic or ""
-
-
-def _env_token(value: str) -> str:
-    return re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
-
-
-def _is_placeholder_auth(value: Any) -> bool:
-    return str(value or "").strip() in _PLACEHOLDER_AUTH_VALUES
-
-
-def _render_standard_answer(expected_tool_calls: Sequence[Mapping[str, Any]]) -> str:
-    parts: list[str] = []
-    for index, call in enumerate(expected_tool_calls, start=1):
-        name = str(call.get("name") or call.get("Action") or "")
-        arguments = call.get("arguments", call.get("Action_Input", {}))
-        if isinstance(arguments, str):
-            arguments_text = arguments
-        else:
-            arguments_text = json.dumps(_sanitize_value(arguments), ensure_ascii=False, sort_keys=True)
-        parts.append(f"{index}. Function: {name}\nParameters: {arguments_text}")
-    return "\n".join(parts)
-
-
-def _render_solution(
-    execution_steps: Sequence[ToolAlpacaExecutionStep],
-    *,
-    final_response: str,
-) -> str:
-    parts: list[str] = []
-    for index, step in enumerate(execution_steps, start=1):
-        parts.append(
-            f"{index}. Function: {step.action.action}\n"
-            f"Parameters: {json.dumps(_sanitize_value(step.action.action_input), ensure_ascii=False, sort_keys=True)}\n"
-            f"Returns: {step.observation}"
+    parse_error: str | None = None,
+    sandbox: "ToolAlpacaSandbox | None" = None,
+) -> SimpleToolCallEvaluation:
+    expected_calls = [_expectation_to_call(item) for item in record.expected_tool_calls]
+    actual_calls = [
+        {
+            "name": str(item.get("name") or ""),
+            "arguments": dict(item.get("arguments") or {}),
+        }
+        for item in decoded_calls
+    ]
+    sandbox = sandbox or _default_toolalpaca_sandbox(record)
+    details: dict[str, Any] = {
+        "execution_mode": getattr(sandbox, "execution_mode", "local_toolalpaca_sandbox"),
+        "expected_tool_calls": expected_calls,
+        "decoded_tool_calls": actual_calls,
+        "call_matches": [],
+        "parse_error": parse_error or "",
+    }
+    if parse_error:
+        return SimpleToolCallEvaluation(
+            reward=0.0,
+            is_passed=False,
+            fail_reason=parse_error,
+            details=details,
         )
-    parts.append(f"{len(execution_steps) + 1}. Final Response: {final_response}")
-    return "\n".join(parts)
 
+    expected_results = sandbox.execute_sequence(record, expected_calls)
+    actual_results = sandbox.execute_sequence(record, actual_calls)
+    details["expected_execution_results"] = [_result_payload(item) for item in expected_results]
+    details["decoded_execution_results"] = [_result_payload(item) for item in actual_results]
+    sandbox_error = _blocking_sandbox_error(expected_results, actual_results)
+    if sandbox_error:
+        return SimpleToolCallEvaluation(
+            reward=0.0,
+            is_passed=False,
+            fail_reason=sandbox_error,
+            details=details,
+        )
 
-def _judge_chat_completion(prompt: str, *, api_key: str, model: str, temperature: float) -> str:
-    _load_env_once()
-    base_url = str(os.environ.get("JUDGE_BASE_URL") or "").rstrip("/")
-    if not base_url:
-        raise ValueError("toolalpaca official judge requires JUDGE_BASE_URL")
-    payload = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    max_tokens = os.environ.get("JUDGE_MAX_TOKENS")
-    if max_tokens:
-        payload["max_tokens"] = int(max_tokens)
-    request = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=float(os.environ.get("JUDGE_TIMEOUT", "120"))) as resp:
-            raw = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(f"judge request failed: HTTP {exc.code}: {body[:500]}") from exc
-    data = json.loads(raw)
-    return str(data["choices"][0]["message"]["content"])
+    required_expected = [item for item in expected_results if not item.optional]
+    denominator = max(1, len(required_expected))
+    passed_count = 0
+    failure_bits: list[str] = []
+    actual_index = 0
+    for expected_index, expected in enumerate(expected_results):
+        if actual_index >= len(actual_results):
+            if expected.optional:
+                details["call_matches"].append(
+                    {
+                        "expected_index": expected_index,
+                        "decoded_index": None,
+                        "ok": True,
+                        "reason": "optional_skipped",
+                    }
+                )
+                continue
+            details["call_matches"].append(
+                {
+                    "expected_index": expected_index,
+                    "decoded_index": None,
+                    "ok": False,
+                    "reason": "missing_call",
+                }
+            )
+            failure_bits.append(f"call_{expected_index}:missing_call")
+            continue
 
-
-def _extract_judge_label(text: str, label: str) -> str:
-    match = re.search(rf"{re.escape(label)}:\s*(Yes|No|Uncertain)", text, flags=re.IGNORECASE)
-    return match.group(1) if match else ""
-
-
-def _official_action_payload(action: ToolAlpacaOfficialAction) -> dict[str, Any]:
-    return {
-        "Action": action.action,
-        "Action_Input": json.dumps(_sanitize_value(action.action_input), ensure_ascii=False, sort_keys=True),
-    }
-
-
-def _execution_step_payload(step: ToolAlpacaExecutionStep) -> dict[str, Any]:
-    return {
-        "Action": step.action.action,
-        "Action_Input": json.dumps(_sanitize_value(step.action.action_input), ensure_ascii=False, sort_keys=True),
-        "Observation": _sanitize_text(step.observation),
-    }
-
-
-def _sanitize_calls(calls: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    sanitized = []
-    for call in calls:
-        sanitized.append(
+        actual = actual_results[actual_index]
+        ok, reason = _execution_matches(actual, expected)
+        if ok:
+            if not expected.optional:
+                passed_count += 1
+            details["call_matches"].append(
+                {
+                    "expected_index": expected_index,
+                    "decoded_index": actual_index,
+                    "ok": True,
+                    "reason": reason,
+                }
+            )
+            actual_index += 1
+            continue
+        if expected.optional:
+            details["call_matches"].append(
+                {
+                    "expected_index": expected_index,
+                    "decoded_index": actual_index,
+                    "ok": True,
+                    "reason": "optional_skipped",
+                    "candidate_reason": reason,
+                }
+            )
+            continue
+        details["call_matches"].append(
             {
-                "name": str(call.get("name") or ""),
-                "arguments": _sanitize_value(call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}),
+                "expected_index": expected_index,
+                "decoded_index": actual_index,
+                "ok": False,
+                "reason": reason,
             }
         )
-    return sanitized
+        failure_bits.append(f"call_{expected_index}:{reason}")
+        actual_index += 1
+
+    while actual_index < len(actual_results):
+        details["call_matches"].append(
+            {
+                "expected_index": None,
+                "decoded_index": actual_index,
+                "ok": False,
+                "reason": "unexpected_extra_call",
+            }
+        )
+        failure_bits.append(f"call_{actual_index}:unexpected_extra_call")
+        actual_index += 1
+
+    reward = passed_count / denominator
+    is_passed = passed_count == len(required_expected) and not failure_bits
+    if not expected_results:
+        is_passed = len(actual_results) == 0
+        reward = 1.0 if is_passed else 0.0
+    return SimpleToolCallEvaluation(
+        reward=float(reward),
+        is_passed=bool(is_passed),
+        fail_reason="; ".join(failure_bits),
+        details=details,
+    )
 
 
-def _sanitize_value(value: Any) -> Any:
+class ToolAlpacaSandbox:
+    execution_mode = "local_toolalpaca_sandbox"
+
+    def execute_sequence(
+        self,
+        record: SimpleToolCallRecord,
+        calls: Sequence[Mapping[str, Any]],
+    ) -> list[ToolAlpacaActionResult]:
+        results: list[ToolAlpacaActionResult] = []
+        for call in calls:
+            results.append(self.execute_call(record, call, history=results))
+        return results
+
+    def execute_call(
+        self,
+        record: SimpleToolCallRecord,
+        call: Mapping[str, Any],
+        *,
+        history: Sequence[ToolAlpacaActionResult],
+    ) -> ToolAlpacaActionResult:
+        normalized = _normalize_toolalpaca_call(call, history)
+        if normalized is None:
+            return ToolAlpacaActionResult(
+                action=str(call.get("name") or call.get("Action") or "").strip(),
+                action_input={},
+                success=False,
+                error="arguments_not_object",
+            )
+        action, resolved_arguments, optional = normalized
+
+        tools_by_name = {str(tool.get("name") or ""): dict(tool) for tool in record.tools}
+        tool = tools_by_name.get(action)
+        if tool is None and action == "getDetails":
+            tool = _get_details_tool_schema()
+        if tool is None:
+            request = {
+                "action": action,
+                "method": "",
+                "path": "",
+                "path_params": {},
+                "query": {},
+                "body": dict(_json_safe(resolved_arguments)),
+                "headers": {},
+                "cookies": {},
+                "builtin": False,
+            }
+            response = _synthetic_toolalpaca_response(action, request, history)
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=True,
+                optional=optional,
+                request=request,
+                response=response,
+            )
+
+        try:
+            request = _build_toolalpaca_request(record, tool, dict(resolved_arguments))
+        except ValueError as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=False,
+                optional=optional,
+                error=str(exc),
+            )
+        response = _synthetic_toolalpaca_response(action, request, history)
+        return ToolAlpacaActionResult(
+            action=action,
+            action_input=dict(_json_safe(resolved_arguments)),
+            success=True,
+            optional=optional,
+            request=request,
+            response=response,
+        )
+
+
+class ToolAlpacaHttpSandbox(ToolAlpacaSandbox):
+    def __init__(
+        self,
+        *,
+        simulator_url: str | None = None,
+        real_http: bool = False,
+        timeout_s: float | None = None,
+    ) -> None:
+        self.simulator_url = (simulator_url or "").rstrip("/")
+        self.real_http = bool(real_http)
+        self.timeout_s = float(timeout_s or os.environ.get("TOOLALPACA_HTTP_TIMEOUT_S") or 30.0)
+        self.execution_mode = "official_toolalpaca_real_http" if self.real_http else "official_toolalpaca_simulator"
+
+    def execute_call(
+        self,
+        record: SimpleToolCallRecord,
+        call: Mapping[str, Any],
+        *,
+        history: Sequence[ToolAlpacaActionResult],
+    ) -> ToolAlpacaActionResult:
+        normalized = _normalize_toolalpaca_call(call, history)
+        if normalized is None:
+            return ToolAlpacaActionResult(
+                action=str(call.get("name") or call.get("Action") or "").strip(),
+                action_input={},
+                success=False,
+                error="arguments_not_object",
+            )
+        action, resolved_arguments, optional = normalized
+        tools_by_name = {str(tool.get("name") or ""): dict(tool) for tool in record.tools}
+        tool = tools_by_name.get(action)
+        if tool is None and action == "getDetails":
+            tool = _get_details_tool_schema()
+        if tool is None:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=False,
+                optional=optional,
+                error=f"unknown_tool:{action}",
+            )
+        try:
+            request = _build_toolalpaca_request(record, tool, dict(resolved_arguments))
+        except ValueError as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=False,
+                optional=optional,
+                error=str(exc),
+            )
+        if request.get("builtin"):
+            response = _synthetic_toolalpaca_response(action, request, history)
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=True,
+                optional=optional,
+                request=request,
+                response=response,
+                status_code=200,
+            )
+        return self._execute_http_request(
+            record,
+            action=action,
+            action_input=dict(_json_safe(resolved_arguments)),
+            optional=optional,
+            request=request,
+        )
+
+    def _execute_http_request(
+        self,
+        record: SimpleToolCallRecord,
+        *,
+        action: str,
+        action_input: dict[str, Any],
+        optional: bool,
+        request: Mapping[str, Any],
+    ) -> ToolAlpacaActionResult:
+        url = self._request_url(record, request)
+        if not url:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error="toolalpaca_sandbox_unavailable:missing_base_url",
+            )
+        method = str(request.get("method") or "get").upper()
+        try:
+            outbound_query = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("query") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_body = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("body") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_headers = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("headers") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_cookies = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("cookies") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+        except ValueError as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error=str(exc),
+            )
+        try:
+            response = requests.request(
+                method,
+                url,
+                params=outbound_query,
+                json=(outbound_body or None),
+                headers=outbound_headers,
+                cookies=outbound_cookies,
+                timeout=self.timeout_s,
+            )
+        except requests.RequestException as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error=f"toolalpaca_sandbox_unavailable:{exc}",
+            )
+        response_payload = _http_response_payload(response)
+        success = 200 <= int(response.status_code) < 300
+        return ToolAlpacaActionResult(
+            action=action,
+            action_input=action_input,
+            success=success,
+            optional=optional,
+            request=dict(request),
+            response=response_payload,
+            error=None if success else f"http_status_{response.status_code}",
+            status_code=int(response.status_code),
+        )
+
+    def _request_url(self, record: SimpleToolCallRecord, request: Mapping[str, Any]) -> str:
+        path = str(request.get("path") or "")
+        if self.real_http:
+            server_url = str(request.get("server_url") or record.metadata.get("api_server_url") or "").strip()
+            return _join_url(server_url, path) if server_url else ""
+        base_url = self.simulator_url or _toolalpaca_simulator_url()
+        api_name = str(request.get("api_name") or record.metadata.get("api_name") or "").strip()
+        if not base_url or not api_name:
+            return ""
+        return _join_url(f"{base_url.rstrip('/')}/{quote(api_name, safe='')}", path)
+
+
+def _build_toolalpaca_request(
+    record: SimpleToolCallRecord,
+    tool: Mapping[str, Any],
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    name = str(tool.get("name") or "").strip()
+    metadata = tool.get("metadata") if isinstance(tool.get("metadata"), Mapping) else {}
+    metadata = dict(metadata or {})
+    parameters = tool.get("parameters") if isinstance(tool.get("parameters"), Mapping) else {}
+    parameters = dict(parameters or {})
+    properties = parameters.get("properties") if isinstance(parameters.get("properties"), Mapping) else {}
+    required = {str(item) for item in _coerce_list(parameters.get("required"))}
+    if metadata.get("tool_type") == "toolalpaca_builtin" or name == "getDetails":
+        return _build_builtin_request(name, arguments, properties, required)
+
+    operation = _load_operation(record, metadata)
+    if operation:
+        op_required, op_properties = _operation_parameter_schema(operation)
+        required.update(op_required)
+        properties = {**op_properties, **dict(properties)}
+
+    canonical_arguments: dict[str, Any] = {}
+    unknown_arguments: dict[str, Any] = {}
+    api_name = str(metadata.get("api_name") or record.metadata.get("api_name") or "")
+    for key, value in arguments.items():
+        if key in {_TOOLALPACA_OPTIONAL_KEY}:
+            continue
+        property_name = _resolve_property_name(str(key), properties)
+        schema = properties.get(property_name) if property_name else None
+        if schema is None:
+            unknown_arguments[str(key)] = _json_safe(value)
+            continue
+        if _is_absent(value) and property_name not in required:
+            continue
+        canonical_arguments[str(property_name)] = _coerce_argument_value(str(property_name), value, schema)
+    _inject_toolalpaca_auth_placeholders(api_name, canonical_arguments, required, properties)
+    missing = sorted(key for key in required if key not in canonical_arguments or _is_absent(canonical_arguments[key]))
+    path = str(metadata.get("path") or "")
+    required_path_arguments = [key for key in missing if f"{{{key}}}" in path]
+    if required_path_arguments:
+        raise ValueError(f"missing_required_arguments({', '.join(required_path_arguments)})")
+    if missing:
+        raise ValueError(f"missing_required_arguments({', '.join(missing)})")
+
+    method = str(metadata.get("method") or "get").lower()
+    param_locations = _operation_param_locations(operation)
+    path_params: dict[str, Any] = {}
+    query: dict[str, Any] = {}
+    headers: dict[str, Any] = {}
+    cookies: dict[str, Any] = {}
+    body: dict[str, Any] = {}
+    for key, value in canonical_arguments.items():
+        location = param_locations.get(key)
+        if location == "path" or f"{{{key}}}" in path:
+            path_params[key] = value
+        elif location == "header":
+            headers[key] = value
+        elif location == "cookie":
+            cookies[key] = value
+        elif location == "query" or method not in _HTTP_BODY_METHODS:
+            query[key] = value
+        else:
+            body[key] = value
+
+    rendered_path = path
+    for key, value in path_params.items():
+        rendered_path = rendered_path.replace(f"{{{key}}}", str(value))
+    unresolved_path_params = re.findall(r"\{([^{}]+)\}", rendered_path)
+    if unresolved_path_params:
+        raise ValueError(f"missing_path_arguments({', '.join(sorted(unresolved_path_params))})")
+
+    return _json_safe(
+        {
+            "action": name,
+            "method": method,
+            "path": rendered_path,
+            "path_template": path,
+            "path_params": path_params,
+            "query": _drop_absent_values(query),
+            "body": _drop_absent_values(body),
+            "headers": _drop_absent_values(headers),
+            "cookies": _drop_absent_values(cookies),
+            "ignored_arguments": unknown_arguments,
+            "builtin": False,
+            "api_name": api_name,
+            "server_url": str(metadata.get("server_url") or record.metadata.get("api_server_url") or ""),
+        }
+    )
+
+
+def _build_builtin_request(
+    name: str,
+    arguments: Mapping[str, Any],
+    properties: Mapping[str, Any],
+    required: set[str],
+) -> dict[str, Any]:
+    canonical_arguments: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if key not in properties:
+            continue
+        if _is_absent(value) and key not in required:
+            continue
+        canonical_arguments[str(key)] = _coerce_argument_value(str(key), value, properties[key])
+    missing = sorted(key for key in required if key not in canonical_arguments or _is_absent(canonical_arguments[key]))
+    if missing:
+        raise ValueError(f"missing_required_arguments({', '.join(missing)})")
+    return _json_safe(
+        {
+            "action": name,
+            "method": "",
+            "path": "",
+            "path_template": "",
+            "path_params": {},
+            "query": {},
+            "body": canonical_arguments,
+            "headers": {},
+            "cookies": {},
+            "ignored_arguments": {},
+            "builtin": True,
+            "api_name": "",
+            "server_url": "",
+        }
+    )
+
+
+def _load_operation(record: SimpleToolCallRecord, metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    operation = metadata.get("operation")
+    if isinstance(operation, Mapping):
+        return operation
+    path = str(metadata.get("path") or "")
+    method = str(metadata.get("method") or "").lower()
+    if not path or not method:
+        return {}
+    source_path = record.metadata.get("source_path")
+    if source_path is None:
+        return {}
+    api_info = load_toolalpaca_api_info_from_source(
+        str(source_path),
+        api_index=record.metadata.get("api_index"),
+        api_name=str(record.metadata.get("api_name") or ""),
+    )
+    documentation = str(api_info.get("Documentation") or "") if isinstance(api_info, Mapping) else ""
+    if not documentation:
+        return {}
+    spec = _load_openapi_spec(documentation)
+    paths = spec.get("paths") if isinstance(spec.get("paths"), Mapping) else {}
+    path_doc = paths.get(path) if isinstance(paths, Mapping) else {}
+    operation = path_doc.get(method) if isinstance(path_doc, Mapping) else {}
+    return operation if isinstance(operation, Mapping) else {}
+
+
+@lru_cache(maxsize=32)
+def _load_openapi_spec(documentation: str) -> Mapping[str, Any]:
+    try:
+        spec = json.loads(documentation)
+    except json.JSONDecodeError:
+        return {}
+    return spec if isinstance(spec, Mapping) else {}
+
+
+def _operation_parameter_schema(
+    operation: Mapping[str, Any],
+) -> tuple[set[str], dict[str, Any]]:
+    required: set[str] = set()
+    properties: dict[str, Any] = {}
+    for param_doc in _coerce_list(operation.get("parameters")):
+        if not isinstance(param_doc, Mapping):
+            continue
+        name = str(param_doc.get("name") or "")
+        if not name:
+            continue
+        schema = param_doc.get("schema") if isinstance(param_doc.get("schema"), Mapping) else {}
+        merged = {
+            **dict(schema or {}),
+            "description": str(param_doc.get("description") or ""),
+        }
+        properties[name] = merged
+        if param_doc.get("required"):
+            required.add(name)
+    body_schema = _request_body_schema(operation)
+    body_props = body_schema.get("properties") if isinstance(body_schema.get("properties"), Mapping) else {}
+    for key, schema in body_props.items():
+        properties[str(key)] = dict(schema) if isinstance(schema, Mapping) else {}
+    required.update(str(item) for item in _coerce_list(body_schema.get("required")))
+    return required, properties
+
+
+def _operation_param_locations(operation: Mapping[str, Any]) -> dict[str, str]:
+    locations: dict[str, str] = {}
+    for param_doc in _coerce_list(operation.get("parameters")):
+        if isinstance(param_doc, Mapping) and param_doc.get("name"):
+            locations[str(param_doc.get("name"))] = str(param_doc.get("in") or "query")
+    return locations
+
+
+def _resolve_property_name(key: str, properties: Mapping[str, Any]) -> str | None:
+    if key in properties:
+        return key
+    lowered = key.lower()
+    for candidate in properties.keys():
+        if str(candidate).lower() == lowered:
+            return str(candidate)
+    if f"{key}s" in properties:
+        return f"{key}s"
+    if key.endswith("s") and key[:-1] in properties:
+        return key[:-1]
+    for candidate in properties.keys():
+        candidate_text = str(candidate)
+        if candidate_text.lower() == f"{lowered}s":
+            return candidate_text
+        if lowered.endswith("s") and candidate_text.lower() == lowered[:-1]:
+            return candidate_text
+    return None
+
+
+def _request_body_schema(operation: Mapping[str, Any]) -> Mapping[str, Any]:
+    request_body = operation.get("requestBody") if isinstance(operation.get("requestBody"), Mapping) else {}
+    content = request_body.get("content") if isinstance(request_body.get("content"), Mapping) else {}
+    json_content = content.get("application/json") if isinstance(content.get("application/json"), Mapping) else {}
+    schema = json_content.get("schema") if isinstance(json_content.get("schema"), Mapping) else {}
+    return schema if isinstance(schema, Mapping) else {}
+
+
+def _coerce_argument_value(key: str, value: Any, schema: Any) -> Any:
+    if not isinstance(schema, Mapping):
+        return _json_safe(value)
+    expected_type = str(schema.get("type") or "").lower()
+    if expected_type == "integer":
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"argument_type_error({key}:integer)") from None
+    elif expected_type == "number":
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"argument_type_error({key}:number)") from None
+    elif expected_type == "boolean":
+        value = _coerce_bool(key, value)
+    elif expected_type == "array":
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value
+            value = parsed
+        if not isinstance(value, list):
+            raise ValueError(f"argument_type_error({key}:array)")
+    elif expected_type == "object":
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value
+            value = parsed
+        if not isinstance(value, Mapping):
+            raise ValueError(f"argument_type_error({key}:object)")
+        value = dict(value)
+    elif expected_type == "string" and not isinstance(value, str):
+        value = str(value)
+
+    enum = _schema_enum(schema)
+    if enum and value not in enum and not _is_absent(value):
+        raise ValueError(f"argument_enum_error({key})")
+    return _json_safe(value)
+
+
+def _coerce_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    raise ValueError(f"argument_type_error({key}:boolean)")
+
+
+def _schema_enum(schema: Mapping[str, Any]) -> list[Any]:
+    raw_enum = schema.get("enum")
+    if isinstance(raw_enum, list):
+        return list(raw_enum)
+    description = str(schema.get("description") or "")
+    match = re.search(r"One of:\s*\[([^\]]+)\]", description, re.IGNORECASE)
+    if not match:
+        return []
+    return [item.strip().strip("\"'") for item in match.group(1).split(",")]
+
+
+def _resolve_toolalpaca_value(value: Any, history: Sequence[ToolAlpacaActionResult]) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): ("<redacted>" if _looks_secret_key(str(key)) else _sanitize_value(val)) for key, val in value.items()}
+        if _TOOLALPACA_REF_KEY in value:
+            return _resolve_toolalpaca_ref(str(value.get(_TOOLALPACA_REF_KEY) or ""), history)
+        return {str(key): _resolve_toolalpaca_value(item, history) for key, item in value.items()}
     if isinstance(value, list):
-        return [_sanitize_value(item) for item in value]
+        return [_resolve_toolalpaca_value(item, history) for item in value]
+    if isinstance(value, str):
+        match = re.fullmatch(r"\$\{([^{}]+)\}", value.strip())
+        if match:
+            return _resolve_toolalpaca_ref(match.group(1).strip(), history)
     return value
 
 
-def _sanitize_text(text: str) -> str:
-    return str(text or "")[:4000]
+def _resolve_toolalpaca_ref(ref: str, history: Sequence[ToolAlpacaActionResult]) -> Any:
+    text = " ".join(str(ref).strip().split())
+    if not text:
+        return ""
+    lowered = text.lower()
+    if " from " in lowered:
+        prefix, source = re.split(r"\s+from\s+", text, maxsplit=1, flags=re.IGNORECASE)
+        field_name = prefix.strip()
+        source_name = source.strip()
+        for result in reversed(history):
+            if result.action == source_name and result.success:
+                extracted = _extract_response_field(result.response, field_name)
+                if extracted is not None:
+                    return extracted
+                return _synthetic_ref_value(field_name, source_name, result.request)
+        return _synthetic_ref_value(field_name, source_name, {})
+    if "end date" in lowered:
+        return "2023-01-31"
+    if "start date" in lowered:
+        return "2023-01-01"
+    if "year" in lowered:
+        return 2023
+    if "permission" in lowered:
+        return "read"
+    if lowered == "string":
+        return "string"
+    return _synthetic_ref_value(text, "context", {})
 
 
-def _looks_secret_key(key: str) -> bool:
-    lowered = key.lower()
-    return lowered in {"api_key", "access_key", "appid"} or "token" in lowered or "secret" in lowered
+def _extract_response_field(response: Any, field_name: str) -> Any:
+    if isinstance(response, Mapping):
+        if field_name in response:
+            return response[field_name]
+        normalized_target = _slug(field_name)
+        for key, value in response.items():
+            if _slug(str(key)) == normalized_target:
+                return value
+            nested = _extract_response_field(value, field_name)
+            if nested is not None:
+                return nested
+    if isinstance(response, list):
+        for item in response:
+            nested = _extract_response_field(item, field_name)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _synthetic_toolalpaca_response(
+    action: str,
+    request: Mapping[str, Any],
+    history: Sequence[ToolAlpacaActionResult],
+) -> dict[str, Any]:
+    seed = _stable_seed({"action": action, "request": _comparable_request(request)})
+    response: dict[str, Any] = {
+        "ok": True,
+        "action": action,
+        "id": _stable_int(seed, "id"),
+        "resultId": _stable_id(seed, "result"),
+    }
+    for field_name in _likely_response_fields(action, request, history):
+        response[field_name] = _synthetic_ref_value(field_name, action, request)
+    return _json_safe(response)
+
+
+def _likely_response_fields(
+    action: str,
+    request: Mapping[str, Any],
+    history: Sequence[ToolAlpacaActionResult],
+) -> list[str]:
+    fields = {
+        "id",
+        "resultId",
+        "userId",
+        "accessToken",
+        "animeId",
+        "ip",
+        "style",
+        "format",
+        "category",
+        "username",
+        "holidayId",
+        "symbol",
+        "dashboardId",
+        "sourceId",
+        "targetId",
+    }
+    for container_name in ("query", "body", "path_params"):
+        container = request.get(container_name)
+        if isinstance(container, Mapping):
+            fields.update(str(key) for key in container)
+    for result in history:
+        if isinstance(result.response, Mapping):
+            fields.update(str(key) for key in result.response.keys())
+    if action.startswith("search"):
+        fields.add(f"{_slug(action.removeprefix('search'))}Id")
+    if action.startswith("create"):
+        fields.add(f"{_slug(action.removeprefix('create'))}Id")
+    return sorted(fields)
+
+
+def _synthetic_ref_value(field_name: str, source_name: str, request: Mapping[str, Any] | None) -> Any:
+    field_slug = _slug(field_name)
+    seed = _stable_seed(
+        {
+            "field": field_name,
+            "source": source_name,
+            "request": _comparable_request(request or {}),
+        }
+    )
+    if "date" in field_slug:
+        return "2023-01-31" if field_slug.startswith("end") else "2023-01-01"
+    if field_slug.endswith("year") or field_slug == "year":
+        return 2023
+    if field_slug.endswith("id") or field_slug == "id":
+        return _stable_int(seed, field_slug)
+    if field_slug in {"ip"}:
+        return f"192.0.2.{_stable_int(seed, field_slug) % 250 + 1}"
+    if field_slug in {"symbol"}:
+        return "BTC/USD"
+    if field_slug in {"format"}:
+        return "png"
+    if field_slug in {"style"}:
+        return "minimal"
+    if field_slug in {"category"}:
+        return "general"
+    if field_slug in {"permission", "permissions", "somepermission"}:
+        return "read"
+    return _stable_id(seed, field_slug)
+
+
+def _execution_matches(actual: ToolAlpacaActionResult, expected: ToolAlpacaActionResult) -> tuple[bool, str]:
+    if actual.action != expected.action:
+        return (
+            False,
+            f"name_mismatch(expected={expected.action}, actual={actual.action})",
+        )
+    if actual.success != expected.success:
+        return (
+            False,
+            f"execution_status_mismatch(expected={expected.success}, actual={actual.success})",
+        )
+    if not expected.success:
+        return (
+            actual.error == expected.error,
+            "ok" if actual.error == expected.error else "execution_error_mismatch",
+        )
+    if _comparable_request(actual.request) != _comparable_request(expected.request):
+        return False, "request_mismatch"
+    return True, "ok"
+
+
+def _comparable_request(request: Mapping[str, Any]) -> dict[str, Any]:
+    return _json_safe(
+        {
+            "action": request.get("action", ""),
+            "method": request.get("method", ""),
+            "path": request.get("path", ""),
+            "path_params": _drop_absent_values(request.get("path_params", {})),
+            "query": _drop_absent_values(request.get("query", {})),
+            "body": _drop_absent_values(request.get("body", {})),
+            "headers": _drop_absent_values(request.get("headers", {})),
+            "cookies": _drop_absent_values(request.get("cookies", {})),
+            "builtin": bool(request.get("builtin", False)),
+        }
+    )
+
+
+def _result_payload(result: ToolAlpacaActionResult) -> dict[str, Any]:
+    return {
+        "Action": result.action,
+        "Action_Input": _clean_action_arguments(result.action_input),
+        "success": bool(result.success),
+        "optional": bool(result.optional),
+        "request": result.request,
+        "response": result.response,
+        "error": result.error or "",
+        "status_code": result.status_code,
+    }
+
+
+def _normalize_toolalpaca_call(
+    call: Mapping[str, Any],
+    history: Sequence[ToolAlpacaActionResult],
+) -> tuple[str, dict[str, Any], bool] | None:
+    action = str(call.get("name") or call.get("Action") or "").strip()
+    raw_arguments = call.get("arguments", call.get("Action_Input", {}))
+    if isinstance(raw_arguments, str):
+        try:
+            raw_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            raw_arguments = {}
+    if not isinstance(raw_arguments, Mapping):
+        return None
+    arguments = dict(raw_arguments)
+    optional = _truthy(arguments.pop(_TOOLALPACA_OPTIONAL_KEY, False))
+    if action.lower().startswith("[optional]"):
+        optional = True
+        action = action.split("]", 1)[-1].strip()
+    resolved_arguments = _resolve_toolalpaca_value(arguments, history)
+    if not isinstance(resolved_arguments, Mapping):
+        resolved_arguments = {}
+    return action, dict(resolved_arguments), optional
+
+
+def _default_toolalpaca_sandbox(record: SimpleToolCallRecord) -> ToolAlpacaSandbox:
+    backend = str(record.metadata.get("execution_backend") or "").strip().lower()
+    if not backend and record.task_id.startswith("toolalpaca_eval_simulated__"):
+        backend = "toolalpaca_simulator"
+    elif not backend and record.task_id.startswith("toolalpaca_eval_real__"):
+        backend = "toolalpaca_real_http"
+    if backend == "toolalpaca_simulator":
+        return ToolAlpacaHttpSandbox(simulator_url=_toolalpaca_simulator_url())
+    if backend == "toolalpaca_real_http":
+        return ToolAlpacaHttpSandbox(real_http=True)
+    return ToolAlpacaSandbox()
+
+
+def _inject_toolalpaca_auth_placeholders(
+    api_name: str,
+    arguments: dict[str, Any],
+    required: set[str],
+    properties: Mapping[str, Any],
+) -> None:
+    auth_params = _TOOLALPACA_AUTH_ENV_BY_API.get(api_name.strip().lower(), {})
+    for param_name in auth_params:
+        if param_name in required or param_name in properties:
+            arguments[param_name] = _toolalpaca_secret_placeholder(api_name, param_name)
+
+
+def _toolalpaca_secret_placeholder(api_name: str, param_name: str) -> str:
+    return f"{_TOOLALPACA_SECRET_PREFIX}{_slug(api_name)}:{param_name}"
+
+
+def _resolve_toolalpaca_secret_placeholders(value: Any, *, api_name: str) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _resolve_toolalpaca_secret_placeholders(item, api_name=api_name) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_resolve_toolalpaca_secret_placeholders(item, api_name=api_name) for item in value]
+    if isinstance(value, str) and value.startswith(_TOOLALPACA_SECRET_PREFIX):
+        param_name = value.rsplit(":", 1)[-1]
+        secret = _toolalpaca_auth_secret(api_name, param_name)
+        if not secret:
+            env_names = ", ".join(_toolalpaca_auth_env_names(api_name, param_name))
+            raise ValueError(f"toolalpaca_auth_missing:{api_name}:{param_name}: set one of {env_names}")
+        return secret
+    return value
+
+
+def _toolalpaca_auth_secret(api_name: str, param_name: str) -> str:
+    for env_name in _toolalpaca_auth_env_names(api_name, param_name):
+        value = os.environ.get(env_name)
+        if value:
+            return value
+    return ""
+
+
+def _toolalpaca_auth_env_names(api_name: str, param_name: str) -> tuple[str, ...]:
+    return _TOOLALPACA_AUTH_ENV_BY_API.get(api_name.strip().lower(), {}).get(param_name, ())
+
+
+def _toolalpaca_simulator_url() -> str:
+    return (os.environ.get("TOOLALPACA_SIMULATOR_URL") or "http://127.0.0.1:5678").rstrip("/")
+
+
+def _blocking_sandbox_error(
+    expected_results: Sequence[ToolAlpacaActionResult],
+    actual_results: Sequence[ToolAlpacaActionResult],
+) -> str:
+    for result in [*expected_results, *actual_results]:
+        error = str(result.error or "")
+        if error.startswith("toolalpaca_sandbox_unavailable:"):
+            return error
+    return ""
+
+
+def _http_response_payload(response: requests.Response) -> Any:
+    content_type = response.headers.get("Content-Type", "")
+    if "json" in content_type.lower():
+        try:
+            return response.json()
+        except ValueError:
+            pass
+    text = response.text
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"response": text}
+
+
+def _join_url(base_url: str, path: str) -> str:
+    if not base_url:
+        return ""
+    return urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/"))
+
+
+def _expectation_to_call(expectation: Any) -> dict[str, Any]:
+    return {"name": expectation.name, "arguments": dict(expectation.arguments)}
+
+
+def _toolalpaca_observation_text(result: ToolAlpacaActionResult) -> str:
+    if result.error:
+        return str(result.error)
+    if result.status_code is not None:
+        return f"Status Code: {result.status_code}. Response: {json.dumps(result.response, ensure_ascii=False)}"
+    return json.dumps(result.response, ensure_ascii=False)
+
+
+def _clean_action_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key): _json_safe(value) for key, value in arguments.items() if key != _TOOLALPACA_OPTIONAL_KEY}
+
+
+def _get_details_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "getDetails",
+        "description": "Ask the user for missing details.",
+        "parameters": {
+            "type": "object",
+            "properties": {"Question": {"type": "string", "description": "Required. String."}},
+            "required": ["Question"],
+        },
+        "metadata": {"tool_type": "toolalpaca_builtin"},
+    }
+
+
+def _drop_absent_values(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _drop_absent_values(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if not _is_absent(item)
+        }
+    if isinstance(value, list):
+        return [_drop_absent_values(item) for item in value if not _is_absent(item)]
+    return value
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _is_absent(value: Any) -> bool:
+    return value is None or value == "" or value == {} or value == []
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _coerce_list(raw: Any) -> list[Any]:
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, tuple):
+        return list(raw)
+    return []
+
+
+def _stable_seed(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(_json_safe(payload), ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def _stable_int(seed: str, salt: str) -> int:
+    digest = hashlib.sha256(f"{seed}:{salt}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 900000 + 1000
+
+
+def _stable_id(seed: str, salt: str) -> str:
+    digest = hashlib.sha256(f"{seed}:{salt}".encode("utf-8")).hexdigest()
+    return f"{_slug(salt)}_{digest[:10]}"
+
+
+def _slug(value: str) -> str:
+    rendered = []
+    for char in str(value):
+        rendered.append(char.lower() if char.isalnum() else "_")
+    return "_".join(part for part in "".join(rendered).split("_") if part) or "value"
 
 
 __all__ = [
     "OFFICIAL_TOOLALPACA_SOURCE",
+    "ToolAlpacaActionResult",
     "ToolAlpacaExecutionStep",
+    "ToolAlpacaHttpSandbox",
     "ToolAlpacaOfficialAction",
-    "build_toolalpaca_judge_prompt",
+    "ToolAlpacaSandbox",
+    "evaluate_toolalpaca_actions",
     "evaluate_toolalpaca_official_calls",
     "execute_toolalpaca_actions",
     "judge_toolalpaca_solution",

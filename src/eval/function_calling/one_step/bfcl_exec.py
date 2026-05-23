@@ -58,7 +58,10 @@ def evaluate_bfcl_executable_calls(
         "official_bfcl_exec_source": OFFICIAL_BFCL_EXEC_SOURCE,
         "expected_expressions": expected_exprs,
         "decoded_tool_calls": [
-            {"name": str(item.get("name") or ""), "arguments": dict(item.get("arguments") or {})}
+            {
+                "name": str(item.get("name") or ""),
+                "arguments": dict(item.get("arguments") or {}),
+            }
             for item in decoded_calls
         ],
         "actual_expressions": [],
@@ -91,10 +94,10 @@ def evaluate_bfcl_executable_calls(
         expected_results.append(result["value"])
     details["expected_results"] = [_jsonable(item) for item in expected_results]
 
-    if _is_multiple_or_parallel(record):
+    if _is_parallel_record(record):
         check = _official_parallel_no_order(actual_exprs, expected_results, match_types)
     else:
-        check = _official_simple_wrapper(actual_exprs, expected_results, match_types)
+        check = _official_ordered_wrapper(actual_exprs, expected_results, match_types)
 
     details["official_check"] = check
     passed = bool(check["valid"])
@@ -107,7 +110,11 @@ def evaluate_bfcl_executable_calls(
 
 
 def _ground_truth_expressions(record: FunctionCallTaskRecord) -> list[str]:
-    raw = record.scorer.get("ground_truth") or record.metadata.get("bfcl_ground_truth")
+    raw = (
+        record.scorer.get("ground_truth")
+        or record.metadata.get("expected_executable_calls")
+        or record.metadata.get("bfcl_ground_truth")
+    )
     if isinstance(raw, str):
         values: Sequence[Any] = [raw]
     elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray, str)):
@@ -149,9 +156,9 @@ def _execution_result_types(record: FunctionCallTaskRecord, expected_count: int)
     return result
 
 
-def _is_multiple_or_parallel(record: FunctionCallTaskRecord) -> bool:
+def _is_parallel_record(record: FunctionCallTaskRecord) -> bool:
     category = str(record.metadata.get("category") or record.task_id or "")
-    return "multiple" in category or "parallel" in category
+    return "parallel" in category
 
 
 def _tool_call_to_expression(call: Mapping[str, Any]) -> str:
@@ -183,22 +190,37 @@ def _execute_official_expression(function_call: str) -> dict[str, Any]:
     return {"valid": True, "value": value}
 
 
-def _official_simple_wrapper(
+def _official_ordered_wrapper(
     actual_exprs: Sequence[str],
     expected_results: Sequence[Any],
     expected_result_types: Sequence[str],
 ) -> dict[str, Any]:
-    if len(actual_exprs) != 1:
+    if len(actual_exprs) != len(expected_results):
         return {
             "valid": False,
-            "error": ["Wrong number of functions."],
-            "error_type": "simple_exec_checker:wrong_count",
+            "error": [
+                f"Wrong number of functions provided. Expected {len(expected_results)}, but got {len(actual_exprs)}."
+            ],
+            "error_type": "value_error:exec_result_count",
         }
-    return _official_executable_checker_simple(
-        actual_exprs[0],
-        expected_results[0],
-        expected_result_types[0],
-    )
+    sub_checks: list[dict[str, Any]] = []
+    for index, (actual_expr, expected_result) in enumerate(zip(actual_exprs, expected_results)):
+        result_type = expected_result_types[index] if index < len(expected_result_types) else "exact_match"
+        result = _official_executable_checker_simple(actual_expr, expected_result, result_type)
+        sub_checks.append({"index": index, **result})
+        if not result["valid"]:
+            return {
+                "valid": False,
+                "error": result.get("error", []),
+                "error_type": result.get("error_type", "executable_checker:failed"),
+                "sub_checks": sub_checks,
+            }
+    return {
+        "valid": True,
+        "error": [],
+        "error_type": "executable_checker:unclear",
+        "sub_checks": sub_checks,
+    }
 
 
 def _official_parallel_no_order(
@@ -218,7 +240,11 @@ def _official_parallel_no_order(
     matched_indices: list[int] = []
     for expected_index in range(len(expected_results)):
         all_errors: list[Any] = []
-        result = {"valid": False, "error": [], "error_type": "executable_checker:unclear"}
+        result = {
+            "valid": False,
+            "error": [],
+            "error_type": "executable_checker:unclear",
+        }
         for actual_index, actual_expr in enumerate(actual_exprs):
             if actual_index in matched_indices:
                 continue
@@ -240,9 +266,7 @@ def _official_parallel_no_order(
                 }
             )
         if not result["valid"]:
-            considered_indices = [
-                idx for idx in range(len(actual_exprs)) if idx not in matched_indices
-            ]
+            considered_indices = [idx for idx in range(len(actual_exprs)) if idx not in matched_indices]
             all_errors.insert(
                 0,
                 (
@@ -395,7 +419,16 @@ def _official_pattern_matcher(
 
 
 def _official_exec_globals() -> dict[str, Any]:
-    values: dict[str, Any] = {"__builtins__": {"abs": abs, "len": len, "max": max, "min": min, "sum": sum, "range": range}}
+    values: dict[str, Any] = {
+        "__builtins__": {
+            "abs": abs,
+            "len": len,
+            "max": max,
+            "min": min,
+            "sum": sum,
+            "range": range,
+        }
+    }
     values.update(_OFFICIAL_FUNCTIONS)
     values["math"] = math
     return values
@@ -563,11 +596,7 @@ def calculate_standard_deviation(numbers):
 
 
 def calc_binomial_probability(n, k, p):
-    return (
-        math_factorial(n)
-        / (math_factorial(k) * math_factorial(n - k))
-        * (p**k * (1 - p) ** (n - k))
-    )
+    return math_factorial(n) / (math_factorial(k) * math_factorial(n - k)) * (p**k * (1 - p) ** (n - k))
 
 
 def calculate_permutations(n, k):
@@ -782,7 +811,11 @@ def get_stock_history(stock_name, interval, diffandsplits="true"):
             "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
             "X-RapidAPI-Host": "yahoo-finance15.p.rapidapi.com",
         },
-        params={"symbol": stock_name, "interval": interval, "diffandsplits": diffandsplits},
+        params={
+            "symbol": stock_name,
+            "interval": interval,
+            "diffandsplits": diffandsplits,
+        },
     )
     try:
         data = response.json()["body"]
@@ -868,8 +901,7 @@ def calculate_investment_value(
                 1 - inflation_rate[year - 1] if year <= len(inflation_rate) else 1 - inflation_rate[-1]
             )
             real_value = (
-                real_value * (1 + annual_return - inflation_rate[year - 1])
-                + annual_contribution * inflation_adjustment
+                real_value * (1 + annual_return - inflation_rate[year - 1]) + annual_contribution * inflation_adjustment
             )
         else:
             real_value = current_value
@@ -912,12 +944,18 @@ def order_food(item, quantity, price):
 
 
 def get_movie_rating(movie_name):
-    response = _request_get("http://www.omdbapi.com/", params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")})
+    response = _request_get(
+        "http://www.omdbapi.com/",
+        params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")},
+    )
     return response.json()["Rated"]
 
 
 def get_movie_director(movie_name):
-    response = _request_get("http://www.omdbapi.com/", params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")})
+    response = _request_get(
+        "http://www.omdbapi.com/",
+        params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")},
+    )
     return response.json()["Director"]
 
 

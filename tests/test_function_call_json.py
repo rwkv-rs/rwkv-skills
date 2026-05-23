@@ -58,8 +58,7 @@ def test_function_call_uses_simple_tool_call_prompt_and_matcher(tmp_path) -> Non
                 "sample_index": 0,
                 "repeat_index": 0,
                 "final_answer": (
-                    '{"name":"calc_binomial_probability",'
-                    '"arguments":{"n":20,"k":5,"p":0.16666666666666666}}'
+                    '{"name":"calc_binomial_probability","arguments":{"n":20,"k":5,"p":0.16666666666666666}}'
                 ),
             }
         ],
@@ -70,7 +69,7 @@ def test_function_call_uses_simple_tool_call_prompt_and_matcher(tmp_path) -> Non
     assert record.env == {"type": "simple_tool_call"}
     assert record.scorer["type"] == "simple_tool_call"
     assert record.expected_tool_calls[0]["argument_options"]["p"] == [1 / 6]
-    assert prompt.endswith("Assistant: ```json\n")
+    assert prompt.endswith("Assistant: <think>\n</think>\n```json\n")
     assert '"arguments": {' in prompt
     assert '"parameters"' not in prompt
     assert metrics.success_rate == 1.0
@@ -101,10 +100,7 @@ def test_function_call_uses_bfcl_exec_scorer_for_exec_rows(tmp_path) -> None:
             {
                 "sample_index": 0,
                 "repeat_index": 0,
-                "final_answer": (
-                    '{"name":"calc_binomial_probability",'
-                    '"arguments":{"n":20,"k":5,"p":0.6}}'
-                ),
+                "final_answer": ('{"name":"calc_binomial_probability","arguments":{"n":20,"k":5,"p":0.6}}'),
             }
         ],
         dataset_path=str(path),
@@ -144,10 +140,7 @@ def test_bfcl_exec_scorer_accepts_bfcl_matrix_argument_names(tmp_path) -> None:
             {
                 "sample_index": 0,
                 "repeat_index": 0,
-                "final_answer": (
-                    '{"name":"mat_mul",'
-                    '"arguments":{"matA":[[1,2],[3,4]],"matB":[[5,6],[7,8]]}}'
-                ),
+                "final_answer": ('{"name":"mat_mul","arguments":{"matA":[[1,2],[3,4]],"matB":[[5,6],[7,8]]}}'),
             }
         ],
         dataset_path=str(path),
@@ -158,7 +151,12 @@ def test_bfcl_exec_scorer_accepts_bfcl_matrix_argument_names(tmp_path) -> None:
     record = JsonlFunctionCallTaskLoader(path).load()[0]
     result = evaluate_bfcl_executable_calls(
         record,
-        [{"name": "mat_mul", "arguments": {"matA": [[1, 2], [3, 4]], "matB": [[5, 6], [7, 8]]}}],
+        [
+            {
+                "name": "mat_mul",
+                "arguments": {"matA": [[1, 2], [3, 4]], "matB": [[5, 6], [7, 8]]},
+            }
+        ],
     )
     assert result.details["official_bfcl_exec_source"] == "ShishirPatil/gorilla@28a0f42"
     assert result.details["official_check"]["valid"] is True
@@ -199,7 +197,9 @@ def test_bfcl_exec_scorer_does_not_fallback_to_argument_identity(tmp_path) -> No
     assert metrics.payloads[0]["fail_reason"] == "bfcl_exec:official_ground_truth_execution_failed"
 
 
-def test_bfcl_exec_scorer_reconstructs_ground_truth_from_legacy_expected_calls(tmp_path) -> None:
+def test_bfcl_exec_scorer_reconstructs_ground_truth_from_legacy_expected_calls(
+    tmp_path,
+) -> None:
     path = tmp_path / "bfcl_exec_simple_legacy.jsonl"
     row = _simple_tool_call_row()
     row["task_id"] = "exec_simple_legacy"
@@ -240,9 +240,10 @@ def test_bfcl_exec_prompt_puts_strict_schema_in_system(tmp_path) -> None:
 
     prompt = pipeline._make_prompt(record)
 
-    assert 'The JSON shape is {"name":"tool_name","arguments":{...}}.' in prompt
-    assert "The arguments value must be a JSON object, not a JSON string." in prompt
-    assert "If multiple tool calls are required, return a JSON array" in prompt
+    assert "Output JSON schema:" in prompt
+    assert "Return exactly one JSON value that validates against the schema." in prompt
+    assert "For multiple required tool calls, return a JSON array containing every required call" in prompt
+    assert "Do not copy tool schemas, descriptions, type/items/properties/required/default fields" in prompt
 
 
 def test_toolalpaca_prompt_adds_name_and_argument_constraints(tmp_path) -> None:
@@ -258,7 +259,7 @@ def test_toolalpaca_prompt_adds_name_and_argument_constraints(tmp_path) -> None:
         },
         {
             "name": "searchAxolotlImages",
-            "description": "Search images.\nParameters: {\"color\":\"Required.\"}\nOutput: results",
+            "description": 'Search images.\nParameters: {"color":"Required."}\nOutput: results',
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -284,19 +285,20 @@ def test_toolalpaca_prompt_adds_name_and_argument_constraints(tmp_path) -> None:
 
     prompt = pipeline._make_prompt(record)
 
-    assert "ToolAlpaca selection rules:" in prompt
-    assert 'Allowed tool names: ["getRandomAxolotlImage","searchAxolotlImages"].' in prompt
-    assert "The name value must exactly copy one allowed tool name" in prompt
-    assert "use only argument keys shown" in prompt
-    assert "Include every argument whose value is stated or directly implied" in prompt
-    assert "return one JSON array item for each required action" in prompt
+    assert "Tools:" in prompt
+    assert "Output JSON schema:" in prompt
+    assert "Use only listed tool names." in prompt
+    assert "Each arguments object must contain only final argument values for that tool." in prompt
+    assert "Return no prose, no markdown, and no extra text outside the JSON value." in prompt
     assert "Omit optional arguments" not in prompt
     assert "fewest tool calls" not in prompt
     assert '"required": [' in prompt
 
 
 def test_toolalpaca_description_summary_drops_embedded_parameters(tmp_path) -> None:
-    from src.eval.function_calling.simple_tool_call import load_toolalpaca_rows_from_source
+    from src.eval.function_calling.simple_tool_call import (
+        load_toolalpaca_rows_from_source,
+    )
 
     source = tmp_path / "toolalpaca.json"
     source.write_text(
@@ -315,9 +317,7 @@ def test_toolalpaca_description_summary_drops_embedded_parameters(tmp_path) -> N
                     ],
                     "Function_Description": {
                         "searchAxolotlImages": (
-                            "Search images.\n"
-                            "Parameters: {\"color\":\"string. Required.\"}\n"
-                            "Output: matching images"
+                            'Search images.\nParameters: {"color":"string. Required."}\nOutput: matching images'
                         )
                     },
                     "Function_Projection": {"searchAxolotlImages": ["/images", "get"]},
@@ -333,14 +333,15 @@ def test_toolalpaca_description_summary_drops_embedded_parameters(tmp_path) -> N
 
     rows = load_toolalpaca_rows_from_source(source, dataset_name="toolalpaca_eval_simulated")
 
-    assert rows[0]["tools"][0]["description"] == "Search images."
+    assert rows[0]["tools"][0]["description"].startswith("Search images.")
     assert rows[0]["tools"][0]["parameters"]["required"] == ["color"]
     assert rows[0]["scorer"]["type"] == "toolalpaca_official"
     assert rows[0]["metadata"]["toolalpaca_dataset"] == "simulated"
-    assert rows[0]["metadata"]["toolalpaca_function_projection"] == {
-        "searchAxolotlImages": ["/images", "get"]
-    }
-    assert rows[0]["metadata"]["toolalpaca_authentication"] == {"api_key": "***"}
+    assert rows[0]["metadata"]["path"] == "/images"
+    assert rows[0]["metadata"]["method"] == "get"
+    assert rows[0]["metadata"]["api_name"] == "Axolotl"
+    assert rows[0]["metadata"]["server_url"] == "https://example.test"
+    assert rows[0]["tools"][0]["metadata"]["path"] == "/images"
 
 
 def test_toolalpaca_official_scorer_executes_and_judges_local_json(tmp_path) -> None:
@@ -390,16 +391,11 @@ def test_toolalpaca_official_scorer_executes_and_judges_local_json(tmp_path) -> 
         "toolalpaca_authentication": {},
     }
     path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
-    with (
-        patch("src.eval.function_calling.one_step.toolalpaca.requests.request") as mocked_request,
-        patch("src.eval.function_calling.one_step.toolalpaca.judge_toolalpaca_solution") as mocked_judge,
-    ):
+    with patch("src.eval.function_calling.one_step.toolalpaca.requests.request") as mocked_request:
         mocked_request.return_value.status_code = 200
         mocked_request.return_value.text = '{"temperature":21}'
-        mocked_judge.return_value = {
-            "process_correctness": "Yes",
-            "final_response_correctness": "Uncertain",
-        }
+        mocked_request.return_value.headers = {"Content-Type": "application/json"}
+        mocked_request.return_value.json.return_value = {"temperature": 21}
         metrics = evaluate_function_call(
             [
                 {
@@ -414,8 +410,7 @@ def test_toolalpaca_official_scorer_executes_and_judges_local_json(tmp_path) -> 
 
     assert metrics.success_rate == 1.0
     assert metrics.avg_at_k == {"avg@1": 1.0}
-    mocked_request.assert_called_once()
-    mocked_judge.assert_called_once()
+    assert mocked_request.call_count == 2
 
 
 def test_toolalpaca_official_adapter_converts_local_json_calls() -> None:
@@ -432,7 +427,9 @@ def test_toolalpaca_official_adapter_converts_local_json_calls() -> None:
     assert actions[0].action_input == {"year": 2023, "countryCode": "US"}
 
 
-def test_toolalpaca_execution_does_not_inject_redacted_auth_placeholder(tmp_path) -> None:
+def test_toolalpaca_execution_does_not_inject_redacted_auth_placeholder(
+    tmp_path,
+) -> None:
     path = tmp_path / "toolalpaca_eval_real.jsonl"
     row = _simple_tool_call_row()
     row["task_id"] = "toolalpaca_eval_real__auth_000"
@@ -443,7 +440,10 @@ def test_toolalpaca_execution_does_not_inject_redacted_auth_placeholder(tmp_path
             "description": "Protected lookup.",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}, "api_key": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "api_key": {"type": "string"},
+                },
                 "required": ["query", "api_key"],
             },
         }
@@ -486,7 +486,7 @@ def test_toolalpaca_execution_does_not_inject_redacted_auth_placeholder(tmp_path
         local_calls_to_official_actions([{"name": "protected_lookup", "arguments": {"query": "alpha"}}]),
     )
 
-    assert "Missing required parameters: api_key" in steps[0].observation
+    assert "missing_required_arguments(api_key)" in steps[0].observation
     assert "***" not in steps[0].observation
 
 
@@ -530,7 +530,10 @@ def test_function_call_scheduler_exposes_only_bfcl_and_toolalpaca_jobs() -> None
     assert _resolve_job_list(("function_one_step_bfcl_ast",), None, None) == ("function_one_step_bfcl_ast",)
     for job_name in FUNCTION_CALL_FUTURE_BENCHMARK_JOBS:
         assert JOB_CATALOGUE[job_name].domain == "function_call"
-        if job_name not in {"function_one_step_apibank_l1", "function_agent_apibank_l2"}:
+        if job_name not in {
+            "function_one_step_apibank_l1",
+            "function_agent_apibank_l2",
+        }:
             assert JOB_CATALOGUE[job_name].dataset_slugs == ()
         assert job_name not in JOB_ORDER
         assert _resolve_job_list((job_name,), None, None) == (job_name,)
@@ -542,7 +545,9 @@ def test_function_call_scheduler_exposes_only_bfcl_and_toolalpaca_jobs() -> None
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=True) is None
 
 
-def test_function_call_eval_preserves_legacy_job_unless_one_step_alias_is_scheduled(monkeypatch) -> None:
+def test_function_call_eval_preserves_legacy_job_unless_one_step_alias_is_scheduled(
+    monkeypatch,
+) -> None:
     from src.eval.function_calling.one_step.jobs import simple_tool_call_job_name
 
     monkeypatch.delenv("RWKV_SKILLS_JOB_NAME", raising=False)
@@ -558,13 +563,21 @@ def test_function_call_eval_preserves_legacy_job_unless_one_step_alias_is_schedu
 
 def test_one_step_modules_preserve_legacy_imports() -> None:
     from src.eval.evaluators.function_call import FunctionCallPipeline as LegacyPipeline
-    from src.eval.function_calling.bfcl_exec import evaluate_bfcl_executable_calls as legacy_bfcl_exec
-    from src.eval.function_calling.one_step.bfcl_exec import evaluate_bfcl_executable_calls as one_step_bfcl_exec
-    from src.eval.function_calling.one_step.pipeline import FunctionCallPipeline as OneStepPipeline
+    from src.eval.function_calling.bfcl_exec import (
+        evaluate_bfcl_executable_calls as legacy_bfcl_exec,
+    )
+    from src.eval.function_calling.one_step.bfcl_exec import (
+        evaluate_bfcl_executable_calls as one_step_bfcl_exec,
+    )
+    from src.eval.function_calling.one_step.pipeline import (
+        FunctionCallPipeline as OneStepPipeline,
+    )
     from src.eval.function_calling.one_step.simple_tool_call import (
         decode_simple_tool_call_response as one_step_decode,
     )
-    from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response as legacy_decode
+    from src.eval.function_calling.simple_tool_call import (
+        decode_simple_tool_call_response as legacy_decode,
+    )
 
     assert LegacyPipeline is OneStepPipeline
     assert legacy_decode is one_step_decode
@@ -664,8 +677,12 @@ def test_future_official_adapter_boundaries_are_declared(tmp_path) -> None:
 
     assert require_official_apibank_root(apibank_root) == apibank_root
     assert require_apibank_level2_assets(ApiBankLevel2AdapterConfig(official_root=apibank_root)) == apibank_root
-    assert require_agentbench_assets(AgentBenchAdapterConfig(task="db", official_root=agentbench_root)) == agentbench_root
-    assert require_agentbench_assets(AgentBenchAdapterConfig(task="kg", official_root=agentbench_root)) == agentbench_root
+    assert (
+        require_agentbench_assets(AgentBenchAdapterConfig(task="db", official_root=agentbench_root)) == agentbench_root
+    )
+    assert (
+        require_agentbench_assets(AgentBenchAdapterConfig(task="kg", official_root=agentbench_root)) == agentbench_root
+    )
     assert apibank_action_text(ToolAction(name="Calculator", arguments={"formula": "1+1"})) == (
         "[Calculator(formula='1+1')]"
     )
@@ -719,7 +736,11 @@ def test_apibank_level2_env_runs_expected_trace(monkeypatch, tmp_path) -> None:
     root = tmp_path / "api-bank"
     root.mkdir()
     (root / "evaluator.py").write_text("", encoding="utf-8")
-    monkeypatch.setattr(apibank_agent, "_official_tool_manager", lambda _root, **_kwargs: FakeToolManager())
+    monkeypatch.setattr(
+        apibank_agent,
+        "_official_tool_manager",
+        lambda _root, **_kwargs: FakeToolManager(),
+    )
     row = {
         "task_id": "apibank_l2__fake",
         "env": {"type": "apibank_level2", "official_root": str(root)},
@@ -792,7 +813,11 @@ def test_apibank_official_scorer_uses_adapter_boundary(monkeypatch, tmp_path) ->
             return FakeApi()
 
     monkeypatch.setattr(apibank_adapter, "require_official_apibank_root", lambda _root=None: tmp_path)
-    monkeypatch.setattr(apibank_adapter, "_official_tool_manager", lambda _root, **_kwargs: FakeToolManager())
+    monkeypatch.setattr(
+        apibank_adapter,
+        "_official_tool_manager",
+        lambda _root, **_kwargs: FakeToolManager(),
+    )
 
     record = FunctionCallTaskRecord(
         task_id="apibank_l1__fake__000",

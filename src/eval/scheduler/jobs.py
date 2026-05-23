@@ -195,6 +195,8 @@ BFCL_EXEC_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
     for slug in (
         "bfcl_exec_simple_test",
         "bfcl_exec_multiple_test",
+        "bfcl_exec_parallel_test",
+        "bfcl_exec_parallel_multiple_test",
     )
 )
 TOOLALPACA_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
@@ -204,8 +206,21 @@ TOOLALPACA_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
         "toolalpaca_eval_real_test",
     )
 )
-APIBANK_L1_DATASET_SLUGS: Final[tuple[str, ...]] = (canonical_slug("apibank_l1_test"),)
-APIBANK_L2_DATASET_SLUGS: Final[tuple[str, ...]] = (canonical_slug("apibank_l2_test"),)
+APIBANK_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug)
+    for slug in (
+        "apibank_level1_test",
+        "apibank_level2_test",
+    )
+)
+APIBANK_L1_DATASET_SLUGS: Final[tuple[str, ...]] = (
+    canonical_slug("apibank_level1_test"),
+    canonical_slug("apibank_l1_test"),
+)
+APIBANK_L2_DATASET_SLUGS: Final[tuple[str, ...]] = (
+    canonical_slug("apibank_level2_test"),
+    canonical_slug("apibank_l2_test"),
+)
 JOB_CATALOGUE: dict[str, JobSpec] = {
     "multi_choice_plain": JobSpec(
         name="multi_choice_plain",
@@ -335,6 +350,14 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         name="function_toolalpaca",
         module="src.bin.eval_function_call",
         dataset_slugs=TOOLALPACA_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
+    "function_api_bank": JobSpec(
+        name="function_api_bank",
+        module="src.bin.eval_function_call",
+        dataset_slugs=APIBANK_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
         batch_flag="--batch-size",

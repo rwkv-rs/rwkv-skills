@@ -26,7 +26,9 @@ def score_one_step_prediction(
     if _looks_like_template_leak(prediction):
         return OneStepScoreResult(False, "decision stage leaked internal template/control tokens")
 
-    from src.eval.function_calling.one_step.simple_tool_call import decode_simple_tool_call_response
+    from src.eval.function_calling.one_step.simple_tool_call import (
+        decode_simple_tool_call_response,
+    )
 
     parse_error: str | None = None
     decoded_calls: list[dict[str, Any]] = []
@@ -35,15 +37,21 @@ def score_one_step_prediction(
     except Exception as exc:  # noqa: BLE001
         parse_error = str(exc)
     if uses_bfcl_exec_scorer(record):
-        from src.eval.function_calling.one_step.bfcl_exec import evaluate_bfcl_executable_calls
+        from src.eval.function_calling.one_step.bfcl_exec import (
+            evaluate_bfcl_executable_calls,
+        )
 
         result = evaluate_bfcl_executable_calls(record, decoded_calls, parse_error=parse_error)
     elif uses_apibank_official_scorer(record):
-        from src.eval.function_calling.one_step.apibank import evaluate_apibank_official_calls
+        from src.eval.function_calling.one_step.apibank import (
+            evaluate_apibank_official_calls,
+        )
 
         result = evaluate_apibank_official_calls(record, decoded_calls, parse_error=parse_error)
     elif uses_toolalpaca_official_scorer(record):
-        from src.eval.function_calling.one_step.toolalpaca import evaluate_toolalpaca_official_calls
+        from src.eval.function_calling.one_step.toolalpaca import (
+            evaluate_toolalpaca_official_calls,
+        )
 
         result = evaluate_toolalpaca_official_calls(record, decoded_calls, parse_error=parse_error)
     else:
@@ -81,9 +89,16 @@ def uses_bfcl_exec_scorer(record: FunctionCallTaskRecord) -> bool:
     if scorer_type == "bfcl_exec":
         return True
     category = str((record.metadata or {}).get("category") or "")
-    if category in {"exec_simple", "exec_multiple"}:
+    if category in {
+        "exec_simple",
+        "exec_multiple",
+        "exec_parallel",
+        "exec_parallel_multiple",
+    }:
         return True
-    return str(record.task_id or "").startswith(("exec_simple_", "exec_multiple_"))
+    return str(record.task_id or "").startswith(
+        ("exec_simple_", "exec_multiple_", "exec_parallel_", "exec_parallel_multiple_")
+    )
 
 
 def uses_toolalpaca_official_scorer(record: FunctionCallTaskRecord) -> bool:
@@ -99,7 +114,9 @@ def uses_apibank_official_scorer(record: FunctionCallTaskRecord) -> bool:
     if scorer_type == "apibank_official":
         return True
     source_format = str((record.metadata or {}).get("source_format") or "")
-    return source_format == "official_apibank" and str(record.task_id or "").startswith("apibank_")
+    return source_format in {"official_apibank", "official_api_bank"} and str(record.task_id or "").startswith(
+        "apibank_"
+    )
 
 
 def record_env_type(record: FunctionCallTaskRecord | None) -> str:

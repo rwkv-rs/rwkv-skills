@@ -12,10 +12,7 @@ from src.eval.scheduler.config import REPO_ROOT
 
 from ..data_utils import download_file, write_jsonl
 
-_BFCL_BASE_URL = (
-    "https://huggingface.co/datasets/gorilla-llm/"
-    "Berkeley-Function-Calling-Leaderboard/resolve/main"
-)
+_BFCL_BASE_URL = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
 _TOOLALPACA_BASE_URL = "https://raw.githubusercontent.com/tangqiaoyu/ToolAlpaca/main/data"
 
 _BFCL_SMALL_CATEGORY_PATHS = {
@@ -38,6 +35,16 @@ _BFCL_SMALL_CATEGORY_PATHS = {
         "exec_multiple",
         ("unused_datasets", "question", "BFCL_v4_exec_multiple.json"),
         ("unused_datasets", "possible_answer", "BFCL_v4_exec_multiple.json"),
+    ),
+    "bfcl_exec_parallel": (
+        "exec_parallel",
+        ("unused_datasets", "question", "BFCL_v4_exec_parallel.json"),
+        ("unused_datasets", "possible_answer", "BFCL_v4_exec_parallel.json"),
+    ),
+    "bfcl_exec_parallel_multiple": (
+        "exec_parallel_multiple",
+        ("unused_datasets", "question", "BFCL_v4_exec_parallel_multiple.json"),
+        ("unused_datasets", "possible_answer", "BFCL_v4_exec_parallel_multiple.json"),
     ),
 }
 
