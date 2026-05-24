@@ -83,6 +83,7 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     toolalpaca = resolve_benchmark_metadata("toolalpaca_eval_simulated_test")
     tau_bench = resolve_benchmark_metadata("tau_bench_airline_test")
     tau2_bench = resolve_benchmark_metadata("tau2_bench_retail_base")
+    tau3_bench = resolve_benchmark_metadata("tau3_bench_banking_knowledge_base")
 
     assert browsecomp.field is BenchmarkField.FUNCTION_CALLING
     assert browsecomp.cot_modes == (CoTMode.COT,)
@@ -109,6 +110,8 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert tau_bench.scheduler_jobs == ("function_tau_bench",)
     assert tau2_bench.default_split == "base"
     assert tau2_bench.scheduler_jobs == ("function_tau2_bench",)
+    assert tau3_bench.default_split == "base"
+    assert tau3_bench.scheduler_jobs == ("function_tau3_bench",)
 
 
 def test_instruction_following_benchmarks_are_no_cot_only() -> None:
@@ -131,6 +134,12 @@ def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
         "tau_bench_retail",
         "tau_bench_airline",
         "tau_bench_telecom",
+    )
+    assert expand_benchmark_alias("tau3_bench") == (
+        "tau3_bench_retail",
+        "tau3_bench_airline",
+        "tau3_bench_telecom",
+        "tau3_bench_banking_knowledge",
     )
 
 

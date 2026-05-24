@@ -28,6 +28,7 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
         "function_toolalpaca",
         "function_tau_bench",
         "function_tau2_bench",
+        "function_tau3_bench",
     ]
 
 

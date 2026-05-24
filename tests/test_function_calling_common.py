@@ -12,6 +12,7 @@ from src.eval.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.function_calling.context_budget import normalize_rwkv_text
+from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
 from src.eval.function_calling.mcp_bench import (
     McpBenchItem,
     McpBenchTaskSpec,
@@ -24,6 +25,7 @@ from src.eval.function_calling.simple_tool_call import (
     ToolCallExpectation,
     build_simple_tool_call_prompt,
 )
+from src.infer.sampling import SamplingConfig
 
 
 def test_build_pending_attempts_filters_skip_keys() -> None:
@@ -81,17 +83,52 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert prompt.startswith("System: Tools:\n[")
     assert '"name": "translate_text"' in prompt
     assert '"arguments": {' in prompt
+    assert '"required": [' in prompt
+    assert prompt.index('"name": "translate_text"') < prompt.index('"arguments": {')
     assert '"parameters"' not in prompt
     assert "Output JSON schema:" in prompt
     assert '"oneOf": [' in prompt
     assert "return a JSON array containing every required call" in prompt
     assert "Do not copy tool schemas" in prompt
     assert "Available tools:" not in prompt
-    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n' in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: <think>\n</think>\n```json\n' in prompt
+
+
+def test_api_bank_prompt_documents_missing_year_convention() -> None:
+    record = SimpleToolCallRecord(
+        task_id="api-bank-0",
+        instruction="Conversation history:\nUser: Book it on September 21st.\nReturn the next API call only.",
+        tools=(),
+        expected_tool_calls=(),
+        metadata={"source_format": "official_api_bank"},
+    )
+
+    prompt = build_simple_tool_call_prompt(record, history_max_chars=4000)
+
+    assert "API-Bank date convention" in prompt
+    assert "use year 2023" in prompt
+
+
+def test_function_calling_sampling_removes_raw_role_stop_tokens() -> None:
+    sampling = SamplingConfig(max_generate_tokens=4096, stop_tokens=(0, 261, 24281))
+
+    adjusted = function_calling_common.clamp_function_calling_sampling(sampling, 768)
+
+    assert adjusted.max_generate_tokens == 768
+    assert adjusted.stop_tokens == (0,)
 
 
 def test_normalize_rwkv_text_strips_crlf_and_blank_lines() -> None:
     assert normalize_rwkv_text("  Line 1\r\n\r\nLine 2\n\n\nLine 3  ") == "Line 1\nLine 2\nLine 3"
+
+
+def test_extract_json_call_value_accepts_sft_safe_wrappers() -> None:
+    assert (
+        extract_json_call_value_text(
+            'Assistant: <think>\n</think>\n```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```'
+        )
+        == '{"name":"lookup","arguments":{"id":"A1"}}'
+    )
 
 
 def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
@@ -131,7 +168,7 @@ def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
     assert '"name": "calendar:search"' in planning
     assert "Output JSON schema:" in planning
     assert "\nUser: Task:\nBook the meeting" in planning
-    assert planning.endswith("Assistant: ```json\n")
+    assert planning.endswith("Assistant: <think>\n</think>\n```json\n")
     assert final.endswith("Assistant:")
 
 

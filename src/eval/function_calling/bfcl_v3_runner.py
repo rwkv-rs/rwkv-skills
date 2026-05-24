@@ -38,6 +38,7 @@ from src.eval.function_calling.bfcl_v3 import (
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
@@ -268,7 +269,9 @@ def _bfcl_official_prompt_messages(
         role = str(message.get("role") or "").strip().lower()
         content = str(message.get("content") or "")
         if role == "user":
-            if content.startswith("User: Request:\n"):
+            if content.startswith("User:Request:\n"):
+                content = content[len("User:Request:\n") :]
+            elif content.startswith("User: Request:\n"):
                 content = content[len("User: Request:\n") :]
             elif content.startswith("Request:\n"):
                 content = content[len("Request:\n") :]
@@ -581,7 +584,7 @@ def _run_bfcl_v3(
     if tool_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     prompt_style = normalize_function_prompt_style(getattr(args, "prompt_style", None))
-    tool_sampling = tool_sampling.clamp(max(1, int(args.decision_max_tokens or 1024)))
+    tool_sampling = clamp_function_calling_sampling(tool_sampling, max(1, int(args.decision_max_tokens or 1024)))
     sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]

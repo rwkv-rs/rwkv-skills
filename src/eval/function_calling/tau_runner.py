@@ -2,14 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Sequence
 
 from src.eval.agent_bench.envs.tau_v2 import TauV2Env
+from src.eval.agent_bench.tau_official import (
+    DEFAULT_TAU_PROMPT_MAX_CHARS,
+    RWKVTauOfficialAgent,
+    TauOfficialRuntime,
+)
+from src.eval.agent_bench.tasks import require_tau_v3_source
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
+from src.eval.env_config import apply_openai_env, resolve_judge_model_config, resolve_required_user_model_config
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.eval.execution_plan import AttemptKey, build_attempt_keys, plan_attempt_count
@@ -17,6 +26,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
@@ -48,8 +58,9 @@ from src.eval.results.schema import make_eval_payload, normalize_sampling_config
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
-DEFAULT_MAX_STEPS = 16
-DEFAULT_MAX_TOOL_ERRORS = 4
+DEFAULT_MAX_STEPS = 200
+DEFAULT_MAX_TOOL_ERRORS = 10
+DEFAULT_TAU_HISTORY_MAX_CHARS = 16000
 
 @dataclass(slots=True)
 class _ActiveEpisode:
@@ -268,6 +279,121 @@ def _tau_completion_to_eval_payload(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _tau_official_completion_payload(
+    *,
+    record: TauManifestRecord,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    simulation: Any,
+    evaluation: Any,
+    agent: RWKVTauOfficialAgent,
+    benchmark_name: str,
+    dataset_split: str,
+    sampling_payload: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = str(getattr(simulation, "task_id", "") or record.task_id)
+    official_reward = float(getattr(evaluation, "reward", 0.0))
+    official_is_passed = bool(getattr(evaluation, "is_passed", False))
+    parse_errors = list(agent.parse_errors)
+    reward = 0.0 if parse_errors else official_reward
+    is_passed = False if parse_errors else official_is_passed
+    details = dict(getattr(evaluation, "details", {}) or {})
+    details["domain"] = record.domain
+    details["task_id"] = task_id
+    details["benchmark_version"] = record.benchmark_version
+    details["parse_errors"] = parse_errors
+    if parse_errors:
+        details["official_reward"] = official_reward
+        details["official_is_passed"] = official_is_passed
+    details["ref_answer"] = (
+        f"domain={record.domain}\n"
+        f"task_id={task_id}\n"
+        f"benchmark_version={record.benchmark_version}\n"
+        "runtime=official_tau_orchestrator"
+    )
+
+    payload = SampleRecord(
+        benchmark_name=benchmark_name,
+        dataset_split=dataset_split,
+        sample_index=sample_index,
+        repeat_index=repeat_index,
+        pass_index=pass_index,
+        stages=list(agent.stages),
+        sampling_config=sampling_payload,
+    ).as_payload()
+    payload["_stage"] = "answer"
+    payload["agent_result"] = {
+        "task_id": task_id,
+        "domain": record.domain,
+        "reward": reward,
+        "num_turns": len(agent.stages),
+        "cost": float(getattr(simulation, "agent_cost", None) or 0.0)
+        + float(getattr(simulation, "user_cost", None) or 0.0),
+        "is_passed": is_passed,
+        "error": "; ".join(parse_errors) if parse_errors else None,
+    }
+    payload["agent_info"] = details
+    payload["agent_trace"] = _trajectory_dump(list(getattr(simulation, "messages", []) or []))
+    return payload
+
+
+def _run_tau_official_attempt(
+    *,
+    args: argparse.Namespace,
+    run: ResolvedFunctionCallingRun,
+    record: TauManifestRecord,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    runtime_env: TauOfficialRuntime,
+    user_model: Any,
+    judge_model: Any,
+    sampling: Any,
+    sampling_payload: dict[str, Any],
+    history_max_chars: int,
+    prompt_max_chars: int,
+    max_steps: int,
+    max_tool_errors: int,
+) -> dict[str, Any]:
+    task = runtime_env.load_task(record.task)
+    environment = runtime_env.create_environment(solo_mode=False)
+    agent = RWKVTauOfficialAgent(
+        engine=run.engine,
+        sampling=sampling,
+        tools=environment.get_tools(),
+        domain_policy=str(environment.get_policy()),
+        history_max_chars=history_max_chars,
+        prompt_max_chars=prompt_max_chars,
+    )
+    user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
+    seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
+    orchestrator = runtime_env.build_orchestrator(
+        agent=agent,
+        user=user,
+        environment=environment,
+        task=task,
+        max_steps=max_steps,
+        max_errors=max_tool_errors,
+        seed=seed,
+        validate_communication=True,
+    )
+    simulation = orchestrator.run()
+    evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
+    return _tau_official_completion_payload(
+        record=record,
+        sample_index=sample_index,
+        repeat_index=repeat_index,
+        pass_index=pass_index,
+        simulation=simulation,
+        evaluation=evaluation,
+        agent=agent,
+        benchmark_name=run.benchmark_name,
+        dataset_split=run.dataset_split,
+        sampling_payload=sampling_payload,
+    )
+
+
 def _run_tau(
     args: argparse.Namespace,
     run: ResolvedFunctionCallingRun,
@@ -279,6 +405,10 @@ def _run_tau(
         records = records[: int(args.max_samples)]
     if not records:
         raise ValueError("tau_bench/tau2_bench manifest is empty")
+    if run.benchmark_kind.value == "tau3_bench" or any(
+        str(record.benchmark_version).lower() == "tau_v3" for record in records
+    ):
+        require_tau_v3_source(run.dataset_slug)
 
     plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
@@ -291,64 +421,70 @@ def _run_tau(
     if decision_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     normalize_function_prompt_style(getattr(args, "prompt_style", None))
-    decision_sampling = decision_sampling.clamp(args.decision_max_tokens or 1024)
+    decision_sampling = clamp_function_calling_sampling(decision_sampling, args.decision_max_tokens or 1024)
     sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     batch_size = max(1, int(args.batch_size or 16))
     max_steps = max(1, int(args.max_steps))
     max_tool_errors = max(1, int(args.max_tool_errors))
-    history_max_chars = max(0, int(args.history_max_chars))
+    prompt_max_chars = int(os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS)))
+    tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
+    history_max_chars = max(0, min(int(args.history_max_chars), tau_history_cap))
+    user_model = resolve_required_user_model_config()
+    judge_model = resolve_judge_model_config(default_model=user_model.model_name) or user_model
+    apply_openai_env(user_model)
 
-    runtime_cache: dict[str, TauV2Env] = {}
+    runtime_cache: dict[str, TauOfficialRuntime] = {}
 
-    def _runtime_for_domain(domain: str) -> TauV2Env:
+    def _runtime_for_domain(domain: str) -> TauOfficialRuntime:
         cached = runtime_cache.get(domain)
         if cached is None:
-            cached = TauV2Env(domain=domain, judge=None)
+            cached = TauOfficialRuntime(domain=domain)
             runtime_cache[domain] = cached
         return cached
 
     if args.probe_only:
         repeated = repeat_probe_entries(selected_entries, batch_size=batch_size)
-        probe_states = [
-            _start_episode(
-                sample_index=sample_index,
-                repeat_index=0,
-                pass_index=0,
-                record=record,
-                runtime_env=_runtime_for_domain(record.domain),
-            )
-            for sample_index, record in repeated
-        ]
-        decision_prompts = [
-            build_json_call_context(
-                state.system_prompt,
-                trim_message_history(
-                    state.prompt_messages,
-                    max_chars=history_max_chars,
-                ),
+        decision_prompts: list[str] = []
+        for _sample_index, record in repeated:
+            runtime_env = _runtime_for_domain(record.domain)
+            task = runtime_env.load_task(record.task)
+            environment = runtime_env.create_environment(solo_mode=False)
+            agent = RWKVTauOfficialAgent(
+                engine=run.engine,
+                sampling=decision_sampling,
+                tools=environment.get_tools(),
+                domain_policy=str(environment.get_policy()),
                 history_max_chars=history_max_chars,
+                prompt_max_chars=prompt_max_chars,
             )
-            for state in probe_states
-        ]
+            decision_prompts.append(
+                agent._build_prompt(  # noqa: SLF001 - probe path intentionally inspects rendered first-turn prompt.
+                    [{"role": "user", "content": str(getattr(task, "user_scenario", ""))}]
+                )
+            )
         run.engine.generate(
             decision_prompts,
             sampling=decision_sampling,
             batch_size=len(decision_prompts),
-            progress_desc="TauBench-Probe-Decision",
+            progress_desc="TauOfficial-Probe",
             prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in decision_prompts],
             prompt_seeds=[
-                sample_repeat_seed(state.sample_index, state.repeat_index, stage=2)
-                for state in probe_states
+                sample_repeat_seed(sample_index, 0, stage=2)
+                for sample_index, _record in repeated
             ],
         )
-        print(f"probe-only run completed: {len(probe_states)} prompt(s)")
+        print(f"probe-only run completed: {len(decision_prompts)} prompt(s)")
         return 0
 
-    default_job_name = (
-        "function_tau2_bench" if run.dataset_slug.lower().startswith("tau2_bench") else "function_tau_bench"
-    )
+    slug_lower = run.dataset_slug.lower()
+    if slug_lower.startswith("tau3_bench"):
+        default_job_name = "function_tau3_bench"
+    elif slug_lower.startswith("tau2_bench"):
+        default_job_name = "function_tau2_bench"
+    else:
+        default_job_name = "function_tau_bench"
     job_name = _resolve_job_name(default_job_name, run_context=run_context)
     ctx = prepare_function_calling_run(
         dataset_slug=str(run.dataset_slug),
@@ -370,9 +506,8 @@ def _run_tau(
         runner_name="tau_bench",
     )
 
-    pending: deque[tuple[AttemptKey, TauManifestRecord]] = deque(
-        build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
-    )
+    pending = list(build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys))
+    max_attempt_workers = batch_size if run.engine.__class__.__name__ == "RemoteInferenceBackend" else 1
 
     try:
         with TaskRunSignalGuard(
@@ -382,158 +517,30 @@ def _run_tau(
             on_interrupt=_flush_partial_eval,
         ):
             try:
-                active: list[_ActiveEpisode] = []
-                while pending or active:
-                    while pending and len(active) < batch_size:
-                        key, record = pending.popleft()
-                        active.append(
-                            _start_episode(
-                                sample_index=key.sample_index,
-                                repeat_index=key.repeat_index,
-                                pass_index=key.pass_index,
-                                record=record,
-                                runtime_env=_runtime_for_domain(record.domain),
-                            )
-                        )
-
-                    if not active:
-                        break
-
-                    decision_prompts = [
-                        build_json_call_context(
-                            state.system_prompt,
-                            trim_message_history(
-                                state.prompt_messages,
-                                max_chars=history_max_chars,
-                            ),
-                            history_max_chars=history_max_chars,
-                        )
-                        for state in active
-                    ]
-                    decision_outputs = run.engine.generate(
-                        decision_prompts,
-                        sampling=decision_sampling,
-                        batch_size=len(decision_prompts),
-                        progress_desc="TauBench-Decision",
-                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in decision_prompts],
-                        prompt_seeds=[
-                            sample_repeat_seed(
-                                state.sample_index,
-                                state.repeat_index,
-                                pass_index=state.pass_index,
-                                stage=state.turn_count * 2 + 2,
-                            )
-                            for state in active
-                        ],
-                    )
-                    decision_by_index = {int(item.prompt_index): item for item in decision_outputs}
-
-                    finished_slots: list[int] = []
-                    for slot_index, state in enumerate(active):
-                        decision_output = decision_by_index.get(slot_index)
-                        cot_text = ""
-                        decision_text = decision_output.text if decision_output is not None else ""
-                        state.stages.append(
-                            StageRecord(
-                                prompt=decision_prompts[slot_index],
-                                completion=decision_text,
-                                stop_reason=(
-                                    decision_output.finish_reason
-                                    if decision_output is not None
-                                    else "missing_output"
-                                ),
-                            )
-                        )
-                        state.turn_count += 1
-
-                        try:
-                            decision = parse_tool_call_or_final_answer(decision_text)
-                        except Exception as exc:
-                            state.termination_reason = "parse_error"
-                            state.error = str(exc)
-                            finished_slots.append(slot_index)
-                            continue
-
-                        if decision.is_tool_call and decision.tool_call is not None:
-                            tool_call = decision.tool_call
-                            state.tool_calls.append(tool_call)
-                            state.prompt_messages.append(
-                                {"role": "assistant", "content": render_assistant_tool_message(cot_text, tool_call)}
-                            )
-                            try:
-                                tool_call_model = state.runtime_env.build_tool_call(
-                                    tool_call_id=(
-                                        f"{state.sample_index}-{state.repeat_index}-{state.pass_index}-"
-                                        f"{uuid.uuid4().hex[:8]}"
-                                    ),
-                                    name=tool_call.name,
-                                    arguments=tool_call.arguments,
-                                    requestor=tool_call.requestor,
-                                )
-                                assistant_message = state.runtime_env.build_assistant_message(
-                                    content=None,
-                                    tool_calls=[tool_call_model],
-                                )
-                                state.trajectory.append(assistant_message)
-                                tool_message = state.runtime_env.call_tool(
-                                    environment=state.environment,
-                                    tool_call=tool_call_model,
-                                )
-                                state.trajectory.append(tool_message)
-                                ok, output, error_text = _tool_output_payload(tool_message)
-                                state.prompt_messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": render_tool_result(
-                                            tool_call,
-                                            ok=ok,
-                                            output=output,
-                                            error=error_text,
-                                        ),
-                                    }
-                                )
-                                if not ok:
-                                    state.tool_errors += 1
-                            except Exception as exc:
-                                state.tool_errors += 1
-                                state.prompt_messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": render_tool_result(tool_call, ok=False, error=str(exc)),
-                                    }
-                                )
-
-                            if state.tool_errors >= max_tool_errors:
-                                state.termination_reason = "too_many_errors"
-                                finished_slots.append(slot_index)
-                                continue
-                            if state.turn_count >= max_steps:
-                                state.termination_reason = "max_steps"
-                                finished_slots.append(slot_index)
-                            continue
-
-                        state.final_answer = decision.final_answer.strip()
-                        state.prompt_messages.append({"role": "assistant", "content": decision_text.strip()})
-                        state.trajectory.append(
-                            state.runtime_env.build_assistant_message(content=state.final_answer)
-                        )
-                        state.termination_reason = "agent_stop"
-                        finished_slots.append(slot_index)
-
-                    completed_payloads = [
-                        _tau_completion_payload(
-                            active[slot_index],
-                            benchmark_name=run.benchmark_name,
-                            dataset_split=run.dataset_split,
+                with ThreadPoolExecutor(max_workers=max(1, int(max_attempt_workers))) as executor:
+                    futures = {
+                        executor.submit(
+                            _run_tau_official_attempt,
+                            args=args,
+                            run=run,
+                            record=record,
+                            sample_index=key.sample_index,
+                            repeat_index=key.repeat_index,
+                            pass_index=key.pass_index,
+                            runtime_env=_runtime_for_domain(record.domain),
+                            user_model=user_model,
+                            judge_model=judge_model,
+                            sampling=decision_sampling,
                             sampling_payload=sampling_payload,
-                        )
-                        for slot_index in finished_slots
-                    ]
-                    for payload in completed_payloads:
-                        writer.enqueue(payload)
-
-                    for slot_index in reversed(finished_slots):
-                        active.pop(slot_index)
+                            history_max_chars=history_max_chars,
+                            prompt_max_chars=prompt_max_chars,
+                            max_steps=max_steps,
+                            max_tool_errors=max_tool_errors,
+                        ): key
+                        for key, record in pending
+                    }
+                    for future in as_completed(futures):
+                        writer.enqueue(future.result())
             except BaseException:
                 runtime.handle_attempt_stage_failure(
                     writer,

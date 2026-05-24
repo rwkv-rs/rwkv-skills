@@ -4,7 +4,7 @@ max_samples = 50
 batch_size = 64
 
 [dataset]
-name = "tau2_bench_airline"
+name = "tau3_bench_telecom"
 split = "base"
 
 [model]
@@ -14,7 +14,7 @@ infer_timeout_s = 600
 infer_max_workers = 64
 
 [runner]
-benchmark_kind = "tau2_bench"
+benchmark_kind = "tau3_bench"
 prompt_style = "rwkv_official_json"
 tool_catalog_format = "json"
 avg_ks = [1]

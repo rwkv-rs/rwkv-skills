@@ -16,6 +16,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
@@ -25,6 +26,7 @@ from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
     _resolve_function_calling_plan,
+    _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
 from src.eval.function_calling.rwkv_prompt import (
@@ -146,6 +148,16 @@ def load_bfcl_ast_rows_from_sources(
 
 
 def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_chars: int) -> str:
+    date_instructions = [
+        "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date.",
+    ]
+    if str(record.metadata.get("source_format") or "").strip() in {
+        "official_api_bank",
+        "official_apibank",
+    }:
+        date_instructions.append(
+            "API-Bank date convention: if a month/day or relative date has no explicit year and the conversation does not state today's date, use year 2023."
+        )
     system_prompt = normalize_rwkv_text(
         "\n".join(
             [
@@ -157,6 +169,7 @@ def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_c
                 "For one tool call, return one JSON object.",
                 "For multiple required tool calls, return a JSON array containing every required call in execution order; do not stop after the first call.",
                 "Each arguments object must contain only final argument values for that tool.",
+                *date_instructions,
                 "Do not copy tool schemas, descriptions, type/items/properties/required/default fields, or wrapper objects like {\"type\":...,\"value\":...} into arguments.",
                 "Use only listed tool names.",
                 "Return no prose, no markdown, and no extra text outside the JSON value.",
@@ -268,12 +281,23 @@ def _run_simple_tool_call(
     run_context: "RunContext | None" = None,
 ) -> int:
     records = load_simple_tool_call_manifest_records(run.dataset_path)
-    if args.max_samples and args.max_samples > 0:
-        records = records[: int(args.max_samples)]
+    sample_limit = _resolve_function_calling_sample_limit(
+        run.dataset_slug,
+        run.model_name,
+        max_samples=args.max_samples,
+    )
+    if sample_limit is not None:
+        records = records[:sample_limit]
     if not records:
         raise ValueError("simple tool-call manifest is empty")
 
-    plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
+    plan = _resolve_function_calling_plan(
+        run.dataset_slug,
+        len(records),
+        avg_ks=args.avg_k,
+        model_name=run.model_name,
+        config_defaults=True,
+    )
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     tool_sampling = resolve_sampling_config(
         run.dataset_slug,
@@ -283,7 +307,7 @@ def _run_simple_tool_call(
     )
     if tool_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    tool_sampling = tool_sampling.clamp(max(1, int(args.decision_max_tokens or 768)))
+    tool_sampling = clamp_function_calling_sampling(tool_sampling, max(1, int(args.decision_max_tokens or 768)))
     sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     batch_size = max(1, int(args.batch_size or 16))
@@ -688,9 +712,14 @@ def _render_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
                     _MAX_TOOL_DESCRIPTION_CHARS,
                 ),
                 "arguments": rendered_arguments,
+                **(
+                    {"required": list(parameters.get("required") or [])}
+                    if isinstance(parameters.get("required"), list) and parameters.get("required")
+                    else {}
+                ),
             }
         )
-    return json.dumps(rendered_tools, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(rendered_tools, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def _render_output_schema() -> str:
@@ -713,7 +742,7 @@ def _render_output_schema() -> str:
             },
         ]
     }
-    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def _read_json_or_jsonl_items(path: Path) -> list[Any]:

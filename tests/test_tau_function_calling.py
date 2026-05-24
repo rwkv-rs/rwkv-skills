@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from src.eval.function_calling import (
     build_tau_system_prompt,
     parse_tool_call_or_final_answer,
     render_tau_user_prompt,
 )
+from src.eval.agent_bench.tau_official import (
+    build_tau_official_agent_system_prompt,
+    configure_tau_nl_assertions_judge,
+    _parse_tau_agent_decision,
+    _normalize_tau_arguments,
+)
+from src.eval.env_config import OpenAIModelConfig, normalize_openai_base_url
+from src.eval.function_calling.tau_runner import _tau_official_completion_payload
 
 
 def test_render_tau_user_prompt_prefers_ticket() -> None:
@@ -84,6 +94,33 @@ def test_parse_tau_tool_call_accepts_openai_response_function_call_shape() -> No
     assert decision.tool_call.arguments == {"order_id": "123"}
 
 
+def test_tau_official_parser_accepts_action_input_shape() -> None:
+    name, arguments = _parse_tau_agent_decision(
+        '{"action":"inspect_order","action_input":{"order_id":"123"}}'
+    )
+
+    assert name == "inspect_order"
+    assert arguments == {"order_id": "123"}
+
+
+def test_tau_official_parser_accepts_top_level_content_as_arguments() -> None:
+    name, arguments = _parse_tau_agent_decision(
+        '{"name":"respond","content":"Done ###STOP###"}'
+    )
+
+    assert name == "respond"
+    assert arguments == {"content": "Done ###STOP###"}
+
+
+def test_tau_official_transfer_to_human_keeps_only_summary_argument() -> None:
+    arguments = _normalize_tau_arguments(
+        "transfer_to_human_agents",
+        {"content": "Please help with cancellation.", "summary": "Cancellation needs human support."},
+    )
+
+    assert arguments == {"summary": "Cancellation needs human support."}
+
+
 def test_parse_tau_rejects_plain_text_final_answer() -> None:
     try:
         parse_tool_call_or_final_answer("The refund has been submitted successfully.")
@@ -117,3 +154,62 @@ def test_build_tau_system_prompt_lists_assistant_and_user_tools() -> None:
     assert "final_answer" in prompt
     assert "Return only a JSON function call." in prompt
     assert "Follow the refund policy." in prompt
+
+
+def test_build_tau_official_agent_system_prompt_uses_respond_and_real_tools() -> None:
+    tool = {
+        "name": "refund_order",
+        "description": "Refund an order",
+        "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}},
+    }
+
+    prompt = build_tau_official_agent_system_prompt("Follow the refund policy.", [tool])
+
+    assert '"name": "refund_order"' in prompt
+    assert '"name": "respond"' in prompt
+    assert "Use a real tool call when you need information or need to change state." in prompt
+    assert "include ###STOP###" in prompt
+    assert "Follow the refund policy." in prompt
+
+
+def test_tau_nl_assertions_judge_config_uses_custom_model_and_base_url() -> None:
+    cfg = OpenAIModelConfig(
+        api_key="test-key",
+        model_name="gpt-5.4",
+        base_url="https://api.ablai.top/v1/chat/completions",
+    )
+
+    configure_tau_nl_assertions_judge(cfg)
+
+    from tau2.evaluator import evaluator_nl_assertions
+
+    assert normalize_openai_base_url(cfg.base_url) == "https://api.ablai.top/v1"
+    assert evaluator_nl_assertions.DEFAULT_LLM_NL_ASSERTIONS == "gpt-5.4"
+    assert evaluator_nl_assertions.DEFAULT_LLM_NL_ASSERTIONS_ARGS["api_key"] == "test-key"
+    assert evaluator_nl_assertions.DEFAULT_LLM_NL_ASSERTIONS_ARGS["api_base"] == "https://api.ablai.top/v1"
+    assert evaluator_nl_assertions.DEFAULT_LLM_NL_ASSERTIONS_ARGS["response_format"] == {"type": "json_object"}
+
+
+def test_tau_official_payload_fails_strictly_on_parse_error() -> None:
+    record = SimpleNamespace(domain="airline", task_id="task-1", benchmark_version="tau_v2")
+    simulation = SimpleNamespace(task_id="task-1", agent_cost=0.0, user_cost=0.0, messages=[])
+    evaluation = SimpleNamespace(reward=1.0, is_passed=True, details={"reward": 1.0})
+    agent = SimpleNamespace(stages=[], parse_errors=["tau agent decision missing name"])
+
+    payload = _tau_official_completion_payload(
+        record=record,
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        simulation=simulation,
+        evaluation=evaluation,
+        agent=agent,
+        benchmark_name="tau2_bench_airline",
+        dataset_split="base",
+        sampling_payload={},
+    )
+
+    assert payload["agent_result"]["reward"] == 0.0
+    assert payload["agent_result"]["is_passed"] is False
+    assert payload["agent_info"]["official_reward"] == 1.0
+    assert payload["agent_info"]["official_is_passed"] is True

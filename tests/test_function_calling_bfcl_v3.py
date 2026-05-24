@@ -603,7 +603,7 @@ def test_build_bfcl_user_block_uses_rwkv_style_sections() -> None:
         current_state_snapshot={"selected": "A1"},
     )
 
-    assert content.startswith("User: Request:\nLine 1\nLine 2")
+    assert content.startswith("User:Request:\nLine 1\nLine 2")
     assert "Function output:" in content
     assert "Current structured state snapshot:" in content
     assert "\r" not in content
@@ -684,9 +684,9 @@ def test_build_bfcl_router_and_branch_prompts_use_hidden_summary_and_tool_prefix
     assert '"name": "lookup"' in router_prompt
     assert "```json" not in router_prompt
     assert "<tool_call>" not in tool_prompt
-    assert tool_prompt.endswith("Assistant: ```json\n")
-    assert ask_prompt.endswith("Assistant: ```json\n")
-    assert handoff_prompt.endswith("Assistant: ```json\n")
+    assert tool_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
+    assert ask_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
+    assert handoff_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
 
 
 def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
@@ -694,7 +694,7 @@ def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
         {"ok": True, "tool": "lookup", "result": {"id": "A1"}},
     )
 
-    assert content.startswith("User: Function output:")
+    assert content.startswith("User:Function output:")
     assert "Request:" not in content
 
 
@@ -987,5 +987,5 @@ def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
     assert context.startswith("System: Tools:")
     assert '"name": "lookup"' in context
     assert "\nUser: Find A1\n" in context
-    assert '\nAssistant: ```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```' in context
-    assert context.endswith("Assistant: ```json\n")
+    assert '\nAssistant: <think>\n</think>\n```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```' in context
+    assert context.endswith("Assistant: <think>\n</think>\n```json\n")

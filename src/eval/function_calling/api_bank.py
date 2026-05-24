@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import copy
 import importlib
 import json
 import os
@@ -21,6 +23,10 @@ if TYPE_CHECKING:
     from src.eval.function_calling.runner_common import ResolvedFunctionCallingRun
 
 _API_BANK_SANDBOX_CACHE: dict[str, "ApiBankSandbox"] = {}
+_API_BANK_ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
+    "CancelTimedSwitch": {"device_id": "name"},
+    "TimedSwitch": {"device_id": "name"},
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +98,7 @@ def evaluate_api_bank_calls(
 ) -> SimpleToolCallEvaluation:
     expected = record.expected_tool_calls[0] if record.expected_tool_calls else None
     expected_name = expected.name if expected is not None else ""
-    expected_result = record.metadata.get("expected_result")
+    expected_result = _normalize_api_bank_expected_result(expected_name, record.metadata.get("expected_result"))
     details: dict[str, Any] = {
         "expected_tool_calls": [
             {"name": expected.name, "arguments": dict(expected.arguments)} for expected in record.expected_tool_calls
@@ -120,7 +126,11 @@ def evaluate_api_bank_calls(
     if not call_result.success:
         return SimpleToolCallEvaluation(0.0, False, call_result.error or "api_execution_failed", details)
     try:
-        ok = sandbox.check_api_call_correctness(actual_name, call_result.result, expected_result)
+        ok = sandbox.check_api_call_correctness(
+            actual_name,
+            copy.deepcopy(call_result.result),
+            copy.deepcopy(expected_result),
+        )
     except Exception as exc:  # noqa: BLE001
         details["check_error"] = str(exc)
         ok = False
@@ -138,9 +148,10 @@ class ApiBankSandbox:
         try:
             tool = self.init_tool(api_name)
             api_info = self._api_info(api_name)
+            normalized_arguments = _normalize_api_bank_arguments(api_name, arguments)
             processed = {
                 key: self._coerce_arg(value, api_info.get("input_parameters", {}).get(key, {}).get("type"))
-                for key, value in arguments.items()
+                for key, value in normalized_arguments.items()
             }
             return ApiBankCallResult(True, tool.call(**processed))
         except Exception as exc:  # noqa: BLE001
@@ -227,7 +238,45 @@ class ApiBankSandbox:
             return float(value)
         if arg_type == "bool":
             return value if isinstance(value, bool) else str(value) == "True"
+        if str(arg_type) in {"list", "list(str)"}:
+            return _coerce_api_bank_list_arg(value)
         return value
+
+
+def _normalize_api_bank_arguments(api_name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    aliases = _API_BANK_ARGUMENT_ALIASES.get(str(api_name), {})
+    normalized: dict[str, Any] = {}
+    for key, value in dict(arguments).items():
+        normalized[aliases.get(str(key), str(key))] = value
+    return normalized
+
+
+def _normalize_api_bank_expected_result(api_name: str, expected: Any) -> Any:
+    if not isinstance(expected, Mapping):
+        return expected
+    normalized = copy.deepcopy(dict(expected))
+    input_payload = normalized.get("input")
+    if isinstance(input_payload, Mapping):
+        normalized["input"] = _normalize_api_bank_arguments(api_name, input_payload)
+    return normalized
+
+
+def _coerce_api_bank_list_arg(value: Any) -> Any:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return value
+    raw = value.strip()
+    if not raw:
+        return []
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    return value
 
 
 def _run_api_bank(
@@ -254,18 +303,21 @@ def _api_bank_level_from_name(file_name: str) -> int | None:
 
 
 def _render_api_bank_history(history: Sequence[Mapping[str, Any]]) -> str:
-    lines = ["Conversation history:"]
+    lines: list[str] = []
     for item in history:
         role = str(item.get("role") or "").strip()
         if role == "User":
-            lines.append(f"User: {item.get('text') or ''}")
+            text = str(item.get("text") or "").lstrip().rstrip(" ")
+            lines.append(f"User: {text}" if text else "User:")
         elif role == "AI":
-            lines.append(f"Assistant: {item.get('text') or ''}")
+            text = str(item.get("text") or "").lstrip().rstrip(" ")
+            lines.append(f"Assistant: {text}" if text else "Assistant:")
         elif role == "API":
-            args = ", ".join(f"{key}={value!r}" for key, value in dict(item.get("param_dict") or {}).items())
-            lines.append(f"Function output [{item.get('api_name')}({args})]: {json.dumps(item.get('result'), ensure_ascii=False)}")
-    lines.append("Return the next API call only.")
-    return "\n".join(lines)
+            args = ", ".join(
+                f"{key}={_official_arg_repr(value)}" for key, value in dict(item.get("param_dict") or {}).items()
+            )
+            lines.append(f"API: [{item.get('api_name')}({args})] Response: {item.get('result')}")
+    return "\n".join(lines).strip()
 
 
 def _api_bank_tool_schema(source_root: Path, api_name: str, fallback_args: Mapping[str, Any]) -> dict[str, Any]:
@@ -320,6 +372,14 @@ def _api_bank_result_payload(result: ApiBankCallResult) -> dict[str, Any]:
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _official_arg_repr(value: Any) -> str:
+    if isinstance(value, str):
+        return repr(value)
+    if value is None:
+        return "None"
+    return repr(value)
 
 
 def _api_bank_json_type(value: Any) -> str:

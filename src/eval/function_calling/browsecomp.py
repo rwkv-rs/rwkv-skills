@@ -30,6 +30,7 @@ from src.eval.function_calling.common import (
 from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _resolve_function_calling_plan,
+    _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
 from src.eval.results.payloads import make_score_payload
@@ -167,7 +168,7 @@ def build_browsecomp_user_prompt(question: str, *, locale: str) -> str:
 
 
 def build_browsecomp_expected_context(user_prompt: str) -> str:
-    return f"User: {normalize_rwkv_text(user_prompt)}\n\nAssistant: <think>"
+    return f"User:{normalize_rwkv_text(user_prompt)}\n\nAssistant: <think>"
 
 
 def build_browsecomp_answer_prompt(expected_context: str, cot: str, *, locale: str) -> str:
@@ -395,12 +396,23 @@ def _run_browsecomp(
     run_context: "RunContext | None" = None,
 ) -> int:
     records = load_browsecomp_manifest_records(run.dataset_path)
-    if args.max_samples and args.max_samples > 0:
-        records = records[: int(args.max_samples)]
+    sample_limit = _resolve_function_calling_sample_limit(
+        run.dataset_slug,
+        run.model_name,
+        max_samples=args.max_samples,
+    )
+    if sample_limit is not None:
+        records = records[:sample_limit]
     if not records:
         raise ValueError("BrowseComp manifest is empty")
 
-    plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
+    plan = _resolve_function_calling_plan(
+        run.dataset_slug,
+        len(records),
+        avg_ks=args.avg_k,
+        model_name=run.model_name,
+        config_defaults=True,
+    )
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     cot_sampling = resolve_sampling_config(
         run.dataset_slug,

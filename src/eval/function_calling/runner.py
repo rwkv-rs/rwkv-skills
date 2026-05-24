@@ -134,6 +134,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         return FunctionCallingBenchmarkKind.BFCL_V3
     if "function_toolalpaca" in job_names:
         return FunctionCallingBenchmarkKind.TOOLALPACA
+    if "function_tau3_bench" in job_names:
+        return FunctionCallingBenchmarkKind.TAU3_BENCH
     if "function_tau2_bench" in job_names:
         return FunctionCallingBenchmarkKind.TAU2_BENCH
     if "function_tau_bench" in job_names:

@@ -10,6 +10,11 @@ from src.eval.function_calling.context_budget import normalize_rwkv_text
 
 _TOOLALPACA_REF_KEY = "__toolalpaca_ref__"
 _TOOLALPACA_OPTIONAL_KEY = "__toolalpaca_optional__"
+_TOOLALPACA_AUTH_PARAMS_BY_API = {
+    "apilayer weatherstack": frozenset({"access_key"}),
+    "wolframalpha": frozenset({"appid"}),
+    "currencybeacon": frozenset({"api_key"}),
+}
 
 
 def load_toolalpaca_rows_from_source(path: str | Path, *, dataset_name: str) -> list[dict[str, Any]]:
@@ -23,9 +28,21 @@ def load_toolalpaca_rows_from_source(path: str | Path, *, dataset_name: str) -> 
         if not isinstance(api_info, Mapping):
             continue
         api_name = str(api_info.get("Name") or api_info.get("API") or f"api_{api_index}")
+        if _toolalpaca_should_skip_api(dataset_name, api_name):
+            continue
         instructions = _coerce_list(api_info.get("Instructions"))
         golden_answers = _coerce_list(api_info.get("Golden_Answers"))
         tools = toolalpaca_tools(api_info)
+        metadata_base: dict[str, Any] = {
+            "source_format": "official_toolalpaca",
+            "api_name": api_name,
+            "api_index": api_index,
+            "source_path": str(source),
+            "execution_backend": _toolalpaca_execution_backend(dataset_name),
+        }
+        server_url = _toolalpaca_api_server_url(api_info)
+        if server_url:
+            metadata_base["api_server_url"] = server_url
         for question_index, instruction in enumerate(instructions):
             if question_index >= len(golden_answers):
                 continue
@@ -39,11 +56,8 @@ def load_toolalpaca_rows_from_source(path: str | Path, *, dataset_name: str) -> 
                     "tools": tools,
                     "expected_tool_calls": normalize_toolalpaca_golden_answer(golden_answers[question_index]),
                     "metadata": {
-                        "source_format": "official_toolalpaca",
-                        "api_name": api_name,
-                        "api_index": api_index,
+                        **metadata_base,
                         "question_index": question_index,
-                        "source_path": str(source),
                     },
                 }
             )
@@ -96,6 +110,9 @@ def parse_toolalpaca_action_input(raw: Any) -> dict[str, Any]:
 
 
 def toolalpaca_tools(api_info: Mapping[str, Any]) -> list[dict[str, Any]]:
+    api_name = str(api_info.get("Name") or api_info.get("API") or "")
+    openapi_spec = _toolalpaca_openapi_spec(api_info)
+    server_url = _openapi_server_url(openapi_spec)
     descriptions = api_info.get("Function_Description")
     projection = api_info.get("Function_Projection")
     tools: list[dict[str, Any]] = []
@@ -111,12 +128,21 @@ def toolalpaca_tools(api_info: Mapping[str, Any]) -> list[dict[str, Any]]:
                 if isinstance(projected, Sequence) and not isinstance(projected, (str, bytes, bytearray)):
                     path = str(projected[0]) if len(projected) > 0 else ""
                     method = str(projected[1]) if len(projected) > 1 else ""
+            metadata: dict[str, Any] = {"path": path, "method": method, "api_name": api_name}
+            if server_url:
+                metadata["server_url"] = server_url
+            operation = _toolalpaca_openapi_operation(openapi_spec, path, method)
+            if operation:
+                metadata["operation"] = dict(operation)
             tools.append(
                 {
                     "name": name_text,
                     "description": normalize_rwkv_text(str(description or "")),
-                    "parameters": _toolalpaca_parameters_from_description(str(description or "")),
-                    "metadata": {"path": path, "method": method},
+                    "parameters": _strip_toolalpaca_auth_parameters(
+                        api_name,
+                        _toolalpaca_parameters_from_description(str(description or "")),
+                    ),
+                    "metadata": metadata,
                 }
             )
     if _toolalpaca_api_uses_action(api_info, "getDetails"):
@@ -138,10 +164,68 @@ def toolalpaca_tools(api_info: Mapping[str, Any]) -> list[dict[str, Any]]:
                     },
                     "required": ["Question"],
                 },
-                "metadata": {"tool_type": "toolalpaca_builtin"},
+                "metadata": {"tool_type": "toolalpaca_builtin", "api_name": api_name},
             }
         )
     return tools
+
+
+def _toolalpaca_execution_backend(dataset_name: str) -> str:
+    if dataset_name == "toolalpaca_eval_simulated":
+        return "toolalpaca_simulator"
+    if dataset_name == "toolalpaca_eval_real":
+        return "toolalpaca_real_http"
+    return "toolalpaca_synthetic"
+
+
+def _toolalpaca_should_skip_api(dataset_name: str, api_name: str) -> bool:
+    return dataset_name == "toolalpaca_eval_real" and api_name.strip().lower() in _TOOLALPACA_AUTH_PARAMS_BY_API
+
+
+def _toolalpaca_api_server_url(api_info: Mapping[str, Any]) -> str:
+    return _openapi_server_url(_toolalpaca_openapi_spec(api_info))
+
+
+def _toolalpaca_openapi_spec(api_info: Mapping[str, Any]) -> Mapping[str, Any]:
+    documentation = api_info.get("Documentation")
+    if not isinstance(documentation, str) or not documentation.strip():
+        return {}
+    try:
+        payload = json.loads(documentation)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, Mapping) else {}
+
+
+def _openapi_server_url(openapi_spec: Mapping[str, Any]) -> str:
+    servers = openapi_spec.get("servers")
+    if isinstance(servers, Sequence) and not isinstance(servers, (str, bytes, bytearray)):
+        for server in servers:
+            if isinstance(server, Mapping) and server.get("url"):
+                return str(server.get("url") or "").strip()
+    return ""
+
+
+def _toolalpaca_openapi_operation(openapi_spec: Mapping[str, Any], path: str, method: str) -> Mapping[str, Any]:
+    paths = openapi_spec.get("paths") if isinstance(openapi_spec.get("paths"), Mapping) else {}
+    path_doc = paths.get(path) if isinstance(paths, Mapping) else {}
+    operation = path_doc.get(str(method or "").lower()) if isinstance(path_doc, Mapping) else {}
+    return operation if isinstance(operation, Mapping) else {}
+
+
+def _strip_toolalpaca_auth_parameters(api_name: str, parameters: Mapping[str, Any]) -> dict[str, Any]:
+    auth_params = _TOOLALPACA_AUTH_PARAMS_BY_API.get(api_name.strip().lower())
+    if not auth_params:
+        return dict(parameters)
+    normalized = dict(parameters)
+    properties = normalized.get("properties") if isinstance(normalized.get("properties"), Mapping) else {}
+    normalized["properties"] = {
+        str(key): value for key, value in dict(properties).items() if str(key) not in auth_params
+    }
+    normalized["required"] = [
+        str(item) for item in _coerce_list(normalized.get("required")) if str(item) not in auth_params
+    ]
+    return normalized
 
 
 @lru_cache(maxsize=32)

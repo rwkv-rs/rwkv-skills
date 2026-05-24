@@ -47,6 +47,7 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["function_toolalpaca"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau3_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["multi_choice_plain"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["multi_choice_fake_cot"].extra_args == ("--cot-mode", "fake_cot")
     assert JOB_CATALOGUE["multi_choice_cot"].extra_args == ("--cot-mode", "cot")
@@ -80,6 +81,7 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     include_spec = DATASET_PREP_SPECS[canonical_slug("include_test")]
     polymath_spec = DATASET_PREP_SPECS[canonical_slug("polymath_all")]
     tau2_spec = DATASET_PREP_SPECS[canonical_slug("tau2_bench_airline_base")]
+    tau3_spec = DATASET_PREP_SPECS[canonical_slug("tau3_bench_banking_knowledge_base")]
 
     assert gpqa_spec.dataset == "gpqa"
     assert gpqa_spec.split == "diamond"
@@ -89,10 +91,13 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     assert polymath_spec.split == "all"
     assert tau2_spec.dataset == "tau2_bench_airline"
     assert tau2_spec.split == "base"
+    assert tau3_spec.dataset == "tau3_bench_banking_knowledge"
+    assert tau3_spec.split == "base"
     assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
+    assert canonical_slug("tau3_bench_banking_knowledge_base") in CODE_DATASET_SLUGS
 
 
-def test_locate_dataset_revalidates_registered_default_artifact(
+def test_locate_dataset_prefers_existing_registered_artifact_without_source_prepare(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -139,6 +144,59 @@ def test_locate_dataset_revalidates_registered_default_artifact(
     found = locate_dataset("bfcl_exec_simple_test", search=[output_root], output_root=output_root)
 
     assert found == stale_path
+    assert calls == []
+    [row] = read_jsonl_items(found)
+    assert "expected_executable_calls" not in row
+
+
+def test_locate_dataset_can_refresh_registered_default_artifact_when_requested(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output_root = tmp_path / "data"
+    dataset_dir = output_root / "bfcl_exec_simple"
+    dataset_dir.mkdir(parents=True)
+    stale_path = dataset_dir / "test.jsonl"
+    stale_path.write_text(
+        json.dumps(
+            {
+                "task_id": "exec_simple_0",
+                "instruction": "Find a probability.",
+                "tools": [],
+                "expected_tool_calls": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[str, Path, str]] = []
+
+    def _prepare_dataset(name: str, root: Path, split: str) -> list[Path]:
+        calls.append((name, root, split))
+        stale_path.write_text(
+            json.dumps(
+                {
+                    "task_id": "exec_simple_0",
+                    "instruction": "Find a probability.",
+                    "tools": [],
+                    "expected_executable_calls": ["calc_binomial_probability(n=20, k=5, p=0.6)"],
+                    "execution_result_type": ["exact_match"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return [stale_path]
+
+    monkeypatch.setenv("RWKV_EVAL_REFRESH_DATASET", "1")
+    monkeypatch.setattr("src.eval.datasets.data_prepper.data_manager.prepare_dataset", _prepare_dataset)
+    monkeypatch.setattr("src.eval.scheduler.dataset_stats.record_dataset_samples", lambda *_args, **_kwargs: None)
+
+    refresh_dataset_index([output_root])
+    found = locate_dataset("bfcl_exec_simple_test", search=[output_root], output_root=output_root)
+
+    assert found == stale_path
     assert calls == [("bfcl_exec_simple", output_root, "test")]
     [row] = read_jsonl_items(found)
     assert row["expected_executable_calls"] == ["calc_binomial_probability(n=20, k=5, p=0.6)"]
@@ -155,6 +213,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert "function_toolalpaca" in JOB_CATALOGUE
     assert "function_tau_bench" in JOB_CATALOGUE
     assert "function_tau2_bench" in JOB_CATALOGUE
+    assert "function_tau3_bench" in JOB_CATALOGUE
 
     browsecomp_slugs = JOB_CATALOGUE["function_browsecomp"].dataset_slugs
     mcp_slugs = JOB_CATALOGUE["function_mcp_bench"].dataset_slugs
@@ -166,6 +225,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     toolalpaca_slugs = JOB_CATALOGUE["function_toolalpaca"].dataset_slugs
     tau_slugs = JOB_CATALOGUE["function_tau_bench"].dataset_slugs
     tau2_slugs = JOB_CATALOGUE["function_tau2_bench"].dataset_slugs
+    tau3_slugs = JOB_CATALOGUE["function_tau3_bench"].dataset_slugs
 
     assert canonical_slug("browsecomp_test") in browsecomp_slugs
     assert canonical_slug("browsecomp_zh_test") in browsecomp_slugs
@@ -191,6 +251,10 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("tau2_bench_retail_base") in tau2_slugs
     assert canonical_slug("tau2_bench_airline_base") in tau2_slugs
     assert canonical_slug("tau2_bench_telecom_base") in tau2_slugs
+    assert canonical_slug("tau3_bench_retail_base") in tau3_slugs
+    assert canonical_slug("tau3_bench_airline_base") in tau3_slugs
+    assert canonical_slug("tau3_bench_telecom_base") in tau3_slugs
+    assert canonical_slug("tau3_bench_banking_knowledge_base") in tau3_slugs
 
     assert detect_job_from_dataset(canonical_slug("browsecomp_test"), is_cot=True) == "function_browsecomp"
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
@@ -203,6 +267,10 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("toolalpaca_eval_real_test"), is_cot=True) == "function_toolalpaca"
     assert detect_job_from_dataset(canonical_slug("tau_bench_retail_test"), is_cot=True) == "function_tau_bench"
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"
+    assert (
+        detect_job_from_dataset(canonical_slug("tau3_bench_banking_knowledge_base"), is_cot=True)
+        == "function_tau3_bench"
+    )
 
 
 def test_jobs_module_does_not_eagerly_import_data_manager() -> None:

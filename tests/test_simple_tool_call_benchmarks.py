@@ -375,7 +375,7 @@ def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatc
                         "properties": {"query": {"type": "string", "description": "Required. String. Search query."}},
                         "required": ["query"],
                     },
-                    "metadata": {"path": "/lookup", "method": "get"},
+                    "metadata": {"path": "/lookup", "method": "get", "api_name": "DemoAPI"},
                 }
             ],
             "expected_tool_calls": [
@@ -391,6 +391,7 @@ def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatc
                 "api_index": 0,
                 "question_index": 0,
                 "source_path": str(source),
+                "execution_backend": "toolalpaca_simulator",
             },
         }
     ]
@@ -435,7 +436,7 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert "return a JSON array containing every required call" in prompt
     assert "Do not copy tool schemas" in prompt
     assert "Available tools:" not in prompt
-    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n' in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: <think>\n</think>\n```json\n' in prompt
 
 
 def test_simple_tool_call_decoder_accepts_arithmetic_literals() -> None:
@@ -467,10 +468,16 @@ def test_toolalpaca_evaluator_reports_execution_details() -> None:
         metadata={},
     )
 
-    evaluation = evaluate_toolalpaca_actions(record, [{"name": "lookup", "arguments": {"query": "alpha"}}])
+    evaluation = evaluate_toolalpaca_actions(
+        record,
+        [{"name": "lookup", "arguments": {"query": "alpha"}}],
+        sandbox=ToolAlpacaSandbox(),
+    )
 
     assert evaluation.is_passed is True
     assert evaluation.details["execution_mode"] == "local_toolalpaca_sandbox"
+    assert evaluation.details["expected_tool_calls"] == [{"name": "lookup", "arguments": {"query": "alpha"}}]
+    assert evaluation.details["decoded_tool_calls"] == [{"name": "lookup", "arguments": {"query": "alpha"}}]
     assert evaluation.details["decoded_execution_results"][0]["Action"] == "lookup"
     assert evaluation.details["decoded_execution_results"][0]["Action_Input"] == {"query": "alpha"}
 
@@ -522,6 +529,36 @@ def test_toolalpaca_source_loader_parses_official_placeholder_references(tmp_pat
     assert records[1].expected_tool_calls[1].arguments[_TOOLALPACA_OPTIONAL_KEY] is True
 
 
+def test_toolalpaca_real_loader_skips_auth_required_apis(tmp_path: Path) -> None:
+    source = tmp_path / "eval_real.json"
+    source.write_text(
+        """[
+  {
+    "Name": "apilayer weatherstack",
+    "Function_Projection": {"current": ["/current", "get"]},
+    "Function_Description": {"current": "Weather.\\nParameters: {}\\nOutput: object"},
+    "Instructions": ["weather"],
+    "Golden_Answers": [[{"Action": "current", "Action_Input": "{}"}]]
+  },
+  {
+    "Name": "Nager.Date",
+    "Function_Projection": {"VersionGetVersion": ["/api/v3/Version", "get"]},
+    "Function_Description": {"VersionGetVersion": "Version.\\nParameters: {}\\nOutput: object"},
+    "Documentation": "{\\"openapi\\": \\"3.0.0\\", \\"servers\\": [{\\"url\\": \\"https://date.nager.at/\\"}], \\"paths\\": {\\"/api/v3/Version\\": {\\"get\\": {\\"responses\\": {\\"200\\": {\\"description\\": \\"ok\\"}}}}}}",
+    "Instructions": ["version"],
+    "Golden_Answers": [[{"Action": "VersionGetVersion", "Action_Input": "{}"}]]
+  }
+]""",
+        encoding="utf-8",
+    )
+
+    rows = load_toolalpaca_rows_from_source(source, dataset_name="toolalpaca_eval_real")
+
+    assert [row["task_id"] for row in rows] == ["toolalpaca_eval_real__nager_date_000"]
+    assert rows[0]["metadata"]["execution_backend"] == "toolalpaca_real_http"
+    assert rows[0]["metadata"]["api_server_url"] == "https://date.nager.at/"
+
+
 def test_toolalpaca_sandbox_executes_openapi_style_requests() -> None:
     record = SimpleToolCallRecord(
         task_id="toolalpaca_eval_simulated__demoapi_000",
@@ -554,14 +591,71 @@ def test_toolalpaca_sandbox_executes_openapi_style_requests() -> None:
     evaluation = evaluate_toolalpaca_actions(
         record,
         [{"name": "lookup", "arguments": {"query": "alpha", "page": "1", "ignored": "ok"}}],
+        sandbox=ToolAlpacaSandbox(),
     )
-    failed = evaluate_toolalpaca_actions(record, [{"name": "lookup", "arguments": {"query": "beta", "page": 1}}])
+    failed = evaluate_toolalpaca_actions(
+        record,
+        [{"name": "lookup", "arguments": {"query": "beta", "page": 1}}],
+        sandbox=ToolAlpacaSandbox(),
+    )
 
     assert evaluation.is_passed is True
     assert evaluation.details["decoded_execution_results"][0]["request"]["path"] == "/lookup/alpha"
     assert evaluation.details["decoded_execution_results"][0]["request"]["query"] == {"page": 1}
     assert failed.is_passed is False
     assert "request_mismatch" in failed.fail_reason
+
+
+def test_toolalpaca_evaluator_calls_configured_official_simulator(monkeypatch) -> None:
+    class FakeResponse:
+        status_code = 200
+        text = '{"ok": true, "lookupId": 123}'
+        headers = {"Content-Type": "application/json"}
+
+        def json(self):
+            return {"ok": True, "lookupId": 123}
+
+    calls: list[dict[str, object]] = []
+
+    def _request(method, url, **kwargs):
+        calls.append({"method": method, "url": url, **kwargs})
+        return FakeResponse()
+
+    monkeypatch.setenv("TOOLALPACA_SIMULATOR_URL", "http://127.0.0.1:5678")
+    monkeypatch.setattr("src.eval.function_calling.toolalpaca.requests.request", _request)
+    record = SimpleToolCallRecord(
+        task_id="toolalpaca_eval_simulated__demoapi_000",
+        instruction="Look up alpha",
+        tools=(
+            {
+                "name": "lookup",
+                "description": "Lookup a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+                "metadata": {"path": "/lookup", "method": "get", "api_name": "DemoAPI"},
+            },
+        ),
+        expected_tool_calls=(
+            ToolCallExpectation(name="lookup", arguments={"query": "alpha"}, argument_options={}),
+        ),
+        metadata={"execution_backend": "toolalpaca_simulator", "api_name": "DemoAPI"},
+    )
+
+    evaluation = evaluate_toolalpaca_actions(
+        record,
+        [{"name": "lookup", "arguments": {"query": "alpha"}}],
+    )
+
+    assert evaluation.is_passed is True
+    assert evaluation.details["execution_mode"] == "official_toolalpaca_simulator"
+    assert [call["url"] for call in calls] == [
+        "http://127.0.0.1:5678/DemoAPI/lookup",
+        "http://127.0.0.1:5678/DemoAPI/lookup",
+    ]
+    assert calls[0]["params"] == {"query": "alpha"}
 
 
 def test_toolalpaca_evaluator_resolves_multi_step_reference_placeholders() -> None:
@@ -654,6 +748,7 @@ def test_toolalpaca_evaluator_allows_skipping_optional_reference_actions() -> No
     evaluation = evaluate_toolalpaca_actions(
         record,
         [{"name": "getUserProfile", "arguments": {"userId": "g-user123"}}],
+        sandbox=ToolAlpacaSandbox(),
     )
 
     assert evaluation.is_passed is True

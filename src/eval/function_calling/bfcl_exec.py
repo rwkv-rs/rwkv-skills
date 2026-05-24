@@ -17,6 +17,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
@@ -26,6 +27,7 @@ from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
     _resolve_function_calling_plan,
+    _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
 from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
@@ -154,7 +156,7 @@ def normalize_bfcl_exec_manifest_row(
 
 
 def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) -> str:
-    return build_simple_tool_call_prompt(
+    prompt = build_simple_tool_call_prompt(
         SimpleToolCallRecord(
             task_id=record.task_id,
             instruction=record.instruction,
@@ -164,6 +166,9 @@ def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) ->
         ),
         history_max_chars=history_max_chars,
     )
+    if _force_bfcl_exec_array_prefix(record):
+        prompt += "[\n"
+    return prompt
 
 
 def render_bfcl_exec_call(call: Mapping[str, Any]) -> str:
@@ -289,6 +294,21 @@ def evaluate_bfcl_exec_calls(
 def _is_parallel_exec_record(record: BfclExecRecord) -> bool:
     category = str(record.metadata.get("category") or record.metadata.get("dataset") or "").strip().lower()
     return "parallel" in category
+
+
+def _force_bfcl_exec_array_prefix(record: BfclExecRecord) -> bool:
+    return _is_parallel_exec_record(record) and len(record.expected_executable_calls) > 1
+
+
+def _complete_bfcl_exec_forced_prefix(record: BfclExecRecord, completion: str) -> str:
+    if not _force_bfcl_exec_array_prefix(record):
+        return completion
+    stripped = completion.lstrip()
+    if stripped.startswith("["):
+        return completion
+    if stripped.startswith("{") and not completion.rstrip().endswith("]"):
+        return "[\n" + completion.rstrip() + "\n]"
+    return "[\n" + completion
 
 
 class BfclExecSandbox:
@@ -611,12 +631,23 @@ def _run_bfcl_exec(
     run_context: "RunContext | None" = None,
 ) -> int:
     records = load_bfcl_exec_manifest_records(run.dataset_path)
-    if args.max_samples and args.max_samples > 0:
-        records = records[: int(args.max_samples)]
+    sample_limit = _resolve_function_calling_sample_limit(
+        run.dataset_slug,
+        run.model_name,
+        max_samples=args.max_samples,
+    )
+    if sample_limit is not None:
+        records = records[:sample_limit]
     if not records:
         raise ValueError("BFCL executable manifest is empty")
 
-    plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
+    plan = _resolve_function_calling_plan(
+        run.dataset_slug,
+        len(records),
+        avg_ks=args.avg_k,
+        model_name=run.model_name,
+        config_defaults=True,
+    )
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     tool_sampling = resolve_sampling_config(
         run.dataset_slug,
@@ -626,7 +657,7 @@ def _run_bfcl_exec(
     )
     if tool_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    tool_sampling = tool_sampling.clamp(max(1, int(args.decision_max_tokens or 768)))
+    tool_sampling = clamp_function_calling_sampling(tool_sampling, max(1, int(args.decision_max_tokens or 768)))
     sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     batch_size = max(1, int(args.batch_size or 16))
@@ -692,11 +723,13 @@ def _run_bfcl_exec(
                     try:
                         if _looks_like_template_leak(output.text):
                             raise ValueError("decision stage leaked internal template/control tokens")
-                        decoded_calls = decode_simple_tool_call_response(output.text)
+                        decision_completion = _complete_bfcl_exec_forced_prefix(record, output.text)
+                        decoded_calls = decode_simple_tool_call_response(decision_completion)
                     except Exception as exc:  # noqa: BLE001
                         parse_error = str(exc)
+                        decision_completion = _complete_bfcl_exec_forced_prefix(record, output.text)
                     evaluation = evaluate_bfcl_exec_calls(record, decoded_calls, parse_error=parse_error, sandbox=sandbox)
-                    stage = StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason)
+                    stage = StageRecord(prompt=prompt, completion=decision_completion, stop_reason=output.finish_reason)
                     payload = SampleRecord(
                         benchmark_name=run.benchmark_name,
                         dataset_split=run.dataset_split,
@@ -721,6 +754,7 @@ def _run_bfcl_exec(
                     payload["agent_trace"] = [
                         {
                             "decision_completion": output.text,
+                            "decision_completion_for_eval": decision_completion,
                             "decision_stop_reason": output.finish_reason,
                             "decoded_calls": decoded_calls,
                             "decoded_executable_calls": evaluation.details.get("decoded_executable_calls", []),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Job catalogue & dataset bookkeeping for the scheduler."""
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Sequence
@@ -134,6 +135,7 @@ FUNCTION_BFCL_AST_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_b
 FUNCTION_TOOLALPACA_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_toolalpaca")
 FUNCTION_TAU_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau_bench")
 FUNCTION_TAU2_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau2_bench")
+FUNCTION_TAU3_BENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_tau3_bench")
 
 
 def _dataset_slugs_for_runner(runner: RegisteredRunnerSpec) -> tuple[str, ...]:
@@ -186,7 +188,7 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
     spec = DATASET_PREP_SPECS.get(canonical)
     found = find_dataset_file(canonical, search)
     if found:
-        if spec is not None:
+        if spec is not None and _dataset_refresh_requested():
             expected_artifact = (output_root.expanduser().resolve() / spec.dataset / f"{spec.split}.jsonl").resolve()
             if found.resolve() == expected_artifact:
                 from src.eval.datasets.data_prepper.data_manager import prepare_dataset
@@ -225,6 +227,11 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
         record_dataset_samples(refreshed, dataset_slug=canonical)
         return refreshed
     raise FileNotFoundError(f"数据集 {slug!r} 未生成 JSONL，prepare_dataset 返回 {prepared_paths}")
+
+
+def _dataset_refresh_requested() -> bool:
+    value = os.environ.get("RWKV_EVAL_REFRESH_DATASET") or os.environ.get("RWKV_DATASET_REFRESH")
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 __all__ = [

@@ -18,6 +18,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
 )
@@ -379,7 +380,7 @@ def _render_mcp_output_schema() -> str:
             "arguments": {"type": "object"},
         },
     }
-    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def build_mcp_task_user_message(item: McpBenchItem) -> str:
@@ -422,7 +423,7 @@ def build_final_answer_prompt(item: McpBenchItem, accumulated_information: str) 
     return "\n".join(
         [
             f"System: {system_prompt}",
-            f"User: {user_prompt}",
+            f"User:{user_prompt}",
             "Assistant:",
         ]
     )
@@ -668,7 +669,7 @@ def _run_mcp_bench(
     if base_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     normalize_function_prompt_style(getattr(args, "prompt_style", None))
-    decision_sampling = base_sampling.clamp(args.decision_max_tokens or 2048)
+    decision_sampling = clamp_function_calling_sampling(base_sampling, args.decision_max_tokens or 2048)
     final_sampling = base_sampling.clamp(args.final_max_tokens)
 
     runtime_root = Path(items[0].runtime_root or "").expanduser().resolve()

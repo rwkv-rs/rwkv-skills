@@ -218,13 +218,44 @@ def _ensure_agent_bench_vendor_module(module_name: str) -> bool:
     if normalized == "tau_bench":
         return _add_first_existing_path((_TAU_V1_VENDOR_ROOT,))
     if normalized == "tau2":
-        ok = _add_first_existing_path((_TAU_V2_VENDOR_ROOT,))
+        ok = _add_first_existing_path((_tau_v2_vendor_root(),))
         if ok:
-            data_root = _first_existing_path((_TAU_V2_DATA_ROOT,))
+            data_root = _first_existing_path((_tau_v2_data_root(),))
             if data_root is not None:
                 os.environ.setdefault("TAU2_DATA_DIR", str(data_root))
         return ok
     return False
+
+
+def _tau_v2_vendor_root() -> Path:
+    override = (
+        os.environ.get("RWKV_TAU3_BENCH_ROOT")
+        or os.environ.get("TAU3_BENCH_ROOT")
+        or os.environ.get("RWKV_TAU2_BENCH_ROOT")
+        or os.environ.get("TAU2_BENCH_ROOT")
+    )
+    if override:
+        root = Path(override).expanduser().resolve()
+        src_root = root / "src"
+        if (src_root / "tau2").exists():
+            return src_root
+        return root
+    return _TAU_V2_VENDOR_ROOT
+
+
+def _tau_v2_data_root() -> Path:
+    override = (
+        os.environ.get("RWKV_TAU3_DATA_ROOT")
+        or os.environ.get("TAU3_DATA_ROOT")
+        or os.environ.get("RWKV_TAU2_DATA_ROOT")
+        or os.environ.get("TAU2_DATA_DIR")
+    )
+    if override:
+        return Path(override).expanduser().resolve()
+    vendor_root = _tau_v2_vendor_root()
+    if vendor_root.name == "src":
+        return vendor_root.parent / "data"
+    return _TAU_V2_DATA_ROOT
 
 
 def _add_first_existing_path(candidates: tuple[Path, ...]) -> bool:

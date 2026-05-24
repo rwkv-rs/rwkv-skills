@@ -1,14 +1,38 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
-from src.eval.agent_bench.tasks import TAU_V2_DATA_ROOT, load_tau_v2_tasks
+from src.eval.agent_bench.tasks import (
+    TAU_V2_DATA_ROOT,
+    load_tau_v2_tasks,
+    require_tau_v3_source,
+    tau_v2_data_root,
+)
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 
 from .common import LocalRowsDatasetSpec
 
 _REQUIRED_FIELDS = ("task_id", "instruction", "task", "benchmark_version")
+
+
+def _tau_data_root() -> Path:
+    if any(
+        os.environ.get(name)
+        for name in (
+            "RWKV_TAU3_DATA_ROOT",
+            "TAU3_DATA_ROOT",
+            "RWKV_TAU2_DATA_ROOT",
+            "TAU2_DATA_DIR",
+            "RWKV_TAU3_BENCH_ROOT",
+            "TAU3_BENCH_ROOT",
+            "RWKV_TAU2_BENCH_ROOT",
+            "TAU2_BENCH_ROOT",
+        )
+    ):
+        return tau_v2_data_root()
+    return Path(TAU_V2_DATA_ROOT)
 
 
 def _tau_bench_spec(output_root: Path, *, dataset_name: str, domain: str, split: str) -> LocalRowsDatasetSpec:
@@ -29,7 +53,7 @@ def _tau_bench_spec(output_root: Path, *, dataset_name: str, domain: str, split:
         split,
         required_fields=_REQUIRED_FIELDS,
         source_kind="tau_v2_vendor_manifest",
-        required_paths=(TAU_V2_DATA_ROOT,),
+        required_paths=lambda: (_tau_data_root(),),
         load_local_records=_load,
         extra={"domain": domain, "benchmark_version": "tau_bench"},
     )
@@ -45,9 +69,31 @@ def _tau_v2_spec(output_root: Path, *, dataset_name: str, domain: str, split: st
         split,
         required_fields=_REQUIRED_FIELDS,
         source_kind="tau_v2_vendor_manifest",
-        required_paths=(TAU_V2_DATA_ROOT,),
+        required_paths=lambda: (_tau_data_root(),),
         load_local_records=_load,
         extra={"domain": domain, "benchmark_version": "tau_v2"},
+    )
+
+
+def _tau_v3_spec(output_root: Path, *, dataset_name: str, domain: str, split: str) -> LocalRowsDatasetSpec:
+    def _load() -> list[dict[str, Any]]:
+        require_tau_v3_source(dataset_name)
+        rows: list[dict[str, Any]] = []
+        for row in load_tau_v2_tasks(domain=domain, split=split):
+            payload = dict(row)
+            payload["benchmark_version"] = "tau_v3"
+            rows.append(payload)
+        return rows
+
+    return LocalRowsDatasetSpec(
+        dataset_name,
+        output_root,
+        split,
+        required_fields=_REQUIRED_FIELDS,
+        source_kind="tau3_official_manifest",
+        required_paths=lambda: (_tau_data_root(),),
+        load_local_records=_load,
+        extra={"domain": domain, "benchmark_version": "tau_v3"},
     )
 
 
@@ -81,6 +127,31 @@ def prepare_tau2_bench_telecom_spec(output_root: Path, split: str = "base") -> L
     return _tau_v2_spec(output_root, dataset_name="tau2_bench_telecom", domain="telecom", split=split)
 
 
+@FUNCTION_CALLING_REGISTRY.register_spec("tau3_bench_retail")
+def prepare_tau3_bench_retail_spec(output_root: Path, split: str = "base") -> LocalRowsDatasetSpec:
+    return _tau_v3_spec(output_root, dataset_name="tau3_bench_retail", domain="retail", split=split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("tau3_bench_airline")
+def prepare_tau3_bench_airline_spec(output_root: Path, split: str = "base") -> LocalRowsDatasetSpec:
+    return _tau_v3_spec(output_root, dataset_name="tau3_bench_airline", domain="airline", split=split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("tau3_bench_telecom")
+def prepare_tau3_bench_telecom_spec(output_root: Path, split: str = "base") -> LocalRowsDatasetSpec:
+    return _tau_v3_spec(output_root, dataset_name="tau3_bench_telecom", domain="telecom", split=split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("tau3_bench_banking_knowledge")
+def prepare_tau3_bench_banking_knowledge_spec(output_root: Path, split: str = "base") -> LocalRowsDatasetSpec:
+    return _tau_v3_spec(
+        output_root,
+        dataset_name="tau3_bench_banking_knowledge",
+        domain="banking_knowledge",
+        split=split,
+    )
+
+
 __all__ = [
     "prepare_tau_bench_retail_spec",
     "prepare_tau_bench_airline_spec",
@@ -88,4 +159,8 @@ __all__ = [
     "prepare_tau2_bench_retail_spec",
     "prepare_tau2_bench_airline_spec",
     "prepare_tau2_bench_telecom_spec",
+    "prepare_tau3_bench_retail_spec",
+    "prepare_tau3_bench_airline_spec",
+    "prepare_tau3_bench_telecom_spec",
+    "prepare_tau3_bench_banking_knowledge_spec",
 ]

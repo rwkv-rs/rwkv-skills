@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
@@ -16,6 +17,7 @@ from src.eval.execution_plan import AttemptKey, avg_k_metric_key
 from src.eval.field_common import build_task_sampling_config, set_task_env
 from src.eval.metrics.at_k import compute_avg_at_k
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.infer.sampling import SamplingConfig
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
@@ -38,6 +40,7 @@ ScorePayloadBuilder = Callable[
     [Sequence[dict[str, object]], Sequence[dict[str, object]], dict[str, float]],
     Mapping[str, object],
 ]
+FUNCTION_CALLING_STOP_TOKENS = (0,)
 
 
 def compute_function_calling_metrics(
@@ -82,6 +85,13 @@ def repeat_probe_entries(entries: Sequence[T], *, batch_size: int) -> list[T]:
         repeat_factor = (batch_size + len(repeated) - 1) // len(repeated)
         repeated = (repeated * repeat_factor)[:batch_size]
     return repeated
+
+
+def clamp_function_calling_sampling(config: SamplingConfig, max_tokens: int | None) -> SamplingConfig:
+    """Use role-boundary string suffixes instead of unsafe raw role tokens."""
+
+    clamped = config.clamp(max_tokens)
+    return replace(clamped, stop_tokens=FUNCTION_CALLING_STOP_TOKENS)
 
 
 def prepare_function_calling_run(
@@ -175,6 +185,7 @@ __all__ = [
     "ScorePayloadBuilder",
     "build_partial_eval_flusher",
     "build_pending_attempts",
+    "clamp_function_calling_sampling",
     "compute_function_calling_metrics",
     "finalize_function_calling_run",
     "prepare_function_calling_run",

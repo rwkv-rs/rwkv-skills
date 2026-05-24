@@ -15,7 +15,8 @@ infer_max_workers = 64
 
 [runner]
 benchmark_kind = "browsecomp"
+prompt_style = "rwkv_official_json"
+tool_catalog_format = "json"
 avg_ks = [1]
 cot_max_tokens = 2048
 answer_max_tokens = 1024
-

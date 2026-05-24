@@ -47,6 +47,32 @@ def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
     assert plan.sample_size == 50
 
 
+def test_function_calling_runner_resolves_configured_avg_k_plan(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "bfcl_simple_python.toml").write_text(
+        "[default]\navg_k = [0.5]\nmax_samples = 12\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", str(tmp_path))
+
+    plan = runner_common._resolve_function_calling_plan(
+        "bfcl_simple_python_test",
+        20,
+        avg_ks=None,
+        model_name="demo-model",
+        config_defaults=True,
+    )
+    sample_limit = runner_common._resolve_function_calling_sample_limit(
+        "bfcl_simple_python_test",
+        "demo-model",
+        max_samples=None,
+    )
+
+    assert plan.avg_k == 0.5
+    assert plan.repeat_count == 1
+    assert plan.sample_size == 10
+    assert sample_limit == 12
+
+
 def test_function_calling_runner_rejects_multiple_explicit_avg_k_values() -> None:
     try:
         runner_common._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0, 2.0])
@@ -92,6 +118,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     assert (
         function_calling_runner._infer_benchmark_kind("tau2_bench_airline_base.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.TAU2_BENCH
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("tau3_bench_banking_knowledge_base.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.TAU3_BENCH
     )
 
 
@@ -510,8 +540,7 @@ def test_run_bfcl_generation_step_uses_official_json_prompt_style() -> None:
     assert call["prompt_stop_suffixes"] == [list(bfcl_v3_runner.BFCL_DECISION_STOP_SUFFIXES)]
     prompt = str(call["prompts"][0])
     assert prompt.startswith("System: Tools:")
-    assert "\n\nUser: Find A1\n\nAssistant: ```json\n" in prompt
-    assert "Assistant: <think>" not in prompt
+    assert "\n\nUser: Find A1\n\nAssistant: <think>\n</think>\n```json\n" in prompt
 
 
 def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:

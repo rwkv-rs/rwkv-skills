@@ -72,6 +72,7 @@ _BFCL_V3_JOBS = ("function_bfcl_v3",)
 _TOOLALPACA_JOBS = ("function_toolalpaca",)
 _TAU_BENCH_JOBS = ("function_tau_bench",)
 _TAU2_BENCH_JOBS = ("function_tau2_bench",)
+_TAU3_BENCH_JOBS = ("function_tau3_bench",)
 
 
 def _metadata(
@@ -294,6 +295,26 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
         default_split="base",
         scheduler_jobs=_TAU2_BENCH_JOBS,
     ),
+    canonical_slug("tau3_bench_airline"): _function_calling(
+        "tau3_bench_airline",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
+    canonical_slug("tau3_bench_retail"): _function_calling(
+        "tau3_bench_retail",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
+    canonical_slug("tau3_bench_telecom"): _function_calling(
+        "tau3_bench_telecom",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
+    canonical_slug("tau3_bench_banking_knowledge"): _function_calling(
+        "tau3_bench_banking_knowledge",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
 }
 
 BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
@@ -312,6 +333,12 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
         canonical_slug("tau2_bench_retail"),
         canonical_slug("tau2_bench_airline"),
         canonical_slug("tau2_bench_telecom"),
+    ),
+    canonical_slug("tau3_bench"): (
+        canonical_slug("tau3_bench_retail"),
+        canonical_slug("tau3_bench_airline"),
+        canonical_slug("tau3_bench_telecom"),
+        canonical_slug("tau3_bench_banking_knowledge"),
     ),
 }
 

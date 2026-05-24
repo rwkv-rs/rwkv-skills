@@ -18,6 +18,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
@@ -169,7 +170,7 @@ def build_agentbench_prompt(
             [
                 *system_messages,
                 "Tools:",
-                json.dumps(tool_schemas, ensure_ascii=False, indent=2, sort_keys=True),
+                json.dumps(tool_schemas, ensure_ascii=False, indent=2, sort_keys=False),
                 "Output JSON schema:",
                 _render_agentbench_output_schema(),
                 "Return exactly one JSON function call object.",
@@ -219,7 +220,7 @@ def _run_agentbench(
     )
     if sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
-    sampling = sampling.clamp(max(1, int(args.decision_max_tokens or 1024)))
+    sampling = clamp_function_calling_sampling(sampling, max(1, int(args.decision_max_tokens or 1024)))
     sampling_payload = normalize_sampling_config_by_stage([(1, sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     controller_url = _agentbench_controller_url(args)
@@ -483,7 +484,7 @@ def _render_agentbench_output_schema() -> str:
             "arguments": {"type": "object"},
         },
     }
-    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True)
+    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def _agentbench_data_count(path: Path) -> int:

@@ -20,6 +20,10 @@ NO_JUDGE_BENCHMARKS: tuple[str, ...] = (
     "tau2_bench_airline",
     "tau2_bench_retail",
     "tau2_bench_telecom",
+    "tau3_bench_airline",
+    "tau3_bench_retail",
+    "tau3_bench_telecom",
+    "tau3_bench_banking_knowledge",
 )
 JUDGE_BENCHMARKS: tuple[str, ...] = (
     "browsecomp",
@@ -58,7 +62,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--enable-checker",
         action="store_true",
-        help="Do not set RWKV_SKILLS_DISABLE_CHECKER=1 for BFCL/tau/tau2 runs",
+        help="Do not set RWKV_SKILLS_DISABLE_CHECKER=1 for BFCL/tau/tau2/tau3 runs",
     )
     return parser.parse_args(argv)
 

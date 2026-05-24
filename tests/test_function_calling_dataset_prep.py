@@ -27,6 +27,7 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "toolalpaca_eval_real" in names
     assert "tau_bench_retail" in names
     assert "tau2_bench_airline" in names
+    assert "tau3_bench_banking_knowledge" in names
 
 
 def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monkeypatch) -> None:
@@ -53,6 +54,7 @@ def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monke
     assert paths == [output_root / "apibank_level1" / "test.jsonl"]
     [row] = read_jsonl_items(paths[0])
     assert row["task_id"] == "apibank_level1__Demo-level-1-1_001"
+    assert row["instruction"] == "User: What is 2 plus 2?"
     assert row["expected_tool_calls"] == [
         {
             "name": "Calculator",
@@ -459,7 +461,7 @@ def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatc
                         "properties": {"query": {"type": "string", "description": "Required. String. Search query."}},
                         "required": ["query"],
                     },
-                    "metadata": {"path": "/lookup", "method": "get"},
+                    "metadata": {"path": "/lookup", "method": "get", "api_name": "DemoAPI"},
                 }
             ],
             "expected_tool_calls": [
@@ -475,6 +477,7 @@ def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatc
                 "api_index": 0,
                 "question_index": 0,
                 "source_path": str(source),
+                "execution_backend": "toolalpaca_simulator",
             },
         }
     ]
@@ -552,5 +555,44 @@ def test_prepare_dataset_materializes_tau2_base_split_to_standard_path(tmp_path:
             "instruction": "Resolve the ticket",
             "task": {"id": "ticket-0"},
             "benchmark_version": "tau_v2",
+        }
+    ]
+
+
+def test_prepare_dataset_materializes_tau3_base_split_to_standard_path(tmp_path: Path, monkeypatch) -> None:
+    tau2_data_root = tmp_path / "tau3_data"
+    (tau2_data_root / "tau2" / "domains" / "banking_knowledge").mkdir(parents=True)
+    monkeypatch.setenv("TAU3_DATA_ROOT", str(tau2_data_root))
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.TAU_V2_DATA_ROOT",
+        tau2_data_root,
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.load_tau_v2_tasks",
+        lambda *, domain, split: [
+            {
+                "task_id": f"{domain}-{split}-0",
+                "domain": domain,
+                "index": 0,
+                "instruction": "Resolve the ticket",
+                "task": {"id": "ticket-0"},
+                "benchmark_version": "tau_v2",
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("tau3_bench_banking_knowledge", output_root, "base")
+
+    assert paths == [output_root / "tau3_bench_banking_knowledge" / "base.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "banking_knowledge-base-0",
+            "domain": "banking_knowledge",
+            "index": 0,
+            "instruction": "Resolve the ticket",
+            "task": {"id": "ticket-0"},
+            "benchmark_version": "tau_v3",
         }
     ]

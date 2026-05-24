@@ -117,7 +117,7 @@ def build_tau_system_prompt(
     )
     lines = [
         "Tools:",
-        json.dumps(tools, ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(tools, ensure_ascii=False, indent=2, sort_keys=False),
         "Return only a JSON function call.",
         'The JSON shape is {"name":"tool_name","arguments":{...}}.',
         "Use exactly one listed tool name.",
@@ -138,7 +138,7 @@ def build_expected_context(system_prompt: str, messages: Sequence[Mapping[str, s
         if role == "assistant":
             parts.append(f"Assistant: {content}")
         else:
-            parts.append(f"User: {content}")
+            parts.append(f"User:{content}")
     parts.append("Assistant: <think><|completions_of_cot|>")
     return "\n\n".join(parts)
 

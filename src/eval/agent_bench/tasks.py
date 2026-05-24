@@ -38,11 +38,58 @@ def ensure_tau_v1_vendor_path() -> Path:
 
 def ensure_tau_v2_vendor_path() -> Path:
     ensure_tau_v2_task_dependencies()
-    if str(TAU_V2_VENDOR_ROOT) not in sys.path:
-        sys.path.insert(0, str(TAU_V2_VENDOR_ROOT))
+    vendor_root = tau_v2_vendor_root()
+    if str(vendor_root) not in sys.path:
+        sys.path.insert(0, str(vendor_root))
     # tau2 expects DATA_DIR/tau2/...; DATA_DIR is TAU2_DATA_DIR when set.
-    os.environ.setdefault("TAU2_DATA_DIR", str(TAU_V2_DATA_ROOT))
+    os.environ.setdefault("TAU2_DATA_DIR", str(tau_v2_data_root()))
+    return vendor_root
+
+
+def tau_v2_vendor_root() -> Path:
+    override = (
+        os.environ.get("RWKV_TAU3_BENCH_ROOT")
+        or os.environ.get("TAU3_BENCH_ROOT")
+        or os.environ.get("RWKV_TAU2_BENCH_ROOT")
+        or os.environ.get("TAU2_BENCH_ROOT")
+    )
+    if override:
+        root = Path(override).expanduser().resolve()
+        src_root = root / "src"
+        if (src_root / "tau2").exists():
+            return src_root
+        return root
     return TAU_V2_VENDOR_ROOT
+
+
+def tau_v2_data_root() -> Path:
+    override = (
+        os.environ.get("RWKV_TAU3_DATA_ROOT")
+        or os.environ.get("TAU3_DATA_ROOT")
+        or os.environ.get("RWKV_TAU2_DATA_ROOT")
+        or os.environ.get("TAU2_DATA_DIR")
+    )
+    if override:
+        return Path(override).expanduser().resolve()
+    vendor_root = tau_v2_vendor_root()
+    if vendor_root.name == "src":
+        return vendor_root.parent / "data"
+    return TAU_V2_DATA_ROOT
+
+
+def tau_v3_source_available() -> bool:
+    return (tau_v2_data_root() / "tau2" / "domains" / "banking_knowledge").exists()
+
+
+def require_tau_v3_source(context: str = "tau3_bench") -> None:
+    if tau_v3_source_available():
+        return
+    raise ValueError(
+        f"{context} 需要最新版官方 tau2/tau3-bench 数据，当前解析到的 tau 数据根目录为 "
+        f"{tau_v2_data_root()}，其中没有 tau2/domains/banking_knowledge。"
+        "请设置 RWKV_TAU3_BENCH_ROOT/TAU3_BENCH_ROOT 指向官方仓库，或设置 "
+        "RWKV_TAU3_DATA_ROOT/TAU3_DATA_ROOT 指向官方 data 目录。"
+    )
 
 
 def infer_domain_from_slug(slug: str) -> str:
@@ -166,9 +213,7 @@ def _tau2_env_module(domain: str) -> str:
 
 def load_tau_v2_tasks(*, domain: str, split: str = "base") -> list[dict[str, Any]]:
     ensure_tau_v2_vendor_path()
-    module_name = _tau2_env_module(domain)
-    module = import_module_with_auto_install(module_name, context=f"tau2-bench task module: {module_name}")
-    get_tasks = getattr(module, "get_tasks")
+    get_tasks = _tau2_tasks_loader(domain)
     tasks = run_with_auto_install(
         lambda: get_tasks(split),
         context=f"tau2-bench task loading: domain={domain}, split={split}",
@@ -190,6 +235,17 @@ def load_tau_v2_tasks(*, domain: str, split: str = "base") -> list[dict[str, Any
     return rows
 
 
+def _tau2_tasks_loader(domain: str):
+    try:
+        registry_module = import_module_with_auto_install("tau2.registry", context="tau2 registry import")
+        registry = getattr(registry_module, "registry")
+        return registry.get_tasks_loader(domain)
+    except Exception:
+        module_name = _tau2_env_module(domain)
+        module = import_module_with_auto_install(module_name, context=f"tau2-bench task module: {module_name}")
+        return getattr(module, "get_tasks")
+
+
 def iter_task_rows(dataset_name: str, split: str) -> Iterable[dict[str, Any]]:
     name = dataset_name.lower()
     if name.startswith("tau_bench_"):
@@ -209,6 +265,10 @@ __all__ = [
     "load_manifest",
     "ensure_tau_v1_vendor_path",
     "ensure_tau_v2_vendor_path",
+    "tau_v2_vendor_root",
+    "tau_v2_data_root",
+    "tau_v3_source_available",
+    "require_tau_v3_source",
     "load_tau_v1_tasks",
     "load_tau_v2_tasks",
     "iter_task_rows",

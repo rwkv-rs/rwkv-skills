@@ -313,7 +313,7 @@ def build_bfcl_user_block(
     if current_state_snapshot:
         parts.append(f"Current structured state snapshot:\n{render_bfcl_state(current_state_snapshot)}")
     user_body = normalize_bfcl_rwkv_text("\n".join(parts))
-    return f"User: {user_body}"
+    return f"User:{user_body}"
 
 
 def extract_bfcl_cot_hidden_summary(
@@ -413,7 +413,7 @@ def _build_bfcl_action_user_block(
             )
             parts.append(f"{label}:\n{rendered_state}")
     user_body = normalize_bfcl_rwkv_text("\n".join(parts))
-    return f"User: {user_body}"
+    return f"User:{user_body}"
 
 
 def build_bfcl_tool_result_message(
@@ -436,7 +436,7 @@ def build_bfcl_tool_result_message(
             )
             parts.append(f"{label}:\n{rendered_state}")
     user_body = normalize_bfcl_rwkv_text("\n".join(parts))
-    return f"User: {user_body}"
+    return f"User:{user_body}"
 
 
 def build_bfcl_rwkv_prompt(
@@ -1198,7 +1198,7 @@ def render_bfcl_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
         sorted(rendered_tools, key=lambda item: str(item.get("name") or "")),
         ensure_ascii=False,
         indent=2,
-        sort_keys=True,
+        sort_keys=False,
     )
 
 

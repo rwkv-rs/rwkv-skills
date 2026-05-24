@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
 from typing import Any, Mapping, Sequence
+from urllib.parse import quote, urljoin
+
+import requests
 
 from src.eval.function_calling.runner_common import ResolvedFunctionCallingRun
 from src.eval.function_calling.simple_tool_call import (
@@ -26,6 +30,23 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
 _HTTP_BODY_METHODS = {"post", "put", "patch"}
+_TOOLALPACA_SECRET_PREFIX = "__toolalpaca_secret__:"
+_TOOLALPACA_AUTH_ENV_BY_API = {
+    "apilayer weatherstack": {
+        "access_key": ("TOOLALPACA_WEATHERSTACK_API_KEY", "WEATHERSTACK_API_KEY"),
+    },
+    "wolframalpha": {
+        "appid": (
+            "TOOLALPACA_WOLFRAMALPHA_APP_ID",
+            "WOLFRAMALPHA_APP_ID",
+            "WOLFRAM_ALPHA_APP_ID",
+            "WOLFRAM_APP_ID",
+        ),
+    },
+    "currencybeacon": {
+        "api_key": ("TOOLALPACA_CURRENCYBEACON_API_KEY", "CURRENCYBEACON_API_KEY", "CURRENCY_BEACON_API_KEY"),
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +58,7 @@ class ToolAlpacaActionResult:
     request: dict[str, Any] = field(default_factory=dict)
     response: Any = None
     error: str | None = None
+    status_code: int | None = None
 
 
 def _run_toolalpaca(
@@ -66,8 +88,11 @@ def evaluate_toolalpaca_actions(
         {"name": str(item.get("name") or ""), "arguments": dict(item.get("arguments") or {})}
         for item in decoded_calls
     ]
+    sandbox = sandbox or _default_toolalpaca_sandbox(record)
     details: dict[str, Any] = {
-        "execution_mode": "local_toolalpaca_sandbox",
+        "execution_mode": getattr(sandbox, "execution_mode", "local_toolalpaca_sandbox"),
+        "expected_tool_calls": expected_calls,
+        "decoded_tool_calls": actual_calls,
         "call_matches": [],
         "parse_error": parse_error or "",
     }
@@ -79,11 +104,18 @@ def evaluate_toolalpaca_actions(
             details=details,
         )
 
-    sandbox = sandbox or ToolAlpacaSandbox()
     expected_results = sandbox.execute_sequence(record, expected_calls)
     actual_results = sandbox.execute_sequence(record, actual_calls)
     details["expected_execution_results"] = [_result_payload(item) for item in expected_results]
     details["decoded_execution_results"] = [_result_payload(item) for item in actual_results]
+    sandbox_error = _blocking_sandbox_error(expected_results, actual_results)
+    if sandbox_error:
+        return SimpleToolCallEvaluation(
+            reward=0.0,
+            is_passed=False,
+            fail_reason=sandbox_error,
+            details=details,
+        )
 
     required_expected = [item for item in expected_results if not item.optional]
     denominator = max(1, len(required_expected))
@@ -176,6 +208,8 @@ def evaluate_toolalpaca_actions(
 
 
 class ToolAlpacaSandbox:
+    execution_mode = "local_toolalpaca_sandbox"
+
     def execute_sequence(
         self,
         record: SimpleToolCallRecord,
@@ -193,28 +227,15 @@ class ToolAlpacaSandbox:
         *,
         history: Sequence[ToolAlpacaActionResult],
     ) -> ToolAlpacaActionResult:
-        action = str(call.get("name") or call.get("Action") or "").strip()
-        raw_arguments = call.get("arguments", call.get("Action_Input", {}))
-        if isinstance(raw_arguments, str):
-            try:
-                raw_arguments = json.loads(raw_arguments)
-            except json.JSONDecodeError:
-                raw_arguments = {}
-        if not isinstance(raw_arguments, Mapping):
+        normalized = _normalize_toolalpaca_call(call, history)
+        if normalized is None:
             return ToolAlpacaActionResult(
-                action=action,
+                action=str(call.get("name") or call.get("Action") or "").strip(),
                 action_input={},
                 success=False,
                 error="arguments_not_object",
             )
-        arguments = dict(raw_arguments)
-        optional = _truthy(arguments.pop(_TOOLALPACA_OPTIONAL_KEY, False))
-        if action.lower().startswith("[optional]"):
-            optional = True
-            action = action.split("]", 1)[-1].strip()
-        resolved_arguments = _resolve_toolalpaca_value(arguments, history)
-        if not isinstance(resolved_arguments, Mapping):
-            resolved_arguments = {}
+        action, resolved_arguments, optional = normalized
 
         tools_by_name = {str(tool.get("name") or ""): dict(tool) for tool in record.tools}
         tool = tools_by_name.get(action)
@@ -263,6 +284,166 @@ class ToolAlpacaSandbox:
         )
 
 
+class ToolAlpacaHttpSandbox(ToolAlpacaSandbox):
+    def __init__(
+        self,
+        *,
+        simulator_url: str | None = None,
+        real_http: bool = False,
+        timeout_s: float | None = None,
+    ) -> None:
+        self.simulator_url = (simulator_url or "").rstrip("/")
+        self.real_http = bool(real_http)
+        self.timeout_s = float(timeout_s or os.environ.get("TOOLALPACA_HTTP_TIMEOUT_S") or 30.0)
+        self.execution_mode = "official_toolalpaca_real_http" if self.real_http else "official_toolalpaca_simulator"
+
+    def execute_call(
+        self,
+        record: SimpleToolCallRecord,
+        call: Mapping[str, Any],
+        *,
+        history: Sequence[ToolAlpacaActionResult],
+    ) -> ToolAlpacaActionResult:
+        normalized = _normalize_toolalpaca_call(call, history)
+        if normalized is None:
+            return ToolAlpacaActionResult(
+                action=str(call.get("name") or call.get("Action") or "").strip(),
+                action_input={},
+                success=False,
+                error="arguments_not_object",
+            )
+        action, resolved_arguments, optional = normalized
+        tools_by_name = {str(tool.get("name") or ""): dict(tool) for tool in record.tools}
+        tool = tools_by_name.get(action)
+        if tool is None and action == "getDetails":
+            tool = _get_details_tool_schema()
+        if tool is None:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=False,
+                optional=optional,
+                error=f"unknown_tool:{action}",
+            )
+        try:
+            request = _build_toolalpaca_request(record, tool, dict(resolved_arguments))
+        except ValueError as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=False,
+                optional=optional,
+                error=str(exc),
+            )
+        if request.get("builtin"):
+            response = _synthetic_toolalpaca_response(action, request, history)
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=dict(_json_safe(resolved_arguments)),
+                success=True,
+                optional=optional,
+                request=request,
+                response=response,
+                status_code=200,
+            )
+        return self._execute_http_request(
+            record,
+            action=action,
+            action_input=dict(_json_safe(resolved_arguments)),
+            optional=optional,
+            request=request,
+        )
+
+    def _execute_http_request(
+        self,
+        record: SimpleToolCallRecord,
+        *,
+        action: str,
+        action_input: dict[str, Any],
+        optional: bool,
+        request: Mapping[str, Any],
+    ) -> ToolAlpacaActionResult:
+        url = self._request_url(record, request)
+        if not url:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error="toolalpaca_sandbox_unavailable:missing_base_url",
+            )
+        method = str(request.get("method") or "get").upper()
+        try:
+            outbound_query = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("query") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_body = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("body") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_headers = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("headers") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+            outbound_cookies = _resolve_toolalpaca_secret_placeholders(
+                dict(request.get("cookies") or {}),
+                api_name=str(request.get("api_name") or record.metadata.get("api_name") or ""),
+            )
+        except ValueError as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error=str(exc),
+            )
+        try:
+            response = requests.request(
+                method,
+                url,
+                params=outbound_query,
+                json=(outbound_body or None),
+                headers=outbound_headers,
+                cookies=outbound_cookies,
+                timeout=self.timeout_s,
+            )
+        except requests.RequestException as exc:
+            return ToolAlpacaActionResult(
+                action=action,
+                action_input=action_input,
+                success=False,
+                optional=optional,
+                request=dict(request),
+                error=f"toolalpaca_sandbox_unavailable:{exc}",
+            )
+        response_payload = _http_response_payload(response)
+        success = 200 <= int(response.status_code) < 300
+        return ToolAlpacaActionResult(
+            action=action,
+            action_input=action_input,
+            success=success,
+            optional=optional,
+            request=dict(request),
+            response=response_payload,
+            error=None if success else f"http_status_{response.status_code}",
+            status_code=int(response.status_code),
+        )
+
+    def _request_url(self, record: SimpleToolCallRecord, request: Mapping[str, Any]) -> str:
+        path = str(request.get("path") or "")
+        if self.real_http:
+            server_url = str(request.get("server_url") or record.metadata.get("api_server_url") or "").strip()
+            return _join_url(server_url, path) if server_url else ""
+        base_url = self.simulator_url or _toolalpaca_simulator_url()
+        api_name = str(request.get("api_name") or record.metadata.get("api_name") or "").strip()
+        if not base_url or not api_name:
+            return ""
+        return _join_url(f"{base_url.rstrip('/')}/{quote(api_name, safe='')}", path)
+
+
 def _build_toolalpaca_request(
     record: SimpleToolCallRecord,
     tool: Mapping[str, Any],
@@ -286,6 +467,7 @@ def _build_toolalpaca_request(
 
     canonical_arguments: dict[str, Any] = {}
     unknown_arguments: dict[str, Any] = {}
+    api_name = str(metadata.get("api_name") or record.metadata.get("api_name") or "")
     for key, value in arguments.items():
         if key in {_TOOLALPACA_OPTIONAL_KEY}:
             continue
@@ -297,6 +479,7 @@ def _build_toolalpaca_request(
         if _is_absent(value) and property_name not in required:
             continue
         canonical_arguments[str(property_name)] = _coerce_argument_value(str(property_name), value, schema)
+    _inject_toolalpaca_auth_placeholders(api_name, canonical_arguments, required, properties)
     missing = sorted(key for key in required if key not in canonical_arguments or _is_absent(canonical_arguments[key]))
     path = str(metadata.get("path") or "")
     required_path_arguments = [key for key in missing if f"{{{key}}}" in path]
@@ -345,6 +528,8 @@ def _build_toolalpaca_request(
             "cookies": _drop_absent_values(cookies),
             "ignored_arguments": unknown_arguments,
             "builtin": False,
+            "api_name": api_name,
+            "server_url": str(metadata.get("server_url") or record.metadata.get("api_server_url") or ""),
         }
     )
 
@@ -378,11 +563,16 @@ def _build_builtin_request(
             "cookies": {},
             "ignored_arguments": {},
             "builtin": True,
+            "api_name": "",
+            "server_url": "",
         }
     )
 
 
 def _load_operation(record: SimpleToolCallRecord, metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    operation = metadata.get("operation")
+    if isinstance(operation, Mapping):
+        return operation
     path = str(metadata.get("path") or "")
     method = str(metadata.get("method") or "").lower()
     if not path or not method:
@@ -715,7 +905,126 @@ def _result_payload(result: ToolAlpacaActionResult) -> dict[str, Any]:
         "request": result.request,
         "response": result.response,
         "error": result.error or "",
+        "status_code": result.status_code,
     }
+
+
+def _normalize_toolalpaca_call(
+    call: Mapping[str, Any],
+    history: Sequence[ToolAlpacaActionResult],
+) -> tuple[str, dict[str, Any], bool] | None:
+    action = str(call.get("name") or call.get("Action") or "").strip()
+    raw_arguments = call.get("arguments", call.get("Action_Input", {}))
+    if isinstance(raw_arguments, str):
+        try:
+            raw_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            raw_arguments = {}
+    if not isinstance(raw_arguments, Mapping):
+        return None
+    arguments = dict(raw_arguments)
+    optional = _truthy(arguments.pop(_TOOLALPACA_OPTIONAL_KEY, False))
+    if action.lower().startswith("[optional]"):
+        optional = True
+        action = action.split("]", 1)[-1].strip()
+    resolved_arguments = _resolve_toolalpaca_value(arguments, history)
+    if not isinstance(resolved_arguments, Mapping):
+        resolved_arguments = {}
+    return action, dict(resolved_arguments), optional
+
+
+def _default_toolalpaca_sandbox(record: SimpleToolCallRecord) -> ToolAlpacaSandbox:
+    backend = str(record.metadata.get("execution_backend") or "").strip().lower()
+    if not backend and record.task_id.startswith("toolalpaca_eval_simulated__"):
+        backend = "toolalpaca_simulator"
+    elif not backend and record.task_id.startswith("toolalpaca_eval_real__"):
+        backend = "toolalpaca_real_http"
+    if backend == "toolalpaca_simulator":
+        return ToolAlpacaHttpSandbox(simulator_url=_toolalpaca_simulator_url())
+    if backend == "toolalpaca_real_http":
+        return ToolAlpacaHttpSandbox(real_http=True)
+    return ToolAlpacaSandbox()
+
+
+def _inject_toolalpaca_auth_placeholders(
+    api_name: str,
+    arguments: dict[str, Any],
+    required: set[str],
+    properties: Mapping[str, Any],
+) -> None:
+    auth_params = _TOOLALPACA_AUTH_ENV_BY_API.get(api_name.strip().lower(), {})
+    for param_name in auth_params:
+        if param_name in required or param_name in properties:
+            arguments[param_name] = _toolalpaca_secret_placeholder(api_name, param_name)
+
+
+def _toolalpaca_secret_placeholder(api_name: str, param_name: str) -> str:
+    return f"{_TOOLALPACA_SECRET_PREFIX}{_slug(api_name)}:{param_name}"
+
+
+def _resolve_toolalpaca_secret_placeholders(value: Any, *, api_name: str) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _resolve_toolalpaca_secret_placeholders(item, api_name=api_name)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_resolve_toolalpaca_secret_placeholders(item, api_name=api_name) for item in value]
+    if isinstance(value, str) and value.startswith(_TOOLALPACA_SECRET_PREFIX):
+        param_name = value.rsplit(":", 1)[-1]
+        secret = _toolalpaca_auth_secret(api_name, param_name)
+        if not secret:
+            env_names = ", ".join(_toolalpaca_auth_env_names(api_name, param_name))
+            raise ValueError(f"toolalpaca_auth_missing:{api_name}:{param_name}: set one of {env_names}")
+        return secret
+    return value
+
+
+def _toolalpaca_auth_secret(api_name: str, param_name: str) -> str:
+    for env_name in _toolalpaca_auth_env_names(api_name, param_name):
+        value = os.environ.get(env_name)
+        if value:
+            return value
+    return ""
+
+
+def _toolalpaca_auth_env_names(api_name: str, param_name: str) -> tuple[str, ...]:
+    return _TOOLALPACA_AUTH_ENV_BY_API.get(api_name.strip().lower(), {}).get(param_name, ())
+
+
+def _toolalpaca_simulator_url() -> str:
+    return (os.environ.get("TOOLALPACA_SIMULATOR_URL") or "http://127.0.0.1:5678").rstrip("/")
+
+
+def _blocking_sandbox_error(
+    expected_results: Sequence[ToolAlpacaActionResult],
+    actual_results: Sequence[ToolAlpacaActionResult],
+) -> str:
+    for result in [*expected_results, *actual_results]:
+        error = str(result.error or "")
+        if error.startswith("toolalpaca_sandbox_unavailable:"):
+            return error
+    return ""
+
+
+def _http_response_payload(response: requests.Response) -> Any:
+    content_type = response.headers.get("Content-Type", "")
+    if "json" in content_type.lower():
+        try:
+            return response.json()
+        except ValueError:
+            pass
+    text = response.text
+    try:
+        return json.loads(text)
+    except ValueError:
+        return {"response": text}
+
+
+def _join_url(base_url: str, path: str) -> str:
+    if not base_url:
+        return ""
+    return urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/"))
 
 
 def _expectation_to_call(expectation: ToolCallExpectation) -> dict[str, Any]:
@@ -802,4 +1111,10 @@ def _slug(value: str) -> str:
     return "_".join(part for part in "".join(rendered).split("_") if part) or "value"
 
 
-__all__ = ["ToolAlpacaActionResult", "ToolAlpacaSandbox", "evaluate_toolalpaca_actions", "_run_toolalpaca"]
+__all__ = [
+    "ToolAlpacaActionResult",
+    "ToolAlpacaHttpSandbox",
+    "ToolAlpacaSandbox",
+    "evaluate_toolalpaca_actions",
+    "_run_toolalpaca",
+]
