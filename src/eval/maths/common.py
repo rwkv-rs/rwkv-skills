@@ -9,7 +9,7 @@ from typing import Iterable
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
-from src.eval.execution_plan import avg_k_metric_key
+from src.eval.k_values import NumericK, filter_metrics_by_k
 
 
 class JudgeMode(str, Enum):
@@ -69,15 +69,8 @@ def resolve_sampling_pair(
     return cot_sampling.clamp(cot_max_tokens), final_sampling.clamp(final_max_tokens)
 
 
-def filter_avg_metrics(metric_map: dict[str, float] | None, ks: Iterable[float]) -> dict[str, float]:
-    if not metric_map:
-        return {}
-    allowed = {avg_k_metric_key(float(k)) for k in ks if float(k) > 0}
-    return {
-        key: value
-        for key, value in metric_map.items()
-        if key.startswith("avg@") and key in allowed
-    }
+def filter_avg_metrics(metric_map: dict[str, float] | None, ks: Iterable[NumericK]) -> dict[str, float]:
+    return filter_metrics_by_k(metric_map, tuple(ks), "avg@")
 
 
 def filter_pass_metrics(metric_map: dict[str, float] | None, ks: Iterable[int]) -> dict[str, float]:
@@ -97,6 +90,7 @@ def build_llm_judge(
     judge_api_key: str | None = None,
     judge_base_url: str | None = None,
     judge_max_workers: int = 32,
+    judge_max_tokens: int | None = None,
     required: bool = True,
 ):
     from src.eval.metrics.free_response import LLMJudge, LLMJudgeConfig
@@ -135,6 +129,7 @@ def build_llm_judge(
             model=resolved_model,
             base_url=resolved_base_url,
             max_workers=judge_max_workers,
+            max_completion_tokens=judge_max_tokens,
         )
     )
 

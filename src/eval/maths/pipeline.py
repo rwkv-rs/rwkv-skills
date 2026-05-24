@@ -24,10 +24,14 @@ from src.infer.sampling import GenerationOutput, SamplingConfig
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
-Assistant: <think>"""
+Assistant: <think"""
 
-DEFAULT_FINAL_PROMPT = """<Q><COT></think>
+DEFAULT_FINAL_PROMPT = """<Q><COT>
 Therefore, the answer is \\(\\boxed{"""
+
+
+def _render_cot_prompt(template: str, question: str) -> str:
+    return template.replace("<Q>", question.lstrip()).rstrip(" ")
 
 
 @dataclass(slots=True)
@@ -117,14 +121,12 @@ class FreeResponsePipeline:
             )
         else:
             remaining_entries = expanded
-        use_legacy_templates = (
-            cot_prompt_template != DEFAULT_COT_PROMPT
-            or final_answer_template != DEFAULT_FINAL_PROMPT
-        )
+        use_legacy_templates = True
         if probe_only:
             if use_legacy_templates:
                 cot_prompts = [
-                    cot_prompt_template.replace("<Q>", record.question) for _key, record in remaining_entries
+                    _render_cot_prompt(cot_prompt_template, record.question)
+                    for _key, record in remaining_entries
                 ]
             else:
                 expected_contexts = [
@@ -162,7 +164,8 @@ class FreeResponsePipeline:
             chunk = remaining_entries[start : start + chunk_size]
             if use_legacy_templates:
                 cot_prompts = [
-                    cot_prompt_template.replace("<Q>", record.question) for _key, record in chunk
+                    _render_cot_prompt(cot_prompt_template, record.question)
+                    for _key, record in chunk
                 ]
                 expected_contexts: list[str] | None = None
             else:

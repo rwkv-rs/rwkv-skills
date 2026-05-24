@@ -8,9 +8,10 @@ These utilities operate over canonical evaluator outputs keyed by:
 """
 
 from collections import defaultdict
+import math
 from typing import Iterable, Sequence
 
-from src.eval.execution_plan import avg_k_metric_key
+from src.eval.k_values import NumericK, format_k_value
 
 
 def estimate_pass_at_k(total: int, correct: int, k: int) -> float:
@@ -56,7 +57,7 @@ def compute_pass_at_k(
 
 def compute_avg_at_k(
     rows: Iterable[tuple[int, int, bool]],
-    ks: Sequence[float | int],
+    ks: Sequence[NumericK],
 ) -> dict[str, float]:
     seen: set[tuple[int, int]] = set()
     grouped: dict[int, list[tuple[int, bool]]] = defaultdict(list)
@@ -69,37 +70,27 @@ def compute_avg_at_k(
 
     metrics: dict[str, float] = {}
     for k in ks:
-        numeric_k = float(k)
-        if numeric_k <= 0:
+        if isinstance(k, bool) or not isinstance(k, (int, float)):
             continue
-        metric_key = avg_k_metric_key(numeric_k)
-        if numeric_k < 1.0:
-            correct = 0
-            total = 0
-            for entries in grouped.values():
-                ordered = sorted(entries, key=lambda pair: pair[0])
-                if not ordered:
-                    continue
-                correct += sum(1 for _, flag in ordered if flag)
-                total += len(ordered)
-            if total > 0:
-                metrics[metric_key] = correct / total
-            continue
-
-        k_int = int(round(numeric_k))
-        if abs(numeric_k - k_int) > 1e-9 or k_int <= 0:
+        number = float(k)
+        if number <= 0:
             continue
         correct = 0
         total = 0
         for entries in grouped.values():
             ordered = sorted(entries, key=lambda pair: pair[0])
-            if len(ordered) < k_int:
-                continue
-            selected = ordered[:k_int]
+            if number >= 1:
+                take = int(number)
+                if len(ordered) < take:
+                    continue
+                selected = ordered[:take]
+            else:
+                take = max(1, math.ceil(len(ordered) * number))
+                selected = ordered[:take]
             correct += sum(1 for _, flag in selected if flag)
-            total += k_int
+            total += take
         if total > 0:
-            metrics[metric_key] = correct / total
+            metrics[f"avg@{format_k_value(k)}"] = correct / total
     return metrics
 
 

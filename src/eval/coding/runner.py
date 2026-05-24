@@ -12,7 +12,8 @@ from typing import Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
-from src.eval.field_common import build_avg_k_metrics, build_plan_task_details, build_task_sampling_config, set_task_env
+from src.eval.field_common import build_plan_task_details, build_task_sampling_config, resolve_configured_k_plan, set_task_env
+from src.eval.k_values import filter_metrics_by_k
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
@@ -34,7 +35,8 @@ class CodingBenchmarkKind(str, Enum):
 _HUMAN_EVAL_JOB_NAMES = frozenset({"code_human_eval"})
 _MBPP_JOB_NAMES = frozenset({"code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot"})
 _LIVECODEBENCH_JOB_NAMES = frozenset({"code_livecodebench"})
-_DEFAULT_PASS_K = (1,)
+_DEFAULT_PASS_K: tuple[int, ...] = ()
+_DEFAULT_AVG_K: tuple[float, ...] = ()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -65,6 +67,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--cot-mode",
         choices=[mode.value for mode in CoTMode],
         help="Prompt mode for MBPP benchmarks; human_eval/livecodebench use fixed modes",
+    )
+    parser.add_argument(
+        "--pass-k",
+        type=int,
+        action="append",
+        help="pass@k values to report (default: none; can be set in configs/<benchmark>.toml)",
+    )
+    parser.add_argument(
+        "--avg-k",
+        type=float,
+        action="append",
+        help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
     )
     return parser.parse_args(argv)
 
@@ -194,8 +208,9 @@ def main(
     from src.eval.coding.pipeline import CodingPipeline
     from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoader
     from src.eval.evaluating import TaskRunController, TaskRunState, prepare_task_execution
-    from src.eval.execution_plan import build_attempt_keys, build_auto_avg_k_execution_plan, plan_attempt_count
+    from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
     from src.eval.metrics.code_generation.evaluate import evaluate_human_eval, evaluate_mbpp_dataset
+    from src.eval.metrics.at_k import compute_avg_at_k
     from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
     from src.eval.results.payloads import make_score_payload
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -211,11 +226,19 @@ def main(
     cot_mode = _resolve_cot_mode(benchmark_kind, args.cot_mode)
 
     dataset_records = JsonlCodeGenerationLoader(str(dataset_path)).load()
-    plan = build_auto_avg_k_execution_plan(slug, len(dataset_records))
-    attempt_keys = build_attempt_keys(plan, max_pass_k=max(_DEFAULT_PASS_K))
     model_name = resolve_backend_model_name(args)
+    k_plan = resolve_configured_k_plan(
+        slug=slug,
+        model_name=model_name,
+        dataset_len=len(dataset_records),
+        args=args,
+        default_pass_k=_DEFAULT_PASS_K,
+        default_avg_k=_DEFAULT_AVG_K,
+    )
+    plan = k_plan.plan
+    attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     batch_size = max(1, args.batch_size)
-    sample_limit = batch_size if args.probe_only else args.max_samples
+    sample_limit = batch_size if args.probe_only else k_plan.sample_limit
 
     sampling = None
     cot_sampling = None
@@ -297,11 +320,11 @@ def main(
                 cot_sampling=cot_sampling,
                 final_sampling=final_sampling,
             ),
-            pass_ks=_DEFAULT_PASS_K,
+            pass_ks=k_plan.pass_k,
             effective_sample_count=plan.effective_sample_count,
         ),
     )
-    expected_count = plan_attempt_count(plan, max_pass_k=max(_DEFAULT_PASS_K))
+    expected_count = plan_attempt_count(plan, max_pass_k=1)
     task_run = TaskRunState.from_task_execution(
         execution_state=task_state,
         attempt_keys=attempt_keys,
@@ -323,7 +346,7 @@ def main(
                 record_indices=plan.sample_indices,
                 eval_timeout=args.eval_timeout,
                 eval_workers=args.eval_workers,
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 samples_per_task=plan.repeat_count,
                 probe_only=False,
                 attempt_keys=attempt_keys,
@@ -340,7 +363,7 @@ def main(
                 record_indices=plan.sample_indices,
                 eval_timeout=args.eval_timeout,
                 eval_workers=args.eval_workers,
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 samples_per_task=plan.repeat_count,
                 probe_only=False,
                 attempt_keys=attempt_keys,
@@ -357,7 +380,7 @@ def main(
                 record_indices=plan.sample_indices,
                 eval_timeout=args.eval_timeout,
                 eval_workers=args.eval_workers,
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 samples_per_task=plan.repeat_count,
                 probe_only=False,
                 attempt_keys=attempt_keys,
@@ -374,7 +397,7 @@ def main(
             eval_metrics, eval_payloads = evaluate_human_eval(
                 completions_payloads,
                 dataset_path=str(dataset_path),
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 n_workers=args.eval_workers,
                 timeout=args.eval_timeout,
             )
@@ -382,7 +405,7 @@ def main(
             eval_metrics, eval_payloads = evaluate_mbpp_dataset(
                 completions_payloads,
                 dataset_path=str(dataset_path),
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 n_workers=args.eval_workers,
                 timeout=args.eval_timeout,
             )
@@ -390,7 +413,7 @@ def main(
             eval_metrics, eval_payloads = evaluate_livecodebench_dataset(
                 completions_payloads,
                 dataset_path=str(dataset_path),
-                pass_k=_DEFAULT_PASS_K,
+                pass_k=k_plan.pass_k,
                 n_workers=args.eval_workers,
                 timeout=args.eval_timeout,
             )
@@ -399,15 +422,23 @@ def main(
             (int(payload["sample_index"]), int(payload["repeat_index"]), bool(payload["is_passed"]))
             for payload in eval_payloads
         ]
-        metrics_payload = dict(eval_metrics)
-        metrics_payload.update(
-            build_avg_k_metrics(
-                rows,
-                avg_k=plan.avg_k,
-                primary_name="pass@1",
-                primary_value=float(eval_metrics.get("pass@1", 0.0)),
-            )
-        )
+        avg_metrics_all = compute_avg_at_k(rows, k_plan.avg_k)
+        metrics_payload: dict[str, float] = {}
+        pass_payload = filter_metrics_by_k(eval_metrics, k_plan.report_pass_k, "pass@")
+        if k_plan.report_pass_k and not pass_payload:
+            pass_payload = eval_metrics or {}
+        if pass_payload:
+            metrics_payload.update(pass_payload)
+        avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
+        if k_plan.report_avg_k and not avg_payload:
+            avg_payload = avg_metrics_all or {}
+        if avg_payload:
+            metrics_payload.update(avg_payload)
+        task_details: dict[str, object] = build_plan_task_details(plan, cot_mode=cot_mode.value)
+        if eval_metrics and pass_payload != eval_metrics:
+            task_details["pass_curve"] = eval_metrics
+        if avg_metrics_all and avg_payload != avg_metrics_all:
+            task_details["avg_curve"] = avg_metrics_all
 
         runtime.ingest_eval_payloads(eval_payloads)
         runtime.run_checker(model_name=model_name)
@@ -419,7 +450,7 @@ def main(
             samples=len(completions_payloads),
             problems=result.problem_count,
             task=job_name,
-            task_details=build_plan_task_details(plan, cot_mode=cot_mode.value),
+            task_details=task_details,
             extra={"cot_mode": cot_mode.value},
         )
         runtime.record_score(score_payload)

@@ -66,4 +66,4 @@ def test_multiple_choice_pipeline_falls_back_to_generation_when_choice_scoring_i
     assert len(result.payloads) == 1
     assert result.payloads[0]["completion1"] == " B"
     assert result.payloads[0]["stop_reason1"] == "logits_only"
-    assert backend.generate_calls and "Therefore, the answer is" in backend.generate_calls[0][0]
+    assert backend.generate_calls and "Assistant: The answer is" in backend.generate_calls[0][0]

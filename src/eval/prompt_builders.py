@@ -100,8 +100,11 @@ def build_maths_expected_context(*, subject: str, question: str, cot_mode: CoTMo
 
 
 def build_instruction_following_prompt(prompt: str, *, enable_think: bool = False) -> str:
-    suffix = " <think>" if enable_think else ""
-    return f"User: {prompt}\n\nAssistant:{suffix}"
+    clean_prompt = prompt.lstrip().rstrip(" ")
+    suffix = "<think" if enable_think else ""
+    if suffix:
+        return f"User: {clean_prompt}\n\nAssistant: {suffix}"
+    return f"User: {clean_prompt}\n\nAssistant:"
 
 
 def build_human_eval_expected_context(

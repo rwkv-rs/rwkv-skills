@@ -1,0 +1,26 @@
+[default]
+pass_k = []
+avg_k = [8]
+report_pass_k = []
+report_avg_k = [8]
+
+[cot]
+max_generate_tokens = 4096
+temperature = 0.3
+top_k = 500
+top_p = 0.4
+alpha_presence = 1.0
+alpha_frequency = 0.3
+alpha_decay = 0.99
+pad_zero = true
+cot_prompt_template = """User: Solve carefully. Preserve exact values and units.
+
+<Q>
+
+Assistant: <think"""
+
+[final]
+pad_zero = true
+final_prompt_template = """<Q><COT>
+</think>
+Therefore, the final answer is \\(\\boxed{"""

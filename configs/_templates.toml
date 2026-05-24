@@ -1,4 +1,7 @@
 [math_cot_default]
+cot_prompt_template = """User: <Q>
+
+Assistant: <think"""
 max_generate_tokens = 4096
 temperature = 0.55
 top_k = 66
@@ -51,6 +54,9 @@ ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
 [free_response_cot_default]
+cot_prompt_template = """User: <Q>
+
+Assistant: <think"""
 max_generate_tokens = 4096
 temperature = 0.3
 top_k = 500
@@ -75,6 +81,22 @@ stop_tokens = [0, 2402, 4910]
 pad_zero = true
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[function_call_cot_default]
+max_generate_tokens = 2048
+temperature = 1.0
+top_k = 200
+top_p = 0.0
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[function_call_default]
+template = "function_call_cot_default"
 
 [instruction_following_default]
 max_generate_tokens = 4096

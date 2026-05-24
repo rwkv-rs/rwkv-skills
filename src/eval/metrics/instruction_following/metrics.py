@@ -8,6 +8,7 @@ from typing import Iterable
 
 
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
+from src.eval.k_values import NumericK
 from src.eval.metrics.at_k import compute_avg_at_k
 from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
@@ -56,7 +57,7 @@ def evaluate_instruction_following(
     *,
     dataset_path: str | Path,
     strict: bool = True,
-    avg_k: tuple[int, ...] = (),
+    avg_k: tuple[NumericK, ...] = (),
 ) -> InstructionFollowingMetrics:
     dataset = list(JsonlInstructionFollowingLoader(str(dataset_path)).load())
     registry = instructions_registry.INSTRUCTION_DICT

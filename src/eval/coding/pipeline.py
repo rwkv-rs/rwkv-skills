@@ -24,8 +24,73 @@ from src.infer.backend import InferenceBackend
 from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 
-# Coding 默认只计算 pass@1；如需更高 k，请通过 CLI 传入
-DEFAULT_PASS_K = (1,)
+# Coding 默认不计算 pass@k；如需单独产出 pass，请通过 CLI/配置显式传入
+DEFAULT_PASS_K: tuple[int, ...] = ()
+
+
+def _compress_newlines(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(lines)
+
+
+def _format_prompt(prompt: str) -> str:
+    clean = _compress_newlines(prompt).strip()
+    return (
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        f"{clean}\n\n"
+        "Assistant: <think>\n</think>\n```python"
+    )
+
+
+def _format_prompt_no_echo(prompt: str) -> str:
+    clean = _compress_newlines(prompt).strip()
+    return (
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        f"{clean}\n\nAssistant: <think></think>\n```python"
+    )
+
+
+def _format_signature_prompt(prompt: str, signature: str) -> str:
+    prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
+    return _format_prompt_no_echo(prompt)
+
+
+_LCB_SYSTEM_MESSAGE = (
+    "You are an expert Python programmer. You will be given a question "
+    "(problem specification) and will generate a correct Python program "
+    "that matches the specification and passes all tests."
+)
+_LCB_FORMAT_WITH_STARTER = (
+    "You will use the following starter code to write the solution to the problem and enclose your code within delimiters."
+)
+_LCB_FORMAT_WITHOUT_STARTER = (
+    "Read the inputs from stdin solve the problem and write the answer to stdout "
+    "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
+    "Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT."
+)
+_LCB_FINAL_ANSWER_PREFIX = "\n</think>\n```python\n"
+
+
+def _format_lcb_body(question: str, starter_code: str | None) -> str:
+    clean = (question or "").strip()
+    body = f"### Question:\n{clean}\n\n"
+    if starter_code and starter_code.strip():
+        body += f"### Format: {_LCB_FORMAT_WITH_STARTER}\n"
+        body += f"```python\n{starter_code}\n```\n\n"
+    else:
+        body += f"### Format: {_LCB_FORMAT_WITHOUT_STARTER}\n"
+        body += "```python\n# YOUR CODE HERE\n```\n\n"
+    body += "### Answer: (use the provided format with backticks)\n\n"
+    return body
+
+
+def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
+    body = _format_lcb_body(question, starter_code)
+    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think"
+
+
+def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
+    return f"{cot_prompt}{cot_completion}{_LCB_FINAL_ANSWER_PREFIX}"
 
 
 @dataclass(slots=True)
@@ -64,12 +129,8 @@ def _expand_attempt_entries(
 
 
 def _build_human_eval_prompt(prompt: str, *, echo_prompt: bool) -> str:
-    expected_context = build_human_eval_expected_context(
-        prompt,
-        assistant_code_prefix=prompt if echo_prompt else None,
-        cot_mode=CoTMode.NO_COT,
-    )
-    return prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
+    _ = echo_prompt
+    return _format_prompt(prompt)
 
 
 def _build_mbpp_context(prompt: str, signature: str | None, cot_mode: CoTMode) -> str:
@@ -262,12 +323,16 @@ class CodingPipeline:
                 _record_idx, record = records[idx % len(records)]
                 raw_code = record.metadata.get("code") if record.metadata else None
                 signature = extract_function_signature(raw_code)
-                expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
-                prompt_text = (
-                    prompt_for_cot(expected_context)
-                    if cot_mode is CoTMode.COT
-                    else prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
-                )
+                if cot_mode is CoTMode.COT:
+                    expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
+                    prompt_text = prompt_for_cot(expected_context)
+                else:
+                    expected_context = ""
+                    prompt_text = (
+                        _format_signature_prompt(record.prompt, signature)
+                        if signature
+                        else _format_prompt_no_echo(record.prompt)
+                    )
                 expected_contexts.append(expected_context)
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
@@ -336,12 +401,16 @@ class CodingPipeline:
         for key, record in expanded:
             raw_code = record.metadata.get("code") if record.metadata else None
             signature = extract_function_signature(raw_code)
-            expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
-            prompt_text = (
-                prompt_for_cot(expected_context)
-                if cot_mode is CoTMode.COT
-                else prompt_for_marker(expected_context, CODE_COMPLETION_PLACEHOLDER)
-            )
+            if cot_mode is CoTMode.COT:
+                expected_context = _build_mbpp_context(record.prompt, signature, cot_mode)
+                prompt_text = prompt_for_cot(expected_context)
+            else:
+                expected_context = ""
+                prompt_text = (
+                    _format_signature_prompt(record.prompt, signature)
+                    if signature
+                    else _format_prompt_no_echo(record.prompt)
+                )
             entries.append((expected_context, prompt_text, record, key))
         skipped = total_expected - len(entries)
         if skipped > 0:
@@ -548,14 +617,11 @@ class CodingPipeline:
             return CodingPipelineResult(dataset_name, 0, 0, [])
 
         if probe_only:
-            expected_contexts = []
             prompts = []
             probe_seeds_stage1: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
-                expected_context = _build_livecodebench_context(record.prompt, record.starter_code)
-                prompt_text = prompt_for_cot(expected_context)
-                expected_contexts.append(expected_context)
+                prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
                 prompts.append(prompt_text)
                 probe_seeds_stage1.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
             cot_outputs = self.backend.generate(
@@ -568,16 +634,10 @@ class CodingPipeline:
             )
             final_prompts: list[str] = []
             cot_by_idx = {item.prompt_index: item for item in cot_outputs}
-            for local_idx, expected_context in enumerate(expected_contexts):
+            for local_idx, prompt_text in enumerate(prompts):
                 cot_seq = cot_by_idx.get(local_idx)
                 cot_text = cot_seq.text if cot_seq is not None else ""
-                final_prompts.append(
-                    prompt_for_marker(
-                        expected_context,
-                        CODE_COMPLETION_PLACEHOLDER,
-                        completions_of_cot=cot_text,
-                    )
-                )
+                final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_text))
             if final_prompts:
                 probe_seeds_stage2 = [
                         sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=2)
@@ -611,8 +671,8 @@ class CodingPipeline:
             )
         entries = []
         for key, record in expanded:
-            expected_context = _build_livecodebench_context(record.prompt, record.starter_code)
-            entries.append((expected_context, prompt_for_cot(expected_context), record, key))
+            prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
+            entries.append((prompt_text, prompt_text, record, key))
         skipped = total_expected - len(entries)
         if skipped > 0:
             print(f"⏩ LiveCodeBench 恢复运行：已跳过 {skipped}/{total_expected} 个样本")
@@ -670,31 +730,21 @@ class CodingPipeline:
 
                 final_prompts: list[str] = []
                 final_prompt_indices: list[int] = []
-                for local_idx, (expected_context, _prompt_text, _record, _key) in enumerate(chunk):
+                for local_idx, (_expected_context, prompt_text, _record, _key) in enumerate(chunk):
                     cot_seq = cot_by_idx.get(local_idx)
                     if cot_seq is None:
                         continue
-                    final_prompts.append(
-                        prompt_for_marker(
-                            expected_context,
-                            CODE_COMPLETION_PLACEHOLDER,
-                            completions_of_cot=cot_seq.text,
-                        )
-                    )
+                    final_prompts.append(_format_lcb_final_prompt(prompt_text, cot_seq.text))
                     final_prompt_indices.append(local_idx)
 
                 def _on_final_complete(output: GenerationOutput) -> None:
                     local_idx = final_prompt_indices[output.prompt_index]
-                    expected_context, prompt_text, _record, key = chunk[local_idx]
+                    _expected_context, prompt_text, _record, key = chunk[local_idx]
                     cot_seq = cot_by_idx.get(local_idx)
                     if cot_seq is None:
                         return
                     prior_context = f"{prompt_text}{cot_seq.text}"
-                    final_prompt = prompt_for_marker(
-                        expected_context,
-                        CODE_COMPLETION_PLACEHOLDER,
-                        completions_of_cot=cot_seq.text,
-                    )
+                    final_prompt = _format_lcb_final_prompt(prompt_text, cot_seq.text)
                     delta_prompt = prompt_delta(final_prompt, prior_context)
                     cot_stage = StageRecord(
                         prompt=prompt_text,

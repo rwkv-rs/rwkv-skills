@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Benchmark-level overrides loaded from configs/<model_name>/<benchmark>.toml."""
 
+import os
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.eval.k_values import NumericK
 from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import (
     canonical_slug,
@@ -17,6 +19,7 @@ from src.infer.sampling import SamplingConfig
 
 CONFIG_ROOT = REPO_ROOT / "configs"
 TEMPLATE_PATH = CONFIG_ROOT / "_templates.toml"
+CONFIG_OVERRIDE_ROOT_ENV = "RWKV_BENCHMARK_CONFIG_ROOT"
 
 _INT_FIELDS = {"max_generate_tokens", "top_k"}
 _FLOAT_FIELDS = {
@@ -43,9 +46,15 @@ class BenchmarkModelConfig:
     sampling_overrides: dict[str, object]
     # Optional evaluation-level overrides (e.g. free-response pass@k / avg@k).
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[float, ...] | None = None
+    avg_k: tuple[NumericK, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[float, ...] | None = None
+    report_avg_k: tuple[NumericK, ...] | None = None
+    max_samples: int | None = None
+    direct_prompt_template: str | None = None
+    cot_prompt_template: str | None = None
+    final_prompt_template: str | None = None
+    judge_prompt_template: str | None = None
+    browsecomp_plus_judge: dict[str, Any] | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -54,20 +63,60 @@ class BenchmarkModelConfig:
 
 
 def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None) -> Path:
+    roots = _config_roots(override_first=True)
+    if model_name:
+        for root in roots:
+            path = _config_path_for_root(root, benchmark_name, model_name)
+            if path.exists():
+                return path
+        for root in roots:
+            path = _config_path_for_root(root, benchmark_name, None)
+            if path.exists():
+                return path
+        return _config_path_for_root(CONFIG_ROOT, benchmark_name, model_name)
+
+    for root in roots:
+        path = _config_path_for_root(root, benchmark_name, None)
+        if path.exists():
+            return path
+    return _config_path_for_root(CONFIG_ROOT, benchmark_name, None)
+
+
+def _config_path_for_root(
+    root: Path,
+    benchmark_name: str,
+    model_name: str | None = None,
+) -> Path:
     raw_slug = safe_slug(canonical_slug(benchmark_name)).lower()
     if model_name:
         model_slug = safe_slug(model_name)
-        direct = CONFIG_ROOT / model_slug / f"{raw_slug}.toml"
+        direct = root / model_slug / f"{raw_slug}.toml"
         if direct.exists():
             return direct
         base, _ = split_benchmark_and_split(raw_slug)
-        return CONFIG_ROOT / model_slug / f"{safe_slug(base).lower()}.toml"
+        return root / model_slug / f"{safe_slug(base).lower()}.toml"
 
-    direct = CONFIG_ROOT / f"{raw_slug}.toml"
+    direct = root / f"{raw_slug}.toml"
     if direct.exists():
         return direct
     base, _ = split_benchmark_and_split(raw_slug)
-    return CONFIG_ROOT / f"{safe_slug(base).lower()}.toml"
+    return root / f"{safe_slug(base).lower()}.toml"
+
+
+def _config_roots(*, override_first: bool = False) -> tuple[Path, ...]:
+    override = _config_override_root()
+    if override is None:
+        return (CONFIG_ROOT,)
+    if override_first:
+        return (override, CONFIG_ROOT)
+    return (CONFIG_ROOT, override)
+
+
+def _config_override_root() -> Path | None:
+    raw = os.environ.get(CONFIG_OVERRIDE_ROOT_ENV)
+    if not raw:
+        return None
+    return Path(raw).expanduser()
 
 
 def resolve_benchmark_model_config(
@@ -101,16 +150,42 @@ def resolve_benchmark_model_config(
 
 
 def _load_benchmark_tables(benchmark_name: str, model_name: str) -> dict[str, Mapping[str, Any]]:
-    path = config_path_for_benchmark(benchmark_name, model_name)
-    payload = _load_toml(path)
-    if not payload:
-        fallback = config_path_for_benchmark(benchmark_name, None)
-        payload = _load_toml(fallback)
     tables: dict[str, Mapping[str, Any]] = {}
-    for key, value in payload.items():
-        if isinstance(value, Mapping):
-            tables[str(key)] = value
+    for path in _benchmark_config_paths(benchmark_name, model_name):
+        payload = _load_toml(path)
+        for key, value in payload.items():
+            if not isinstance(value, Mapping):
+                continue
+            key = str(key)
+            previous = tables.get(key, {})
+            tables[key] = _merge_mapping(previous, value)
     return tables
+
+
+def _benchmark_config_paths(benchmark_name: str, model_name: str) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for root in _config_roots():
+        for path in (
+            _config_path_for_root(root, benchmark_name, None),
+            _config_path_for_root(root, benchmark_name, model_name),
+        ):
+            if path.exists() and path not in paths:
+                paths.append(path)
+    return tuple(paths)
+
+
+def _merge_mapping(
+    base: Mapping[str, Any],
+    override: Mapping[str, Any],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(base)
+    for key, value in override.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[key] = _merge_mapping(existing, value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -132,11 +207,15 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
 
 def _load_template_tables() -> dict[str, Mapping[str, Any]]:
-    payload = _load_toml(TEMPLATE_PATH)
     tables: dict[str, Mapping[str, Any]] = {}
-    for key, value in payload.items():
-        if isinstance(value, Mapping):
-            tables[str(key)] = value
+    for root in _config_roots():
+        payload = _load_toml(root / TEMPLATE_PATH.name)
+        for key, value in payload.items():
+            if not isinstance(value, Mapping):
+                continue
+            key = str(key)
+            previous = tables.get(key, {})
+            tables[key] = _merge_mapping(previous, value)
     return tables
 
 
@@ -221,9 +300,15 @@ def _normalize_model_key(value: str) -> str:
 def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     sampling_overrides: dict[str, object] = {}
     pass_k: tuple[int, ...] | None = None
-    avg_k: tuple[float, ...] | None = None
+    avg_k: tuple[NumericK, ...] | None = None
     report_pass_k: tuple[int, ...] | None = None
-    report_avg_k: tuple[float, ...] | None = None
+    report_avg_k: tuple[NumericK, ...] | None = None
+    max_samples: int | None = None
+    direct_prompt_template: str | None = None
+    cot_prompt_template: str | None = None
+    final_prompt_template: str | None = None
+    judge_prompt_template: str | None = None
+    browsecomp_plus_judge: dict[str, Any] | None = None
 
     for key, raw in table.items():
         normalized_key = _INT_FIELD_ALIASES.get(key, _FLOAT_FIELD_ALIASES.get(key, key))
@@ -247,6 +332,24 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "report_avg_k":
             report_avg_k = _coerce_avg_k_tuple(raw)
             continue
+        elif key == "max_samples":
+            max_samples = _coerce_int(raw)
+            continue
+        elif key == "direct_prompt_template":
+            direct_prompt_template = _coerce_str(raw)
+            continue
+        elif key == "cot_prompt_template":
+            cot_prompt_template = _coerce_str(raw)
+            continue
+        elif key == "final_prompt_template":
+            final_prompt_template = _coerce_str(raw)
+            continue
+        elif key == "judge_prompt_template":
+            judge_prompt_template = _coerce_str(raw)
+            continue
+        elif key == "browsecomp_plus_judge":
+            browsecomp_plus_judge = _coerce_str_mapping(raw)
+            continue
         else:
             continue
         if value is not None:
@@ -258,6 +361,12 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         avg_k=avg_k,
         report_pass_k=report_pass_k,
         report_avg_k=report_avg_k,
+        max_samples=max_samples,
+        direct_prompt_template=direct_prompt_template,
+        cot_prompt_template=cot_prompt_template,
+        final_prompt_template=final_prompt_template,
+        judge_prompt_template=judge_prompt_template,
+        browsecomp_plus_judge=browsecomp_plus_judge,
     )
 
 
@@ -277,6 +386,18 @@ def _coerce_float(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _coerce_str(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _coerce_str_mapping(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {str(key): item for key, item in value.items()}
 
 
 def _coerce_int_tuple(value: Any) -> tuple[int, ...] | None:
@@ -317,23 +438,37 @@ def _coerce_k_tuple(value: Any) -> tuple[int, ...] | None:
     return tuple(filtered)
 
 
-def _coerce_avg_k_tuple(value: Any) -> tuple[float, ...] | None:
-    if value is None:
+def _coerce_avg_k_tuple(value: Any) -> tuple[NumericK, ...] | None:
+    """Coerce avg@k configs.
+
+    Accepts positive integer counts and positive ratios in (0, 1).
+    """
+
+    if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, bool):
-        return None
-    values: list[float] = []
-    if isinstance(value, (int, float)):
-        values = [float(value)]
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            if isinstance(item, bool) or not isinstance(item, (int, float)):
+    values: list[NumericK] = []
+    raw_items = value if isinstance(value, (list, tuple)) else (value,)
+    for item in raw_items:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if number <= 0:
+            continue
+        if number >= 1:
+            if not number.is_integer():
                 return None
-            values.append(float(item))
-    else:
-        return None
-    filtered = sorted({float(item) for item in values if float(item) > 0.0})
-    return tuple(filtered)
+            values.append(int(number))
+            continue
+        values.append(number)
+    normalized: list[NumericK] = []
+    seen: set[str] = set()
+    for item in sorted(values, key=float):
+        key = str(int(item)) if isinstance(item, int) else f"{float(item):.12g}"
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return tuple(normalized)
 
 
 def resolve_sampling_config(

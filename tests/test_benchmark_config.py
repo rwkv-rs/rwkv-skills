@@ -19,10 +19,10 @@ def test_resolve_math_500_cot_config_merges_default_and_template() -> None:
     config = resolve_benchmark_model_config("math_500_test", "rwkv7-g1a-2.9b", stage="cot")
 
     assert config is not None
-    assert config.pass_k == (1,)
-    assert config.avg_k == (4,)
-    assert config.report_pass_k == (1,)
-    assert config.report_avg_k == (4,)
+    assert config.pass_k == ()
+    assert config.avg_k == (8,)
+    assert config.report_pass_k == ()
+    assert config.report_avg_k == (8,)
     assert config.sampling_overrides["max_generate_tokens"] == 4096
     assert config.sampling_overrides["top_k"] == 500
     assert config.sampling_overrides["temperature"] == 0.3

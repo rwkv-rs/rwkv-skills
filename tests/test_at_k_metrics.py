@@ -31,5 +31,5 @@ def test_compute_avg_at_k_deduplicates_resume_rows_by_sample_and_repeat() -> Non
 
     metrics = compute_avg_at_k(rows, (0.5, 1))
 
-    assert metrics["avg@0.5"] == pytest.approx(0.25)
+    assert metrics["avg@0.5"] == pytest.approx(0.5)
     assert metrics["avg@1"] == pytest.approx(0.5)

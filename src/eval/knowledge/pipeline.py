@@ -27,6 +27,57 @@ from src.infer.sampling import GenerationOutput, SamplingConfig
 
 TARGET_TOKEN_FORMAT = " <LETTER>"
 
+EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
+<Q>
+<CHOICES>
+
+Assistant: The answer is"""
+
+EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
+<Q>
+<CHOICES>
+
+Assistant: <think"""
+
+EN_FINAL_ANSWER_TEMPLATE = """<Q><COT>
+Therefore, the answer is"""
+
+ZH_DIRECT_PROMPT_TEMPLATE = """User: <Q>
+<CHOICES>
+
+Assistant: 正确答案是"""
+
+ZH_COT_PROMPT_TEMPLATE = """User: <Q>
+<CHOICES>
+
+Assistant: <think"""
+
+ZH_FINAL_ANSWER_TEMPLATE = """<Q><COT>
+综上所述，答案是"""
+
+
+@dataclass(frozen=True)
+class PromptTemplates:
+    direct: str
+    cot: str
+    final: str
+
+
+def _select_prompt_templates(dataset_name: str | None) -> PromptTemplates:
+    if dataset_name:
+        stem = dataset_name.lower()
+        if any(token in stem for token in ("ceval", "zh", "cn")):
+            return PromptTemplates(
+                ZH_DIRECT_PROMPT_TEMPLATE,
+                ZH_COT_PROMPT_TEMPLATE,
+                ZH_FINAL_ANSWER_TEMPLATE,
+            )
+    return PromptTemplates(
+        EN_DIRECT_PROMPT_TEMPLATE,
+        EN_COT_PROMPT_TEMPLATE,
+        EN_FINAL_ANSWER_TEMPLATE,
+    )
+
 
 @dataclass(slots=True)
 class MultipleChoicePipelineResult:
@@ -64,6 +115,9 @@ class MultipleChoicePipeline:
         )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
+        templates = _select_prompt_templates(dataset_name)
+        if prompt_template is None:
+            prompt_template = templates.direct
         skip_keys = skip_keys or set()
         if resume_start_index < 0:
             resume_start_index = 0
@@ -88,11 +142,7 @@ class MultipleChoicePipeline:
 
         payloads: list[dict] = []
         for key, record in expanded:
-            if prompt_template is not None:
-                prompt = self._format_prompt(record, prompt_template)
-            else:
-                expected_context = self._build_expected_context(record, cot_mode)
-                prompt = self._prompt_for_final_answer(expected_context, None)
+            prompt = self._format_prompt(record, prompt_template)
             _, pred_letter = self._score_prompt(record, prompt)
             token_text = self.target_token_format.replace("<LETTER>", pred_letter)
             stages = [
@@ -142,7 +192,12 @@ class MultipleChoicePipeline:
         )
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
+        templates = _select_prompt_templates(dataset_name)
         batch_size = max(1, int(batch_size))
+        if cot_prompt_template is None:
+            cot_prompt_template = templates.cot
+        if final_answer_template is None:
+            final_answer_template = templates.final
 
         repeats = max(1, int(samples_per_task)) if not probe_only else 1
         skip_keys = skip_keys or set()
@@ -196,12 +251,7 @@ class MultipleChoicePipeline:
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
             expected_contexts = [self._build_expected_context(record, CoTMode.COT) for _key, record in chunk]
-            prompts = [
-                self._format_prompt(record, cot_prompt_template)
-                if cot_prompt_template is not None
-                else self._prompt_for_cot(expected_context)
-                for expected_context, (_key, record) in zip(expected_contexts, chunk, strict=True)
-            ]
+            prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in chunk]
 
             def _on_cot_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
@@ -227,12 +277,9 @@ class MultipleChoicePipeline:
                 cot_payload["_stage"] = "cot"
                 if on_record is not None:
                     on_record(cot_payload)
-                if final_answer_template is not None:
-                    final_prompt = (
-                        final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", output.text)
-                    )
-                else:
-                    final_prompt = self._prompt_for_final_answer(expected_context, output.text)
+                final_prompt = (
+                    final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", output.text)
+                )
                 _, pred_letter = self._score_prompt(record, final_prompt)
                 prior_context = f"{cot_prompt}{output.text}"
                 delta_prompt = prompt_delta(final_prompt, prior_context)
@@ -315,11 +362,13 @@ class MultipleChoicePipeline:
         )
 
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
+        subject = (record.subject or "unknown").replace("_", " ")
+        question = record.question.lstrip()
         return (
-            template.replace("<SUBJECT>", normalize_subject(record.subject, "unknown"))
-            .replace("<Q>", record.question)
+            template.replace("<SUBJECT>", subject)
+            .replace("<Q>", question)
             .replace("<CHOICES>", concat_choices(record.choices))
-        )
+        ).rstrip(" ")
 
     def _choice_tokens(self, num_choices: int) -> list[int]:
         return [

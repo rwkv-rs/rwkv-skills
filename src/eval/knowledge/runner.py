@@ -9,11 +9,12 @@ from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
 from src.eval.field_common import (
-    build_avg_k_metrics,
     build_plan_task_details,
     build_task_sampling_config,
+    resolve_configured_k_plan,
     set_task_env,
 )
+from src.eval.k_values import filter_metrics_by_k
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
@@ -44,6 +45,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Run a single-batch CoT probe and skip scoring",
     )
+    parser.add_argument(
+        "--pass-k",
+        type=int,
+        action="append",
+        help="pass@k values to compute (default: none; can be set in configs/<benchmark>.toml)",
+    )
+    parser.add_argument(
+        "--avg-k",
+        type=float,
+        action="append",
+        help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
+    )
     return parser.parse_args(argv)
 
 
@@ -71,6 +84,7 @@ def _task_sampling_config(
     avg_k: float,
     effective_sample_count: int,
     cot_sampling: object | None = None,
+    pass_ks: Sequence[int] | None = None,
 ) -> dict[str, object]:
     from src.eval.results.schema import sampling_config_to_dict
 
@@ -81,6 +95,7 @@ def _task_sampling_config(
         cot_mode=cot_mode,
         avg_k=avg_k,
         sampling_config=sampling_payload,
+        pass_ks=pass_ks,
         effective_sample_count=effective_sample_count,
     )
 
@@ -95,11 +110,12 @@ def main(
     args = parse_args(argv)
     validate_inference_backend_args(args)
 
-    from src.eval.benchmark_config import resolve_sampling_config
+    from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
     from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
     from src.eval.evaluating import TaskRunController, TaskRunState, prepare_task_execution
-    from src.eval.execution_plan import build_attempt_keys, build_auto_avg_k_execution_plan, plan_attempt_count
+    from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
     from src.eval.knowledge.pipeline import MultipleChoicePipeline
+    from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
     from src.eval.metrics.multi_choice import evaluate_multiple_choice
     from src.eval.results.payloads import make_score_payload
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -116,10 +132,34 @@ def main(
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = resolve_backend_model_name(args)
     dataset_records = JsonlMultipleChoiceLoader(str(dataset_path)).load()
-    plan = build_auto_avg_k_execution_plan(slug, len(dataset_records))
+    k_plan = resolve_configured_k_plan(
+        slug=slug,
+        model_name=model_name,
+        dataset_len=len(dataset_records),
+        args=args,
+    )
+    plan = k_plan.plan
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     backend = build_inference_backend_from_args(args)
     pipeline = MultipleChoicePipeline(backend, target_token_format=args.target_token_format)
+    direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    direct_prompt_template = (
+        direct_config.direct_prompt_template
+        if direct_config is not None and direct_config.direct_prompt_template
+        else None
+    )
+    cot_prompt_template = (
+        cot_config.cot_prompt_template
+        if cot_config is not None and cot_config.cot_prompt_template
+        else None
+    )
+    final_answer_template = (
+        final_config.final_prompt_template
+        if final_config is not None and final_config.final_prompt_template
+        else None
+    )
 
     cot_sampling = None
     if cot_mode is CoTMode.COT:
@@ -135,6 +175,8 @@ def main(
             batch_size = max(1, args.batch_size)
             pipeline.run_chain_of_thought(
                 dataset_path=str(dataset_path),
+                **({"cot_prompt_template": cot_prompt_template} if cot_prompt_template else {}),
+                **({"final_answer_template": final_answer_template} if final_answer_template else {}),
                 cot_sampling=cot_sampling,
                 batch_size=batch_size,
                 sample_limit=batch_size,
@@ -163,6 +205,7 @@ def main(
             avg_k=plan.avg_k,
             effective_sample_count=plan.effective_sample_count,
             cot_sampling=cot_sampling,
+            pass_ks=k_plan.pass_k,
         ),
     )
     task_run = TaskRunState.from_task_execution(
@@ -180,6 +223,8 @@ def main(
         if cot_mode is CoTMode.COT:
             result = pipeline.run_chain_of_thought(
                 dataset_path=str(dataset_path),
+                **({"cot_prompt_template": cot_prompt_template} if cot_prompt_template else {}),
+                **({"final_answer_template": final_answer_template} if final_answer_template else {}),
                 cot_sampling=cot_sampling,
                 batch_size=max(1, args.batch_size),
                 record_indices=plan.sample_indices,
@@ -191,6 +236,7 @@ def main(
         else:
             result = pipeline.run_direct(
                 dataset_path=str(dataset_path),
+                prompt_template=direct_prompt_template,
                 cot_mode=cot_mode,
                 record_indices=plan.sample_indices,
                 samples_per_task=plan.repeat_count,
@@ -205,24 +251,40 @@ def main(
     completions_payloads = runtime.complete_attempt_stage(writer)
     try:
         metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
+        pass_metrics_all = compute_pass_at_k(metrics.rows, k_plan.pass_k)
+        avg_metrics_all = compute_avg_at_k(metrics.rows, k_plan.avg_k)
+        has_explicit_k_metrics = bool(k_plan.report_pass_k) or bool(k_plan.report_avg_k)
+        metrics_payload: dict[str, float] = {}
+        if not has_explicit_k_metrics:
+            metrics_payload["accuracy"] = metrics.accuracy
+        pass_payload = filter_metrics_by_k(pass_metrics_all, k_plan.report_pass_k, "pass@")
+        if k_plan.report_pass_k and not pass_payload:
+            pass_payload = pass_metrics_all or {}
+        if pass_payload:
+            metrics_payload.update(pass_payload)
+        avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
+        if k_plan.report_avg_k and not avg_payload:
+            avg_payload = avg_metrics_all or {}
+        if avg_payload:
+            metrics_payload.update(avg_payload)
+        task_details = {
+            "accuracy_by_subject": metrics.accuracy_by_subject,
+            **build_plan_task_details(plan, cot_mode=cot_mode.value),
+        }
+        if pass_metrics_all and pass_payload != pass_metrics_all:
+            task_details["pass_curve"] = pass_metrics_all
+        if avg_metrics_all and avg_payload != avg_metrics_all:
+            task_details["avg_curve"] = avg_metrics_all
         runtime.ingest_eval_payloads(metrics.payloads)
         runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
             is_cot=cot_mode is not CoTMode.NO_COT,
             model_name=model_name,
-            metrics=build_avg_k_metrics(
-                metrics.rows,
-                avg_k=plan.avg_k,
-                primary_name="accuracy",
-                primary_value=metrics.accuracy,
-            ),
+            metrics=metrics_payload,
             samples=metrics.samples,
             task=job_name,
-            task_details={
-                "accuracy_by_subject": metrics.accuracy_by_subject,
-                **build_plan_task_details(plan, cot_mode=cot_mode.value),
-            },
+            task_details=task_details,
             extra={"cot_mode": cot_mode.value},
         )
         runtime.record_score(score_payload)
