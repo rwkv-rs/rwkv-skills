@@ -98,7 +98,7 @@ def scan_completed_jobs() -> tuple[set[CompletedKey], dict[str, CompletedRecord]
         )
         job_id = _completed_job_id(key)
         completed.add(key)
-        records[job_id] = CompletedRecord(
+        record = CompletedRecord(
             job_id=job_id,
             key=key,
             model_name=model_name,
@@ -108,6 +108,7 @@ def scan_completed_jobs() -> tuple[set[CompletedKey], dict[str, CompletedRecord]
             task_details=raw.get("task_details") if isinstance(raw.get("task_details"), dict) else None,
             version_id=str(raw.get("task_id")) if raw.get("task_id") is not None else None,
         )
+        records[job_id] = _newer_completed_record(records.get(job_id), record)
     return completed, records
 
 
@@ -115,6 +116,25 @@ def _completed_job_id(key: CompletedKey) -> str:
     suffix = "cot" if key.is_cot else "nocot"
     run_slug = safe_slug(f"{key.dataset_slug}_{suffix}_{key.model_slug}")
     return f"{key.job}__{run_slug}"
+
+
+def _newer_completed_record(
+    existing: CompletedRecord | None,
+    candidate: CompletedRecord,
+) -> CompletedRecord:
+    if existing is None:
+        return candidate
+    if _version_sort_key(candidate.version_id) >= _version_sort_key(existing.version_id):
+        return candidate
+    return existing
+
+
+def _version_sort_key(version_id: str | None) -> tuple[int, str]:
+    text = str(version_id or "")
+    try:
+        return int(text), text
+    except ValueError:
+        return -1, text
 
 
 def _warn_job_detection(json_path: Path, category: str, message: str) -> None:

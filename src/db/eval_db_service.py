@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from collections.abc import Mapping as AbcMapping
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from zoneinfo import ZoneInfo
@@ -122,23 +125,45 @@ class EvalDbService:
 
     @classmethod
     def _sanitize_json_text(cls, value: Any) -> Any:
-        """PostgreSQL JSONB rejects NUL bytes in text values; strip them recursively."""
+        """Return a JSONB-safe value, stripping NUL bytes recursively."""
+        if value is None or isinstance(value, bool):
+            return value
         if isinstance(value, str):
             return value.replace("\x00", "")
-        if isinstance(value, dict):
-            sanitized: dict[Any, Any] = {}
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace").replace("\x00", "")
+        if is_dataclass(value) and not isinstance(value, type):
+            return cls._sanitize_json_text(asdict(value))
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            try:
+                return cls._sanitize_json_text(value.model_dump())
+            except Exception:
+                return str(value)
+        if isinstance(value, AbcMapping):
+            sanitized: dict[str, Any] = {}
             for key, item in value.items():
-                if isinstance(key, str):
-                    sanitized_key = cls._sanitize_json_text(key)
-                else:
-                    sanitized_key = key
+                sanitized_key = cls._sanitize_json_text(key)
+                if not isinstance(sanitized_key, str):
+                    sanitized_key = str(sanitized_key)
                 sanitized[sanitized_key] = cls._sanitize_json_text(item)
             return sanitized
         if isinstance(value, list):
             return [cls._sanitize_json_text(item) for item in value]
         if isinstance(value, tuple):
             return [cls._sanitize_json_text(item) for item in value]
-        return value
+        if isinstance(value, set):
+            return [cls._sanitize_json_text(item) for item in sorted(value, key=str)]
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            return str(value)
 
     @staticmethod
     def _normalize_task_status(value: object) -> str:
