@@ -91,6 +91,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_HISTORY_MAX_CHARS,
         help="Clamp accumulated conversation/tool history length",
     )
+    parser.add_argument(
+        "--prompt-max-chars",
+        type=int,
+        help="Hard prompt character budget for long-context agent runners (env-specific defaults may apply)",
+    )
+    parser.add_argument("--long-doc-max-chars", type=int, default=1000, help="Long-document chunk max characters")
+    parser.add_argument("--long-doc-overlap-lines", type=int, default=3, help="Long-document chunk overlap lines")
+    parser.add_argument(
+        "--long-doc-min-chars",
+        type=int,
+        default=6000,
+        help="Only compact individual messages at or above this character count",
+    )
+    parser.add_argument(
+        "--long-doc-max-evidence-chunks",
+        type=int,
+        default=4,
+        help="Maximum selected chunks when compacting one long message",
+    )
+    parser.add_argument(
+        "--long-doc-max-evidence-chars",
+        type=int,
+        default=6000,
+        help="Maximum selected evidence characters when compacting one long message",
+    )
     parser.add_argument("--cot-max-tokens", type=int, default=2048, help="Clamp CoT generation length")
     parser.add_argument("--answer-max-tokens", type=int, default=1024, help="Clamp final answer generation length")
     parser.add_argument("--planning-max-tokens", type=int, default=2048, help="Clamp MCP planning generation length")

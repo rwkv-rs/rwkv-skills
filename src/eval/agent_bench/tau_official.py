@@ -16,6 +16,11 @@ from src.eval.function_calling.rwkv_prompt import (
     build_rwkv_json_call_prompt,
     extract_json_call_value_text,
 )
+from src.eval.long_doc_evidence import (
+    LongDocEvidenceConfig,
+    compact_messages_for_long_context,
+    long_doc_config_from_env,
+)
 from src.infer.backend import InferenceBackend
 from src.infer.sampling import SamplingConfig
 
@@ -194,6 +199,7 @@ class RWKVTauOfficialAgent:
         domain_policy: str,
         history_max_chars: int,
         prompt_max_chars: int = DEFAULT_TAU_PROMPT_MAX_CHARS,
+        long_doc_config: LongDocEvidenceConfig | None = None,
     ) -> None:
         ensure_tau_v2_vendor_path()
         message_module = import_module_with_auto_install("tau2.data_model.message", context="tau2 message import")
@@ -209,6 +215,7 @@ class RWKVTauOfficialAgent:
         self._system_prompt = build_tau_official_agent_system_prompt(domain_policy, self._tools)
         self._history_max_chars = max(0, int(history_max_chars))
         self._prompt_max_chars = max(4096, int(prompt_max_chars))
+        self._long_doc_config = long_doc_config or long_doc_config_from_env("RWKV_TAU_LONG_DOC")
         self._seed: int | None = None
         self._turn_index = 0
         self.stages: list[StageRecord] = []
@@ -275,9 +282,13 @@ class RWKVTauOfficialAgent:
 
     def _build_prompt(self, prompt_messages: Sequence[Mapping[str, object]]) -> str:
         history_budget = self._history_max_chars
+        compacted_messages = compact_messages_for_long_context(
+            prompt_messages,
+            config=self._long_doc_config,
+        ).messages
         prompt = build_rwkv_json_call_prompt(
             self._system_prompt,
-            prompt_messages,
+            compacted_messages,
             history_max_chars=history_budget,
         )
         if len(prompt) <= self._prompt_max_chars or history_budget <= 0:
@@ -286,7 +297,7 @@ class RWKVTauOfficialAgent:
         history_budget = max(0, history_budget - overflow - 512)
         return build_rwkv_json_call_prompt(
             self._system_prompt,
-            trim_message_history(prompt_messages, max_chars=history_budget),
+            trim_message_history(compacted_messages, max_chars=history_budget),
             history_max_chars=history_budget,
         )
 

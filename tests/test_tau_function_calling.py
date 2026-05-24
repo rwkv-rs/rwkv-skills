@@ -8,6 +8,7 @@ from src.eval.function_calling import (
     render_tau_user_prompt,
 )
 from src.eval.agent_bench.tau_official import (
+    RWKVTauOfficialAgent,
     build_tau_official_agent_system_prompt,
     configure_tau_nl_assertions_judge,
     _parse_tau_agent_decision,
@@ -15,6 +16,7 @@ from src.eval.agent_bench.tau_official import (
 )
 from src.eval.env_config import OpenAIModelConfig, normalize_openai_base_url
 from src.eval.function_calling.tau_runner import _tau_official_completion_payload
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 
 
 def test_render_tau_user_prompt_prefers_ticket() -> None:
@@ -170,6 +172,42 @@ def test_build_tau_official_agent_system_prompt_uses_respond_and_real_tools() ->
     assert "Use a real tool call when you need information or need to change state." in prompt
     assert "include ###STOP###" in prompt
     assert "Follow the refund policy." in prompt
+
+
+def test_tau_official_agent_prompt_compacts_long_tool_outputs() -> None:
+    long_tool_output = "\n".join(
+        [f"unrelated order row {index:03d}" for index in range(80)]
+        + ["order ORD-77 refund eligibility approved evidence"]
+        + [f"archive order row {index:03d}" for index in range(80)]
+    )
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=[],
+        domain_policy="Follow the order policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        long_doc_config=LongDocEvidenceConfig(
+            max_chunk_chars=240,
+            overlap_lines=1,
+            min_long_text_chars=400,
+            max_evidence_chunks=1,
+            max_evidence_chars=320,
+        ),
+    )
+
+    prompt = agent._build_prompt(  # noqa: SLF001 - prompt compaction is the behavior under test.
+        [
+            {"role": "user", "content": "Check refund eligibility for order ORD-77."},
+            {"role": "assistant", "content": '{"name":"get_order","arguments":{"order_id":"ORD-77"}}'},
+            {"role": "user", "content": long_tool_output},
+        ]
+    )
+
+    assert "Long document compacted" in prompt
+    assert "order ORD-77 refund eligibility approved evidence" in prompt
+    assert "unrelated order row 000" not in prompt
+    assert len(prompt) <= 5000
 
 
 def test_tau_nl_assertions_judge_config_uses_custom_model_and_base_url() -> None:

@@ -36,6 +36,7 @@ from src.eval.function_calling.rwkv_prompt import (
     render_json_function_call,
 )
 from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response
+from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_messages_for_long_context
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 
@@ -149,9 +150,13 @@ def build_agentbench_prompt(
     *,
     history_max_chars: int,
     allow_final_answer_text: bool,
+    prompt_max_chars: int | None = None,
+    long_doc_config: LongDocEvidenceConfig | None = None,
 ) -> str:
     system_messages = [str(item.get("content") or "") for item in messages if str(item.get("role") or "").lower() == "system"]
     dialog_messages = [item for item in messages if str(item.get("role") or "").lower() != "system"]
+    if long_doc_config is not None:
+        dialog_messages = compact_messages_for_long_context(dialog_messages, config=long_doc_config).messages
     tool_schemas = [_normalize_openai_tool(tool) for tool in tools]
     if allow_final_answer_text:
         tool_schemas.append(
@@ -180,7 +185,12 @@ def build_agentbench_prompt(
             ]
         )
     )
-    return build_rwkv_json_call_prompt(system_prompt, dialog_messages, history_max_chars=history_max_chars)
+    prompt = build_rwkv_json_call_prompt(system_prompt, dialog_messages, history_max_chars=history_max_chars)
+    if prompt_max_chars is None or int(prompt_max_chars) <= 0 or len(prompt) <= int(prompt_max_chars):
+        return prompt
+    overflow = len(prompt) - int(prompt_max_chars)
+    adjusted_history = max(0, int(history_max_chars) - overflow - 512)
+    return build_rwkv_json_call_prompt(system_prompt, dialog_messages, history_max_chars=adjusted_history)
 
 
 def _agentbench_completion_to_eval_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -223,6 +233,8 @@ def _run_agentbench(
     sampling = clamp_function_calling_sampling(sampling, max(1, int(args.decision_max_tokens or 1024)))
     sampling_payload = normalize_sampling_config_by_stage([(1, sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
+    prompt_max_chars = _agentbench_prompt_max_chars(args)
+    long_doc_config = _agentbench_long_doc_config(args)
     controller_url = _agentbench_controller_url(args)
     controller = AgentBenchControllerClient(controller_url)
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
@@ -241,6 +253,8 @@ def _run_agentbench(
                         data.get("tools") or [],
                         history_max_chars=history_max_chars,
                         allow_final_answer_text=_is_agentbench_kg(record),
+                        prompt_max_chars=prompt_max_chars,
+                        long_doc_config=long_doc_config,
                     )
                 )
             run.engine.generate(
@@ -298,6 +312,8 @@ def _run_agentbench(
                         sampling=sampling,
                         sampling_payload=sampling_payload,
                         history_max_chars=history_max_chars,
+                        prompt_max_chars=prompt_max_chars,
+                        long_doc_config=long_doc_config,
                     )
                     writer.enqueue(payload)
             except BaseException:
@@ -346,6 +362,8 @@ def _run_one_agentbench_attempt(
     sampling: Any,
     sampling_payload: dict[str, Any],
     history_max_chars: int,
+    prompt_max_chars: int,
+    long_doc_config: LongDocEvidenceConfig,
 ) -> dict[str, Any]:
     session_id = ""
     stages: list[StageRecord] = []
@@ -365,6 +383,8 @@ def _run_one_agentbench_attempt(
                 tools,
                 history_max_chars=history_max_chars,
                 allow_final_answer_text=_is_agentbench_kg(record),
+                prompt_max_chars=prompt_max_chars,
+                long_doc_config=long_doc_config,
             )
             output = run.engine.generate(
                 [prompt],
@@ -504,6 +524,24 @@ def _agentbench_controller_url(args: argparse.Namespace) -> str:
         or os.environ.get("AGENTRL_CONTROLLER_URL")
         or "http://127.0.0.1:5020/api"
     ).rstrip("/")
+
+
+def _agentbench_prompt_max_chars(args: argparse.Namespace) -> int:
+    raw = getattr(args, "prompt_max_chars", None) or os.environ.get("RWKV_AGENTBENCH_PROMPT_MAX_CHARS", "24576")
+    try:
+        return max(4096, int(raw))
+    except (TypeError, ValueError):
+        return 24576
+
+
+def _agentbench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    return LongDocEvidenceConfig(
+        max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
+        overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
+        min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
+        max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
+        max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
+    )
 
 
 def _is_agentbench_kg(record: AgentBenchRecord) -> bool:

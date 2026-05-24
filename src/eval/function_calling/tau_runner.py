@@ -52,6 +52,7 @@ from src.eval.function_calling.tau_bench import (
     render_tau_user_prompt,
     render_tool_result,
 )
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 
@@ -353,6 +354,7 @@ def _run_tau_official_attempt(
     sampling_payload: dict[str, Any],
     history_max_chars: int,
     prompt_max_chars: int,
+    long_doc_config: LongDocEvidenceConfig,
     max_steps: int,
     max_tool_errors: int,
 ) -> dict[str, Any]:
@@ -365,6 +367,7 @@ def _run_tau_official_attempt(
         domain_policy=str(environment.get_policy()),
         history_max_chars=history_max_chars,
         prompt_max_chars=prompt_max_chars,
+        long_doc_config=long_doc_config,
     )
     user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
     seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
@@ -391,6 +394,16 @@ def _run_tau_official_attempt(
         benchmark_name=run.benchmark_name,
         dataset_split=run.dataset_split,
         sampling_payload=sampling_payload,
+    )
+
+
+def _tau_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    return LongDocEvidenceConfig(
+        max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
+        overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
+        min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
+        max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
+        max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
     )
 
 
@@ -428,7 +441,11 @@ def _run_tau(
     batch_size = max(1, int(args.batch_size or 16))
     max_steps = max(1, int(args.max_steps))
     max_tool_errors = max(1, int(args.max_tool_errors))
-    prompt_max_chars = int(os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS)))
+    prompt_max_chars = int(
+        getattr(args, "prompt_max_chars", None)
+        or os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS))
+    )
+    long_doc_config = _tau_long_doc_config(args)
     tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
     history_max_chars = max(0, min(int(args.history_max_chars), tau_history_cap))
     user_model = resolve_required_user_model_config()
@@ -458,6 +475,7 @@ def _run_tau(
                 domain_policy=str(environment.get_policy()),
                 history_max_chars=history_max_chars,
                 prompt_max_chars=prompt_max_chars,
+                long_doc_config=long_doc_config,
             )
             decision_prompts.append(
                 agent._build_prompt(  # noqa: SLF001 - probe path intentionally inspects rendered first-turn prompt.
@@ -534,6 +552,7 @@ def _run_tau(
                             sampling_payload=sampling_payload,
                             history_max_chars=history_max_chars,
                             prompt_max_chars=prompt_max_chars,
+                            long_doc_config=long_doc_config,
                             max_steps=max_steps,
                             max_tool_errors=max_tool_errors,
                         ): key
