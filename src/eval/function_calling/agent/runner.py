@@ -46,6 +46,7 @@ def run_function_calling_agent(
     finish_reason = "max_steps"
     final_score: float | None = None
     final_success: bool | None = None
+    final_env_details: dict[str, Any] = {}
 
     observation = env.reset()
     events.append(_observation_event(observation, step=0))
@@ -112,6 +113,8 @@ def run_function_calling_agent(
             observation = result.observation
             final_score = result.score if result.score is not None else final_score
             final_success = result.success if result.success is not None else final_success
+            if result.details:
+                final_env_details = dict(result.details)
             events.append(
                 FunctionCallEvent(
                     type="env_result",
@@ -144,6 +147,8 @@ def run_function_calling_agent(
         "parse_error_count": parse_error_count,
         "timeout": timeout,
     }
+    if final_env_details:
+        details["final_env_details"] = final_env_details
     events.append(
         FunctionCallEvent(
             type="final_score",

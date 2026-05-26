@@ -5,6 +5,7 @@ from __future__ import annotations
 __all__ = [
     "apibank",
     "bfcl_exec",
+    "complexfuncbench",
     "jobs",
     "pipeline",
     "scorer",

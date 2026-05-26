@@ -22,7 +22,7 @@ Notes:
 - avg_k / report_avg_k accept either integers (e.g. `16`) or ratios in `(0, 1)` (e.g. `0.2`).
 - When `avg_k` is a ratio, the evaluator uses the first `ceil(ratio * repeats)` samples available for each problem.
 - max_samples is used as the default sample limit when CLI `--max-samples` is omitted.
-- llm_judge stays in evaluator code or CLI flags; it is not read from TOML.
+- Most llm_judge settings stay in evaluator code or CLI flags. BrowseComp-Plus is the exception: its OpenAI-compatible judge is read from `[default.browsecomp_plus_judge]`.
 - `cot_prompt_template` / `final_prompt_template` are currently used by free_response and free_response_judge.
 - `judge_prompt_template` is currently used by free_response_judge.
 - free_response applies sampling overrides to CoT generation.

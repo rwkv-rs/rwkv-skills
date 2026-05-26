@@ -23,6 +23,7 @@ dependencies = [
     "immutabledict>=2.2.5",
     "nltk>=3.9.1",
     "pynvml>=13.0.1",
+    "pyserini>=1.2.0",
     "huggingface-hub>=0.25.0",
     "pyrwkv-tokenizer>=0.9.1",
     "rwkv>=0.8.29",

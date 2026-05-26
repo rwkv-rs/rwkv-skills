@@ -4,12 +4,12 @@
 
 | rwkv-skills 显示名 | scheduler dataset | scheduler job | 原始来源 | 当前本地评测形态 |
 |---|---|---|---|---|
-| `bfcl_simple_python_nocot` | `bfcl_simple_python_test` | `function_bfcl_ast` | BFCL v4 `simple_python` | 单轮 JSON tool-call exact match |
-| `bfcl_multiple_nocot` | `bfcl_multiple_test` | `function_bfcl_ast` | BFCL v4 `multiple` | 单轮 JSON tool-call exact match |
-| `bfcl_exec_simple_nocot` | `bfcl_exec_simple_test` | `function_bfcl_exec` | BFCL v4 `unused_datasets/question/BFCL_v4_exec_simple.json` | 单轮 JSON tool-call + 本地 BFCL executable scorer |
-| `bfcl_exec_multiple_nocot` | `bfcl_exec_multiple_test` | `function_bfcl_exec` | BFCL v4 `unused_datasets/question/BFCL_v4_exec_multiple.json` | 单轮 JSON tool-call + 本地 BFCL executable scorer |
-| `toolalpaca_eval_simulated_nocot` | `toolalpaca_eval_simulated_test` | `function_toolalpaca` | ToolAlpaca `data/eval_simulated.json` | 单轮 JSON tool-call exact match |
-| `toolalpaca_eval_real_nocot` | `toolalpaca_eval_real_test` | `function_toolalpaca` | ToolAlpaca `data/eval_real.json` | 单轮 JSON tool-call exact match |
+| `bfcl_simple_python_nocot` | `bfcl_simple_python_test` | `function_one_step_bfcl_ast` | BFCL v4 `simple_python` | 单轮 JSON tool-call exact match |
+| `bfcl_multiple_nocot` | `bfcl_multiple_test` | `function_one_step_bfcl_ast` | BFCL v4 `multiple` | 单轮 JSON tool-call exact match |
+| `bfcl_exec_simple_nocot` | `bfcl_exec_simple_test` | `function_one_step_bfcl_exec` | BFCL v4 `unused_datasets/question/BFCL_v4_exec_simple.json` | 单轮 JSON tool-call + 本地 BFCL executable scorer |
+| `bfcl_exec_multiple_nocot` | `bfcl_exec_multiple_test` | `function_one_step_bfcl_exec` | BFCL v4 `unused_datasets/question/BFCL_v4_exec_multiple.json` | 单轮 JSON tool-call + 本地 BFCL executable scorer |
+| `toolalpaca_eval_simulated_nocot` | `toolalpaca_eval_simulated_test` | `function_one_step_toolalpaca` | ToolAlpaca `data/eval_simulated.json` | 单轮 JSON tool-call exact match |
+| `toolalpaca_eval_real_nocot` | `toolalpaca_eval_real_test` | `function_one_step_toolalpaca` | ToolAlpaca `data/eval_real.json` | 单轮 JSON tool-call exact match |
 
 ## 原始 Benchmark
 ### BFCL
@@ -27,7 +27,7 @@ BFCL 官方说明里，BFCL 用来评估模型准确调用 functions/tools 的�
 本地接入点：
 
 - `src/eval/datasets/data_prepper/function_call/bfcl_toolalpaca.py`
-- `src/eval/function_calling/simple_tool_call.py`
+- `src/eval/function_calling/one_step/simple_tool_call.py`
 - `src/eval/scheduler/jobs.py`
 - `configs/bfcl_simple_python.toml`
 - `configs/bfcl_multiple.toml`
@@ -65,7 +65,7 @@ BFCL 官方说明里，BFCL 用来评估模型准确调用 functions/tools 的�
 本地接入点：
 
 - `src/eval/datasets/data_prepper/function_call/bfcl_toolalpaca.py`
-- `src/eval/function_calling/simple_tool_call.py`
+- `src/eval/function_calling/one_step/simple_tool_call.py`
 - `src/eval/scheduler/jobs.py`
 - `configs/toolalpaca_eval_simulated.toml`
 - `configs/toolalpaca_eval_real.toml`
@@ -173,7 +173,7 @@ The model must choose the proper action and arguments from the provided API func
 
 ## 当前上下文组装
 
-入口：`FunctionCallPipeline._make_prompt()`。
+入口：`src/eval/function_calling/one_step/pipeline.py::FunctionCallPipeline._make_prompt()`。
 
 组装流程：
 
@@ -271,7 +271,7 @@ alpha_decay = 0.99
 
 入口：`evaluate_function_call()` -> `_score_prediction()`。
 
-当前有两个 scorer：
+one-step 当前有两个 scorer：
 
 - `simple_tool_call`: `evaluate_simple_tool_calls()`，用于 `bfcl_simple_python`、`bfcl_multiple`、ToolAlpaca 两项。
 - `bfcl_exec`: `evaluate_bfcl_executable_calls()`，用于 `bfcl_exec_simple`、`bfcl_exec_multiple`。

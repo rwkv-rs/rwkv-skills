@@ -14,7 +14,12 @@ from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord, sample_repeat_seed
 
-DEFAULT_COT_PROMPT = """User:<Q>
+
+def _render_cot_prompt(template: str, question: str) -> str:
+    return template.replace("<Q>", question.lstrip()).rstrip(" ")
+
+
+DEFAULT_COT_PROMPT = """User: <Q>
 
 Assistant: <think"""
 
@@ -97,7 +102,7 @@ class FreeResponsePipeline:
             remaining_entries = expanded
         if probe_only:
             cot_prompts = [
-                cot_prompt_template.replace("<Q>", record.question) for _, record, _ in remaining_entries
+                _render_cot_prompt(cot_prompt_template, record.question) for _, record, _ in remaining_entries
             ]
             probe_seeds = [
                 sample_repeat_seed(problem_idx, sample_id, stage=1)
@@ -119,7 +124,7 @@ class FreeResponsePipeline:
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
             cot_prompts = [
-                cot_prompt_template.replace("<Q>", record.question) for _, record, _ in chunk
+                _render_cot_prompt(cot_prompt_template, record.question) for _, record, _ in chunk
             ]
 
             def _on_cot_complete(output: GenerationOutput) -> None:

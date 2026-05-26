@@ -95,7 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"{slug} 不是 simple tool-call 数据集")
     job_name = _simple_tool_call_job_name(str(slug))
     if job_name is None:
-        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank 数据集: {slug}")
+        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank/ComplexFuncBench 数据集: {slug}")
     sampling = resolve_sampling_config(
         slug,
         model_name,

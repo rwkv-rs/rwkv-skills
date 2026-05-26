@@ -5,4 +5,6 @@ from __future__ import annotations
 __all__ = [
     "agentbench",
     "apibank",
+    "browsecomp_plus",
+    "browsecomp_plus_judge",
 ]

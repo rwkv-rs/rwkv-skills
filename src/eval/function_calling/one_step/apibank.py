@@ -258,9 +258,11 @@ def _render_apibank_history(history: Sequence[Mapping[str, Any]]) -> str:
     for item in history:
         role = str(item.get("role") or "")
         if role == "User":
-            rendered.append(f"User: {item.get('text') or ''}")
+            text = str(item.get("text") or "").lstrip().rstrip(" ")
+            rendered.append(f"User: {text}" if text else "User:")
         elif role == "AI":
-            rendered.append(f"Assistant: {item.get('text') or ''}")
+            text = str(item.get("text") or "").lstrip().rstrip(" ")
+            rendered.append(f"Assistant: {text}" if text else "Assistant:")
         elif role == "API":
             action = ToolAction(
                 name=str(item.get("api_name") or ""),

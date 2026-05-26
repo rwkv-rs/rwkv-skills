@@ -22,7 +22,7 @@
 - avg_k / report_avg_k 既支持整数（例如 `16`），也支持 `(0, 1)` 之间的小数比例（例如 `0.2`）。
 - 当 `avg_k` 配成比例时，评测会对每道题使用前 `ceil(比例 * repeats)` 个可用样本计算 avg。
 - 未显式传入 CLI `--max-samples` 时，会默认读取配置里的 `max_samples`。
-- llm_judge 仍由评测脚本或 CLI 控制，不从 TOML 读取。
+- 大多数 llm_judge 仍由评测脚本或 CLI 控制。BrowseComp-Plus 是例外：OpenAI 兼容 judge 从 `[default.browsecomp_plus_judge]` 读取。
 - cot_prompt_template / final_prompt_template 当前用于 free_response 和 free_response_judge。
 - judge_prompt_template 当前用于 free_response_judge。
 - free_response 的采样配置只用于 CoT 生成阶段。

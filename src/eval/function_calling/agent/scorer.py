@@ -46,9 +46,15 @@ def evaluate_function_call_agent(completions: Iterable[dict[str, Any]]) -> Funct
         score = _numeric(payload.get("official_score"), None)
         if score is None:
             score = _numeric(details.get("score"), None)
+        score_unavailable = bool(details.get("official_score_unavailable"))
+        final_env_details = details.get("final_env_details")
+        if isinstance(final_env_details, dict):
+            score_unavailable = score_unavailable or bool(final_env_details.get("official_score_unavailable"))
         success = bool(payload.get("success"))
         if not success and score is not None:
             success = score > 0.0
+        if score is None and score_unavailable:
+            score = 0.0
         if score is None:
             score = 1.0 if success else 0.0
 

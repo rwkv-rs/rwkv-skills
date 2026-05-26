@@ -148,14 +148,6 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 
 Contributions are welcome—please implement missing pieces and update the docs accordingly.
 
-## Migrating historical results
-If you have JSON summaries from older versions (`rwkv-mmlu` / `rwkv-skills`) under `results_old/`, you can migrate them into the current `results/scores/` layout to avoid rerunning everything:
-
-```bash
-python -m src.bin.migrate_old_results --source results_old
-# use --dry-run to preview outputs; use --overwrite to replace existing results
-```
-
 ## Scheduler-only workflow (DB)
 ### C.1 One-time setup
 1. Prepare PostgreSQL and ensure connectivity (set `.env` / env vars).

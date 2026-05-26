@@ -15,9 +15,7 @@ from src.eval.datasets.data_prepper.data_manager import (
     prepare_dataset,
 )
 from src.eval.function_calling.common.benchmarks import (
-    FUNCTION_CALLING_ALIAS_JOBS,
     FUNCTION_CALLING_EXPLICIT_ONLY_JOBS,
-    FUNCTION_CALLING_FUTURE_JOBS,
 )
 
 from .dataset_utils import (
@@ -221,6 +219,12 @@ APIBANK_L2_DATASET_SLUGS: Final[tuple[str, ...]] = (
     canonical_slug("apibank_level2_test"),
     canonical_slug("apibank_l2_test"),
 )
+COMPLEXFUNCBENCH_SUBSET_DATASET_SLUGS: Final[tuple[str, ...]] = (
+    canonical_slug("complexfuncbench_subset_test"),
+)
+BROWSECOMP_PLUS_DATASET_SLUGS: Final[tuple[str, ...]] = (
+    canonical_slug("browsecomp_plus_test"),
+)
 JOB_CATALOGUE: dict[str, JobSpec] = {
     "multi_choice_plain": JobSpec(
         name="multi_choice_plain",
@@ -330,38 +334,6 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         domain="instruction_following",
         extra_args=("--no-param-search",),
     ),
-    "function_bfcl_ast": JobSpec(
-        name="function_bfcl_ast",
-        module="src.bin.eval_function_call",
-        dataset_slugs=BFCL_AST_DATASET_SLUGS,
-        is_cot=False,
-        domain="function_call",
-        batch_flag="--batch-size",
-    ),
-    "function_bfcl_exec": JobSpec(
-        name="function_bfcl_exec",
-        module="src.bin.eval_function_call",
-        dataset_slugs=BFCL_EXEC_DATASET_SLUGS,
-        is_cot=False,
-        domain="function_call",
-        batch_flag="--batch-size",
-    ),
-    "function_toolalpaca": JobSpec(
-        name="function_toolalpaca",
-        module="src.bin.eval_function_call",
-        dataset_slugs=TOOLALPACA_DATASET_SLUGS,
-        is_cot=False,
-        domain="function_call",
-        batch_flag="--batch-size",
-    ),
-    "function_api_bank": JobSpec(
-        name="function_api_bank",
-        module="src.bin.eval_function_call",
-        dataset_slugs=APIBANK_DATASET_SLUGS,
-        is_cot=False,
-        domain="function_call",
-        batch_flag="--batch-size",
-    ),
     "function_one_step_bfcl_ast": JobSpec(
         name="function_one_step_bfcl_ast",
         module="src.bin.eval_function_call",
@@ -394,10 +366,26 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         domain="function_call",
         batch_flag="--batch-size",
     ),
+    "function_one_step_complexfuncbench_subset": JobSpec(
+        name="function_one_step_complexfuncbench_subset",
+        module="src.bin.eval_function_call",
+        dataset_slugs=COMPLEXFUNCBENCH_SUBSET_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
     "function_agent_apibank_l2": JobSpec(
         name="function_agent_apibank_l2",
         module="src.bin.eval_function_call_agent",
         dataset_slugs=APIBANK_L2_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
+    "function_agent_browsecomp_plus": JobSpec(
+        name="function_agent_browsecomp_plus",
+        module="src.bin.eval_function_call_agent",
+        dataset_slugs=BROWSECOMP_PLUS_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
         batch_flag="--batch-size",
@@ -419,9 +407,6 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         batch_flag="--batch-size",
     ),
 }
-
-FUNCTION_CALL_ONE_STEP_ALIAS_JOBS: Final[tuple[str, ...]] = FUNCTION_CALLING_ALIAS_JOBS
-FUNCTION_CALL_FUTURE_BENCHMARK_JOBS: Final[tuple[str, ...]] = FUNCTION_CALLING_FUTURE_JOBS
 
 JOB_ORDER: tuple[str, ...] = tuple(
     job_name for job_name in JOB_CATALOGUE if job_name not in FUNCTION_CALLING_EXPLICIT_ONLY_JOBS
@@ -474,8 +459,6 @@ __all__ = [
     "JobSpec",
     "JOB_CATALOGUE",
     "JOB_ORDER",
-    "FUNCTION_CALL_ONE_STEP_ALIAS_JOBS",
-    "FUNCTION_CALL_FUTURE_BENCHMARK_JOBS",
     "DATASET_PREP_SPECS",
     "detect_job_from_dataset",
     "locate_dataset",

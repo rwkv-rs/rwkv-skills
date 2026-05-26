@@ -1,0 +1,17 @@
+[default]
+avg_k = [1]
+report_avg_k = [1]
+
+[default.browsecomp_plus_judge]
+base_url = "https://api.ablai.top/v1/chat/completions"
+model = "gpt-5.4-mini"
+api_mode = "chat"
+max_output_tokens = 1024
+timeout_s = 120
+
+[tool]
+template = "instruction_following_default"
+max_generate_tokens = 1024
+temperature = 0.2
+top_k = 20
+top_p = 0.2

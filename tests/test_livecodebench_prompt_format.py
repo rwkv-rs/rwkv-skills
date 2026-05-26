@@ -29,7 +29,7 @@ class LiveCodeBenchPromptFormatTest(unittest.TestCase):
         mbpp_prompt = _format_prompt_no_echo("Write a function that returns 1.")
 
         self.assertTrue(mbpp_prompt.endswith("Assistant: <think></think>\n```python"))
-        self.assertTrue(mbpp_prompt.startswith("User:"))
+        self.assertTrue(mbpp_prompt.startswith("User: "))
         self.assertIn("You are a top-level code master", mbpp_prompt)
         self.assertIn("Complete the following code without any additional text or explanation", mbpp_prompt)
 

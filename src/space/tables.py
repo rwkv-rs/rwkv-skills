@@ -705,7 +705,14 @@ def _build_domain_tables(
             )
 
         title = f"{group['title']} · {TABLE_VIEW_LABELS[mode]}"
-        tables[group["key"]] = _render_pivot_html(headers, rows, title=title, cell_meta=cell_meta, sort_state=sort_state)
+        tables[group["key"]] = _render_pivot_html(
+            headers,
+            rows,
+            title=title,
+            cell_meta=cell_meta,
+            sort_state=sort_state,
+            split_suspect_rows=mode == "benchmark_detail_delta",
+        )
         for meta in cell_meta.values():
             interaction_meta[meta.cell_id] = meta.as_dict()
 
@@ -871,6 +878,49 @@ def _sort_table_by_column(
     return sorted_rows, new_cell_meta
 
 
+def _row_has_suspect_cell(row: list[Any]) -> bool:
+    return any(
+        isinstance(cell, tuple)
+        and len(cell) == 2
+        and str(cell[1]).strip() == "cell-delta-suspect"
+        for cell in row
+    )
+
+
+def _split_rows_by_suspect(
+    rows: list[list[Any]],
+    cell_meta: dict[tuple[int, int], TableCellMeta] | None = None,
+) -> tuple[
+    tuple[list[list[Any]], dict[tuple[int, int], TableCellMeta]],
+    tuple[list[list[Any]], dict[tuple[int, int], TableCellMeta]],
+]:
+    normal_rows: list[list[Any]] = []
+    suspect_rows: list[list[Any]] = []
+    normal_old_indices: list[int] = []
+    suspect_old_indices: list[int] = []
+
+    for old_idx, row in enumerate(rows):
+        if _row_has_suspect_cell(row):
+            suspect_old_indices.append(old_idx)
+            suspect_rows.append(row)
+        else:
+            normal_old_indices.append(old_idx)
+            normal_rows.append(row)
+
+    def _remap(old_indices: list[int]) -> dict[tuple[int, int], TableCellMeta]:
+        if not cell_meta:
+            return {}
+        old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(old_indices)}
+        remapped: dict[tuple[int, int], TableCellMeta] = {}
+        for (old_row_idx, col_idx), meta in cell_meta.items():
+            new_row_idx = old_to_new.get(old_row_idx)
+            if new_row_idx is not None:
+                remapped[(new_row_idx, col_idx)] = meta
+        return remapped
+
+    return (normal_rows, _remap(normal_old_indices)), (suspect_rows, _remap(suspect_old_indices))
+
+
 def _render_pivot_html(
     headers: list[str],
     rows: list[list[Any]],
@@ -878,6 +928,7 @@ def _render_pivot_html(
     title: str = "明细",
     cell_meta: dict[tuple[int, int], TableCellMeta] | None = None,
     sort_state: SortState | None = None,
+    split_suspect_rows: bool = False,
 ) -> str:
     """Render a pivot table with two-row thead and CSS-class-based cell styling."""
     if not headers:
@@ -907,62 +958,58 @@ def _render_pivot_html(
         display_name = _col_display_name(str(header_name))
         col_header_cells.append(f"<th{class_attr}{data_attr}>{_html(display_name)}{sort_indicator}</th>")
 
-    body_rows: list[str] = []
-    for row_idx, row in enumerate(rows):
-        cells: list[str] = []
-        for col_idx, header_name in enumerate(headers):
-            cell = row[col_idx] if col_idx < len(row) else "—"
+    def _render_table(target_rows: list[list[Any]], target_meta: dict[tuple[int, int], TableCellMeta] | None) -> str:
+        body_rows: list[str] = []
+        for row_idx, row in enumerate(target_rows):
+            cells: list[str] = []
+            for col_idx, header_name in enumerate(headers):
+                cell = row[col_idx] if col_idx < len(row) else "—"
 
-            class_names = _header_cell_classes(col_idx, str(header_name))
-            data_attrs: list[str] = []
-            display_value: Any = cell
+                class_names = _header_cell_classes(col_idx, str(header_name))
+                data_attrs: list[str] = []
+                display_value: Any = cell
 
-            if isinstance(cell, tuple) and len(cell) == 2:
-                display_value = cell[0]
-                css_class = str(cell[1]).strip()
-                if css_class:
-                    class_names.append(css_class)
-            elif str(display_value).strip() == "—":
-                class_names.append("cell-na")
+                if isinstance(cell, tuple) and len(cell) == 2:
+                    display_value = cell[0]
+                    css_class = str(cell[1]).strip()
+                    if css_class:
+                        class_names.append(css_class)
+                elif str(display_value).strip() == "—":
+                    class_names.append("cell-na")
 
-            meta = cell_meta.get((row_idx, col_idx)) if cell_meta else None
-            if meta and meta.tooltip:
-                data_attrs.append(f'data-tooltip="{_html(meta.tooltip)}"')
-            if meta:
-                data_attrs.append(f'data-cell-id="{_html(meta.cell_id)}"')
-                if meta.clickable:
-                    class_names.append("space-clickable-score")
-                    data_attrs.append('data-clickable="1"')
+                meta = target_meta.get((row_idx, col_idx)) if target_meta else None
+                if meta and meta.tooltip:
+                    data_attrs.append(f'data-tooltip="{_html(meta.tooltip)}"')
+                if meta:
+                    data_attrs.append(f'data-cell-id="{_html(meta.cell_id)}"')
+                    if meta.clickable:
+                        class_names.append("space-clickable-score")
+                        data_attrs.append('data-clickable="1"')
 
-            deduped_classes: list[str] = []
-            for cls in class_names:
-                if cls and cls not in deduped_classes:
-                    deduped_classes.append(cls)
+                deduped_classes: list[str] = []
+                for cls in class_names:
+                    if cls and cls not in deduped_classes:
+                        deduped_classes.append(cls)
 
-            class_attr = f' class="{" ".join(deduped_classes)}"' if deduped_classes else ""
-            data_attr = f" {' '.join(data_attrs)}" if data_attrs else ""
-            cell_html = _html(display_value)
+                class_attr = f' class="{" ".join(deduped_classes)}"' if deduped_classes else ""
+                data_attr = f" {' '.join(data_attrs)}" if data_attrs else ""
+                cell_html = _html(display_value)
 
-            if meta and meta.clickable:
-                inner_html = f'<button type="button" class="space-score-button">{cell_html}</button>'
-            else:
-                inner_html = cell_html
+                if meta and meta.clickable:
+                    inner_html = f'<button type="button" class="space-score-button">{cell_html}</button>'
+                else:
+                    inner_html = cell_html
 
-            cells.append(f"<td{class_attr}{data_attr}>{inner_html}</td>")
+                cells.append(f"<td{class_attr}{data_attr}>{inner_html}</td>")
 
-        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    rows_html = (
-        "".join(body_rows)
-        if body_rows
-        else f'<tr><td class="cell-na" colspan="{len(headers)}">当前筛选条件下没有数据。</td></tr>'
-    )
-
-    return f"""
-<div class="space-section-card">
-    <div class="space-section-header">
-        <h3 class="space-section-title">{_html(title)}</h3>
-    </div>
+        rows_html = (
+            "".join(body_rows)
+            if body_rows
+            else f'<tr><td class="cell-na" colspan="{len(headers)}">当前筛选条件下没有数据。</td></tr>'
+        )
+        return f"""
     <div class="space-table-wrapper">
       <table class="bench-table">
         <thead>
@@ -974,5 +1021,29 @@ def _render_pivot_html(
         </tbody>
       </table>
     </div>
+""".strip()
+
+    if split_suspect_rows:
+        (normal_rows, normal_meta), (suspect_rows, suspect_meta) = _split_rows_by_suspect(rows, cell_meta)
+        return f"""
+<div class="space-section-card">
+    <div class="space-section-header">
+        <h3 class="space-section-title">{_html(title)}</h3>
+    </div>
+    <div class="space-table-split">
+        <div class="space-table-subtitle">正常 benchmark <span>{len(normal_rows)} rows</span></div>
+        {_render_table(normal_rows, normal_meta)}
+        <div class="space-table-subtitle suspect">可疑 benchmark <span>{len(suspect_rows)} rows</span></div>
+        {_render_table(suspect_rows, suspect_meta)}
+    </div>
+</div>
+""".strip()
+
+    return f"""
+<div class="space-section-card">
+    <div class="space-section-header">
+        <h3 class="space-section-title">{_html(title)}</h3>
+    </div>
+    {_render_table(rows, cell_meta)}
 </div>
 """.strip()

@@ -132,10 +132,11 @@ class InstructionFollowingPipeline:
         return InstructionFollowingPipelineResult(dataset_name, len(expanded), payloads)
 
     def _make_prompt(self, prompt: str, enable_think: bool) -> str:
+        clean_prompt = prompt.lstrip().rstrip(" ")
         suffix = "<think" if enable_think else ""
         if suffix:
-            return f"User:{prompt}\n\nAssistant: {suffix}"
-        return f"User:{prompt}\n\nAssistant:"
+            return f"User: {clean_prompt}\n\nAssistant: {suffix}"
+        return f"User: {clean_prompt}\n\nAssistant:"
 
     def _load_records(
         self, dataset_path: str, sample_limit: int | None

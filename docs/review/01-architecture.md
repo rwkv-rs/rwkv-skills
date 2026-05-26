@@ -37,9 +37,9 @@
 - 证据：多个入口重复解析 benchmark/model 的采样配置（如 `src/bin/eval_free_response.py:142-153`, `src/bin/eval_code_livecodebench.py:61-72`）。
 - 建议：抽取统一的 `SamplingResolver` 服务。
 
-### A5. 旧脚本/迁移脚本耦合主代码路径
-- 证据：`src/bin/migrate_old_results.py`（604 行）等脚本仍在主包中。
-- 建议：迁移脚本下沉到 `tools/legacy/`，不参与主流程。
+### A5. 旧辅助脚本耦合主代码路径
+- 现状：数据迁移脚本已从 `src/bin/` 删除；剩余 CLI 仍需要继续收敛到统一调度入口。
+- 建议：后续只保留正式评测入口和必要运维入口，历史一次性脚本不要放回主包。
 
 ## 目标架构建议
 

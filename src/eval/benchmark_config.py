@@ -56,6 +56,7 @@ class BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
+    browsecomp_plus_judge: dict[str, Any] | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -102,7 +103,6 @@ def _config_path_for_root(
         return direct
     base, _ = split_benchmark_and_split(raw_slug)
     return root / f"{safe_slug(base).lower()}.toml"
-
 
 def _config_roots(*, override_first: bool = False) -> tuple[Path, ...]:
     override = _config_override_root()
@@ -309,6 +309,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
+    browsecomp_plus_judge: dict[str, Any] | None = None
 
     for key, raw in table.items():
         if key in _INT_FIELDS:
@@ -346,6 +347,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "judge_prompt_template":
             judge_prompt_template = _coerce_str(raw)
             continue
+        elif key == "browsecomp_plus_judge":
+            browsecomp_plus_judge = _coerce_str_mapping(raw)
+            continue
         else:
             continue
         if value is not None:
@@ -362,6 +366,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         cot_prompt_template=cot_prompt_template,
         final_prompt_template=final_prompt_template,
         judge_prompt_template=judge_prompt_template,
+        browsecomp_plus_judge=browsecomp_plus_judge,
     )
 
 
@@ -387,6 +392,12 @@ def _coerce_str(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return None
+
+
+def _coerce_str_mapping(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {str(key): item for key, item in value.items()}
 
 
 def _coerce_int_tuple(value: Any) -> tuple[int, ...] | None:

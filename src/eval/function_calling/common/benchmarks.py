@@ -12,6 +12,14 @@ ONE_STEP_METRIC_KEYS: tuple[str, ...] = (
     "missing_call",
     "extra_call",
 )
+COMPLEXFUNC_METRIC_KEYS: tuple[str, ...] = (
+    "success_rate",
+    "official_score",
+    "call_accuracy",
+    "parse_error_rate",
+    "missing_call",
+    "extra_call",
+)
 AGENT_METRIC_KEYS: tuple[str, ...] = (
     "success_rate",
     "official_score",
@@ -31,12 +39,6 @@ class FunctionCallingBenchmarkSpec:
 
 
 FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
-    "function_bfcl_ast": FunctionCallingBenchmarkSpec("function_bfcl_ast", "one_step", "bfcl", ONE_STEP_METRIC_KEYS),
-    "function_bfcl_exec": FunctionCallingBenchmarkSpec("function_bfcl_exec", "one_step", "bfcl", ONE_STEP_METRIC_KEYS),
-    "function_toolalpaca": FunctionCallingBenchmarkSpec(
-        "function_toolalpaca", "one_step", "toolalpaca", ONE_STEP_METRIC_KEYS
-    ),
-    "function_api_bank": FunctionCallingBenchmarkSpec("function_api_bank", "one_step", "apibank", ONE_STEP_METRIC_KEYS),
     "function_one_step_bfcl_ast": FunctionCallingBenchmarkSpec(
         "function_one_step_bfcl_ast", "one_step", "bfcl", ONE_STEP_METRIC_KEYS
     ),
@@ -49,8 +51,20 @@ FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
     "function_one_step_apibank_l1": FunctionCallingBenchmarkSpec(
         "function_one_step_apibank_l1", "one_step", "apibank", ONE_STEP_METRIC_KEYS
     ),
+    "function_one_step_complexfuncbench_subset": FunctionCallingBenchmarkSpec(
+        "function_one_step_complexfuncbench_subset",
+        "one_step",
+        "complexfuncbench",
+        COMPLEXFUNC_METRIC_KEYS,
+    ),
     "function_agent_apibank_l2": FunctionCallingBenchmarkSpec(
         "function_agent_apibank_l2", "agent", "apibank", AGENT_METRIC_KEYS
+    ),
+    "function_agent_browsecomp_plus": FunctionCallingBenchmarkSpec(
+        "function_agent_browsecomp_plus",
+        "agent",
+        "browsecomp_plus",
+        AGENT_METRIC_KEYS,
     ),
     "function_agent_agentbench_db": FunctionCallingBenchmarkSpec(
         "function_agent_agentbench_db", "agent", "agentbench", AGENT_METRIC_KEYS
@@ -66,21 +80,12 @@ FUNCTION_CALLING_DATASET_PREFIXES: tuple[str, ...] = (
     "toolalpaca_",
     "apibank_",
     "agentbench_",
-)
-FUNCTION_CALLING_ALIAS_JOBS: tuple[str, ...] = (
-    "function_one_step_bfcl_ast",
-    "function_one_step_bfcl_exec",
-    "function_one_step_toolalpaca",
-)
-FUNCTION_CALLING_FUTURE_JOBS: tuple[str, ...] = (
-    "function_one_step_apibank_l1",
-    "function_agent_apibank_l2",
-    "function_agent_agentbench_db",
-    "function_agent_agentbench_kg",
+    "complexfuncbench_",
+    "browsecomp_plus",
 )
 FUNCTION_CALLING_EXPLICIT_ONLY_JOBS: tuple[str, ...] = (
-    *FUNCTION_CALLING_ALIAS_JOBS,
-    *FUNCTION_CALLING_FUTURE_JOBS,
+    "function_agent_agentbench_db",
+    "function_agent_agentbench_kg",
 )
 
 
@@ -98,11 +103,10 @@ def is_function_calling_job(job_name: str | None) -> bool:
 
 __all__ = [
     "AGENT_METRIC_KEYS",
-    "FUNCTION_CALLING_ALIAS_JOBS",
+    "COMPLEXFUNC_METRIC_KEYS",
     "FUNCTION_CALLING_BENCHMARK_SPECS",
     "FUNCTION_CALLING_DATASET_PREFIXES",
     "FUNCTION_CALLING_EXPLICIT_ONLY_JOBS",
-    "FUNCTION_CALLING_FUTURE_JOBS",
     "FUNCTION_CALLING_JOB_NAMES",
     "FunctionCallingBenchmarkSpec",
     "FunctionCallingSubtype",

@@ -5,15 +5,21 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
 from src.db.orm import init_orm
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
+from src.eval.function_calling.agent.adapters.browsecomp_plus_judge import (
+    BrowseCompPlusJudgeConfig,
+    default_browsecomp_plus_eval_dir,
+    evaluate_browsecomp_plus_completions,
+)
 from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline, load_agent_records
 from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
+from src.eval.function_calling.common.benchmarks import function_calling_benchmark_spec
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -23,7 +29,9 @@ from src.infer.model import ModelLoadConfig
 
 
 AGENT_JOB_BY_DATASET: dict[str, str] = {
+    "apibank_level2_test": "function_agent_apibank_l2",
     "apibank_l2_test": "function_agent_apibank_l2",
+    "browsecomp_plus_test": "function_agent_browsecomp_plus",
 }
 
 
@@ -49,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     job_name = AGENT_JOB_BY_DATASET.get(str(slug))
     if job_name is None:
         raise ValueError(f"function_call agent 暂不支持数据集: {slug}")
+    benchmark_config = resolve_benchmark_model_config(slug, model_name, stage="tool")
     sampling = resolve_sampling_config(
         slug,
         model_name,
@@ -120,25 +129,66 @@ def main(argv: Sequence[str] | None = None) -> int:
     writer.close()
 
     completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
-    metrics = evaluate_function_call_agent(completions_payloads)
-    service.ingest_eval_payloads(payloads=metrics.payloads or [], task_id=task_id)
-    score_payload = make_score_payload(
-        slug,
-        is_cot=False,
-        model_name=model_name,
-        metrics={
+    try:
+        metrics = evaluate_function_call_agent(completions_payloads)
+        eval_payloads = metrics.payloads or []
+        score_metrics: dict[str, Any] = {
             "success_rate": metrics.success_rate,
             "official_score": metrics.official_score,
             "avg_steps": metrics.avg_steps,
             "invalid_action_rate": metrics.invalid_action_rate,
             "timeout_rate": metrics.timeout_rate,
             "parse_error_rate": metrics.parse_error_rate,
-        },
-        samples=metrics.samples,
-        task=job_name,
-        task_details={"subtype": "agent", "benchmark": "apibank"},
-    )
-    service.record_score_payload(payload=score_payload, task_id=task_id)
+        }
+        benchmark_spec = function_calling_benchmark_spec(job_name)
+        task_details: dict[str, Any] = {
+            "subtype": benchmark_spec.subtype if benchmark_spec else "agent",
+            "benchmark": benchmark_spec.benchmark if benchmark_spec else "",
+        }
+        if job_name == "function_agent_browsecomp_plus":
+            judge_config = BrowseCompPlusJudgeConfig.from_benchmark_config(benchmark_config)
+            judge_eval_dir = default_browsecomp_plus_eval_dir(task_id)
+            judge_metrics = evaluate_browsecomp_plus_completions(
+                completions_payloads,
+                config=judge_config,
+                eval_dir=judge_eval_dir,
+            )
+            eval_payloads = judge_metrics.payloads
+            score_metrics["success_rate"] = judge_metrics.accuracy
+            score_metrics["official_score"] = judge_metrics.accuracy
+            if judge_metrics.retrieval_recall is not None:
+                score_metrics["browsecomp_plus_retrieval_recall"] = judge_metrics.retrieval_recall
+            if judge_metrics.calibration_error is not None:
+                score_metrics["browsecomp_plus_calibration_error"] = judge_metrics.calibration_error
+            score_metrics["browsecomp_plus_accuracy_percent"] = judge_metrics.summary.get("Accuracy (%)", 0.0)
+            score_metrics["browsecomp_plus_recall_percent"] = judge_metrics.summary.get("Recall (%)")
+            task_details["browsecomp_plus_judge"] = {
+                key: value
+                for key, value in judge_metrics.summary.items()
+                if key != "per_query_metrics"
+            }
+            task_details["browsecomp_plus_eval_dir"] = str(judge_eval_dir)
+
+        service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=False,
+            model_name=model_name,
+            metrics=score_metrics,
+            samples=metrics.samples,
+            task=job_name,
+            task_details=task_details,
+        )
+        service.record_score_payload(payload=score_payload, task_id=task_id)
+    except BaseException:
+        service.update_task_status(task_id=task_id, status="failed")
+        session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+        if session_task_id:
+            try:
+                service.update_task_session_status(task_id=session_task_id, session_status="failed")
+            except Exception:
+                pass
+        raise
     session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
     if session_task_id:
         try:

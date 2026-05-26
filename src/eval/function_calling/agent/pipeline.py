@@ -11,6 +11,10 @@ from src.eval.benchmark_config import BenchmarkModelConfig
 from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 from src.eval.evaluators.common import sample_repeat_seed
 from src.eval.function_calling.agent.adapters.apibank import create_apibank_level2_env
+from src.eval.function_calling.agent.adapters.browsecomp_plus import (
+    browsecomp_plus_run_from_agent_details,
+    create_browsecomp_plus_env,
+)
 from src.eval.function_calling.agent.runner import AgentRunConfig, run_function_calling_agent
 from src.eval.function_calling.common.payload import (
     FunctionCallRunStats,
@@ -132,6 +136,9 @@ class FunctionCallAgentPipeline:
                 official_score=result.score,
                 details=result.details,
             )
+            browsecomp_plus_run = browsecomp_plus_run_from_agent_details(result.details)
+            if browsecomp_plus_run is not None:
+                payload["browsecomp_plus_run"] = browsecomp_plus_run
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
@@ -155,7 +162,7 @@ class FunctionCallAgentPipeline:
             f"{tools_json}\n\n"
             f"Trajectory:\n{trajectory}\n\n"
             f"Current observation:\n{current}\n\n"
-            "Assistant: ```json\n"
+            "Assistant: <think>\n</think>\n```json\n"
         )
 
 
@@ -163,6 +170,8 @@ def create_agent_env(record: FunctionCallTaskRecord):
     env_type = str(record.env.get("type") or "")
     if env_type == "apibank_level2":
         return create_apibank_level2_env(record)
+    if env_type == "browsecomp_plus":
+        return create_browsecomp_plus_env(record)
     raise NotImplementedError(f"Unsupported function-calling agent env.type: {env_type}")
 
 

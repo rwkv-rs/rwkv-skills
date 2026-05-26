@@ -712,6 +712,17 @@ class EvalDbService:
                         payload[f"prompt{idx}"] = stage.get("prompt")
                         payload[f"completion{idx}"] = stage.get("completion")
                         payload[f"stop_reason{idx}"] = stage.get("stop_reason")
+                for key in (
+                    "agent_details",
+                    "browsecomp_plus_run",
+                    "success",
+                    "official_score",
+                    "function_call_subtype",
+                    "function_call_env_type",
+                    "function_call_scorer_type",
+                ):
+                    if key in context:
+                        payload[key] = context.get(key)
             payloads.append(payload)
         return payloads
 
@@ -1002,6 +1013,17 @@ class EvalDbService:
             "final_answer": payload.get("final_answer", ""),
             "sampling_config": payload.get("sampling_config", {}),
         }
+        for key in (
+            "agent_details",
+            "browsecomp_plus_run",
+            "success",
+            "official_score",
+            "function_call_subtype",
+            "function_call_env_type",
+            "function_call_scorer_type",
+        ):
+            if key in payload:
+                context[key] = payload.get(key)
         sanitized = EvalDbService._sanitize_json_text(context)
         return sanitized if isinstance(sanitized, dict) else {}
 

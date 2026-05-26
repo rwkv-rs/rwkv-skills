@@ -17,13 +17,13 @@ from .common import SampleRecord, StageRecord, sample_repeat_seed
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 TARGET_TOKEN_FORMAT = " <LETTER>"
 
-EN_DIRECT_PROMPT_TEMPLATE = """User:You are a very talented expert in <SUBJECT>. Answer this question:
+EN_DIRECT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
 Assistant: The answer is"""
 
-EN_COT_PROMPT_TEMPLATE = """User:You are a very talented expert in <SUBJECT>. Answer this question:
+EN_COT_PROMPT_TEMPLATE = """User: You are a very talented expert in <SUBJECT>. Answer this question:
 <Q>
 <CHOICES>
 
@@ -32,12 +32,12 @@ Assistant: <think"""
 EN_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 Therefore, the answer is"""
 
-ZH_DIRECT_PROMPT_TEMPLATE = """User:<Q>
+ZH_DIRECT_PROMPT_TEMPLATE = """User: <Q>
 <CHOICES>
 
 Assistant: 正确答案是"""
 
-ZH_COT_PROMPT_TEMPLATE = """User:<Q>
+ZH_COT_PROMPT_TEMPLATE = """User: <Q>
 <CHOICES>
 
 Assistant: <think"""
@@ -297,12 +297,13 @@ class MultipleChoicePipeline:
 
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
         subject = (record.subject or "unknown").replace("_", " ")
+        question = record.question.lstrip()
         choice_lines = [f"{ALPHABET[i]}. {choice}" for i, choice in enumerate(record.choices)]
         return (
             template.replace("<SUBJECT>", subject)
-            .replace("<Q>", record.question)
+            .replace("<Q>", question)
             .replace("<CHOICES>", "\n".join(choice_lines))
-        )
+        ).rstrip(" ")
 
     def _choice_tokens(self, num_choices: int) -> list[int]:
         if num_choices not in self._choice_token_cache:

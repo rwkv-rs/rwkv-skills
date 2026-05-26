@@ -216,15 +216,15 @@ class FunctionCallPipeline:
         rendered: list[str] = []
         for message in messages:
             role = str(message.get("role") or "user").strip().lower()
-            content = self._message_content(message)
+            content = self._message_content(message).lstrip().rstrip(" ")
             if role == "assistant":
                 rendered.append(f"Assistant: {content}" if content else "Assistant:")
             elif role in {"tool", "function"}:
-                rendered.append(f"User:Function output:\n{content}" if content else "User:Function output:")
+                rendered.append(f"User: Function output:\n{content}" if content else "User: Function output:")
             elif role == "system":
                 rendered.append(f"System: {content}" if content else "System:")
             else:
-                rendered.append(f"User:{content}" if content else "User:")
+                rendered.append(f"User: {content}" if content else "User:")
         return "\n\n".join(item for item in rendered if item.strip())
 
     @staticmethod

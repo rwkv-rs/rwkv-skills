@@ -23,15 +23,17 @@ def assistant_json_prefix() -> str:
 
 
 def render_system_block(content: str) -> str:
-    return f"{SYSTEM_HEADER} {normalize_rwkv_text(content)}"
+    return f"{SYSTEM_HEADER} {normalize_rwkv_text(content)}".rstrip(" ")
 
 
 def render_user_block(content: str) -> str:
-    return f"{USER_HEADER}{_strip_role_prefix(content, USER_HEADER)}"
+    rendered = _strip_role_prefix(content, USER_HEADER)
+    return f"{USER_HEADER} {rendered}".rstrip(" ")
 
 
 def render_assistant_text_block(content: str) -> str:
-    return f"{ASSISTANT_HEADER} {_strip_role_prefix(content, ASSISTANT_HEADER)}"
+    rendered = _strip_role_prefix(content, ASSISTANT_HEADER)
+    return f"{ASSISTANT_HEADER} {rendered}".rstrip(" ")
 
 
 def render_json_function_call(name: str, arguments: Mapping[str, Any] | None = None) -> str:
