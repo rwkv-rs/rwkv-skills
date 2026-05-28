@@ -36,6 +36,7 @@ DATA_VERSION_ORDER: Final[tuple[str, ...]] = (
     "g1d",
     "g1e",
     "g1f",
+    "g1g",
 )
 NUM_PARAM_ORDER: Final[tuple[str, ...]] = ("0.1b", "0.4b", "1.5b", "2.9b", "7.2b", "13.3b")
 NUM_PARAM_SKIP: Final[set[str]] = {"0.1b", "0.4b"}

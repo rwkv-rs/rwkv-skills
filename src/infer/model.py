@@ -33,6 +33,7 @@ class DataVersion(str, Enum):
     G1D = "g1d"
     G1E = "g1e"
     G1F = "g1f"
+    G1G = "g1g"
 
 
 class ParamSize(str, Enum):

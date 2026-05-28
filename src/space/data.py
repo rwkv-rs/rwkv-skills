@@ -38,6 +38,7 @@ DATA_VERSIONS = (
     "g1d",
     "g1e",
     "g1f",
+    "g1g",
 )
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")

@@ -729,7 +729,7 @@ def _build_dashboard() -> gr.Blocks:
                 with gr.Row():
                     model_dropdown = gr.Dropdown(
                         label="模型选择",
-                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1f）最新的模型；手动选择时展示单个模型的最新数据库分数。",
+                        info="默认项会对每个架构 + 参数量组合选取 data_version（G0→…→G1g）最新的模型；手动选择时展示单个模型的最新数据库分数。",
                         choices=model_choices,
                         value=AUTO_MODEL_LABEL,
                         scale=3,
