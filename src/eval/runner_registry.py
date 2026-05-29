@@ -379,6 +379,8 @@ FUNCTION_CALLING_RUNNERS: tuple[RunnerSpec, ...] = (
             "tau3_bench_retail_base",
             "tau3_bench_telecom_base",
             "tau3_bench_banking_knowledge_base",
+            "tau3_bench_mock_base",
+            "tau3_bench_mock_long_context_base",
         ),
         batch_flag="--batch-size",
         probe_flag="--probe-only",

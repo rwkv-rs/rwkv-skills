@@ -13,14 +13,18 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 ALLOWED_ANSWER_FORMATS = frozenset({"scalar_string", "scalar_number_string"})
+LongDocEvidenceMode = Literal["lexical", "model_parallel"]
+LONG_DOC_MODE_CHOICES: tuple[str, ...] = ("off", "lexical", "model_parallel")
 DEFAULT_LONG_DOC_MAX_CHARS = 1000
 DEFAULT_LONG_DOC_OVERLAP_LINES = 3
 DEFAULT_LONG_DOC_MIN_CHARS = 6000
 DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS = 4
 DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS = 6000
+DEFAULT_LONG_DOC_MODEL_MAX_TOKENS = 96
+DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE = 8
 
 _LATIN_WORD_RE = re.compile(r"[a-z0-9_]{2,}")
 _CJK_SPAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}")
@@ -57,11 +61,15 @@ class SelectedEvidenceChunk:
 
 @dataclass(frozen=True, slots=True)
 class LongDocEvidenceConfig:
+    enabled: bool = True
+    mode: LongDocEvidenceMode = "lexical"
     max_chunk_chars: int = DEFAULT_LONG_DOC_MAX_CHARS
     overlap_lines: int = DEFAULT_LONG_DOC_OVERLAP_LINES
     min_long_text_chars: int = DEFAULT_LONG_DOC_MIN_CHARS
     max_evidence_chunks: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS
     max_evidence_chars: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS
+    model_max_tokens: int = DEFAULT_LONG_DOC_MODEL_MAX_TOKENS
+    model_parallel_batch_size: int = DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,10 +285,84 @@ def select_relevant_chunks(
         SelectedEvidenceChunk(chunk=chunk, score=_chunk_score(chunk.text, terms, query))
         for chunk in chunks
     ]
-    scored.sort(key=lambda item: (-item.score, item.chunk.chunk_id))
+    if terms or normalize_newlines(query).strip():
+        positive_scored = [item for item in scored if item.score > 0.0]
+        if not positive_scored:
+            return []
+        scored = positive_scored
+    return _take_evidence_chunks(scored, max_chunks=max_chunks, max_chars=max_chars)
+
+
+def select_relevant_chunks_model_parallel(
+    chunks: Sequence[TextChunk],
+    query: str,
+    *,
+    engine: Any | None,
+    sampling: Any | None,
+    max_chunks: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS,
+    max_chars: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS,
+    max_tokens: int = DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
+    batch_size: int = DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
+    progress_desc: str = "LongDocEvidence",
+    prompt_seed: int | None = None,
+) -> tuple[list[SelectedEvidenceChunk], str, str | None]:
+    from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
+
+    if not chunks or max_chunks <= 0 or max_chars <= 0:
+        return [], "model_parallel_empty", None
+    if engine is None or sampling is None:
+        fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
+        return fallback, "model_parallel_missing_engine_lexical_fallback", "missing engine/sampling"
+
+    prompts = [build_long_doc_evidence_router_prompt(chunk=chunk, query=query) for chunk in chunks]
+    try:
+        outputs = engine.generate(
+            prompts,
+            sampling=_long_doc_router_sampling(sampling, max_tokens=max_tokens),
+            batch_size=min(len(prompts), max(1, int(batch_size))),
+            progress_desc=progress_desc,
+            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
+            prompt_seeds=None if prompt_seed is None else [int(prompt_seed) + index for index in range(len(prompts))],
+            show_progress=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - compaction falls back to the deterministic selector.
+        fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
+        return fallback, "model_parallel_error_lexical_fallback", str(exc)
+
+    scored: list[SelectedEvidenceChunk] = []
+    parse_errors: list[str] = []
+    for chunk, output in zip(chunks, outputs, strict=False):
+        raw_text = str(getattr(output, "text", "") or "")
+        try:
+            relevant, score = parse_long_doc_evidence_router_response(raw_text)
+        except Exception as exc:  # noqa: BLE001 - one bad shard should not discard the whole message.
+            relevant = False
+            score = 0.0
+            parse_errors.append(f"chunk {chunk.chunk_id}: {exc}")
+        if relevant or score > 0.0:
+            scored.append(SelectedEvidenceChunk(chunk=chunk, score=max(float(score), 1.0 if relevant else 0.0)))
+
+    if scored:
+        return _take_evidence_chunks(scored, max_chunks=max_chunks, max_chars=max_chars), "model_parallel", (
+            "; ".join(parse_errors) if parse_errors else None
+        )
+
+    fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
+    reason = "model_parallel_empty_lexical_fallback" if fallback else "model_parallel_empty"
+    return fallback, reason, "; ".join(parse_errors) if parse_errors else None
+
+
+def _take_evidence_chunks(
+    scored: Sequence[SelectedEvidenceChunk],
+    *,
+    max_chunks: int,
+    max_chars: int,
+) -> list[SelectedEvidenceChunk]:
+    ranked = list(scored)
+    ranked.sort(key=lambda item: (-item.score, item.chunk.chunk_id))
     selected: list[SelectedEvidenceChunk] = []
     used_chars = 0
-    for item in scored:
+    for item in ranked:
         if len(selected) >= max_chunks:
             break
         chunk_len = item.chunk.char_count
@@ -294,15 +376,84 @@ def select_relevant_chunks(
     return selected
 
 
+def build_long_doc_evidence_router_prompt(*, chunk: TextChunk, query: str) -> str:
+    from src.eval.function_calling.rwkv_prompt import build_rwkv_json_call_prompt
+
+    system_prompt = normalize_newlines(
+        "\n".join(
+            [
+                "You decide whether one document chunk contains evidence needed for the next agent step.",
+                "Prefer recall over precision. Mark relevant when the chunk may help choose a tool, fill arguments, or follow policy.",
+                "Return exactly one JSON object with this shape:",
+                '{"relevant":true,"score":3,"reason":"short"}',
+                "Use score 0 for irrelevant, 1 for weakly relevant, 2 for useful, 3 for critical.",
+            ]
+        )
+    )
+    user_text = normalize_newlines(
+        "\n".join(
+            [
+                "Current task/context:",
+                str(query or "").strip()[-1600:],
+                "",
+                f"Chunk {chunk.chunk_id} lines {chunk.line_start}-{chunk.line_end}:",
+                chunk.text.strip(),
+            ]
+        )
+    )
+    return build_rwkv_json_call_prompt(system_prompt, [{"role": "user", "content": user_text}], history_max_chars=4096)
+
+
+def parse_long_doc_evidence_router_response(text: str) -> tuple[bool, float]:
+    from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
+
+    candidate = extract_json_call_value_text(str(text or ""))
+    payload = json.loads(candidate)
+    if not isinstance(payload, Mapping):
+        raise ValueError("long-doc router response must be a JSON object")
+    relevant_raw = payload.get("relevant", payload.get("is_relevant", payload.get("selected", False)))
+    if isinstance(relevant_raw, str):
+        relevant = relevant_raw.strip().lower() in {"true", "yes", "y", "1", "relevant", "selected"}
+    else:
+        relevant = bool(relevant_raw)
+    try:
+        score = float(payload.get("score", 1.0 if relevant else 0.0))
+    except (TypeError, ValueError):
+        score = 1.0 if relevant else 0.0
+    return relevant, max(0.0, min(score, 3.0))
+
+
+def _long_doc_router_sampling(sampling: Any, *, max_tokens: int) -> Any:
+    clamp = getattr(sampling, "clamp", None)
+    if callable(clamp):
+        try:
+            return clamp(max(1, int(max_tokens)))
+        except Exception:
+            return sampling
+    return sampling
+
+
 def compact_long_text(
     text: str,
     *,
     query: str,
     config: LongDocEvidenceConfig | None = None,
     label: str = "document",
+    engine: Any | None = None,
+    sampling: Any | None = None,
+    progress_desc: str = "LongDocEvidence",
+    prompt_seed: int | None = None,
 ) -> LongDocCompactionResult:
     cfg = config or LongDocEvidenceConfig()
     normalized = normalize_newlines(text)
+    if not cfg.enabled:
+        return LongDocCompactionResult(
+            text=normalized,
+            original_chars=len(normalized),
+            chunk_count=0,
+            selected_chunk_ids=(),
+            compacted=False,
+        )
     if len(normalized) < max(1, int(cfg.min_long_text_chars)):
         return LongDocCompactionResult(
             text=normalized,
@@ -316,17 +467,36 @@ def compact_long_text(
         max_chars=max(1, int(cfg.max_chunk_chars)),
         overlap_lines=max(0, int(cfg.overlap_lines)),
     )
-    selected = select_relevant_chunks(
-        chunks,
-        query,
-        max_chunks=max(1, int(cfg.max_evidence_chunks)),
-        max_chars=max(1, int(cfg.max_evidence_chars)),
-    )
+    reason = "lexical"
+    error: str | None = None
+    if cfg.mode == "model_parallel":
+        selected, reason, error = select_relevant_chunks_model_parallel(
+            chunks,
+            query,
+            engine=engine,
+            sampling=sampling,
+            max_chunks=max(1, int(cfg.max_evidence_chunks)),
+            max_chars=max(1, int(cfg.max_evidence_chars)),
+            max_tokens=max(1, int(cfg.model_max_tokens)),
+            batch_size=max(1, int(cfg.model_parallel_batch_size)),
+            progress_desc=progress_desc,
+            prompt_seed=prompt_seed,
+        )
+    else:
+        selected = select_relevant_chunks(
+            chunks,
+            query,
+            max_chunks=max(1, int(cfg.max_evidence_chunks)),
+            max_chars=max(1, int(cfg.max_evidence_chars)),
+        )
     compacted = render_evidence_window(
         selected,
         label=label,
         original_chars=len(normalized),
         chunk_count=len(chunks),
+        mode=cfg.mode,
+        reason=reason,
+        error=error,
     )
     return LongDocCompactionResult(
         text=compacted,
@@ -342,6 +512,10 @@ def compact_messages_for_long_context(
     *,
     query: str | None = None,
     config: LongDocEvidenceConfig | None = None,
+    engine: Any | None = None,
+    sampling: Any | None = None,
+    progress_desc: str = "LongDocEvidence",
+    prompt_seed: int | None = None,
 ) -> LongDocMessageCompaction:
     cfg = config or LongDocEvidenceConfig()
     normalized = [
@@ -367,6 +541,10 @@ def compact_messages_for_long_context(
             query=resolved_query,
             config=cfg,
             label=f"message {index} role={message['role']}",
+            engine=engine,
+            sampling=sampling,
+            progress_desc=progress_desc,
+            prompt_seed=None if prompt_seed is None else int(prompt_seed) + index * 10_000,
         )
         if result.compacted:
             compacted_count += 1
@@ -408,13 +586,18 @@ def render_evidence_window(
     label: str,
     original_chars: int,
     chunk_count: int,
+    mode: str = "lexical",
+    reason: str = "lexical",
+    error: str | None = None,
 ) -> str:
     header = (
         f"[Long document compacted: label={label}; original_chars={int(original_chars)}; "
-        f"chunks={int(chunk_count)}; selected_chunks={len(selected)}]"
+        f"chunks={int(chunk_count)}; selected_chunks={len(selected)}; mode={mode}; reason={reason}]"
     )
+    if error:
+        header += f"\n[Long document router note: {str(error)[:500]}]"
     if not selected:
-        return header + "\n[No lexical evidence chunk selected.]"
+        return header + "\n[No evidence chunk selected.]"
     parts = [header]
     for item in selected:
         chunk = item.chunk
@@ -426,12 +609,20 @@ def render_evidence_window(
 
 
 def long_doc_config_from_env(prefix: str = "RWKV_LONG_DOC") -> LongDocEvidenceConfig:
+    mode = _env_choice(f"{prefix}_MODE", "lexical", ("lexical", "model_parallel"))
     return LongDocEvidenceConfig(
+        enabled=_env_bool(f"{prefix}_ENABLED", True),
+        mode=mode,  # type: ignore[arg-type]
         max_chunk_chars=_env_int(f"{prefix}_MAX_CHARS", DEFAULT_LONG_DOC_MAX_CHARS),
         overlap_lines=_env_int(f"{prefix}_OVERLAP_LINES", DEFAULT_LONG_DOC_OVERLAP_LINES),
         min_long_text_chars=_env_int(f"{prefix}_MIN_CHARS", DEFAULT_LONG_DOC_MIN_CHARS),
         max_evidence_chunks=_env_int(f"{prefix}_MAX_EVIDENCE_CHUNKS", DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS),
         max_evidence_chars=_env_int(f"{prefix}_MAX_EVIDENCE_CHARS", DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS),
+        model_max_tokens=_env_int(f"{prefix}_MODEL_MAX_TOKENS", DEFAULT_LONG_DOC_MODEL_MAX_TOKENS),
+        model_parallel_batch_size=_env_int(
+            f"{prefix}_MODEL_PARALLEL_BATCH_SIZE",
+            DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
+        ),
     )
 
 
@@ -564,13 +755,36 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return bool(default)
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _env_choice(name: str, default: str, choices: Sequence[str]) -> str:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return str(default)
+    normalized = raw.strip().lower()
+    return normalized if normalized in set(choices) else str(default)
+
+
 __all__ = [
     "ALLOWED_ANSWER_FORMATS",
+    "LONG_DOC_MODE_CHOICES",
     "LongDocCompactionResult",
     "LongDocEvidenceConfig",
+    "LongDocEvidenceMode",
     "LongDocMessageCompaction",
     "SelectedEvidenceChunk",
     "TextChunk",
+    "build_long_doc_evidence_router_prompt",
     "build_answer_or_null_prompt",
     "build_evidence_tasks",
     "chunk_text_by_newline",
@@ -581,9 +795,11 @@ __all__ = [
     "long_doc_config_from_env",
     "match_positive_rule",
     "normalize_newlines",
+    "parse_long_doc_evidence_router_response",
     "parse_answer_or_null_response",
     "render_evidence_window",
     "select_relevant_chunks",
+    "select_relevant_chunks_model_parallel",
     "summarize_chunks",
     "validate_task_definition",
     "write_jsonl",

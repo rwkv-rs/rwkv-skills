@@ -36,6 +36,7 @@ from src.eval.function_calling.bfcl_v3 import (
     _bfcl_tools_with_control_functions,
 )
 from src.eval.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     clamp_function_calling_sampling,
@@ -56,6 +57,11 @@ from src.eval.function_calling.rwkv_prompt import (
     normalize_function_prompt_style,
 )
 from src.eval.function_calling.tau_bench import TauToolCall
+from src.eval.function_calling.tool_router import (
+    ToolRoutingConfig,
+    route_tools_for_prompt,
+    tool_routing_config_from_args,
+)
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 from src.infer.constraints import build_bfcl_tool_call_constraint
@@ -279,6 +285,29 @@ def _bfcl_official_prompt_messages(
     return official_messages
 
 
+def _route_bfcl_tools(
+    *,
+    state: _ActiveBfclEpisode,
+    run: ResolvedFunctionCallingRun,
+    tool_sampling: Any,
+    tool_routing_config: ToolRoutingConfig,
+    progress_desc: str,
+    prompt_seed: int | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    route = route_tools_for_prompt(
+        state.active_tools,
+        _bfcl_official_prompt_messages(state.prompt_messages),
+        config=tool_routing_config,
+        engine=run.engine,
+        sampling=tool_sampling,
+        control_tool_names=("ask_user", "final_answer"),
+        progress_desc=progress_desc,
+        prompt_seed=prompt_seed,
+    )
+    routed_tools = [dict(tool) for tool in route.selected_tools if isinstance(tool, Mapping)]
+    return route, routed_tools
+
+
 def _run_bfcl_official_json_generation_step(
     *,
     state: _ActiveBfclEpisode,
@@ -286,9 +315,19 @@ def _run_bfcl_official_json_generation_step(
     tool_sampling: Any,
     progress_suffix: str,
     history_max_chars: int,
+    tool_routing_config: ToolRoutingConfig,
 ) -> _BfclGenerationStepOutcome:
+    route, routed_tools = _route_bfcl_tools(
+        state=state,
+        run=run,
+        tool_sampling=tool_sampling,
+        tool_routing_config=tool_routing_config,
+        progress_desc=f"BFCLV3-ToolRouter {progress_suffix}",
+        prompt_seed=_next_bfcl_stage_seed(state) + 10_000,
+    )
+    system_prompt = build_bfcl_system_prompt(routed_tools)
     prompt = build_bfcl_rwkv_prompt(
-        state.system_prompt,
+        system_prompt,
         _bfcl_official_prompt_messages(state.prompt_messages),
         history_max_chars=history_max_chars,
     )
@@ -299,7 +338,7 @@ def _run_bfcl_official_json_generation_step(
         sampling=tool_sampling,
         progress_desc=f"BFCLV3-Decision {progress_suffix}",
         stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
-        constraint=build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(state.active_tools)),
+        constraint=build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(routed_tools)),
         constraint_mode="strict",
     )
     decision_text = normalize_bfcl_decision_output(output.text)
@@ -308,6 +347,7 @@ def _run_bfcl_official_json_generation_step(
         "decision_completion": output.text,
         "decision_text": decision_text,
         "decision_stop_reason": output.finish_reason,
+        "tool_route": route.trace_payload(),
     }
     if _looks_like_template_leak(decision_text):
         return _failed_bfcl_step(
@@ -327,7 +367,7 @@ def _run_bfcl_official_json_generation_step(
     try:
         decoded_calls, final_answer = decode_bfcl_exec_response(
             decision_text,
-            tools=state.active_tools,
+            tools=routed_tools,
         )
     except Exception as exc:
         trace_entry["parse_error_type"] = _bfcl_decision_error_type(exc)
@@ -370,6 +410,7 @@ def _run_bfcl_generation_step(
     progress_suffix: str,
     prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
     history_max_chars: int = 0,
+    tool_routing_config: ToolRoutingConfig | None = None,
 ) -> _BfclGenerationStepOutcome:
     normalize_function_prompt_style(prompt_style)
     return _run_bfcl_official_json_generation_step(
@@ -378,6 +419,7 @@ def _run_bfcl_generation_step(
         tool_sampling=tool_sampling,
         progress_suffix=progress_suffix,
         history_max_chars=history_max_chars,
+        tool_routing_config=tool_routing_config or ToolRoutingConfig(),
     )
 
 
@@ -389,9 +431,11 @@ def _run_bfcl_v3_official_episode(
     max_steps: int,
     max_tool_errors: int,
     history_max_chars: int,
+    tool_routing_config: ToolRoutingConfig | None = None,
     prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
 ) -> list[dict[str, object]]:
     prompt_style = normalize_function_prompt_style(prompt_style)
+    tool_routing_config = tool_routing_config or ToolRoutingConfig()
     trace: list[dict[str, object]] = []
 
     for turn_index, turn in enumerate(state.record.turns):
@@ -423,6 +467,7 @@ def _run_bfcl_v3_official_episode(
                 progress_suffix=progress_suffix,
                 prompt_style=prompt_style,
                 history_max_chars=history_max_chars,
+                tool_routing_config=tool_routing_config,
             )
             trace_entry = {
                 "turn_index": turn_index,
@@ -585,7 +630,6 @@ def _run_bfcl_v3(
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     prompt_style = normalize_function_prompt_style(getattr(args, "prompt_style", None))
     tool_sampling = clamp_function_calling_sampling(tool_sampling, max(1, int(args.decision_max_tokens or 1024)))
-    sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     dataset_issues = collect_bfcl_dataset_issues([record for _index, record in selected_entries])
@@ -602,6 +646,11 @@ def _run_bfcl_v3(
     max_steps = max(1, int(args.max_steps))
     max_tool_errors = max(1, int(args.max_tool_errors))
     history_max_chars = max(0, int(args.history_max_chars))
+    tool_routing_config = tool_routing_config_from_args(args)
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, tool_sampling)]),
+        tool_routing_config=tool_routing_config,
+    )
 
     if args.probe_only:
         repeated = repeat_probe_entries(selected_entries, batch_size=batch_size)
@@ -632,20 +681,31 @@ def _run_bfcl_v3(
                         "content": build_bfcl_user_block(turn_request),
                     }
                 )
+        probe_routes = [
+            _route_bfcl_tools(
+                state=state,
+                run=run,
+                tool_sampling=tool_sampling,
+                tool_routing_config=tool_routing_config,
+                progress_desc="BFCLV3-ToolRouter-Probe",
+                prompt_seed=sample_repeat_seed(state.sample_index, state.repeat_index, stage=10_001),
+            )
+            for state in probe_states
+        ]
         decision_prompts = [
             build_bfcl_rwkv_prompt(
-                state.system_prompt,
+                build_bfcl_system_prompt(routed_tools),
                 _bfcl_official_prompt_messages(state.prompt_messages),
                 history_max_chars=history_max_chars,
             )
-            for state in probe_states
+            for state, (_route, routed_tools) in zip(probe_states, probe_routes, strict=True)
         ]
         constraints = (
             None
             if isinstance(run.engine, RemoteInferenceBackend)
             else [
-                build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(state.active_tools))
-                for state in probe_states
+                build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(routed_tools))
+                for _route, routed_tools in probe_routes
             ]
         )
         run.engine.generate(
@@ -711,6 +771,7 @@ def _run_bfcl_v3(
                             max_tool_errors=max_tool_errors,
                             history_max_chars=history_max_chars,
                             prompt_style=prompt_style,
+                            tool_routing_config=tool_routing_config,
                         )
                     else:
                         for _ in range(max_steps):
@@ -722,6 +783,7 @@ def _run_bfcl_v3(
                                 progress_suffix=progress_suffix,
                                 prompt_style=prompt_style,
                                 history_max_chars=history_max_chars,
+                                tool_routing_config=tool_routing_config,
                             )
                             state.turn_count += 1
                             trace_entry = {

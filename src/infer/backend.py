@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
+import socket
+import time
 from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
@@ -28,6 +31,15 @@ class RemoteHTTPError(RuntimeError):
         super().__init__(f"remote infer request failed: HTTP {status_code}: {detail}")
         self.status_code = int(status_code)
         self.detail = str(detail)
+
+
+_REMOTE_TRANSIENT_ERRORS = (
+    urllib_error.URLError,
+    http.client.HTTPException,
+    TimeoutError,
+    ConnectionError,
+    socket.timeout,
+)
 
 
 def normalize_api_base(base_url: str) -> str:
@@ -237,6 +249,9 @@ class RemoteInferenceConfig:
     api_key: str = ""
     timeout_s: float = 600.0
     max_workers: int = 32
+    max_retries: int = 3
+    retry_initial_delay_s: float = 1.0
+    retry_max_delay_s: float = 10.0
 
     def completions_url(self) -> str:
         return f"{normalize_api_base(self.base_url)}/completions"
@@ -372,9 +387,17 @@ class RemoteInferenceBackend:
             "prompt": prompt,
             "max_tokens": int(sampling.max_generate_tokens),
             "temperature": float(sampling.temperature),
+            "top_k": int(sampling.top_k),
             "top_p": float(sampling.top_p),
             "presence_penalty": float(sampling.alpha_presence),
             "frequency_penalty": float(sampling.alpha_frequency),
+            "repetition_penalty": float(sampling.alpha_frequency),
+            "penalty_decay": float(sampling.alpha_decay),
+            "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
+            "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
+            "pad_zero": bool(sampling.pad_zero),
+            "no_penalty_token_ids": [int(token_id) for token_id in sampling.no_penalty_token_ids],
+            "prefill_chunk_size": int(prefill_chunk_size),
         }
         if seed is not None:
             payload["seed"] = int(seed)
@@ -408,18 +431,35 @@ class RemoteInferenceBackend:
                 "Authorization": f"Bearer {self.config.api_key or 'rwkv-skills'}",
             },
         )
-        try:
-            with urllib_request.urlopen(req, timeout=max(float(self.config.timeout_s), 1.0)) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib_error.HTTPError as exc:  # pragma: no cover - exercised through integration
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RemoteHTTPError(exc.code, detail) from exc
-        except urllib_error.URLError as exc:  # pragma: no cover - exercised through integration
-            raise RuntimeError(f"remote infer request failed: {exc.reason}") from exc
+        raw = self._urlopen_with_retries(req)
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise RuntimeError("remote infer response must be a JSON object")
         return data
+
+    def _urlopen_with_retries(self, req: urllib_request.Request) -> str:
+        attempts = max(1, int(self.config.max_retries) + 1)
+        timeout_s = max(float(self.config.timeout_s), 1.0)
+        delay_s = max(float(self.config.retry_initial_delay_s), 0.0)
+        max_delay_s = max(float(self.config.retry_max_delay_s), delay_s)
+        last_exc: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib_request.urlopen(req, timeout=timeout_s) as resp:
+                    return resp.read().decode("utf-8")
+            except urllib_error.HTTPError as exc:  # pragma: no cover - exercised through integration
+                detail = exc.read().decode("utf-8", errors="replace")
+                raise RemoteHTTPError(exc.code, detail) from exc
+            except _REMOTE_TRANSIENT_ERRORS as exc:  # pragma: no cover - exercised through integration
+                last_exc = exc
+                if attempt >= attempts:
+                    break
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                    delay_s = min(delay_s * 2, max_delay_s)
+        if isinstance(last_exc, urllib_error.URLError):
+            raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc.reason}") from last_exc
+        raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc}") from last_exc
 
 
 def _extract_completion_choice_text(choice: dict[str, object]) -> str:

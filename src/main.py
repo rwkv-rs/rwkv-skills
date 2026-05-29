@@ -186,6 +186,24 @@ class RunnerSection:
     max_steps: int | None = None
     max_tool_errors: int | None = None
     history_max_chars: int | None = None
+    prompt_max_chars: int | None = None
+    long_doc_mode: str | None = None
+    long_doc_max_chars: int | None = None
+    long_doc_overlap_lines: int | None = None
+    long_doc_min_chars: int | None = None
+    long_doc_max_evidence_chunks: int | None = None
+    long_doc_max_evidence_chars: int | None = None
+    long_doc_model_max_tokens: int | None = None
+    long_doc_model_parallel_batch_size: int | None = None
+    tool_router_mode: str | None = None
+    tool_router_max_tools: int | None = None
+    tool_router_trigger_tool_count: int | None = None
+    tool_router_trigger_catalog_chars: int | None = None
+    tool_router_context_chars: int | None = None
+    tool_router_max_tokens: int | None = None
+    tool_router_description_chars: int | None = None
+    tool_router_parallel_chunk_tools: int | None = None
+    tool_router_parallel_batch_size: int | None = None
     enable_think: bool = False
     stop_tokens: tuple[int, ...] = ()
     ban_tokens: tuple[int, ...] = ()
@@ -223,6 +241,57 @@ class RunnerSection:
             max_steps=_maybe_int(payload.get("max_steps"), field_name="runner.max_steps"),
             max_tool_errors=_maybe_int(payload.get("max_tool_errors"), field_name="runner.max_tool_errors"),
             history_max_chars=_maybe_int(payload.get("history_max_chars"), field_name="runner.history_max_chars"),
+            prompt_max_chars=_maybe_int(payload.get("prompt_max_chars"), field_name="runner.prompt_max_chars"),
+            long_doc_mode=_maybe_str(payload.get("long_doc_mode")),
+            long_doc_max_chars=_maybe_int(payload.get("long_doc_max_chars"), field_name="runner.long_doc_max_chars"),
+            long_doc_overlap_lines=_maybe_int(
+                payload.get("long_doc_overlap_lines"),
+                field_name="runner.long_doc_overlap_lines",
+            ),
+            long_doc_min_chars=_maybe_int(payload.get("long_doc_min_chars"), field_name="runner.long_doc_min_chars"),
+            long_doc_max_evidence_chunks=_maybe_int(
+                payload.get("long_doc_max_evidence_chunks"),
+                field_name="runner.long_doc_max_evidence_chunks",
+            ),
+            long_doc_max_evidence_chars=_maybe_int(
+                payload.get("long_doc_max_evidence_chars"),
+                field_name="runner.long_doc_max_evidence_chars",
+            ),
+            long_doc_model_max_tokens=_maybe_int(
+                payload.get("long_doc_model_max_tokens"),
+                field_name="runner.long_doc_model_max_tokens",
+            ),
+            long_doc_model_parallel_batch_size=_maybe_int(
+                payload.get("long_doc_model_parallel_batch_size"),
+                field_name="runner.long_doc_model_parallel_batch_size",
+            ),
+            tool_router_mode=_maybe_str(payload.get("tool_router_mode")),
+            tool_router_max_tools=_maybe_int(payload.get("tool_router_max_tools"), field_name="runner.tool_router_max_tools"),
+            tool_router_trigger_tool_count=_maybe_int(
+                payload.get("tool_router_trigger_tool_count"),
+                field_name="runner.tool_router_trigger_tool_count",
+            ),
+            tool_router_trigger_catalog_chars=_maybe_int(
+                payload.get("tool_router_trigger_catalog_chars"),
+                field_name="runner.tool_router_trigger_catalog_chars",
+            ),
+            tool_router_context_chars=_maybe_int(
+                payload.get("tool_router_context_chars"),
+                field_name="runner.tool_router_context_chars",
+            ),
+            tool_router_max_tokens=_maybe_int(payload.get("tool_router_max_tokens"), field_name="runner.tool_router_max_tokens"),
+            tool_router_description_chars=_maybe_int(
+                payload.get("tool_router_description_chars"),
+                field_name="runner.tool_router_description_chars",
+            ),
+            tool_router_parallel_chunk_tools=_maybe_int(
+                payload.get("tool_router_parallel_chunk_tools"),
+                field_name="runner.tool_router_parallel_chunk_tools",
+            ),
+            tool_router_parallel_batch_size=_maybe_int(
+                payload.get("tool_router_parallel_batch_size"),
+                field_name="runner.tool_router_parallel_batch_size",
+            ),
             enable_think=bool(_maybe_bool(payload.get("enable_think"), field_name="runner.enable_think") or False),
             stop_tokens=_tuple_int(payload.get("stop_tokens"), field_name="runner.stop_tokens"),
             ban_tokens=_tuple_int(payload.get("ban_tokens"), field_name="runner.ban_tokens"),
@@ -527,6 +596,8 @@ def _function_calling_benchmark_kind(job_name: str) -> str:
         return "mcp_bench"
     if job_name == "function_bfcl_v3":
         return "bfcl_v3"
+    if job_name == "function_tau3_bench":
+        return "tau3_bench"
     if job_name == "function_tau2_bench":
         return "tau2_bench"
     return "tau_bench"
@@ -599,6 +670,24 @@ def _build_runner_argv(
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
         _append_flag(argv, "--db-close-timeout-s", runner_cfg.db_close_timeout_s)
         _append_flag(argv, "--history-max-chars", runner_cfg.history_max_chars)
+        _append_flag(argv, "--prompt-max-chars", runner_cfg.prompt_max_chars)
+        _append_flag(argv, "--long-doc-mode", runner_cfg.long_doc_mode)
+        _append_flag(argv, "--long-doc-max-chars", runner_cfg.long_doc_max_chars)
+        _append_flag(argv, "--long-doc-overlap-lines", runner_cfg.long_doc_overlap_lines)
+        _append_flag(argv, "--long-doc-min-chars", runner_cfg.long_doc_min_chars)
+        _append_flag(argv, "--long-doc-max-evidence-chunks", runner_cfg.long_doc_max_evidence_chunks)
+        _append_flag(argv, "--long-doc-max-evidence-chars", runner_cfg.long_doc_max_evidence_chars)
+        _append_flag(argv, "--long-doc-model-max-tokens", runner_cfg.long_doc_model_max_tokens)
+        _append_flag(argv, "--long-doc-model-parallel-batch-size", runner_cfg.long_doc_model_parallel_batch_size)
+        _append_flag(argv, "--tool-router-mode", runner_cfg.tool_router_mode)
+        _append_flag(argv, "--tool-router-max-tools", runner_cfg.tool_router_max_tools)
+        _append_flag(argv, "--tool-router-trigger-tool-count", runner_cfg.tool_router_trigger_tool_count)
+        _append_flag(argv, "--tool-router-trigger-catalog-chars", runner_cfg.tool_router_trigger_catalog_chars)
+        _append_flag(argv, "--tool-router-context-chars", runner_cfg.tool_router_context_chars)
+        _append_flag(argv, "--tool-router-max-tokens", runner_cfg.tool_router_max_tokens)
+        _append_flag(argv, "--tool-router-description-chars", runner_cfg.tool_router_description_chars)
+        _append_flag(argv, "--tool-router-parallel-chunk-tools", runner_cfg.tool_router_parallel_chunk_tools)
+        _append_flag(argv, "--tool-router-parallel-batch-size", runner_cfg.tool_router_parallel_batch_size)
         _append_repeatable(argv, "--avg-k", runner_cfg.avg_ks)
         if runner.name == "function_browsecomp":
             _append_flag(argv, "--cot-max-tokens", runner_cfg.cot_max_tokens)

@@ -28,6 +28,8 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "tau_bench_retail" in names
     assert "tau2_bench_airline" in names
     assert "tau3_bench_banking_knowledge" in names
+    assert "tau3_bench_mock" in names
+    assert "tau3_bench_mock_long_context" in names
 
 
 def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monkeypatch) -> None:
@@ -596,3 +598,66 @@ def test_prepare_dataset_materializes_tau3_base_split_to_standard_path(tmp_path:
             "benchmark_version": "tau_v3",
         }
     ]
+
+
+def test_prepare_dataset_materializes_tau3_lightweight_mock_without_tau3_source(tmp_path: Path, monkeypatch) -> None:
+    tau2_data_root = tmp_path / "tau2_data"
+    tau2_data_root.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.TAU_V2_DATA_ROOT",
+        tau2_data_root,
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.load_tau_v2_tasks",
+        lambda *, domain, split: [
+            {
+                "task_id": "create_task_1_with_env_assertions",
+                "domain": domain,
+                "index": 0,
+                "instruction": "Create task",
+                "task": {
+                    "id": "create_task_1_with_env_assertions",
+                    "ticket": "Create task",
+                    "evaluation_criteria": {
+                        "nl_assertions": ["The user is told the task was created."],
+                        "reward_basis": ["DB", "ENV_ASSERTION"],
+                    },
+                },
+                "benchmark_version": "tau_v2",
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("tau3_bench_mock", output_root, "base")
+    [row] = read_jsonl_items(paths[0])
+
+    assert paths == [output_root / "tau3_bench_mock" / "base.jsonl"]
+    assert row["domain"] == "mock"
+    assert row["benchmark_version"] == "tau_v3_light"
+    assert row["task"]["evaluation_criteria"]["reward_basis"] == ["DB", "ENV_ASSERTION"]
+    assert "nl_assertions" not in row["task"]["evaluation_criteria"]
+
+
+def test_prepare_dataset_materializes_tau3_lightweight_long_context(tmp_path: Path, monkeypatch) -> None:
+    tau2_data_root = tmp_path / "tau2_data"
+    tau2_data_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.tau_bench.TAU_V2_DATA_ROOT",
+        tau2_data_root,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("tau3_bench_mock_long_context", output_root, "base")
+    rows = read_jsonl_items(paths[0])
+
+    assert paths == [output_root / "tau3_bench_mock_long_context" / "base.jsonl"]
+    assert [row["task_id"] for row in rows] == [
+        "mock_long_context_create_task",
+        "mock_long_context_update_task",
+    ]
+    assert rows[0]["benchmark_version"] == "tau_v3_light"
+    history = rows[0]["task"]["initial_state"]["message_history"]
+    assert len(history[0]["content"]) > 6000
+    assert "Important Meeting" in history[0]["content"]

@@ -113,6 +113,14 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
                 "avg_ks": [1.0],
                 "max_steps": 20,
                 "max_tool_errors": 20,
+                "prompt_max_chars": 8192,
+                "long_doc_mode": "off",
+                "long_doc_model_max_tokens": 64,
+                "long_doc_model_parallel_batch_size": 6,
+                "tool_router_mode": "lexical",
+                "tool_router_max_tools": 8,
+                "tool_router_parallel_chunk_tools": 3,
+                "tool_router_parallel_batch_size": 5,
             },
         }
     )
@@ -130,6 +138,21 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert "1.0" in resolved.argv
     assert "--prompt-style" in resolved.argv
     assert "rwkv_official_json" in resolved.argv
+    assert "--prompt-max-chars" in resolved.argv
+    assert "8192" in resolved.argv
+    assert "--long-doc-mode" in resolved.argv
+    assert "off" in resolved.argv
+    assert "--long-doc-model-max-tokens" in resolved.argv
+    assert "64" in resolved.argv
+    assert "--long-doc-model-parallel-batch-size" in resolved.argv
+    assert "6" in resolved.argv
+    assert "--tool-router-mode" in resolved.argv
+    assert "lexical" in resolved.argv
+    assert "--tool-router-max-tools" in resolved.argv
+    assert "--tool-router-parallel-chunk-tools" in resolved.argv
+    assert "3" in resolved.argv
+    assert "--tool-router-parallel-batch-size" in resolved.argv
+    assert "5" in resolved.argv
 
 
 def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: Path) -> None:

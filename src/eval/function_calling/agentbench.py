@@ -16,6 +16,7 @@ from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     clamp_function_calling_sampling,
@@ -36,6 +37,11 @@ from src.eval.function_calling.rwkv_prompt import (
     render_json_function_call,
 )
 from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response
+from src.eval.function_calling.tool_router import (
+    ToolRoutingConfig,
+    route_tools_for_prompt,
+    tool_routing_config_from_args,
+)
 from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_messages_for_long_context
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
@@ -231,10 +237,16 @@ def _run_agentbench(
     if sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     sampling = clamp_function_calling_sampling(sampling, max(1, int(args.decision_max_tokens or 1024)))
-    sampling_payload = normalize_sampling_config_by_stage([(1, sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     prompt_max_chars = _agentbench_prompt_max_chars(args)
     long_doc_config = _agentbench_long_doc_config(args)
+    tool_routing_config = tool_routing_config_from_args(args)
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, sampling)]),
+        long_doc_config=long_doc_config,
+        tool_routing_config=tool_routing_config,
+        prompt_max_chars=prompt_max_chars,
+    )
     controller_url = _agentbench_controller_url(args)
     controller = AgentBenchControllerClient(controller_url)
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
@@ -247,10 +259,19 @@ def _run_agentbench(
             for _sample_index, record in repeated:
                 session_id, data = controller.start_sample(record.task_name, record.index)
                 sessions.append(session_id)
+                tool_route = route_tools_for_prompt(
+                    data.get("tools") or [],
+                    data.get("messages") or [],
+                    config=tool_routing_config,
+                    engine=run.engine,
+                    sampling=sampling,
+                    control_tool_names=("final_answer",) if _is_agentbench_kg(record) else (),
+                    progress_desc="AgentBench-ToolRouter-Probe",
+                )
                 prompts.append(
                     build_agentbench_prompt(
                         data.get("messages") or [],
-                        data.get("tools") or [],
+                        tool_route.selected_tools,
                         history_max_chars=history_max_chars,
                         allow_final_answer_text=_is_agentbench_kg(record),
                         prompt_max_chars=prompt_max_chars,
@@ -314,6 +335,7 @@ def _run_agentbench(
                         history_max_chars=history_max_chars,
                         prompt_max_chars=prompt_max_chars,
                         long_doc_config=long_doc_config,
+                        tool_routing_config=tool_routing_config,
                     )
                     writer.enqueue(payload)
             except BaseException:
@@ -364,6 +386,7 @@ def _run_one_agentbench_attempt(
     history_max_chars: int,
     prompt_max_chars: int,
     long_doc_config: LongDocEvidenceConfig,
+    tool_routing_config: ToolRoutingConfig,
 ) -> dict[str, Any]:
     session_id = ""
     stages: list[StageRecord] = []
@@ -378,9 +401,19 @@ def _run_one_agentbench_attempt(
         messages = [dict(item) for item in data.get("messages") or [] if isinstance(item, Mapping)]
         tools = [dict(item) for item in data.get("tools") or [] if isinstance(item, Mapping)]
         for round_index in range(1, max(1, int(args.max_steps or 20)) + 1):
+            tool_route = route_tools_for_prompt(
+                tools,
+                messages,
+                config=tool_routing_config,
+                engine=run.engine,
+                sampling=sampling,
+                control_tool_names=("final_answer",) if _is_agentbench_kg(record) else (),
+                progress_desc=f"AgentBench tool route {sample_index} round {round_index}",
+                prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=10_000 + round_index),
+            )
             prompt = build_agentbench_prompt(
                 messages,
-                tools,
+                tool_route.selected_tools,
                 history_max_chars=history_max_chars,
                 allow_final_answer_text=_is_agentbench_kg(record),
                 prompt_max_chars=prompt_max_chars,
@@ -402,13 +435,21 @@ def _run_one_agentbench_attempt(
                 assistant_message = _agentbench_assistant_message(decoded_calls, round_index)
             except Exception as exc:  # noqa: BLE001
                 error = str(exc)
-                trace.append({"round": round_index, "completion": output.text, "parse_error": error})
+                trace.append(
+                    {
+                        "round": round_index,
+                        "tool_route": tool_route.trace_payload(),
+                        "completion": output.text,
+                        "parse_error": error,
+                    }
+                )
                 break
             messages.append(assistant_message)
             response = controller.interact(session_id, assistant_message)
             trace.append(
                 {
                     "round": round_index,
+                    "tool_route": tool_route.trace_payload(),
                     "completion": output.text,
                     "decoded_calls": decoded_calls,
                     "controller_response": response,
@@ -535,12 +576,20 @@ def _agentbench_prompt_max_chars(args: argparse.Namespace) -> int:
 
 
 def _agentbench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    mode = str(getattr(args, "long_doc_mode", "lexical") or "lexical").strip().lower()
+    enabled = mode != "off"
+    if mode == "off":
+        mode = "lexical"
     return LongDocEvidenceConfig(
+        enabled=enabled,
+        mode=mode,  # type: ignore[arg-type]
         max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
         overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
+        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
+        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 

@@ -10,6 +10,7 @@ The benchmark-specific execution loops live in the sibling modules:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
@@ -21,6 +22,17 @@ from src.eval.function_calling.rwkv_prompt import (
     DEFAULT_TOOL_CATALOG_FORMAT,
     FUNCTION_PROMPT_STYLE_CHOICES,
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
+)
+from src.eval.function_calling.tool_router import (
+    DEFAULT_TOOL_ROUTER_CONTEXT_CHARS,
+    DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS,
+    DEFAULT_TOOL_ROUTER_MAX_TOKENS,
+    DEFAULT_TOOL_ROUTER_MAX_TOOLS,
+    DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE,
+    DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS,
+    DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS,
+    DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT,
+    TOOL_ROUTER_MODE_CHOICES,
 )
 from src.eval.function_calling.agentbench import _run_agentbench
 from src.eval.function_calling.api_bank import _run_api_bank
@@ -39,6 +51,11 @@ from src.eval.function_calling.tau_runner import (
     _run_tau,
 )
 from src.eval.function_calling.toolalpaca import _run_toolalpaca
+from src.eval.long_doc_evidence import (
+    DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
+    DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
+    LONG_DOC_MODE_CHOICES,
+)
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, split_benchmark_and_split
 from src.infer.backend import (
@@ -54,6 +71,26 @@ if TYPE_CHECKING:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV unified function-calling benchmark runner")
     parser.add_argument("--dataset", required=True, help="Prepared function-calling JSONL dataset path")
+    parser.add_argument("--task-desc", help="Task description stored in the local evaluation DB")
+    parser.add_argument(
+        "--run-mode",
+        choices=("auto", "new", "resume", "rerun"),
+        help="Task persistence mode; mirrors RWKV_EVAL_RUN_MODE without requiring shell env injection",
+    )
+    parser.add_argument(
+        "--tau-bench-root",
+        help="Official tau2/tau3-bench repository root; mirrors RWKV_TAU3_BENCH_ROOT",
+    )
+    parser.add_argument(
+        "--tau-llm-timeout-s",
+        type=float,
+        help="Timeout for official tau user/judge LLM calls; mirrors RWKV_TAU_LLM_TIMEOUT_S",
+    )
+    parser.add_argument(
+        "--disable-checker",
+        action="store_true",
+        help="Disable optional checker hooks; mirrors RWKV_SKILLS_DISABLE_CHECKER=1",
+    )
     parser.add_argument(
         "--benchmark-kind",
         choices=[kind.value for kind in FunctionCallingBenchmarkKind],
@@ -96,6 +133,66 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Hard prompt character budget for long-context agent runners (env-specific defaults may apply)",
     )
+    parser.add_argument(
+        "--long-doc-mode",
+        choices=LONG_DOC_MODE_CHOICES,
+        default="lexical",
+        help="Long-message compaction mode for long-context agent runners",
+    )
+    parser.add_argument(
+        "--tool-router-mode",
+        choices=TOOL_ROUTER_MODE_CHOICES,
+        default="off",
+        help="Select a per-turn tool window before rendering long-context agent prompts",
+    )
+    parser.add_argument(
+        "--tool-router-max-tools",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_MAX_TOOLS,
+        help="Maximum environment tools exposed after tool routing",
+    )
+    parser.add_argument(
+        "--tool-router-trigger-tool-count",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT,
+        help="Only route when the environment exposes at least this many tools",
+    )
+    parser.add_argument(
+        "--tool-router-trigger-catalog-chars",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS,
+        help="Only route when the full tool catalog has at least this many serialized characters",
+    )
+    parser.add_argument(
+        "--tool-router-context-chars",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_CONTEXT_CHARS,
+        help="Recent conversation characters shown to the tool router",
+    )
+    parser.add_argument(
+        "--tool-router-max-tokens",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_MAX_TOKENS,
+        help="Generation token cap for model-based tool routing",
+    )
+    parser.add_argument(
+        "--tool-router-description-chars",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS,
+        help="Description character cap per tool in the router catalog",
+    )
+    parser.add_argument(
+        "--tool-router-parallel-chunk-tools",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS,
+        help="Tool count per model_parallel router shard",
+    )
+    parser.add_argument(
+        "--tool-router-parallel-batch-size",
+        type=int,
+        default=DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE,
+        help="Batch size for model_parallel router shard calls",
+    )
     parser.add_argument("--long-doc-max-chars", type=int, default=1000, help="Long-document chunk max characters")
     parser.add_argument("--long-doc-overlap-lines", type=int, default=3, help="Long-document chunk overlap lines")
     parser.add_argument(
@@ -115,6 +212,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=6000,
         help="Maximum selected evidence characters when compacting one long message",
+    )
+    parser.add_argument(
+        "--long-doc-model-max-tokens",
+        type=int,
+        default=DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
+        help="Generation token cap for model_parallel long-document chunk routing",
+    )
+    parser.add_argument(
+        "--long-doc-model-parallel-batch-size",
+        type=int,
+        default=DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
+        help="Batch size for model_parallel long-document chunk routing",
     )
     parser.add_argument("--cot-max-tokens", type=int, default=2048, help="Clamp CoT generation length")
     parser.add_argument("--answer-max-tokens", type=int, default=1024, help="Clamp final answer generation length")
@@ -169,7 +278,7 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
 
 
 def _resolve_run(args: argparse.Namespace) -> ResolvedFunctionCallingRun:
-    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False, record_stats=not bool(args.probe_only))
     dataset_slug = infer_dataset_slug_from_path(str(dataset_path))
     detected_kind = _infer_benchmark_kind(str(dataset_path))
     requested_kind = FunctionCallingBenchmarkKind(args.benchmark_kind)
@@ -203,6 +312,7 @@ def main(
     del task_spec
     load_env_file(Path(".env"))
     args = parse_args(argv)
+    _apply_runner_env_overrides(args)
     validate_inference_backend_args(args)
     run = _resolve_run(args)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP:
@@ -222,6 +332,20 @@ def main(
     if run.benchmark_kind is FunctionCallingBenchmarkKind.TOOLALPACA:
         return _run_toolalpaca(args, run, run_context=run_context)
     return _run_tau(args, run, run_context=run_context)
+
+
+def _apply_runner_env_overrides(args: argparse.Namespace) -> None:
+    if getattr(args, "task_desc", None):
+        os.environ["RWKV_TASK_DESC"] = str(args.task_desc)
+    if getattr(args, "run_mode", None):
+        os.environ["RWKV_EVAL_RUN_MODE"] = str(args.run_mode)
+    if getattr(args, "tau_bench_root", None):
+        os.environ["RWKV_TAU3_BENCH_ROOT"] = str(args.tau_bench_root)
+    timeout_s = getattr(args, "tau_llm_timeout_s", None)
+    if timeout_s is not None:
+        os.environ["RWKV_TAU_LLM_TIMEOUT_S"] = str(float(timeout_s))
+    if bool(getattr(args, "disable_checker", False)):
+        os.environ["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
 
 __all__ = [

@@ -44,7 +44,11 @@ def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = Non
     slug = canonical_slug(dataset_slug or infer_dataset_slug_from_path(str(dataset_path)))
     if not slug:
         return
-    init_db(DEFAULT_DB_CONFIG)
+    try:
+        init_db(DEFAULT_DB_CONFIG)
+    except Exception as exc:  # noqa: BLE001 - dataset stats must not block dry/probe runs.
+        print(f"⚠️  无法连接 DB 登记数据集样本数: {slug} ({exc})")
+        return
 
     service = EvalDbService()
     existing = service.get_benchmark_num_samples(dataset=slug)

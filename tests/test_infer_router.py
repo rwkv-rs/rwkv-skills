@@ -7,8 +7,24 @@ def test_parse_routes_normalizes_base_urls() -> None:
     routes = parse_routes(("model-a=127.0.0.1:18081", "model-b=http://127.0.0.1:18082/v1"))
 
     assert routes == {
-        "model-a": "http://127.0.0.1:18081/v1",
-        "model-b": "http://127.0.0.1:18082/v1",
+        "model-a": ("http://127.0.0.1:18081/v1",),
+        "model-b": ("http://127.0.0.1:18082/v1",),
+    }
+
+
+def test_parse_routes_preserves_duplicate_model_backends() -> None:
+    routes = parse_routes(
+        (
+            "model-a=http://127.0.0.1:18081",
+            "model-a=http://127.0.0.1:18082/v1",
+        )
+    )
+
+    assert routes == {
+        "model-a": (
+            "http://127.0.0.1:18081/v1",
+            "http://127.0.0.1:18082/v1",
+        )
     }
 
 

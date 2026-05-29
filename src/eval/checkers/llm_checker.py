@@ -184,7 +184,7 @@ class LLMCheckerConfig:
     max_workers: int = 16
     max_prompt_chars: int = 20000
     # Set to -1 to retry forever (handled by the scheduler loop with backoff).
-    max_retries: int = -1
+    max_retries: int = 2
 
     @classmethod
     def from_env(cls) -> LLMCheckerConfig | None:
@@ -440,7 +440,7 @@ def _call_llm_checker(client: OpenAI, *, config: LLMCheckerConfig, prompt: str) 
                     response_format=response_format,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                content = (response.choices[0].message.content or "").strip()
+                content = _checker_response_content(response)
                 data = json.loads(content)
                 if not isinstance(data, dict):
                     raise _LLMCheckerOutputError("LLM checker output is not a JSON object")
@@ -472,7 +472,7 @@ def _call_llm_checker(client: OpenAI, *, config: LLMCheckerConfig, prompt: str) 
                     }
                 ],
             )
-            content = (response.choices[0].message.content or "").strip()
+            content = _checker_response_content(response)
             data = json.loads(content)
             if not isinstance(data, dict):
                 raise _LLMCheckerOutputError("LLM checker output is not a JSON object")
@@ -499,6 +499,22 @@ def _call_llm_checker(client: OpenAI, *, config: LLMCheckerConfig, prompt: str) 
         time.sleep(delay)
 
     raise LLMCheckerFailure(f"LLM checker failed after retries: {last_exc}") from last_exc
+
+
+def _checker_response_content(response: Any) -> str:
+    if isinstance(response, str):
+        content = response.strip()
+        if not content:
+            raise _LLMCheckerOutputError("LLM checker returned an empty string response")
+        return content
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        raise _LLMCheckerOutputError("LLM checker response has no message content") from exc
+    content = (content or "").strip()
+    if not content:
+        raise _LLMCheckerOutputError("LLM checker returned empty message content")
+    return content
 
 
 _thread_local = threading.local()

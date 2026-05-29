@@ -31,6 +31,8 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "rwkv_official_json",
             "--prompt-max-chars",
             "8192",
+            "--long-doc-mode",
+            "off",
             "--long-doc-max-chars",
             "512",
             "--long-doc-overlap-lines",
@@ -41,6 +43,14 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "3",
             "--long-doc-max-evidence-chars",
             "1536",
+            "--tool-router-mode",
+            "lexical",
+            "--tool-router-max-tools",
+            "8",
+            "--tool-router-trigger-tool-count",
+            "10",
+            "--tool-router-trigger-catalog-chars",
+            "2048",
             "--model-path",
             "model.pth",
         ]
@@ -50,11 +60,16 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.avg_k == [1.0]
     assert args.prompt_style == RWKV_OFFICIAL_JSON_PROMPT_STYLE
     assert args.prompt_max_chars == 8192
+    assert args.long_doc_mode == "off"
     assert args.long_doc_max_chars == 512
     assert args.long_doc_overlap_lines == 2
     assert args.long_doc_min_chars == 2048
     assert args.long_doc_max_evidence_chunks == 3
     assert args.long_doc_max_evidence_chars == 1536
+    assert args.tool_router_mode == "lexical"
+    assert args.tool_router_max_tools == 8
+    assert args.tool_router_trigger_tool_count == 10
+    assert args.tool_router_trigger_catalog_chars == 2048
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
@@ -139,6 +154,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     )
     assert (
         function_calling_runner._infer_benchmark_kind("tau3_bench_banking_knowledge_base.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.TAU3_BENCH
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("tau3_bench_mock_long_context_base.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.TAU3_BENCH
     )
 

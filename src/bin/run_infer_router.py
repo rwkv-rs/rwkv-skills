@@ -32,25 +32,59 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def parse_routes(raw_routes: Sequence[str]) -> dict[str, str]:
-    routes: dict[str, str] = {}
+RouteMap = dict[str, tuple[str, ...]]
+
+
+def parse_routes(raw_routes: Sequence[str]) -> RouteMap:
+    routes: dict[str, list[str]] = {}
     for raw in raw_routes:
         model, sep, base_url = str(raw).partition("=")
         model = model.strip()
         base_url = base_url.strip()
         if not sep or not model or not base_url:
             raise ValueError(f"route must be MODEL=BASE_URL, got {raw!r}")
-        routes[model] = normalize_api_base(base_url)
-    return routes
+        routes.setdefault(model, []).append(normalize_api_base(base_url))
+    return {model: tuple(urls) for model, urls in routes.items()}
 
 
-def create_app(routes: Mapping[str, str], *, timeout_s: float = 600.0) -> FastAPI:
-    route_map = dict(routes)
+def normalize_routes(routes: Mapping[str, str | Sequence[str]]) -> RouteMap:
+    normalized: dict[str, list[str]] = {}
+    for model, raw_urls in routes.items():
+        model = str(model).strip()
+        if not model:
+            raise ValueError("route model name cannot be empty")
+        if isinstance(raw_urls, str):
+            urls = (raw_urls,)
+        else:
+            urls = tuple(str(url) for url in raw_urls)
+        if not urls:
+            raise ValueError(f"route for model {model!r} cannot be empty")
+        normalized[model] = [normalize_api_base(url) for url in urls]
+    return {model: tuple(urls) for model, urls in normalized.items()}
+
+
+def _next_backend_url(model: str, routes: RouteMap, offsets: dict[str, int]) -> str:
+    urls = routes.get(model)
+    if urls is None:
+        available = ", ".join(sorted(routes))
+        raise HTTPException(status_code=400, detail=f"unknown model {model!r}; available models: {available}")
+    index = offsets.get(model, 0) % len(urls)
+    offsets[model] = index + 1
+    return urls[index]
+
+
+def create_app(routes: Mapping[str, str | Sequence[str]], *, timeout_s: float = 600.0) -> FastAPI:
+    route_map = normalize_routes(routes)
+    route_offsets = {model: 0 for model in route_map}
     app = FastAPI(title="RWKV Skills Infer Router", version="0.1.0")
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
-        return {"status": "ok", "models": sorted(route_map)}
+        return {
+            "status": "ok",
+            "models": sorted(route_map),
+            "route_counts": {model: len(urls) for model, urls in sorted(route_map.items())},
+        }
 
     @app.get("/v1/models")
     @app.get("/openai/v1/models")
@@ -66,6 +100,7 @@ def create_app(routes: Mapping[str, str], *, timeout_s: float = 600.0) -> FastAP
         return await _forward_json_request(
             request,
             routes=route_map,
+            route_offsets=route_offsets,
             backend_path="chat/completions",
             timeout_s=timeout_s,
         )
@@ -76,6 +111,7 @@ def create_app(routes: Mapping[str, str], *, timeout_s: float = 600.0) -> FastAP
         return await _forward_json_request(
             request,
             routes=route_map,
+            route_offsets=route_offsets,
             backend_path="completions",
             timeout_s=timeout_s,
         )
@@ -86,7 +122,8 @@ def create_app(routes: Mapping[str, str], *, timeout_s: float = 600.0) -> FastAP
 async def _forward_json_request(
     request: Request,
     *,
-    routes: Mapping[str, str],
+    routes: RouteMap,
+    route_offsets: dict[str, int],
     backend_path: str,
     timeout_s: float,
 ) -> Response:
@@ -98,10 +135,7 @@ async def _forward_json_request(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be a JSON object")
     model = str(payload.get("model") or "").strip()
-    base_url = routes.get(model)
-    if base_url is None:
-        available = ", ".join(sorted(routes))
-        raise HTTPException(status_code=400, detail=f"unknown model {model!r}; available models: {available}")
+    base_url = _next_backend_url(model, routes, route_offsets)
     target_url = f"{base_url}/{backend_path}"
     authorization = request.headers.get("authorization")
     content_type = request.headers.get("content-type") or "application/json"

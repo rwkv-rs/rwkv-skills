@@ -150,6 +150,14 @@ def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:
             "rwkv_official_json",
             "--function-history-max-chars",
             "32000",
+            "--function-prompt-max-chars",
+            "8192",
+            "--function-long-doc-mode",
+            "off",
+            "--function-tool-router-mode",
+            "model",
+            "--function-tool-router-max-tools",
+            "8",
         ]
     )
 
@@ -157,6 +165,10 @@ def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:
     assert args.function_decision_max_tokens == 32
     assert args.function_prompt_style == "rwkv_official_json"
     assert args.function_history_max_chars == 32000
+    assert args.function_prompt_max_chars == 8192
+    assert args.function_long_doc_mode == "off"
+    assert args.function_tool_router_mode == "model"
+    assert args.function_tool_router_max_tools == 8
 
 
 def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path) -> None:
@@ -169,6 +181,10 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
         function_cot_max_tokens=4096,
         function_decision_max_tokens=32,
         function_max_steps=24,
+        function_prompt_max_chars=8192,
+        function_long_doc_mode="off",
+        function_tool_router_mode="lexical",
+        function_tool_router_max_tools=8,
     )
 
     assert actions._function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"]) == (
@@ -178,6 +194,14 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
         "4096",
         "--decision-max-tokens",
         "32",
+        "--prompt-max-chars",
+        "8192",
+        "--long-doc-mode",
+        "off",
+        "--tool-router-mode",
+        "lexical",
+        "--tool-router-max-tools",
+        "8",
         "--max-steps",
         "24",
     )

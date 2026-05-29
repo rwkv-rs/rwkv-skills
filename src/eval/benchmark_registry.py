@@ -315,6 +315,16 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
         default_split="base",
         scheduler_jobs=_TAU3_BENCH_JOBS,
     ),
+    canonical_slug("tau3_bench_mock"): _function_calling(
+        "tau3_bench_mock",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
+    canonical_slug("tau3_bench_mock_long_context"): _function_calling(
+        "tau3_bench_mock_long_context",
+        default_split="base",
+        scheduler_jobs=_TAU3_BENCH_JOBS,
+    ),
 }
 
 BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
@@ -339,6 +349,8 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
         canonical_slug("tau3_bench_airline"),
         canonical_slug("tau3_bench_telecom"),
         canonical_slug("tau3_bench_banking_knowledge"),
+        canonical_slug("tau3_bench_mock"),
+        canonical_slug("tau3_bench_mock_long_context"),
     ),
 }
 

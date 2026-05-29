@@ -255,6 +255,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("tau3_bench_airline_base") in tau3_slugs
     assert canonical_slug("tau3_bench_telecom_base") in tau3_slugs
     assert canonical_slug("tau3_bench_banking_knowledge_base") in tau3_slugs
+    assert canonical_slug("tau3_bench_mock_base") in tau3_slugs
+    assert canonical_slug("tau3_bench_mock_long_context_base") in tau3_slugs
 
     assert detect_job_from_dataset(canonical_slug("browsecomp_test"), is_cot=True) == "function_browsecomp"
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
@@ -269,6 +271,10 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"
     assert (
         detect_job_from_dataset(canonical_slug("tau3_bench_banking_knowledge_base"), is_cot=True)
+        == "function_tau3_bench"
+    )
+    assert (
+        detect_job_from_dataset(canonical_slug("tau3_bench_mock_long_context_base"), is_cot=True)
         == "function_tau3_bench"
     )
 

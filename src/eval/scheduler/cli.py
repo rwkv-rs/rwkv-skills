@@ -17,6 +17,7 @@ from src.eval.function_calling.rwkv_prompt import (
     FUNCTION_PROMPT_STYLE_CHOICES,
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
 )
+from src.eval.function_calling.tool_router import TOOL_ROUTER_MODE_CHOICES
 
 from .actions import (
     DispatchOptions,
@@ -197,6 +198,32 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--function-final-max-tokens", type=int, help="function-calling runner 的 --final-max-tokens")
     parser.add_argument("--function-answer-max-tokens", type=int, help="function-calling runner 的 --answer-max-tokens")
     parser.add_argument("--function-history-max-chars", type=int, help="function-calling runner 的 --history-max-chars")
+    parser.add_argument("--function-prompt-max-chars", type=int, help="function-calling runner 的 --prompt-max-chars")
+    parser.add_argument(
+        "--function-long-doc-mode",
+        choices=("off", "lexical"),
+        help="function-calling runner 的 --long-doc-mode",
+    )
+    parser.add_argument(
+        "--function-tool-router-mode",
+        choices=TOOL_ROUTER_MODE_CHOICES,
+        help="function-calling runner 的 --tool-router-mode",
+    )
+    parser.add_argument(
+        "--function-tool-router-max-tools",
+        type=int,
+        help="function-calling runner 的 --tool-router-max-tools",
+    )
+    parser.add_argument(
+        "--function-tool-router-trigger-tool-count",
+        type=int,
+        help="function-calling runner 的 --tool-router-trigger-tool-count",
+    )
+    parser.add_argument(
+        "--function-tool-router-trigger-catalog-chars",
+        type=int,
+        help="function-calling runner 的 --tool-router-trigger-catalog-chars",
+    )
     parser.add_argument("--function-max-rounds", type=int, help="function-calling runner 的 --max-rounds")
     parser.add_argument("--function-max-steps", type=int, help="function-calling runner 的 --max-steps")
     parser.add_argument("--function-max-tool-errors", type=int, help="function-calling runner 的 --max-tool-errors")
@@ -302,6 +329,12 @@ def _dispatch_options_from_args(
         function_final_max_tokens=getattr(args, "function_final_max_tokens", None),
         function_answer_max_tokens=getattr(args, "function_answer_max_tokens", None),
         function_history_max_chars=getattr(args, "function_history_max_chars", None),
+        function_prompt_max_chars=getattr(args, "function_prompt_max_chars", None),
+        function_long_doc_mode=getattr(args, "function_long_doc_mode", None),
+        function_tool_router_mode=getattr(args, "function_tool_router_mode", None),
+        function_tool_router_max_tools=getattr(args, "function_tool_router_max_tools", None),
+        function_tool_router_trigger_tool_count=getattr(args, "function_tool_router_trigger_tool_count", None),
+        function_tool_router_trigger_catalog_chars=getattr(args, "function_tool_router_trigger_catalog_chars", None),
         function_max_rounds=getattr(args, "function_max_rounds", None),
         function_max_steps=getattr(args, "function_max_steps", None),
         function_max_tool_errors=getattr(args, "function_max_tool_errors", None),

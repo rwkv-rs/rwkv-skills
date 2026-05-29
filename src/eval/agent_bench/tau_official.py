@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-import time
+import os
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -10,15 +11,18 @@ from src.eval.agent_bench.deps import import_module_with_auto_install
 from src.eval.agent_bench.tasks import ensure_tau_v2_vendor_path
 from src.eval.env_config import normalize_openai_base_url
 from src.eval.evaluators.common import StageRecord
-from src.eval.function_calling.context_budget import normalize_rwkv_text, trim_message_history
+from src.eval.function_calling.context_budget import normalize_rwkv_text, trim_message_history, truncate_text
 from src.eval.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     build_rwkv_json_call_prompt,
     extract_json_call_value_text,
 )
+from src.eval.function_calling.tool_router import ToolRoutingConfig, route_tools_for_prompt
 from src.eval.long_doc_evidence import (
     LongDocEvidenceConfig,
+    compact_long_text,
     compact_messages_for_long_context,
+    infer_query_from_messages,
     long_doc_config_from_env,
 )
 from src.infer.backend import InferenceBackend
@@ -42,10 +46,35 @@ TAU_USER_REQUEST_ALIASES = {
     "request_user_id": "Could you please provide your user ID?",
 }
 TAU_TOOL_NAME_ALIASES = {
+    "airline_booking_search": "search_direct_flight",
+    "airline_flight_search": "search_direct_flight",
+    "find_flights": "search_direct_flight",
+    "flight_search": "search_direct_flight",
+    "get_booking": "get_reservation_details",
+    "get_flight": "search_direct_flight",
+    "get_flights": "search_direct_flight",
+    "get_reservation": "get_reservation_details",
     "get_reservations_by_user_id": "get_user_details",
+    "get_user_bookings": "get_user_details",
+    "get_user_info": "get_user_details",
     "get_user_reservations": "get_user_details",
     "list_user_reservations": "get_user_details",
+    "lookup_booking": "get_reservation_details",
+    "lookup_reservation": "get_reservation_details",
+    "lookup_user": "get_user_details",
+    "search_available_flights": "search_direct_flight",
+    "search_bookings": "get_user_details",
+    "search_flight": "search_direct_flight",
+    "search_flights": "search_direct_flight",
+    "search_one_stop_flight": "search_onestop_flight",
+    "search_onestop_flights": "search_onestop_flight",
+    "update_baggage": "update_reservation_baggages",
+    "update_baggages": "update_reservation_baggages",
+    "update_passengers": "update_reservation_passengers",
+    "update_reservation": "update_reservation_flights",
 }
+TAU_FORBIDDEN_PSEUDO_TOOLS = {"analysis", "reason", "thought", "think"}
+_TAU_RESERVATION_ID_RE = re.compile(r"\b[A-Z0-9]{6}\b")
 
 
 @dataclass(slots=True)
@@ -78,7 +107,9 @@ class TauOfficialRuntime:
                 raise
             return self._environment_constructor()
 
-    def build_user(self, *, task: Any, environment: Any, user_model: Any, temperature: float = 0.0) -> Any:
+    def build_user(self, *, task: Any, environment: Any, user_model: Any | None, temperature: float = 0.0) -> Any:
+        if user_model is None:
+            return StaticStopTauUser()
         user_module = import_module_with_auto_install("tau2.user.user_simulator", context="tau2 user simulator import")
         UserSimulator = getattr(user_module, "UserSimulator")
         try:
@@ -88,11 +119,12 @@ class TauOfficialRuntime:
         return UserSimulator(
             tools=user_tools,
             instructions=str(getattr(task, "user_scenario", "")),
-            llm=user_model.model_name,
+            llm=_tau_litellm_model_name(user_model),
             llm_args={
                 "temperature": float(temperature),
                 "api_key": user_model.api_key,
                 "api_base": user_model.base_url,
+                **_tau_llm_timeout_args(),
             },
         )
 
@@ -137,27 +169,13 @@ class TauOfficialRuntime:
             if _task_uses_nl_assertions(task)
             else EvaluationType.ALL
         )
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                reward_info = evaluate_simulation(
-                    simulation=simulation,
-                    task=task,
-                    evaluation_type=evaluation_type,
-                    solo_mode=False,
-                    domain=self.domain,
-                )
-                break
-            except Exception as exc:  # Official NL assertion judges can return empty/non-JSON content.
-                last_error = exc
-                if attempt < 2:
-                    time.sleep(1.0 + attempt)
-        else:
-            details = {
-                "evaluation_error": str(last_error or "unknown tau evaluation error"),
-                "termination_reason": str(getattr(simulation, "termination_reason", "")),
-            }
-            return TauOfficialEvaluation(reward=0.0, is_passed=False, details=details)
+        reward_info = evaluate_simulation(
+            simulation=simulation,
+            task=task,
+            evaluation_type=evaluation_type,
+            solo_mode=False,
+            domain=self.domain,
+        )
         simulation.reward_info = reward_info
         details = _model_dump_safe(reward_info)
         details["termination_reason"] = str(getattr(simulation, "termination_reason", ""))
@@ -169,7 +187,7 @@ class TauOfficialRuntime:
 
 
 def configure_tau_nl_assertions_judge(judge_model: Any) -> None:
-    model_name = str(getattr(judge_model, "model_name", "") or "").strip()
+    model_name = _tau_litellm_model_name(judge_model)
     api_key = str(getattr(judge_model, "api_key", "") or "").strip()
     base_url = normalize_openai_base_url(getattr(judge_model, "base_url", None))
     if not model_name or not api_key:
@@ -181,10 +199,49 @@ def configure_tau_nl_assertions_judge(judge_model: Any) -> None:
     }
     if base_url:
         llm_args["api_base"] = base_url
+    llm_args.update(_tau_llm_timeout_args())
     for module_name in ("tau2.config", "tau2.evaluator.evaluator_nl_assertions"):
         module = import_module_with_auto_install(module_name, context=f"tau2 NL assertion judge config: {module_name}")
         setattr(module, "DEFAULT_LLM_NL_ASSERTIONS", model_name)
         setattr(module, "DEFAULT_LLM_NL_ASSERTIONS_ARGS", dict(llm_args))
+
+
+def _tau_litellm_model_name(model_config: Any) -> str:
+    model_name = str(getattr(model_config, "model_name", "") or "").strip()
+    if not model_name or "/" in model_name:
+        return model_name
+    base_url = normalize_openai_base_url(getattr(model_config, "base_url", None)) or ""
+    if "api.deepseek.com" in base_url and model_name.startswith("deepseek-"):
+        return f"deepseek/{model_name}"
+    return model_name
+
+
+def _tau_llm_timeout_args() -> dict[str, float]:
+    timeout_s = _first_positive_float_env(
+        "RWKV_TAU_LLM_TIMEOUT_S",
+        "RWKV_TAU_USER_TIMEOUT_S",
+        "RWKV_LLM_TIMEOUT_S",
+    )
+    if timeout_s is None:
+        return {}
+    return {"timeout": timeout_s}
+
+
+def _first_positive_float_env(*names: str) -> float | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        text = value.strip()
+        if not text:
+            continue
+        try:
+            parsed = float(text)
+        except ValueError:
+            continue
+        if parsed > 0:
+            return parsed
+    return None
 
 
 class RWKVTauOfficialAgent:
@@ -200,6 +257,7 @@ class RWKVTauOfficialAgent:
         history_max_chars: int,
         prompt_max_chars: int = DEFAULT_TAU_PROMPT_MAX_CHARS,
         long_doc_config: LongDocEvidenceConfig | None = None,
+        tool_routing_config: ToolRoutingConfig | None = None,
     ) -> None:
         ensure_tau_v2_vendor_path()
         message_module = import_module_with_auto_install("tau2.data_model.message", context="tau2 message import")
@@ -211,15 +269,19 @@ class RWKVTauOfficialAgent:
         self._engine = engine
         self._sampling = sampling
         self._tools = list(tools)
-        self._tool_names = {_tool_name(tool) for tool in self._tools if _tool_name(tool)}
-        self._system_prompt = build_tau_official_agent_system_prompt(domain_policy, self._tools)
+        self._tools_by_name = {_tool_name(tool): tool for tool in self._tools if _tool_name(tool)}
+        self._tool_names = set(self._tools_by_name)
+        self._current_tool_names = set(self._tool_names)
+        self._domain_policy = str(domain_policy)
         self._history_max_chars = max(0, int(history_max_chars))
-        self._prompt_max_chars = max(4096, int(prompt_max_chars))
+        self._prompt_max_chars = max(1024, int(prompt_max_chars))
         self._long_doc_config = long_doc_config or long_doc_config_from_env("RWKV_TAU_LONG_DOC")
+        self._tool_routing_config = tool_routing_config or ToolRoutingConfig()
         self._seed: int | None = None
         self._turn_index = 0
         self.stages: list[StageRecord] = []
         self.parse_errors: list[str] = []
+        self.tool_routes: list[dict[str, Any]] = []
 
     def set_seed(self, seed: int) -> None:
         self._seed = int(seed)
@@ -262,6 +324,18 @@ class RWKVTauOfficialAgent:
         try:
             name, arguments = _parse_tau_agent_decision(raw_text)
             assistant_message = self._decision_to_assistant_message(name, arguments)
+            loop_error = _repeated_assistant_decision_error(
+                history,
+                assistant_message,
+                AssistantMessage=self._AssistantMessage,
+            )
+            if loop_error:
+                parse_error = loop_error
+                self.parse_errors.append(parse_error)
+                assistant_message = self._AssistantMessage(
+                    role="assistant",
+                    content="I am unable to make progress on this task. ###STOP###",
+                )
         except Exception as exc:
             parse_error = str(exc)
             self.parse_errors.append(parse_error)
@@ -282,24 +356,129 @@ class RWKVTauOfficialAgent:
 
     def _build_prompt(self, prompt_messages: Sequence[Mapping[str, object]]) -> str:
         history_budget = self._history_max_chars
+        long_doc_query = infer_query_from_messages(
+            prompt_messages,
+            skip_longer_than=max(1, int(self._long_doc_config.min_long_text_chars)),
+        )
+        long_doc_seed = None if self._seed is None else int(self._seed) + 20_000 + self._turn_index
         compacted_messages = compact_messages_for_long_context(
             prompt_messages,
+            query=long_doc_query,
             config=self._long_doc_config,
+            engine=self._engine,
+            sampling=self._sampling,
+            progress_desc="TauOfficial-LongDoc",
+            prompt_seed=long_doc_seed,
         ).messages
-        prompt = build_rwkv_json_call_prompt(
-            self._system_prompt,
+        policy_result = compact_long_text(
+            self._domain_policy,
+            query=long_doc_query,
+            config=self._long_doc_config,
+            label="domain_policy",
+            engine=self._engine,
+            sampling=self._sampling,
+            progress_desc="TauOfficial-Policy",
+            prompt_seed=None if long_doc_seed is None else long_doc_seed + 5_000,
+        )
+        domain_policy = policy_result.text
+        tool_route = route_tools_for_prompt(
+            self._tools,
             compacted_messages,
-            history_max_chars=history_budget,
+            config=self._tool_routing_config,
+            engine=self._engine,
+            sampling=self._sampling,
+            control_tool_names=(RESPOND_TOOL_NAME,),
+            progress_desc="TauOfficial-ToolRouter",
+            prompt_seed=None if self._seed is None else int(self._seed) + 10_000 + self._turn_index,
         )
-        if len(prompt) <= self._prompt_max_chars or history_budget <= 0:
-            return prompt
-        overflow = len(prompt) - self._prompt_max_chars
-        history_budget = max(0, history_budget - overflow - 512)
-        return build_rwkv_json_call_prompt(
-            self._system_prompt,
-            trim_message_history(compacted_messages, max_chars=history_budget),
-            history_max_chars=history_budget,
+        (
+            prompt,
+            emitted_tools,
+            emitted_policy_chars,
+            emitted_tool_schema_mode,
+        ) = self._build_budgeted_agent_prompt(
+            domain_policy=domain_policy,
+            selected_tools=tool_route.selected_tools,
+            messages=compacted_messages,
+            history_budget=history_budget,
         )
+        self._current_tool_names = {_tool_name(tool) for tool in emitted_tools if _tool_name(tool)}
+        route_trace = {"turn_index": self._turn_index, **tool_route.trace_payload()}
+        if len(emitted_tools) != len(tool_route.selected_tools):
+            route_trace["emitted_names"] = [_tool_name(tool) for tool in emitted_tools if _tool_name(tool)]
+            route_trace["system_budget_reduced"] = True
+        if emitted_tool_schema_mode != "full":
+            route_trace["emitted_tool_schema_mode"] = emitted_tool_schema_mode
+            route_trace["system_budget_reduced"] = True
+        if emitted_policy_chars < len(domain_policy):
+            route_trace["emitted_policy_chars"] = int(emitted_policy_chars)
+            route_trace["system_budget_reduced"] = True
+        self.tool_routes.append(route_trace)
+        return prompt
+
+    def _build_budgeted_agent_prompt(
+        self,
+        *,
+        domain_policy: str,
+        selected_tools: Sequence[Any],
+        messages: Sequence[Mapping[str, object]],
+        history_budget: int,
+    ) -> tuple[str, list[Any], int, str]:
+        tools = list(selected_tools)
+        policy = normalize_rwkv_text(domain_policy)
+        policy_budgets = _policy_budget_candidates(policy, self._prompt_max_chars)
+        tool_schema_modes = ("full", "compact", "minimal")
+
+        best_prompt = ""
+        best_policy_chars = len(policy)
+        best_tool_schema_mode = "full"
+        for policy_budget in policy_budgets:
+            policy_view = truncate_text(policy, policy_budget)
+            for tool_schema_mode in tool_schema_modes:
+                system_prompt = build_tau_official_agent_system_prompt(
+                    policy_view,
+                    tools,
+                    tool_schema_mode=tool_schema_mode,
+                )
+                prompt = build_rwkv_json_call_prompt(
+                    system_prompt,
+                    messages,
+                    history_max_chars=history_budget,
+                )
+                best_prompt = prompt
+                best_policy_chars = len(policy_view)
+                best_tool_schema_mode = tool_schema_mode
+                if len(prompt) <= self._prompt_max_chars:
+                    return prompt, tools, len(policy_view), tool_schema_mode
+                overflow = len(prompt) - self._prompt_max_chars
+                trimmed_history_budget = max(0, history_budget - overflow - 512)
+                prompt = build_rwkv_json_call_prompt(
+                    system_prompt,
+                    trim_message_history(messages, max_chars=trimmed_history_budget),
+                    history_max_chars=trimmed_history_budget,
+                )
+                best_prompt = prompt
+                if len(prompt) <= self._prompt_max_chars:
+                    return prompt, tools, len(policy_view), tool_schema_mode
+
+        # Last resort: keep the prompt valid and under the hard cap by trimming history
+        # and then the already-compacted policy. Do not drop routed tools here:
+        # the official runtime must execute against the same tool window the
+        # agent saw, otherwise a correct tool choice can be rejected locally.
+        if len(best_prompt) <= self._prompt_max_chars:
+            return best_prompt, tools, best_policy_chars, best_tool_schema_mode
+        final_system = build_tau_official_agent_system_prompt(
+            truncate_text(policy, min(policy_budgets[-1], 240)),
+            tools,
+            tool_schema_mode="minimal",
+        )
+        final_prompt = build_rwkv_json_call_prompt(final_system, [], history_max_chars=0)
+        if len(final_prompt) > self._prompt_max_chars:
+            raise ValueError(
+                "tau prompt budget cannot fit routed tools without corrupting the prompt: "
+                f"prompt_chars={len(final_prompt)} budget={self._prompt_max_chars} tools={len(tools)}"
+            )
+        return final_prompt, tools, min(policy_budgets[-1], 240), "minimal"
 
     def _decision_to_assistant_message(self, name: str, arguments: Mapping[str, Any]) -> Any:
         normalized_name, arguments = _normalize_tau_decision(name, arguments)
@@ -317,6 +496,9 @@ class RWKVTauOfficialAgent:
             return self._AssistantMessage(role="assistant", content=content_text)
         if normalized_name not in self._tool_names:
             raise ValueError(f"unknown tau tool name: {normalized_name}")
+        if normalized_name not in self._current_tool_names:
+            raise ValueError(f"tau tool name not in routed tool window: {normalized_name}")
+        arguments = _filter_tau_arguments_for_tool(self._tools_by_name.get(normalized_name), arguments)
         return self._AssistantMessage(
             role="assistant",
             content=None,
@@ -331,8 +513,54 @@ class RWKVTauOfficialAgent:
         )
 
 
-def build_tau_official_agent_system_prompt(domain_policy: str, tools: Sequence[Any]) -> str:
-    tool_schemas = [_normalize_tool_schema(tool) for tool in tools]
+class StaticStopTauUser:
+    """Minimal no-LLM tau user for ticket-seeded lightweight tasks."""
+
+    def __init__(self, *, stop_content: str = "###STOP###") -> None:
+        self.stop_content = str(stop_content)
+        message_module = import_module_with_auto_install("tau2.data_model.message", context="tau2 message import")
+        base_module = import_module_with_auto_install(
+            "tau2.user.user_simulator_base",
+            context="tau2 user base import",
+        )
+        self._UserMessage = getattr(message_module, "UserMessage")
+        self._UserState = getattr(base_module, "UserState")
+
+    def get_init_state(self, message_history: list[Any] | None = None) -> Any:
+        return self._UserState(system_messages=[], messages=list(message_history or []))
+
+    @classmethod
+    def is_stop(cls, message: Any) -> bool:
+        content = getattr(message, "content", "")
+        return isinstance(content, str) and "###STOP###" in content
+
+    def generate_next_message(self, message: Any, state: Any) -> tuple[Any, Any]:
+        del message
+        user_message = self._UserMessage(role="user", content=self.stop_content, cost=0.0)
+        state.messages.append(user_message)
+        return user_message, state
+
+    def set_seed(self, seed: int) -> None:
+        del seed
+
+    def stop(self, message: Any | None = None, state: Any | None = None) -> None:
+        del message, state
+
+
+def build_tau_official_agent_system_prompt(
+    domain_policy: str,
+    tools: Sequence[Any],
+    *,
+    tool_schema_mode: str = "full",
+) -> str:
+    if tool_schema_mode == "compact":
+        tool_schemas = [_compact_tool_schema(_normalize_tool_schema(tool)) for tool in tools]
+    elif tool_schema_mode == "minimal":
+        tool_schemas = [_minimal_tool_schema(_normalize_tool_schema(tool)) for tool in tools]
+    elif tool_schema_mode == "full":
+        tool_schemas = [_normalize_tool_schema(tool) for tool in tools]
+    else:
+        raise ValueError(f"unsupported tau tool schema mode: {tool_schema_mode}")
     tool_schemas.append(
         {
             "name": RESPOND_TOOL_NAME,
@@ -344,6 +572,11 @@ def build_tau_official_agent_system_prompt(domain_policy: str, tools: Sequence[A
             },
         }
     )
+    tool_json_kwargs: dict[str, Any] = {"ensure_ascii": False, "sort_keys": False}
+    if tool_schema_mode == "full":
+        tool_json_kwargs["indent"] = 2
+    else:
+        tool_json_kwargs["separators"] = (",", ":")
     return normalize_rwkv_text(
         "\n".join(
             [
@@ -354,8 +587,12 @@ def build_tau_official_agent_system_prompt(domain_policy: str, tools: Sequence[A
                 "When the task is complete and no more tool calls are needed, use respond and include ###STOP### in the content.",
                 "Return exactly one JSON function call object and no extra prose.",
                 'JSON shape: {"name":"tool_name","arguments":{...}}',
+                "Valid names are exactly the listed tool names plus respond.",
+                "Never invent wrapper or pseudo tools such as think, thought, search_flights, get_flights, search_bookings, get_user_bookings, or airline_agent_tool.",
+                "Never copy a Function output object; do not return requestor/ok/output as your decision.",
+                "Use only argument keys declared by the selected tool schema.",
                 "Tools:",
-                json.dumps(tool_schemas, ensure_ascii=False, indent=2, sort_keys=False),
+                json.dumps(tool_schemas, **tool_json_kwargs),
                 "Policy:",
                 normalize_rwkv_text(domain_policy),
             ]
@@ -363,10 +600,71 @@ def build_tau_official_agent_system_prompt(domain_policy: str, tools: Sequence[A
     )
 
 
+def _policy_budget_candidates(policy: str, prompt_max_chars: int) -> list[int]:
+    full = len(policy)
+    candidates = [
+        full,
+        max(400, min(full, int(prompt_max_chars * 0.22))),
+        max(350, min(full, 1600)),
+        max(300, min(full, 1000)),
+        max(240, min(full, 650)),
+        max(180, min(full, 400)),
+    ]
+    deduped: list[int] = []
+    for value in candidates:
+        normalized = max(0, int(value))
+        if normalized not in deduped:
+            deduped.append(normalized)
+    return deduped or [0]
+
+
 def _parse_tau_agent_decision(text: str) -> tuple[str, dict[str, Any]]:
-    candidate = extract_json_call_value_text(text)
-    payload = _coerce_tau_decision_payload(json.loads(candidate))
+    try:
+        candidate = extract_json_call_value_text(text)
+        raw_payload = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raw_payload = _partial_tau_decision_payload(text, cause=exc)
+    payload = _coerce_tau_decision_payload(raw_payload)
     return _normalize_tau_decision(str(payload["name"]).strip(), dict(payload["arguments"]))
+
+
+def _partial_tau_decision_payload(text: str, *, cause: Exception) -> dict[str, Any]:
+    """Recover a complete name/arguments pair from a runaway JSON object.
+
+    RWKV sometimes emits a valid function call and then continues with an
+    unfinished OpenAI-style id field. The tool execution contract only needs
+    name and arguments; accepting those complete fields avoids turning a valid
+    tool choice into a parse failure.
+    """
+    normalized = normalize_rwkv_text(text)
+    start = normalized.find("{")
+    if start < 0:
+        raise ValueError(f"tau agent decision missing JSON object: {normalized}") from cause
+    body = normalized[start:]
+    name = _raw_decode_json_field(body, "name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"tau agent decision missing recoverable name: {normalized}") from cause
+    try:
+        arguments = _raw_decode_json_field(body, "arguments")
+    except ValueError as exc:
+        raise ValueError(f"tau agent decision missing recoverable arguments: {normalized}") from exc
+    if arguments is None:
+        arguments = {}
+    return {"name": name, "arguments": arguments}
+
+
+def _raw_decode_json_field(body: str, key: str) -> Any:
+    match = re.search(rf'"{re.escape(key)}"\s*:', body)
+    if match is None:
+        if key == "arguments":
+            return None
+        raise ValueError(f"missing JSON field {key!r}")
+    value_text = body[match.end() :].lstrip()
+    if not value_text:
+        raise ValueError(f"missing JSON value for field {key!r}")
+    decoder = json.JSONDecoder()
+    value, _end = decoder.raw_decode(value_text)
+    return value
 
 
 def _coerce_tau_decision_payload(payload: Any) -> dict[str, Any]:
@@ -443,6 +741,7 @@ def _tau_top_level_arguments(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _normalize_tau_decision(name: str, arguments: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     normalized_name = _strip_tau_requestor_prefix(name)
     normalized_arguments = dict(arguments)
+    normalized_name, normalized_arguments = _normalize_tau_wrapper_tool(normalized_name, normalized_arguments)
     if normalized_name in TAU_USER_REQUEST_ALIASES:
         content = _first_text_field(
             normalized_arguments,
@@ -459,11 +758,37 @@ def _normalize_tau_decision(name: str, arguments: Mapping[str, Any]) -> tuple[st
             normalized_arguments["content"] = f"{normalized_arguments['content']} ###STOP###"
     else:
         normalized_name = TAU_TOOL_NAME_ALIASES.get(normalized_name, normalized_name)
+        if normalized_name in TAU_FORBIDDEN_PSEUDO_TOOLS:
+            raise ValueError(f"tau pseudo tool is not executable: {normalized_name}")
     return normalized_name, normalized_arguments
 
 
 def _normalize_tau_arguments(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(arguments)
+    if name in {
+        "cancel_reservation",
+        "get_reservation_details",
+        "update_reservation_baggages",
+        "update_reservation_flights",
+        "update_reservation_passengers",
+    }:
+        _rename_first_present(
+            normalized,
+            "reservation_id",
+            ("booking_id", "reservation_code", "confirmation_number", "confirmation_code", "record_locator"),
+        )
+    if name == "get_user_details":
+        _rename_first_present(normalized, "user_id", ("customer_id", "account_id", "member_id"))
+    if name in {"search_direct_flight", "search_onestop_flight"}:
+        _rename_first_present(normalized, "date", ("departure_date", "flight_date", "travel_date"))
+        for key in ("return_date", "cabin", "cabin_class", "flight_type", "passenger_count", "passengers"):
+            normalized.pop(key, None)
+    if name in {"update_reservation_baggages", "update_reservation_flights"}:
+        _rename_first_present(normalized, "payment_id", ("payment_method", "payment", "card_id", "refund_method"))
+    if name == "update_reservation_flights":
+        _rename_first_present(normalized, "flights", ("new_flights", "flight_segments", "segments"))
+    if name == "update_reservation_passengers":
+        _rename_first_present(normalized, "passengers", ("new_passengers", "travellers", "travelers"))
     if name == "transfer_to_human_agents":
         summary = normalized.get("summary")
         for key in ("content", "message", "answer"):
@@ -474,6 +799,65 @@ def _normalize_tau_arguments(name: str, arguments: Mapping[str, Any]) -> dict[st
                 summary = value.strip()
         normalized = {"summary": str(summary or "").strip()}
     return normalized
+
+
+def _filter_tau_arguments_for_tool(tool: Any | None, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    if tool is None:
+        return dict(arguments)
+    schema = _normalize_tool_schema(tool)
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, Mapping):
+        parameters = schema.get("arguments")
+    if not isinstance(parameters, Mapping):
+        return dict(arguments)
+    properties = parameters.get("properties")
+    if not isinstance(properties, Mapping) or not properties:
+        return dict(arguments)
+    allowed = {str(key) for key in properties}
+    return {str(key): value for key, value in arguments.items() if str(key) in allowed}
+
+
+def _normalize_tau_wrapper_tool(name: str, arguments: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    if name != "airline_agent_tool":
+        return name, dict(arguments)
+    normalized = dict(arguments)
+    action_details = normalized.get("action_details")
+    if isinstance(action_details, str) and action_details.strip():
+        try:
+            action_details = json.loads(action_details)
+        except json.JSONDecodeError:
+            action_details = {}
+    if not isinstance(action_details, Mapping):
+        action_details = {}
+    merged = {**normalized, **dict(action_details)}
+    action = str(merged.get("action") or merged.get("intent") or "").strip().lower()
+    query = " ".join(
+        str(merged.get(key) or "")
+        for key in ("query", "content", "message", "summary")
+        if merged.get(key)
+    )
+    reservation_id = merged.get("reservation_id") or merged.get("booking_id")
+    if not reservation_id:
+        match = _TAU_RESERVATION_ID_RE.search(query)
+        if match:
+            reservation_id = match.group(0)
+    if action in {"cancel", "cancellation"} or "cancel" in query.lower():
+        args = {"reservation_id": reservation_id} if reservation_id else dict(merged)
+        return "cancel_reservation", args
+    if action in {"lookup", "get_reservation", "reservation"} and reservation_id:
+        return "get_reservation_details", {"reservation_id": reservation_id}
+    if action in {"get_user", "lookup_user"} and merged.get("user_id"):
+        return "get_user_details", {"user_id": merged["user_id"]}
+    return name, dict(arguments)
+
+
+def _rename_first_present(arguments: dict[str, Any], canonical: str, aliases: Sequence[str]) -> None:
+    if canonical in arguments and arguments[canonical] not in (None, ""):
+        return
+    for alias in aliases:
+        if alias in arguments and arguments[alias] not in (None, ""):
+            arguments[canonical] = arguments.pop(alias)
+            return
 
 
 def _first_text_field(arguments: Mapping[str, Any], keys: Sequence[str]) -> str | None:
@@ -540,6 +924,41 @@ def _render_tau_tool_call(tool_call: Any) -> str:
     )
 
 
+def _repeated_assistant_decision_error(history: Sequence[Any], message: Any, *, AssistantMessage: Any) -> str | None:
+    signature = _assistant_decision_signature(message)
+    if not signature:
+        return None
+    previous_count = 0
+    for item in history:
+        role = str(getattr(item, "role", "") or "").strip().lower()
+        if not isinstance(item, AssistantMessage) and role != "assistant":
+            continue
+        if _assistant_decision_signature(item) == signature:
+            previous_count += 1
+    if previous_count >= 2:
+        return f"tau repeated agent decision loop guard: {signature[:160]}"
+    return None
+
+
+def _assistant_decision_signature(message: Any) -> str:
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        rows = []
+        for call in tool_calls:
+            rows.append(
+                {
+                    "name": str(getattr(call, "name", "") or ""),
+                    "arguments": dict(getattr(call, "arguments", {}) or {}),
+                }
+            )
+        return "tool:" + json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    content = normalize_rwkv_text(str(getattr(message, "content", "") or "")).strip()
+    if not content or "###STOP###" in content:
+        return ""
+    lowered = re.sub(r"\s+", " ", content.lower())
+    return "content:" + lowered[:240]
+
+
 def _normalize_tool_schema(tool: Any) -> dict[str, Any]:
     schema = getattr(tool, "openai_schema", None)
     if isinstance(schema, Mapping):
@@ -554,6 +973,89 @@ def _normalize_tool_schema(tool: Any) -> dict[str, Any]:
     if isinstance(tool, Mapping):
         return dict(tool)
     return {"name": _tool_name(tool), "description": str(tool)}
+
+
+def _compact_tool_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    name = str(schema.get("name") or "").strip()
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, Mapping):
+        parameters = schema.get("arguments")
+    if not isinstance(parameters, Mapping):
+        parameters = {}
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, Mapping):
+        properties = {}
+    compact_properties: dict[str, Any] = {}
+    for prop_name, prop_schema in properties.items():
+        compact_properties[str(prop_name)] = _compact_parameter_schema(prop_schema)
+
+    required = parameters.get("required")
+    if not isinstance(required, (list, tuple)):
+        required = []
+
+    compact: dict[str, Any] = {
+        "name": name,
+        "description": truncate_text(normalize_rwkv_text(str(schema.get("description") or "")), 120),
+        "parameters": {
+            "type": "object",
+            "properties": compact_properties,
+            "required": [str(item) for item in required],
+        },
+    }
+    return compact
+
+
+def _compact_parameter_schema(schema: Any) -> dict[str, Any]:
+    if not isinstance(schema, Mapping):
+        return {"type": "string"}
+    schema_type = schema.get("type") or "string"
+    compact: dict[str, Any] = {"type": str(schema_type)}
+    description = normalize_rwkv_text(str(schema.get("description") or "")).strip()
+    if description:
+        compact["description"] = truncate_text(description, 48)
+    enum = schema.get("enum")
+    if isinstance(enum, (list, tuple)) and len(enum) <= 12:
+        compact["enum"] = [str(item) for item in enum]
+    items = schema.get("items")
+    if isinstance(items, Mapping):
+        compact["items"] = _compact_parameter_schema(items)
+    return compact
+
+
+def _minimal_tool_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    name = str(schema.get("name") or "").strip()
+    description = truncate_text(normalize_rwkv_text(str(schema.get("description") or "")), 64)
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, Mapping):
+        parameters = schema.get("arguments")
+    if not isinstance(parameters, Mapping):
+        parameters = {}
+    properties = parameters.get("properties")
+    if not isinstance(properties, Mapping):
+        properties = {}
+    required = parameters.get("required")
+    if not isinstance(required, (list, tuple)):
+        required = []
+    return {
+        "name": name,
+        "description": description,
+        "args": {
+            str(prop_name): _minimal_parameter_type(prop_schema)
+            for prop_name, prop_schema in properties.items()
+        },
+        "required": [str(item) for item in required],
+    }
+
+
+def _minimal_parameter_type(schema: Any) -> str:
+    if not isinstance(schema, Mapping):
+        return "string"
+    schema_type = str(schema.get("type") or "string")
+    enum = schema.get("enum")
+    if isinstance(enum, (list, tuple)) and 0 < len(enum) <= 8:
+        return f"{schema_type} enum={','.join(str(item) for item in enum)}"
+    return schema_type
 
 
 def _tool_name(tool: Any) -> str:
@@ -603,6 +1105,7 @@ __all__ = [
     "DEFAULT_TAU_PROMPT_MAX_CHARS",
     "RESPOND_TOOL_NAME",
     "RWKVTauOfficialAgent",
+    "StaticStopTauUser",
     "TauOfficialEvaluation",
     "TauOfficialRuntime",
     "build_tau_official_agent_system_prompt",

@@ -75,6 +75,12 @@ class QueueOptions:
     function_final_max_tokens: int | None = None
     function_answer_max_tokens: int | None = None
     function_history_max_chars: int | None = None
+    function_prompt_max_chars: int | None = None
+    function_long_doc_mode: str | None = None
+    function_tool_router_mode: str | None = None
+    function_tool_router_max_tools: int | None = None
+    function_tool_router_trigger_tool_count: int | None = None
+    function_tool_router_trigger_catalog_chars: int | None = None
     function_max_rounds: int | None = None
     function_max_steps: int | None = None
     function_max_tool_errors: int | None = None
@@ -859,6 +865,12 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
     _append("--final-max-tokens", opts.function_final_max_tokens)
     _append("--answer-max-tokens", opts.function_answer_max_tokens)
     _append("--history-max-chars", opts.function_history_max_chars)
+    _append("--prompt-max-chars", opts.function_prompt_max_chars)
+    _append_str("--long-doc-mode", opts.function_long_doc_mode)
+    _append_str("--tool-router-mode", opts.function_tool_router_mode)
+    _append("--tool-router-max-tools", opts.function_tool_router_max_tools)
+    _append("--tool-router-trigger-tool-count", opts.function_tool_router_trigger_tool_count)
+    _append("--tool-router-trigger-catalog-chars", opts.function_tool_router_trigger_catalog_chars)
     _append("--max-rounds", opts.function_max_rounds)
     _append("--max-steps", opts.function_max_steps)
     _append("--max-tool-errors", opts.function_max_tool_errors)

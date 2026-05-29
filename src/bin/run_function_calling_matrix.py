@@ -20,6 +20,8 @@ NO_JUDGE_BENCHMARKS: tuple[str, ...] = (
     "tau2_bench_airline",
     "tau2_bench_retail",
     "tau2_bench_telecom",
+    "tau3_bench_mock",
+    "tau3_bench_mock_long_context",
     "tau3_bench_airline",
     "tau3_bench_retail",
     "tau3_bench_telecom",
@@ -31,6 +33,47 @@ JUDGE_BENCHMARKS: tuple[str, ...] = (
     "mcp_bench",
 )
 ALL_BENCHMARKS: tuple[str, ...] = NO_JUDGE_BENCHMARKS + JUDGE_BENCHMARKS
+LONG_CONTEXT_ABLATION_BENCHMARKS: tuple[str, ...] = (
+    "tau3_bench_mock_long_context",
+    "tau3_bench_banking_knowledge",
+    "tau3_bench_airline",
+    "tau3_bench_retail",
+    "tau3_bench_telecom",
+)
+ABLATION_VARIANTS: tuple[str, ...] = (
+    "baseline",
+    "chunk",
+    "tool_router_lexical",
+    "chunk_tool_router_lexical",
+    "tool_router_model",
+    "chunk_tool_router_model",
+)
+ABLATION_RUNNER_OVERRIDES: dict[str, dict[str, Any]] = {
+    "baseline": {
+        "long_doc_mode": "off",
+        "tool_router_mode": "off",
+    },
+    "chunk": {
+        "long_doc_mode": "lexical",
+        "tool_router_mode": "off",
+    },
+    "tool_router_lexical": {
+        "long_doc_mode": "off",
+        "tool_router_mode": "lexical",
+    },
+    "chunk_tool_router_lexical": {
+        "long_doc_mode": "lexical",
+        "tool_router_mode": "lexical",
+    },
+    "tool_router_model": {
+        "long_doc_mode": "off",
+        "tool_router_mode": "model",
+    },
+    "chunk_tool_router_model": {
+        "long_doc_mode": "lexical",
+        "tool_router_mode": "model",
+    },
+}
 
 DEFAULT_MODEL_SPECS: tuple[str, ...] = (
     "18081:rwkv7-g1e-13.3b-20260309-ctx8192:64",
@@ -60,6 +103,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--keep-going", action="store_true", help="Continue with the next run after a failure")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument(
+        "--ablation",
+        choices=("none", "agent-long-context"),
+        default="none",
+        help="Run a built-in ablation matrix for long-context agent prompt controls",
+    )
+    parser.add_argument(
+        "--ablation-variant",
+        action="append",
+        dest="ablation_variants",
+        choices=ABLATION_VARIANTS,
+        help="Restrict --ablation agent-long-context to one or more variants",
+    )
+    parser.add_argument(
         "--enable-checker",
         action="store_true",
         help="Do not set RWKV_SKILLS_DISABLE_CHECKER=1 for BFCL/tau/tau2/tau3 runs",
@@ -82,30 +138,34 @@ def parse_model_spec(raw: str) -> tuple[int, str, int]:
 
 def run_matrix(args: argparse.Namespace) -> int:
     model_specs = tuple(parse_model_spec(raw) for raw in (args.models or DEFAULT_MODEL_SPECS))
-    benchmarks = tuple(args.benchmarks or ALL_BENCHMARKS)
+    benchmarks = tuple(args.benchmarks or (LONG_CONTEXT_ABLATION_BENCHMARKS if args.ablation != "none" else ALL_BENCHMARKS))
+    ablation_variants = _resolve_ablation_variants(args)
     config_dir = Path(args.config_dir).expanduser()
     with tempfile.TemporaryDirectory(prefix="rwkv-fc-matrix-") as tmp:
         tmp_root = Path(tmp)
         for port, model_name, batch_size in model_specs:
             for benchmark in benchmarks:
-                source_config = config_dir / f"{benchmark}.toml"
-                run_config = _build_run_config(
-                    source_config,
-                    output_path=tmp_root / f"{benchmark}.{model_name}.toml",
-                    port=port,
-                    model_name=model_name,
-                    batch_size=batch_size,
-                )
-                command = [str(args.python), "-m", "src.main", "--config", str(run_config)]
-                env = dict(os.environ)
-                if benchmark in NO_JUDGE_BENCHMARKS and not args.enable_checker:
-                    env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
-                print(f"$ {' '.join(command)}", flush=True)
-                if args.dry_run:
-                    continue
-                result = subprocess.run(command, env=env, check=False)
-                if result.returncode != 0 and not args.keep_going:
-                    return int(result.returncode)
+                for ablation_variant in ablation_variants:
+                    source_config = config_dir / f"{benchmark}.toml"
+                    suffix = "" if ablation_variant is None else f".{ablation_variant}"
+                    run_config = _build_run_config(
+                        source_config,
+                        output_path=tmp_root / f"{benchmark}.{model_name}{suffix}.toml",
+                        port=port,
+                        model_name=model_name,
+                        batch_size=batch_size,
+                        ablation_variant=ablation_variant,
+                    )
+                    command = [str(args.python), "-m", "src.main", "--config", str(run_config)]
+                    env = dict(os.environ)
+                    if benchmark in NO_JUDGE_BENCHMARKS and not args.enable_checker:
+                        env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
+                    print(f"$ {' '.join(command)}", flush=True)
+                    if args.dry_run:
+                        continue
+                    result = subprocess.run(command, env=env, check=False)
+                    if result.returncode != 0 and not args.keep_going:
+                        return int(result.returncode)
         return 0
 
 
@@ -116,6 +176,7 @@ def _build_run_config(
     port: int,
     model_name: str,
     batch_size: int,
+    ablation_variant: str | None = None,
 ) -> Path:
     payload = _load_toml_mapping(source_path)
     updated: dict[str, Any] = {key: _copy_table(value) for key, value in payload.items()}
@@ -131,8 +192,29 @@ def _build_run_config(
     else:
         run.pop("batch_size", None)
 
+    if ablation_variant is not None:
+        _apply_ablation_variant(updated, ablation_variant)
+
     output_path.write_text(_render_toml(updated), encoding="utf-8")
     return output_path
+
+
+def _resolve_ablation_variants(args: argparse.Namespace) -> tuple[str | None, ...]:
+    if str(getattr(args, "ablation", "none")) == "none":
+        return (None,)
+    variants = tuple(getattr(args, "ablation_variants", None) or ABLATION_VARIANTS)
+    return variants
+
+
+def _apply_ablation_variant(payload: dict[str, Any], variant: str) -> None:
+    if variant not in ABLATION_RUNNER_OVERRIDES:
+        raise ValueError(f"unknown ablation variant: {variant}")
+    runner = _ensure_table(payload, "runner")
+    for key, value in ABLATION_RUNNER_OVERRIDES[variant].items():
+        runner[key] = value
+    run = _ensure_table(payload, "run")
+    run_id = str(run.get("id") or "").strip()
+    run["id"] = f"{run_id + '_' if run_id else ''}ablation_{variant}"
 
 
 def _load_toml_mapping(path: Path) -> dict[str, Any]:
@@ -196,8 +278,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "ALL_BENCHMARKS",
+    "ABLATION_RUNNER_OVERRIDES",
+    "ABLATION_VARIANTS",
     "DEFAULT_MODEL_SPECS",
     "JUDGE_BENCHMARKS",
+    "LONG_CONTEXT_ABLATION_BENCHMARKS",
     "NO_JUDGE_BENCHMARKS",
     "main",
     "parse_args",

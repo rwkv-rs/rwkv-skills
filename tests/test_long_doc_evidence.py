@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from src.eval.long_doc_evidence import (
     LongDocEvidenceConfig,
     TextChunk,
@@ -102,6 +104,55 @@ def test_compact_messages_uses_recent_short_user_query_before_long_tool_output()
     assert result.compacted_message_count == 1
     assert infer_query_from_messages(messages, skip_longer_than=200) == task
     assert "invoice INV-42 status paid evidence" in result.messages[-1]["content"]
+
+
+def test_model_parallel_long_doc_compaction_uses_model_chunk_judgment() -> None:
+    class _Engine:
+        def __init__(self) -> None:
+            self.prompt_count = 0
+            self.batch_size = 0
+
+        def generate(self, prompts, **kwargs):  # noqa: ANN001
+            self.prompt_count = len(prompts)
+            self.batch_size = kwargs["batch_size"]
+            return [
+                SimpleNamespace(
+                    text='{"relevant":true,"score":3}'
+                    if "special-policy ALPHA7" in prompt
+                    else '{"relevant":false,"score":0}',
+                    finish_reason="stop",
+                )
+                for prompt in prompts
+            ]
+
+    engine = _Engine()
+    text = "\n".join(
+        [f"noise policy row {index:03d}" for index in range(20)]
+        + ["special-policy ALPHA7 requires supervisor approval"]
+        + [f"archive policy row {index:03d}" for index in range(20)]
+    )
+
+    result = compact_long_text(
+        text,
+        query="What is the approval requirement?",
+        config=LongDocEvidenceConfig(
+            mode="model_parallel",
+            max_chunk_chars=160,
+            overlap_lines=1,
+            min_long_text_chars=200,
+            max_evidence_chunks=1,
+            max_evidence_chars=240,
+            model_parallel_batch_size=8,
+        ),
+        engine=engine,
+        sampling=SimpleNamespace(),
+    )
+
+    assert engine.prompt_count > 1
+    assert engine.batch_size > 1
+    assert "mode=model_parallel" in result.text
+    assert "special-policy ALPHA7 requires supervisor approval" in result.text
+    assert "noise policy row 000" not in result.text
 
 
 def test_parse_answer_or_null_response_accepts_json_fence() -> None:

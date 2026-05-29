@@ -26,15 +26,15 @@ def load_env_file(path: Path | str = ".env") -> None:
 
 
 def resolve_required_user_model_config() -> OpenAIModelConfig:
-    api_key = _first_env("API_KEY", "OPENAI_API_KEY")
-    model_name = _first_env("model_name", "MODEL_NAME", "USER_MODEL_NAME")
-    base_url = _first_env("OPENAI_BASE_URL", "API_BASE", "BASE_URL")
+    api_key = _first_env("USER_API_KEY", "API_KEY", "OPENAI_API_KEY")
+    model_name = _first_env("USER_MODEL_NAME", "model_name", "MODEL_NAME")
+    base_url = _first_env("USER_BASE_URL", "OPENAI_BASE_URL", "API_BASE", "BASE_URL")
 
     missing: list[str] = []
     if not api_key:
-        missing.append("API_KEY (or OPENAI_API_KEY)")
+        missing.append("USER_API_KEY (or API_KEY / OPENAI_API_KEY)")
     if not model_name:
-        missing.append("model_name (or MODEL_NAME / USER_MODEL_NAME)")
+        missing.append("USER_MODEL_NAME (or model_name / MODEL_NAME)")
     if missing:
         detail = ", ".join(missing)
         raise ValueError(f"Missing required .env fields for user simulator: {detail}")
@@ -42,7 +42,7 @@ def resolve_required_user_model_config() -> OpenAIModelConfig:
     return OpenAIModelConfig(
         api_key=api_key,
         model_name=model_name,
-        base_url=base_url or None,
+        base_url=normalize_openai_base_url(base_url),
     )
 
 
@@ -54,15 +54,28 @@ def resolve_judge_model_config(default_model: str | None = None) -> OpenAIModelC
     if not api_key:
         raise ValueError("Missing judge API key: set JUDGE_API_KEY or API_KEY / OPENAI_API_KEY in .env")
     base_url = _first_env("JUDGE_BASE_URL", "OPENAI_BASE_URL", "API_BASE")
-    return OpenAIModelConfig(api_key=api_key, model_name=model_name, base_url=base_url or None)
+    return OpenAIModelConfig(api_key=api_key, model_name=model_name, base_url=normalize_openai_base_url(base_url))
 
 
 def apply_openai_env(config: OpenAIModelConfig) -> None:
-    os.environ.setdefault("OPENAI_API_KEY", config.api_key)
-    os.environ.setdefault("API_KEY", config.api_key)
-    if config.base_url:
-        os.environ.setdefault("OPENAI_BASE_URL", config.base_url)
-        os.environ.setdefault("API_BASE", config.base_url)
+    os.environ["OPENAI_API_KEY"] = config.api_key
+    os.environ["API_KEY"] = config.api_key
+    base_url = normalize_openai_base_url(config.base_url)
+    if base_url:
+        os.environ["OPENAI_BASE_URL"] = base_url
+        os.environ["API_BASE"] = base_url
+
+
+def normalize_openai_base_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip().rstrip("/")
+    if not text:
+        return None
+    suffix = "/chat/completions"
+    if text.endswith(suffix):
+        text = text[: -len(suffix)].rstrip("/")
+    return text or None
 
 
 def _first_env(*names: str) -> str | None:
@@ -82,4 +95,5 @@ __all__ = [
     "resolve_required_user_model_config",
     "resolve_judge_model_config",
     "apply_openai_env",
+    "normalize_openai_base_url",
 ]

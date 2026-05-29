@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 from types import ModuleType, SimpleNamespace
@@ -357,7 +358,7 @@ def test_chat_completion_request_preparation_preserves_chat_and_sampling_fields(
     prepared = prepare_chat_completion_request(request)
     completion_request = prepared.completion_request
 
-    assert completion_request.prompt == "User: hello\n\nAssistant: prefill"
+    assert completion_request.prompt == "User:hello\n\nAssistant: prefill"
     assert completion_request.max_tokens == 7
     assert completion_request.temperature == 0.2
     assert completion_request.repetition_penalty == 0.4
@@ -435,7 +436,7 @@ def test_chat_completion_request_supports_openai_tool_prompting_and_parsing() ->
     assert prepared.response_mode == "tool_call"
     assert "OpenAI tool-calling interface" in prepared.completion_request.prompt
     assert "get_weather" in prepared.completion_request.prompt
-    assert prepared.completion_request.prompt.endswith("\n\nAssistant:")
+    assert prepared.completion_request.prompt.endswith("\n\nAssistant: <think>\n</think>\n```json\n")
 
     response = build_chat_completion_response(
         request,
@@ -446,12 +447,16 @@ def test_chat_completion_request_supports_openai_tool_prompting_and_parsing() ->
             model="demo-model",
             choices=[
                 CompletionChoice(
-                    text=json.dumps(
-                        {
-                            "type": "tool_calls",
-                            "tool_calls": [{"name": "get_weather", "arguments": {"city": "Hangzhou"}}],
-                        },
-                        ensure_ascii=False,
+                    text=(
+                        "<think>\n</think>\n```json\n"
+                        + json.dumps(
+                            {
+                                "type": "tool_calls",
+                                "tool_calls": [{"name": "get_weather", "arguments": {"city": "Hangzhou"}}],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n```"
                     ),
                     finish_reason="stop_token",
                 )
@@ -573,12 +578,16 @@ def test_chat_stream_builder_matches_openai_chunk_shape_for_tool_calls() -> None
             model="demo-model",
             choices=[
                 CompletionChoice(
-                    text=json.dumps(
-                        {
-                            "type": "tool_calls",
-                            "tool_calls": [{"name": "get_weather", "arguments": {"city": "Hangzhou"}}],
-                        },
-                        ensure_ascii=False,
+                    text=(
+                        "```json\n"
+                        + json.dumps(
+                            {
+                                "type": "tool_calls",
+                                "tool_calls": [{"name": "get_weather", "arguments": {"city": "Hangzhou"}}],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n```"
                     ),
                     finish_reason="stop_token",
                 )
@@ -646,11 +655,18 @@ def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scor
         sampling=SamplingConfig(
             max_generate_tokens=4,
             temperature=0.3,
+            top_k=42,
             top_p=0.8,
             alpha_presence=0.1,
             alpha_frequency=0.2,
+            alpha_decay=0.95,
+            stop_tokens=(0,),
+            ban_tokens=(123,),
+            pad_zero=False,
+            no_penalty_token_ids=(33, 10),
         ),
         batch_size=1,
+        prefill_chunk_size=64,
         show_progress=False,
     )
 
@@ -660,8 +676,13 @@ def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scor
     assert calls[0][0].endswith("/completions")
     assert calls[0][1]["prompt"] == "prompt"
     assert "messages" not in calls[0][1]
-    assert "top_k" not in calls[0][1]
-    assert "penalty_decay" not in calls[0][1]
+    assert calls[0][1]["top_k"] == 42
+    assert calls[0][1]["penalty_decay"] == 0.95
+    assert calls[0][1]["stop_tokens"] == [0]
+    assert calls[0][1]["ban_tokens"] == [123]
+    assert calls[0][1]["pad_zero"] is False
+    assert calls[0][1]["no_penalty_token_ids"] == [33, 10]
+    assert calls[0][1]["prefill_chunk_size"] == 64
 
     with pytest.raises(NotImplementedError):
         backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
@@ -691,6 +712,42 @@ def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:
             constraint_mode="strict",
             show_progress=False,
         )
+
+
+def test_remote_backend_retries_transient_disconnect(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+            max_retries=2,
+            retry_initial_delay_s=0.0,
+        )
+    )
+    calls = 0
+
+    class _FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"choices":[{"text":"ok","finish_reason":"stop"}]}'
+
+    def _fake_urlopen(_req, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise http.client.RemoteDisconnected("closed")
+        return _FakeResponse()
+
+    monkeypatch.setattr("src.infer.backend.urllib_request.urlopen", _fake_urlopen)
+
+    response = backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
+
+    assert calls == 2
+    assert response["choices"][0]["text"] == "ok"
 
 
 def test_local_inference_backend_can_select_lightning_engine(monkeypatch, tmp_path) -> None:

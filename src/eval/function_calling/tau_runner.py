@@ -7,6 +7,7 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Sequence
 
 from src.eval.agent_bench.envs.tau_v2 import TauV2Env
@@ -24,6 +25,7 @@ from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_
 from src.eval.execution_plan import AttemptKey, build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     clamp_function_calling_sampling,
@@ -52,6 +54,7 @@ from src.eval.function_calling.tau_bench import (
     render_tau_user_prompt,
     render_tool_result,
 )
+from src.eval.function_calling.tool_router import ToolRoutingConfig, tool_routing_config_from_args
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
@@ -297,16 +300,14 @@ def _tau_official_completion_payload(
     official_reward = float(getattr(evaluation, "reward", 0.0))
     official_is_passed = bool(getattr(evaluation, "is_passed", False))
     parse_errors = list(agent.parse_errors)
-    reward = 0.0 if parse_errors else official_reward
-    is_passed = False if parse_errors else official_is_passed
     details = dict(getattr(evaluation, "details", {}) or {})
     details["domain"] = record.domain
     details["task_id"] = task_id
     details["benchmark_version"] = record.benchmark_version
     details["parse_errors"] = parse_errors
-    if parse_errors:
-        details["official_reward"] = official_reward
-        details["official_is_passed"] = official_is_passed
+    details["official_reward"] = official_reward
+    details["official_is_passed"] = official_is_passed
+    details["tool_routes"] = list(getattr(agent, "tool_routes", []) or [])
     details["ref_answer"] = (
         f"domain={record.domain}\n"
         f"task_id={task_id}\n"
@@ -327,11 +328,11 @@ def _tau_official_completion_payload(
     payload["agent_result"] = {
         "task_id": task_id,
         "domain": record.domain,
-        "reward": reward,
+        "reward": official_reward,
         "num_turns": len(agent.stages),
         "cost": float(getattr(simulation, "agent_cost", None) or 0.0)
         + float(getattr(simulation, "user_cost", None) or 0.0),
-        "is_passed": is_passed,
+        "is_passed": official_is_passed,
         "error": "; ".join(parse_errors) if parse_errors else None,
     }
     payload["agent_info"] = details
@@ -348,7 +349,7 @@ def _run_tau_official_attempt(
     repeat_index: int,
     pass_index: int,
     runtime_env: TauOfficialRuntime,
-    user_model: Any,
+    user_model: Any | None,
     judge_model: Any,
     sampling: Any,
     sampling_payload: dict[str, Any],
@@ -357,6 +358,7 @@ def _run_tau_official_attempt(
     long_doc_config: LongDocEvidenceConfig,
     max_steps: int,
     max_tool_errors: int,
+    tool_routing_config: ToolRoutingConfig | None = None,
 ) -> dict[str, Any]:
     task = runtime_env.load_task(record.task)
     environment = runtime_env.create_environment(solo_mode=False)
@@ -368,6 +370,7 @@ def _run_tau_official_attempt(
         history_max_chars=history_max_chars,
         prompt_max_chars=prompt_max_chars,
         long_doc_config=long_doc_config,
+        tool_routing_config=tool_routing_config or ToolRoutingConfig(),
     )
     user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
     seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
@@ -381,8 +384,25 @@ def _run_tau_official_attempt(
         seed=seed,
         validate_communication=True,
     )
-    simulation = orchestrator.run()
-    evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
+    try:
+        simulation = orchestrator.run()
+        evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
+    except Exception as exc:
+        error_text = f"tau official runtime error: {type(exc).__name__}: {exc}"
+        agent.parse_errors.append(error_text)
+        messages = list(getattr(orchestrator, "messages", []) or getattr(orchestrator, "_messages", []) or [])
+        simulation = SimpleNamespace(
+            task_id=record.task_id,
+            messages=messages,
+            agent_cost=float(getattr(orchestrator, "agent_cost", 0.0) or 0.0),
+            user_cost=float(getattr(orchestrator, "user_cost", 0.0) or 0.0),
+            termination_reason=error_text,
+        )
+        evaluation = SimpleNamespace(
+            reward=0.0,
+            is_passed=False,
+            details={"termination_reason": error_text, "runtime_error": error_text},
+        )
     return _tau_official_completion_payload(
         record=record,
         sample_index=sample_index,
@@ -398,13 +418,36 @@ def _run_tau_official_attempt(
 
 
 def _tau_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    mode = str(getattr(args, "long_doc_mode", "lexical") or "lexical").strip().lower()
+    enabled = mode != "off"
+    if mode == "off":
+        mode = "lexical"
     return LongDocEvidenceConfig(
+        enabled=enabled,
+        mode=mode,  # type: ignore[arg-type]
         max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
         overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
+        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
+        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
+
+
+def _is_lightweight_tau_record(record: TauManifestRecord) -> bool:
+    version = str(record.benchmark_version).lower().strip()
+    return version in {"tau_v3_light", "tau3_light", "tau_light"} or (
+        record.domain == "mock" and version.startswith("tau_v3_light")
+    )
+
+
+def _requires_tau_v3_source(records: Sequence[TauManifestRecord]) -> bool:
+    return any(str(record.benchmark_version).lower().strip() == "tau_v3" for record in records)
+
+
+def _requires_tau_user_model(records: Sequence[TauManifestRecord]) -> bool:
+    return any(not _is_lightweight_tau_record(record) for record in records)
 
 
 def _run_tau(
@@ -418,9 +461,7 @@ def _run_tau(
         records = records[: int(args.max_samples)]
     if not records:
         raise ValueError("tau_bench/tau2_bench manifest is empty")
-    if run.benchmark_kind.value == "tau3_bench" or any(
-        str(record.benchmark_version).lower() == "tau_v3" for record in records
-    ):
+    if _requires_tau_v3_source(records):
         require_tau_v3_source(run.dataset_slug)
 
     plan = _resolve_function_calling_plan(run.dataset_slug, len(records), avg_ks=args.avg_k)
@@ -435,7 +476,6 @@ def _run_tau(
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     normalize_function_prompt_style(getattr(args, "prompt_style", None))
     decision_sampling = clamp_function_calling_sampling(decision_sampling, args.decision_max_tokens or 1024)
-    sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling)])
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     batch_size = max(1, int(args.batch_size or 16))
@@ -446,11 +486,21 @@ def _run_tau(
         or os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS))
     )
     long_doc_config = _tau_long_doc_config(args)
+    tool_routing_config = tool_routing_config_from_args(args)
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, decision_sampling)]),
+        long_doc_config=long_doc_config,
+        tool_routing_config=tool_routing_config,
+        prompt_max_chars=prompt_max_chars,
+    )
     tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
     history_max_chars = max(0, min(int(args.history_max_chars), tau_history_cap))
-    user_model = resolve_required_user_model_config()
-    judge_model = resolve_judge_model_config(default_model=user_model.model_name) or user_model
-    apply_openai_env(user_model)
+    user_model = None
+    judge_model = None
+    if _requires_tau_user_model(records):
+        user_model = resolve_required_user_model_config()
+        judge_model = resolve_judge_model_config(default_model=user_model.model_name) or user_model
+        apply_openai_env(user_model)
 
     runtime_cache: dict[str, TauOfficialRuntime] = {}
 
@@ -476,6 +526,7 @@ def _run_tau(
                 history_max_chars=history_max_chars,
                 prompt_max_chars=prompt_max_chars,
                 long_doc_config=long_doc_config,
+                tool_routing_config=tool_routing_config,
             )
             decision_prompts.append(
                 agent._build_prompt(  # noqa: SLF001 - probe path intentionally inspects rendered first-turn prompt.
@@ -553,6 +604,7 @@ def _run_tau(
                             history_max_chars=history_max_chars,
                             prompt_max_chars=prompt_max_chars,
                             long_doc_config=long_doc_config,
+                            tool_routing_config=tool_routing_config,
                             max_steps=max_steps,
                             max_tool_errors=max_tool_errors,
                         ): key

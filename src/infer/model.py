@@ -25,7 +25,7 @@ def load_rwkv_model(config: ModelLoadConfig):
         base_path = weights_path.with_suffix("")
     else:
         base_path = weights_path
-        weights_path = base_path.with_suffix(".pth")
+        weights_path = Path(str(base_path) + ".pth")
     if not weights_path.exists():
         raise FileNotFoundError(f"模型权重不存在: {weights_path}")
 

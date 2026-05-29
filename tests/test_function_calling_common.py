@@ -6,8 +6,12 @@ from src.eval.evaluating import RunContext, RunMode, TaskExecutionState
 from src.eval.execution_plan import AttemptKey
 from src.eval.function_calling import common as function_calling_common
 from src.eval.function_calling.common import (
+    FunctionCallingRunContext,
+    attach_function_calling_context_metadata,
     build_pending_attempts,
+    compute_function_calling_diagnostics,
     compute_function_calling_metrics,
+    finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
 )
@@ -26,6 +30,8 @@ from src.eval.function_calling.simple_tool_call import (
     build_simple_tool_call_prompt,
 )
 from src.infer.sampling import SamplingConfig
+from src.eval.function_calling.tool_router import ToolRoutingConfig
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 
 
 def test_build_pending_attempts_filters_skip_keys() -> None:
@@ -193,6 +199,117 @@ def test_compute_function_calling_metrics_reports_success_rate_and_avg_key() -> 
 
     assert metrics["success_rate"] == 0.5
     assert metrics["avg@1"] == 0.5
+
+
+def test_compute_function_calling_diagnostics_reports_ablation_metrics() -> None:
+    payloads = [
+        {
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "prompt1": "System: x\n[Long document compacted: label=demo]",
+            "completion1": "{}",
+            "agent_result": {"num_turns": 2, "error": None},
+            "agent_trace": [
+                {
+                    "tool_route": {
+                        "routed": True,
+                        "reason": "lexical",
+                        "selected_names": ["refund_order"],
+                        "total_tool_count": 20,
+                        "catalog_chars": 9000,
+                    }
+                }
+            ],
+        },
+        {
+            "sample_index": 1,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "prompt1": "System: y",
+            "prompt2": "Followup",
+            "completion1": "bad json",
+            "agent_result": {"num_turns": 1, "error": "unknown tool name"},
+        },
+    ]
+
+    metrics = compute_function_calling_diagnostics(payloads)
+
+    assert metrics["avg_stage_prompt_chars"] == metrics["avg_sample_prompt_chars"]
+    assert metrics["avg_sample_total_prompt_chars"] > metrics["avg_sample_prompt_chars"]
+    assert metrics["long_doc_prompt_rate"] == 1 / 3
+    assert metrics["agent_error_rate"] == 0.5
+    assert metrics["unknown_tool_error_rate"] == 0.5
+    assert metrics["tool_route_count"] == 1.0
+    assert metrics["tool_route_avg_selected_tools"] == 1.0
+    assert metrics["tool_route_routed_rate"] == 1.0
+
+
+def test_finalize_function_calling_run_records_score_when_checker_fails() -> None:
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.recorded_score: dict[str, object] | None = None
+
+        def complete_attempt_stage(self, _writer: object, *, timeout_s: float | None) -> list[dict[str, object]]:
+            assert timeout_s is None
+            return [{"sample_index": 0, "repeat_index": 0, "pass_index": 0, "prompt1": "x"}]
+
+        def ingest_eval_payloads(self, _payloads: list[dict[str, object]]) -> None:
+            return None
+
+        def run_checker(self, *, model_name: str) -> None:
+            assert model_name == "model"
+            raise RuntimeError("checker unavailable")
+
+        def record_score(self, payload: dict[str, object]) -> None:
+            self.recorded_score = payload
+
+    runtime = FakeRuntime()
+    ctx = FunctionCallingRunContext(
+        service=object(),
+        runtime=runtime,
+        writer=object(),
+        task_id="task",
+        skip_keys=frozenset(),
+    )
+
+    _completions, _evals, metrics = finalize_function_calling_run(
+        ctx=ctx,
+        completion_to_eval=lambda _item: {
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "is_passed": True,
+        },
+        model_name="model",
+        avg_k=1.0,
+        timeout_s=None,
+        build_score_payload=lambda _completions, _evals, score_metrics: {"metrics": dict(score_metrics)},
+    )
+
+    assert metrics["checker_failed"] == 1.0
+    assert runtime.recorded_score is not None
+    assert runtime.recorded_score["metrics"]["success_rate"] == 1.0
+
+
+def test_attach_function_calling_context_metadata_distinguishes_ablations() -> None:
+    payload = attach_function_calling_context_metadata(
+        {"1": {"temperature": 0.0}},
+        long_doc_config=LongDocEvidenceConfig(enabled=False, min_long_text_chars=1200),
+        tool_routing_config=ToolRoutingConfig(mode="lexical", max_tools=8),
+        prompt_max_chars=8192,
+    )
+
+    assert payload["long_context"]["prompt_max_chars"] == 8192
+    assert payload["long_context"]["long_doc"]["enabled"] is False
+    assert payload["long_context"]["long_doc"]["mode"] == "lexical"
+    assert payload["long_context"]["long_doc"]["model_max_tokens"] > 0
+    assert payload["long_context"]["long_doc"]["model_parallel_batch_size"] > 0
+    assert payload["long_context"]["tool_router"]["mode"] == "lexical"
+    assert payload["long_context"]["tool_router"]["max_tools"] == 8
+    assert payload["long_context"]["tool_router"]["description_chars"] > 0
+    assert payload["long_context"]["tool_router"]["parallel_chunk_tools"] > 0
+    assert payload["long_context"]["tool_router"]["parallel_batch_size"] > 0
 
 
 def test_prepare_function_calling_run_uses_explicit_run_context(monkeypatch) -> None:

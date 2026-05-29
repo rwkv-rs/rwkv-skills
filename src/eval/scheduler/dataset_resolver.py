@@ -13,7 +13,7 @@ from .dataset_stats import record_dataset_samples
 from .jobs import locate_dataset
 
 
-def resolve_or_prepare_dataset(dataset_arg: str, *, verbose: bool = True) -> Path:
+def resolve_or_prepare_dataset(dataset_arg: str, *, verbose: bool = True, record_stats: bool = True) -> Path:
     """Resolve dataset path, auto-preparing via registered preparers.
 
     Missing/failed prepare will raise so callers can fail fast.
@@ -21,12 +21,13 @@ def resolve_or_prepare_dataset(dataset_arg: str, *, verbose: bool = True) -> Pat
 
     candidate = Path(dataset_arg).expanduser()
     if candidate.exists():
-        record_dataset_samples(candidate)
+        if record_stats:
+            record_dataset_samples(candidate)
         return candidate
 
     slug = canonical_slug(infer_dataset_slug_from_path(dataset_arg))
     try:
-        return locate_dataset(slug, search=DATASET_ROOTS, output_root=DATA_OUTPUT_ROOT)
+        return locate_dataset(slug, search=DATASET_ROOTS, output_root=DATA_OUTPUT_ROOT, record_stats=record_stats)
     except Exception as exc:  # noqa: BLE001
         if verbose:
             print(f"❌ 自动准备数据集失败：{slug} ({exc})")

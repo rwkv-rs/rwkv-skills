@@ -696,7 +696,13 @@ def _build_chat_prompt(
         parts.append(_render_prompt_message(message))
 
     last_role = _normalize_chat_role(messages[-1].role)
-    if response_mode != "plain_text" or last_role != "assistant":
+    if last_role == "assistant":
+        return "\n\n".join(parts)
+    if response_mode == "tool_call":
+        parts.append("Assistant: <think>\n</think>\n```json\n")
+    elif response_mode == "plain_text":
+        parts.append("Assistant: <think>")
+    else:
         parts.append("Assistant:")
     return "\n\n".join(parts)
 
@@ -713,7 +719,7 @@ def _render_prompt_message(message: ChatCompletionMessage) -> str:
         if message.text_content().strip():
             raise ValueError("assistant tool_calls messages cannot include content")
         tool_history = _render_tool_call_history_json(message.tool_calls or [])
-        return f"Assistant: ```json\n{tool_history}\n```"
+        return f"Assistant: <think>\n</think>\n```json\n{tool_history}\n```"
 
     content = message.text_content()
     if role == "tool":
@@ -727,6 +733,8 @@ def _render_prompt_message(message: ChatCompletionMessage) -> str:
         "user": "User",
         "assistant": "Assistant",
     }
+    if role == "user":
+        return f"User:{content}"
     return f"{labels[role]}: {content}"
 
 
@@ -754,6 +762,7 @@ def _render_tool_call_history_json(tool_calls: list[ChatCompletionToolCall]) -> 
 
 
 def _parse_tool_model_output(text: str) -> dict[str, object]:
+    text = _strip_tool_model_output_wrappers(text)
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -774,6 +783,24 @@ def _parse_tool_model_output(text: str) -> dict[str, object]:
     if isinstance(parsed, list):
         return {"type": "tool_calls", "tool_calls": _parse_tool_call_items(parsed)}
     raise ValueError("tool output JSON shape is unsupported")
+
+
+def _strip_tool_model_output_wrappers(text: str) -> str:
+    stripped = str(text or "").strip()
+    if stripped.startswith("Assistant:"):
+        stripped = stripped[len("Assistant:") :].strip()
+    if stripped.startswith("<think>"):
+        close = stripped.find("</think>")
+        if close >= 0:
+            stripped = stripped[close + len("</think>") :].strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].strip().lower() in {"```", "```json", "```js", "```javascript"}:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    return stripped
 
 
 def _parse_tool_call_items(items: list[object]) -> list[dict[str, str]]:

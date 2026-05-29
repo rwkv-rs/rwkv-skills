@@ -45,6 +45,8 @@ def test_simple_tool_call_benchmarks_are_registered() -> None:
     assert "agentbench_kg" in names
     assert "toolalpaca_eval_simulated" in names
     assert "toolalpaca_eval_real" in names
+    assert "tau3_bench_mock" in names
+    assert "tau3_bench_mock_long_context" in names
 
 
 def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkeypatch) -> None:
