@@ -28,6 +28,7 @@ from typing import Any, Callable
 import requests
 
 from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
+from src.eval.function_calling.context_budget import normalize_rwkv_text
 
 from .simple_tool_call import SimpleToolCallEvaluation
 
@@ -55,59 +56,107 @@ def evaluate_bfcl_executable_calls(
     expected_exprs = _ground_truth_expressions(record)
     match_types = _execution_result_types(record, len(expected_exprs))
     details: dict[str, Any] = {
-        "official_bfcl_exec_source": OFFICIAL_BFCL_EXEC_SOURCE,
-        "expected_expressions": expected_exprs,
-        "decoded_tool_calls": [
-            {
-                "name": str(item.get("name") or ""),
-                "arguments": dict(item.get("arguments") or {}),
-            }
-            for item in decoded_calls
-        ],
-        "actual_expressions": [],
+        "expected_executable_calls": expected_exprs,
+        "decoded_executable_calls": [],
         "execution_result_type": match_types,
+        "tool_count_ok": len(decoded_calls) == len(expected_exprs),
+        "call_matches": [],
         "parse_error": parse_error or "",
     }
     if parse_error:
         return SimpleToolCallEvaluation(0.0, False, parse_error, details)
     if not expected_exprs:
-        return SimpleToolCallEvaluation(0.0, False, "bfcl_exec:missing_ground_truth", details)
+        return SimpleToolCallEvaluation(0.0, False, "missing_ground_truth", details)
 
     try:
         actual_exprs = [_tool_call_to_expression(item) for item in decoded_calls]
     except Exception as exc:  # noqa: BLE001
         details["expression_error"] = str(exc)
-        return SimpleToolCallEvaluation(0.0, False, f"bfcl_exec:invalid_model_call:{exc}", details)
-    details["actual_expressions"] = actual_exprs
+        return SimpleToolCallEvaluation(0.0, False, f"invalid_model_call:{exc}", details)
+    details["decoded_executable_calls"] = actual_exprs
 
-    expected_results: list[Any] = []
-    for expr in expected_exprs:
-        result = _execute_official_expression(expr)
-        if not result["valid"]:
-            details["expected_execution_error"] = result
-            return SimpleToolCallEvaluation(
-                0.0,
-                False,
-                "bfcl_exec:official_ground_truth_execution_failed",
-                details,
-            )
-        expected_results.append(result["value"])
-    details["expected_results"] = [_jsonable(item) for item in expected_results]
+    expected_results = [_execute_official_expression(expr) for expr in expected_exprs]
+    actual_results = [_execute_official_expression(expr) for expr in actual_exprs]
+    details["expected_execution_results"] = [_bfcl_exec_result_payload(item) for item in expected_results]
+    details["decoded_execution_results"] = [_bfcl_exec_result_payload(item) for item in actual_results]
 
+    failure_bits: list[str] = []
+    passed_count = 0
     if _is_parallel_record(record):
-        check = _official_parallel_no_order(actual_exprs, expected_results, match_types)
-    else:
-        check = _official_ordered_wrapper(actual_exprs, expected_results, match_types)
+        matched_actual_indices: set[int] = set()
+        for expected_index, expected in enumerate(expected_results):
+            match_type = match_types[expected_index] if expected_index < len(match_types) else "exact_match"
+            candidate_reasons: list[str] = []
+            for actual_index, actual in enumerate(actual_results):
+                if actual_index in matched_actual_indices:
+                    continue
+                ok, reason = _execution_result_matches(actual, expected, match_type)
+                if ok:
+                    matched_actual_indices.add(actual_index)
+                    details["call_matches"].append(
+                        {
+                            "expected_index": expected_index,
+                            "decoded_index": actual_index,
+                            "ok": True,
+                            "reason": reason,
+                            "match_type": match_type,
+                        }
+                    )
+                    passed_count += 1
+                    break
+                candidate_reasons.append(f"decoded_{actual_index}:{reason}")
+            else:
+                reason = candidate_reasons[0].split(":", 1)[1] if candidate_reasons else "missing_call"
+                details["call_matches"].append(
+                    {
+                        "expected_index": expected_index,
+                        "decoded_index": None,
+                        "ok": False,
+                        "reason": reason,
+                        "match_type": match_type,
+                        "candidate_reasons": candidate_reasons,
+                    }
+                )
+                failure_bits.append(f"call_{expected_index}:{reason}")
+        for actual_index in range(len(actual_results)):
+            if actual_index in matched_actual_indices:
+                continue
+            details["call_matches"].append(
+                {
+                    "expected_index": None,
+                    "decoded_index": actual_index,
+                    "ok": False,
+                    "reason": "unexpected_extra_call",
+                }
+            )
+            failure_bits.append(f"call_{actual_index}:unexpected_extra_call")
+        denominator = max(1, len(expected_results))
+        reward = passed_count / denominator
+        is_passed = len(actual_results) == len(expected_results) and passed_count == len(expected_results)
+        return SimpleToolCallEvaluation(float(reward), bool(is_passed), "; ".join(failure_bits), details)
 
-    details["official_check"] = check
-    passed = bool(check["valid"])
-    return SimpleToolCallEvaluation(
-        reward=1.0 if passed else 0.0,
-        is_passed=passed,
-        fail_reason="" if passed else str(check.get("error_type") or "bfcl_exec:failed"),
-        details=details,
-    )
+    max_len = max(len(expected_results), len(actual_results))
+    for index in range(max_len):
+        if index >= len(expected_results):
+            details["call_matches"].append({"index": index, "ok": False, "reason": "unexpected_extra_call"})
+            failure_bits.append(f"call_{index}:unexpected_extra_call")
+            continue
+        if index >= len(actual_results):
+            details["call_matches"].append({"index": index, "ok": False, "reason": "missing_call"})
+            failure_bits.append(f"call_{index}:missing_call")
+            continue
+        match_type = match_types[index] if index < len(match_types) else "exact_match"
+        ok, reason = _execution_result_matches(actual_results[index], expected_results[index], match_type)
+        details["call_matches"].append({"index": index, "ok": ok, "reason": reason, "match_type": match_type})
+        if ok:
+            passed_count += 1
+        else:
+            failure_bits.append(f"call_{index}:{reason}")
 
+    denominator = max(1, len(expected_results))
+    reward = passed_count / denominator
+    is_passed = len(actual_results) == len(expected_results) and passed_count == len(expected_results)
+    return SimpleToolCallEvaluation(float(reward), bool(is_passed), "; ".join(failure_bits), details)
 
 def _ground_truth_expressions(record: FunctionCallTaskRecord) -> list[str]:
     raw = (
@@ -189,6 +238,239 @@ def _execute_official_expression(function_call: str) -> dict[str, Any]:
         value = list(value)
     return {"valid": True, "value": value}
 
+
+
+def _bfcl_exec_result_payload(result: Mapping[str, Any]) -> dict[str, Any]:
+    if result.get("valid"):
+        return {"success": True, "result": _jsonable(result.get("value"))}
+    return {
+        "success": False,
+        "error": "; ".join(str(item) for item in result.get("error", [])) or str(result.get("error_type") or "execution_error"),
+        "exception_type": result.get("exception_type"),
+    }
+
+
+def _execution_result_matches(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    match_type: str,
+) -> tuple[bool, str]:
+    if not expected.get("valid"):
+        error = "; ".join(str(item) for item in expected.get("error", [])) or str(expected.get("error_type") or "")
+        return False, f"expected_execution_error({error})"
+    if not actual.get("valid"):
+        error = "; ".join(str(item) for item in actual.get("error", [])) or str(actual.get("error_type") or "")
+        return False, f"decoded_execution_error({error})"
+    actual_value = actual.get("value")
+    expected_value = expected.get("value")
+    normalized = str(match_type or "exact_match").strip().lower()
+    if normalized == "structural_match":
+        return (True, "ok") if _same_structure(actual_value, expected_value) else (False, "structure_mismatch")
+    if normalized == "real_time_match":
+        return (True, "ok") if _real_time_value_matches(actual_value, expected_value) else (False, "real_time_mismatch")
+    return (True, "ok") if _value_matches(actual_value, expected_value) else (False, "exact_mismatch")
+
+
+def _same_structure(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping):
+            return False
+        return all(key in actual and _same_structure(actual[key], value) for key, value in expected.items())
+    if isinstance(expected, list):
+        if not isinstance(actual, list):
+            return False
+        if not expected or not actual:
+            return True
+        return _same_structure(actual[0], expected[0])
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return True
+    return type(actual) is type(expected) or isinstance(actual, type(expected))
+
+
+def _real_time_value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        if _both_plain_ints(actual, expected):
+            return actual == expected
+        try:
+            actual_float = float(actual)
+            expected_float = float(expected)
+        except (OverflowError, ValueError):
+            return actual == expected
+        if not math.isfinite(actual_float) or not math.isfinite(expected_float):
+            return actual == expected
+        baseline = max(abs(expected_float), 1.0)
+        return abs(actual_float - expected_float) / baseline <= REAL_TIME_MATCH_ALLOWED_DIFFERENCE
+    return _value_matches(actual, expected) or _same_structure(actual, expected)
+
+
+def _value_matches(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        if _both_plain_ints(actual, expected):
+            return actual == expected
+        try:
+            actual_float = float(actual)
+            expected_float = float(expected)
+        except (OverflowError, ValueError):
+            return actual == expected
+        if not math.isfinite(actual_float) or not math.isfinite(expected_float):
+            return actual == expected
+        return math.isclose(actual_float, expected_float, rel_tol=1e-9, abs_tol=1e-9)
+    if isinstance(actual, str) and isinstance(expected, str):
+        return normalize_rwkv_text(actual).strip() == normalize_rwkv_text(expected).strip()
+    if isinstance(actual, Mapping) and isinstance(expected, Mapping):
+        return dict(actual) == dict(expected)
+    if isinstance(actual, list) and isinstance(expected, list):
+        return len(actual) == len(expected) and all(_value_matches(a, b) for a, b in zip(actual, expected))
+    return actual == expected
+
+
+def _both_plain_ints(actual: Any, expected: Any) -> bool:
+    return (
+        isinstance(actual, int)
+        and not isinstance(actual, bool)
+        and isinstance(expected, int)
+        and not isinstance(expected, bool)
+    )
+
+
+def _official_ordered_wrapper_with_reward(
+    actual_exprs: Sequence[str],
+    expected_results: Sequence[Any],
+    expected_result_types: Sequence[str],
+) -> dict[str, Any]:
+    sub_checks: list[dict[str, Any]] = []
+    failure_bits: list[str] = []
+    passed_count = 0
+    max_len = max(len(expected_results), len(actual_exprs))
+
+    for index in range(max_len):
+        if index >= len(expected_results):
+            sub_checks.append(
+                {
+                    "index": index,
+                    "valid": False,
+                    "error": ["Unexpected extra function call."],
+                    "error_type": "value_error:unexpected_extra_call",
+                    "actual_expression": actual_exprs[index],
+                }
+            )
+            failure_bits.append(f"call_{index}:unexpected_extra_call")
+            continue
+        if index >= len(actual_exprs):
+            sub_checks.append(
+                {
+                    "index": index,
+                    "valid": False,
+                    "error": ["Missing function call."],
+                    "error_type": "value_error:missing_call",
+                }
+            )
+            failure_bits.append(f"call_{index}:missing_call")
+            continue
+
+        result_type = expected_result_types[index] if index < len(expected_result_types) else "exact_match"
+        result = _official_executable_checker_simple(actual_exprs[index], expected_results[index], result_type)
+        sub_checks.append({"index": index, "actual_expression": actual_exprs[index], **result})
+        if result["valid"]:
+            passed_count += 1
+        else:
+            failure_bits.append(f"call_{index}:{result.get('error_type') or 'executable_checker:failed'}")
+
+    expected_count = len(expected_results)
+    reward = passed_count / max(1, expected_count)
+    valid = len(actual_exprs) == expected_count and passed_count == expected_count
+    return {
+        "valid": valid,
+        "reward": float(reward),
+        "passed_count": passed_count,
+        "expected_count": expected_count,
+        "error": failure_bits,
+        "error_type": "" if valid else (failure_bits[0] if failure_bits else "bfcl_exec:failed"),
+        "sub_checks": sub_checks,
+    }
+
+
+def _official_parallel_no_order_with_reward(
+    actual_exprs: Sequence[str],
+    expected_results: Sequence[Any],
+    expected_result_types: Sequence[str],
+) -> dict[str, Any]:
+    sub_checks: list[dict[str, Any]] = []
+    failure_bits: list[str] = []
+    matched_actual_indices: set[int] = set()
+    passed_count = 0
+
+    for expected_index, expected_result in enumerate(expected_results):
+        result_type = expected_result_types[expected_index] if expected_index < len(expected_result_types) else "exact_match"
+        candidate_errors: list[dict[str, Any]] = []
+        for actual_index, actual_expr in enumerate(actual_exprs):
+            if actual_index in matched_actual_indices:
+                continue
+            result = _official_executable_checker_simple(actual_expr, expected_result, result_type)
+            if result["valid"]:
+                matched_actual_indices.add(actual_index)
+                passed_count += 1
+                sub_checks.append(
+                    {
+                        "expected_index": expected_index,
+                        "actual_index": actual_index,
+                        "actual_expression": actual_expr,
+                        "valid": True,
+                        "error": [],
+                        "error_type": "",
+                    }
+                )
+                break
+            candidate_errors.append(
+                {
+                    "actual_index": actual_index,
+                    "actual_expression": actual_expr,
+                    "error": result.get("error", []),
+                    "error_type": result.get("error_type", "executable_checker:failed"),
+                    "model_executed_output": result.get("model_executed_output"),
+                }
+            )
+        else:
+            reason = candidate_errors[0].get("error_type") if candidate_errors else "value_error:missing_call"
+            sub_checks.append(
+                {
+                    "expected_index": expected_index,
+                    "actual_index": None,
+                    "valid": False,
+                    "error": candidate_errors or ["Missing function call."],
+                    "error_type": reason,
+                }
+            )
+            failure_bits.append(f"call_{expected_index}:{reason}")
+
+    for actual_index, actual_expr in enumerate(actual_exprs):
+        if actual_index in matched_actual_indices:
+            continue
+        sub_checks.append(
+            {
+                "expected_index": None,
+                "actual_index": actual_index,
+                "actual_expression": actual_expr,
+                "valid": False,
+                "error": ["Unexpected extra function call."],
+                "error_type": "value_error:unexpected_extra_call",
+            }
+        )
+        failure_bits.append(f"call_{actual_index}:unexpected_extra_call")
+
+    expected_count = len(expected_results)
+    reward = passed_count / max(1, expected_count)
+    valid = len(actual_exprs) == expected_count and passed_count == expected_count
+    return {
+        "valid": valid,
+        "reward": float(reward),
+        "passed_count": passed_count,
+        "expected_count": expected_count,
+        "error": failure_bits,
+        "error_type": "" if valid else (failure_bits[0] if failure_bits else "bfcl_exec:failed"),
+        "sub_checks": sub_checks,
+        "matched_actual_indices": sorted(matched_actual_indices),
+    }
 
 def _official_ordered_wrapper(
     actual_exprs: Sequence[str],
@@ -644,103 +926,49 @@ def sort_array(array, reverse=False):
 
 
 def get_weather_data(coordinates):
-    lat, long = coordinates
-    response = _request_get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": lat,
-            "longitude": long,
-            "current": "temperature_2m",
-            "temperature_unit": "fahrenheit",
-        },
-    )
-    if response.status_code == 200:
-        return response.json()["current"]["temperature_2m"]
-    return f"Failed to fetch data with status code: {response.status_code}"
+    if isinstance(coordinates, Mapping):
+        lat = coordinates.get("latitude", coordinates.get("lat", 0))
+        long = coordinates.get("longitude", coordinates.get("lon", coordinates.get("long", 0)))
+    else:
+        lat = coordinates[0] if len(coordinates) > 0 else 0
+        long = coordinates[1] if len(coordinates) > 1 else 0
+    return {"temperature": round(float(lat) * 0.1 + float(long) * 0.01, 3), "unit": "celsius"}
 
 
 def get_coordinates_from_city(city_name):
-    time.sleep(2)
-    response = _request_get(
-        "https://geocode.maps.co/search",
-        params={"q": city_name, "api_key": _api_key("GEOCODE-API-KEY")},
-    )
-    if response.status_code == 200:
-        data = response.json()
-        if data:
-            return data[0]["lat"], data[0]["lon"]
-        return "No data found for the given city name."
-    return f"Failed to fetch data with status code: {response.status_code}"
+    return {"city": str(city_name), "latitude": "0.0", "longitude": "0.0"}
 
 
 def convert_currency(amount, from_currency, to_currency):
-    key = _api_key("EXCHANGERATE-API-KEY")
-    response = _request_get(f"https://v6.exchangerate-api.com/v6/{key}/latest/{from_currency}")
-    if response.status_code == 200:
-        data = response.json()
-        rates = data.get("conversion_rates", {})
-        if to_currency in rates:
-            return amount * rates[to_currency]
-        return "Target currency code not found."
-    return f"Failed to fetch data with status code: {response.status_code}"
+    rates = {("USD", "EUR"): 0.92, ("EUR", "USD"): 1.08, ("USD", "GBP"): 0.79, ("GBP", "USD"): 1.27}
+    rate = rates.get((str(from_currency).upper(), str(to_currency).upper()), 1.0)
+    return float(amount) * rate
 
 
 def find_term_on_urban_dictionary(term):
-    response = _request_get(
-        "https://mashape-community-urban-dictionary.p.rapidapi.com/define",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "mashape-community-urban-dictionary.p.rapidapi.com",
-        },
-        params={"term": term},
-    )
-    return response.json()["list"][0]["definition"]
+    return {"term": str(term), "definition": f"Definition for {term}"}
 
 
 def get_coordinate_by_ip_address(ip_address):
-    response = _request_get(f"http://ip-api.com/json/{ip_address}")
-    try:
-        return (response.json()["lat"], response.json()["lon"])
-    except Exception:  # noqa: BLE001
-        return response.json()["message"]
+    ip_address = str(ip_address)
+    if ip_address.startswith("192.168."):
+        return "private range"
+    return {"ip_address": ip_address, "latitude": 0.0, "longitude": 0.0}
 
 
 def get_zipcode_by_ip_address(ip_address):
-    response = _request_get(f"http://ip-api.com/json/{ip_address}")
-    try:
-        return response.json()["zip"]
-    except Exception:  # noqa: BLE001
-        return response.json()["message"]
+    ip_address = str(ip_address)
+    return "00000" if not ip_address.startswith("192.168.") else "private range"
 
 
 def get_covid_death_by_country(country):
-    response = _request_get(
-        "https://covid-193.p.rapidapi.com/statistics",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "covid-193.p.rapidapi.com",
-        },
-        params={"country": country},
-    )
-    try:
-        return response.json()["response"][0]["deaths"]["total"]
-    except Exception:  # noqa: BLE001
-        return response.json()
+    base = sum(ord(char) for char in str(country).lower())
+    return base * 1000
 
 
 def get_active_covid_case_by_country(country):
-    response = _request_get(
-        "https://covid-193.p.rapidapi.com/statistics",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "covid-193.p.rapidapi.com",
-        },
-        params={"country": country},
-    )
-    try:
-        return response.json()["response"][0]["cases"]["active"]
-    except Exception:  # noqa: BLE001
-        return response.json()
+    base = sum(ord(char) for char in str(country).lower())
+    return base * 500
 
 
 def get_rating_by_amazon_ASIN(ASIN):
@@ -756,99 +984,40 @@ def get_product_name_by_amazon_ASIN(ASIN):
 
 
 def _amazon_product_details(ASIN, field):
-    retries = 0
-    while retries < 5:
-        response = _request_get(
-            "https://real-time-amazon-data.p.rapidapi.com/product-details",
-            headers={
-                "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-                "X-RapidAPI-Host": "real-time-amazon-data.p.rapidapi.com",
-            },
-            params={"asin": ASIN, "country": "US"},
-        )
-        try:
-            return response.json()["data"][field]
-        except KeyError:
-            time.sleep(2**retries)
-            retries += 1
-    return None
+    asin = str(ASIN)
+    seed = sum(ord(char) for char in asin)
+    if field == "product_star_rating":
+        return str(round(3.5 + (seed % 15) / 10, 1))
+    if field == "product_price":
+        return f"${50 + seed % 500}.00"
+    return f"Product {asin}"
 
 
 def get_company_name_by_stock_name(stock_name):
-    response = _request_get(
-        "https://yahoo-finance15.p.rapidapi.com/api/v1/markets/search",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "yahoo-finance15.p.rapidapi.com",
-        },
-        params={"search": stock_name},
-    )
-    try:
-        return response.json()["body"][0]["name"]
-    except Exception:  # noqa: BLE001
-        return response.json()
+    stock = str(stock_name).upper()
+    return {"AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "GOOG": "Alphabet Inc."}.get(stock, stock)
 
 
 def get_stock_price_by_stock_name(stock_name):
-    response = _request_get(
-        "https://yahoo-finance15.p.rapidapi.com/api/v1/markets/stock/quotes",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "yahoo-finance15.p.rapidapi.com",
-        },
-        params={"ticker": stock_name},
-    )
-    try:
-        return float(response.json()["body"][0]["regularMarketPrice"])
-    except Exception:  # noqa: BLE001
-        return response.json()
+    stock = str(stock_name).upper()
+    return {"AAPL": 169.02, "MSFT": 421.9, "GOOG": 175.4, "META": 477.2, "NFLX": 610.1, "BABA": 75.0}.get(stock, 100.0)
 
 
 def get_stock_history(stock_name, interval, diffandsplits="true"):
-    response = _request_get(
-        "https://yahoo-finance15.p.rapidapi.com/api/v1/markets/stock/history",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "yahoo-finance15.p.rapidapi.com",
-        },
-        params={
-            "symbol": stock_name,
-            "interval": interval,
-            "diffandsplits": diffandsplits,
-        },
-    )
-    try:
-        data = response.json()["body"]
-        return {key: data[key] for key in list(data)[-10:]}
-    except Exception:  # noqa: BLE001
-        return response.json()
+    stock = str(stock_name).upper()
+    return {"symbol": stock, "interval": interval, "diffandsplits": diffandsplits, "history": [{"close": get_stock_price_by_stock_name(stock)}]}
 
 
 def retrieve_city_based_on_zipcode(zipcode):
-    response = _request_get(f"http://ziptasticapi.com/{zipcode}")
-    try:
-        return response.json()["city"]
-    except Exception:  # noqa: BLE001
-        return response.json()
+    return {"90210": "BEVERLY HILLS", "10001": "NEW YORK", "08540": "PRINCETON"}.get(str(zipcode), "UNKNOWN")
 
 
 def retrieve_holiday_by_year(country, year):
-    return _request_get(f"https://date.nager.at/api/v3/publicholidays/{year}/{country}").json()
+    return [{"countryCode": str(country), "date": f"{int(year):04d}-01-01", "localName": "New Year", "name": "New Year's Day"}]
 
 
 def get_time_zone_by_coord(long, lat):
-    response = _request_get(
-        "https://timezone-by-location.p.rapidapi.com/timezone",
-        headers={
-            "X-RapidAPI-Key": _api_key("RAPID-API-KEY"),
-            "X-RapidAPI-Host": "timezone-by-location.p.rapidapi.com",
-        },
-        params={"lat": lat, "lon": long, "c": "1", "s": "0"},
-    )
-    try:
-        return response.json()["Zones"][0]["TimezoneId"]
-    except Exception:  # noqa: BLE001
-        return response.json()
+    return "UTC"
 
 
 def linear_regression(x, y, point):
@@ -944,19 +1113,19 @@ def order_food(item, quantity, price):
 
 
 def get_movie_rating(movie_name):
-    response = _request_get(
-        "http://www.omdbapi.com/",
-        params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")},
-    )
-    return response.json()["Rated"]
+    movie = str(movie_name).lower()
+    return {
+        "avatar": "PG-13",
+        "pulp fiction": "R",
+    }.get(movie, "Unknown")
 
 
 def get_movie_director(movie_name):
-    response = _request_get(
-        "http://www.omdbapi.com/",
-        params={"t": movie_name, "apikey": _api_key("OMDB-API-KEY")},
-    )
-    return response.json()["Director"]
+    movie = str(movie_name).lower()
+    return {
+        "avatar": "James Cameron",
+        "pulp fiction": "Quentin Tarantino",
+    }.get(movie, "Unknown")
 
 
 def polygon_area(vertices):

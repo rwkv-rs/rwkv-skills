@@ -29,8 +29,6 @@ from src.infer.model import ModelLoadConfig
 
 
 AGENT_JOB_BY_DATASET: dict[str, str] = {
-    "apibank_level2_test": "function_agent_apibank_l2",
-    "apibank_l2_test": "function_agent_apibank_l2",
     "browsecomp_plus_test": "function_agent_browsecomp_plus",
 }
 
@@ -133,6 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         metrics = evaluate_function_call_agent(completions_payloads)
         eval_payloads = metrics.payloads or []
         score_metrics: dict[str, Any] = {
+            "avg@1": metrics.official_score,
             "success_rate": metrics.success_rate,
             "official_score": metrics.official_score,
             "avg_steps": metrics.avg_steps,
@@ -154,6 +153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 eval_dir=judge_eval_dir,
             )
             eval_payloads = judge_metrics.payloads
+            score_metrics["avg@1"] = judge_metrics.accuracy
             score_metrics["success_rate"] = judge_metrics.accuracy
             score_metrics["official_score"] = judge_metrics.accuracy
             if judge_metrics.retrieval_recall is not None:

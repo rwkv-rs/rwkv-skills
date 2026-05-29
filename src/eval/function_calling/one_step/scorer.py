@@ -11,6 +11,7 @@ from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 class OneStepScoreResult:
     passed: bool
     fail_reason: str
+    reward: float = 0.0
     reference: str = ""
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -20,11 +21,11 @@ def score_one_step_prediction(
     prediction: str,
 ) -> OneStepScoreResult:
     if record is None:
-        return OneStepScoreResult(False, "missing_record")
+        return OneStepScoreResult(False, "missing_record", 0.0)
     if not record.expected_tool_calls:
-        return OneStepScoreResult(False, "missing_expected_tool_calls")
+        return OneStepScoreResult(False, "missing_expected_tool_calls", 0.0)
     if _looks_like_template_leak(prediction):
-        return OneStepScoreResult(False, "decision stage leaked internal template/control tokens")
+        return OneStepScoreResult(False, "decision stage leaked internal template/control tokens", 0.0)
 
     from src.eval.function_calling.one_step.simple_tool_call import (
         decode_simple_tool_call_response,
@@ -85,6 +86,7 @@ def score_one_step_prediction(
     return OneStepScoreResult(
         passed=bool(result.is_passed),
         fail_reason=result.fail_reason,
+        reward=float(result.reward),
         reference=reference,
         details=dict(result.details),
     )

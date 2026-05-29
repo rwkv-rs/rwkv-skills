@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Sequence
 
-from .data import FUNCTION_CALL_JOBS, ScoreEntry
+from .data import FUNCTION_CALL_DATASET_PREFIXES, FUNCTION_CALL_JOBS, ScoreEntry
 from .constants import (
     AIME_BASES,
     IFEVAL_BASES,
@@ -51,6 +51,17 @@ def _method_tag(is_cot: bool, *, domain: str | None = None, task: str | None = N
     if domain in {"function_call系列", "function_call"} or task_key in FUNCTION_CALL_JOBS:
         return "nocot"
     return "cot" if is_cot else "nocot"
+
+
+def _is_function_calling_entry(entry: ScoreEntry) -> bool:
+    task_key = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(entry.task or "")).strip("_")
+    base = _dataset_base(entry.dataset).lower()
+    return (
+        entry.domain in {"function_call系列", "function_call"}
+        or task_key in FUNCTION_CALL_JOBS
+        or task_key.startswith("function_")
+        or any(base.startswith(prefix) for prefix in FUNCTION_CALL_DATASET_PREFIXES)
+    )
 
 
 def _benchmark_name(entry: ScoreEntry) -> str:
@@ -146,6 +157,20 @@ def _preferred_k_metric(metrics: dict[str, Any]) -> str:
     return "pass@1"
 
 
+def _preferred_avg_metric_key(metrics: dict[str, Any]) -> str | None:
+    candidates: list[tuple[float, str]] = []
+    for key, value in metrics.items():
+        parsed = _parse_k_metric(str(key))
+        if parsed is None or _numeric_value(value) is None:
+            continue
+        kind, k = parsed
+        if kind == "avg":
+            candidates.append((k, str(key)))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
 def _preferred_numeric(metrics: dict[str, Any], keys: Sequence[str]) -> tuple[str | None, float | None]:
     for key in keys:
         value = metrics.get(key)
@@ -156,6 +181,9 @@ def _preferred_numeric(metrics: dict[str, Any], keys: Sequence[str]) -> tuple[st
 
 
 def _primary_numeric_metric(metrics: dict[str, Any]) -> tuple[str | None, float | None]:
+    avg_key = _preferred_avg_metric_key(metrics)
+    if avg_key:
+        return avg_key, _numeric_value(metrics.get(avg_key))
     key, value = _preferred_numeric(metrics, PRIMARY_KEYS)
     if key:
         return key, value
@@ -174,6 +202,14 @@ def _primary_numeric_metric(metrics: dict[str, Any]) -> tuple[str | None, float 
 def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) -> tuple[str | None, float | None]:
     base = (dataset_base or _dataset_base(entry.dataset)).lower()
     metrics = entry.metrics
+
+    if _is_function_calling_entry(entry):
+        avg_key = _preferred_avg_metric_key(metrics)
+        if avg_key:
+            return avg_key, _numeric_value(metrics.get(avg_key))
+        key, value = _preferred_numeric(metrics, ("official_score", "success_rate"))
+        if key:
+            return key, value
 
     if base.startswith("aime"):
         key, value = _preferred_numeric(metrics, ("pass@8", "avg@16"))
@@ -234,6 +270,11 @@ def _format_metric_value(value: Any) -> str:
 
 
 def _primary_metric(metrics: dict[str, Any]) -> tuple[str, str] | None:
+    avg_key = _preferred_avg_metric_key(metrics)
+    if avg_key:
+        value = metrics.get(avg_key)
+        if isinstance(value, (int, float)):
+            return avg_key, _format_metric_value(value)
     for key in PRIMARY_KEYS:
         value = metrics.get(key)
         if isinstance(value, (int, float)):
@@ -393,6 +434,17 @@ def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
             return _format_metric_value(value)
         return None
 
+    if _is_function_calling_entry(entry):
+        avg_key = _preferred_avg_metric_key(metrics)
+        if avg_key:
+            formatted = _format_specific(avg_key)
+            if formatted is not None:
+                return f"{avg_key} {formatted}"
+        for key in ("official_score", "success_rate"):
+            formatted = _format_specific(key)
+            if formatted is not None:
+                return f"{key} {formatted}"
+
     if _is_multi_choice_entry(entry):
         preferred_k = _preferred_k_metric(metrics)
         formatted = _format_specific(preferred_k)
@@ -434,6 +486,17 @@ def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float
     def _numeric_specific(key: str) -> float | None:
         return _numeric_value(metrics.get(key))
 
+    if _is_function_calling_entry(entry):
+        avg_key = _preferred_avg_metric_key(metrics)
+        if avg_key:
+            value = _numeric_specific(avg_key)
+            if value is not None:
+                return value
+        for key in ("official_score", "success_rate"):
+            value = _numeric_specific(key)
+            if value is not None:
+                return value
+
     if _is_multi_choice_entry(entry):
         preferred_k = _preferred_k_metric(metrics)
         value = _numeric_specific(preferred_k)
@@ -468,9 +531,12 @@ def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float
 # ---------------------------------------------------------------------------
 
 def _metric_score(item: ScoreEntry | None) -> float | None:
-    """Return the first numeric metric value from an entry, or None."""
+    """Return the display-primary numeric metric value from an entry, or None."""
     if item is None:
         return None
+    if _is_function_calling_entry(item):
+        _, value = _best_numeric_metric(item, dataset_base=_dataset_base(item.dataset))
+        return value
     for val in item.metrics.values():
         if isinstance(val, (int, float)):
             return float(val)
@@ -561,6 +627,9 @@ def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float
 
 
 def _field_primary_score(entry: ScoreEntry) -> float | None:
+    if _is_function_calling_entry(entry):
+        _, value = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
+        return value
     if _is_multi_choice_entry(entry):
         return _score_for_eval_method(entry, "logits", _preferred_k_metric(entry.metrics))
     if _prefer_llm_judge(entry):

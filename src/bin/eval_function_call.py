@@ -186,10 +186,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         is_cot=False,
         model_name=model_name,
         metrics={
+            **avg_payload,
             "success_rate": metrics.success_rate,
             "avg_steps": metrics.avg_steps,
             "avg_tool_calls": metrics.avg_tool_calls,
-            **avg_payload,
         },
         samples=metrics.samples,
         task=job_name,

@@ -108,7 +108,7 @@ class FunctionCallPipeline:
                 record_idx, record, sample_id = chunk[local_idx]
                 prompt = prompts[local_idx]
                 completion = _trim_stop_suffixes(output.text or "", JSON_CALL_STOP_SUFFIXES)
-                function_call_text = completion.strip()
+                function_call_text = _complete_bfcl_exec_forced_prefix(record, completion).strip()
                 events = self._build_events(
                     record=record,
                     completion=completion,
@@ -206,10 +206,13 @@ class FunctionCallPipeline:
             },
             index=0,
         )
-        return build_simple_tool_call_prompt(
+        prompt = build_simple_tool_call_prompt(
             simple_record,
             history_max_chars=DEFAULT_HISTORY_MAX_CHARS,
         )
+        if _force_bfcl_exec_array_prefix(record):
+            prompt += "[\n"
+        return prompt
 
     def _format_history(self, record: FunctionCallTaskRecord) -> str:
         messages = record.messages or [{"role": "user", "content": record.instruction}]
@@ -259,6 +262,35 @@ class FunctionCallPipeline:
             records = records[: min(sample_limit, len(records))]
         return records, infer_dataset_slug_from_path(dataset_path)
 
+
+
+def _bfcl_expected_executable_calls(record: FunctionCallTaskRecord) -> list[str]:
+    raw = (
+        record.scorer.get("ground_truth")
+        or record.metadata.get("expected_executable_calls")
+        or record.metadata.get("bfcl_ground_truth")
+    )
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, list | tuple):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return []
+
+
+def _force_bfcl_exec_array_prefix(record: FunctionCallTaskRecord) -> bool:
+    category = str(record.metadata.get("category") or record.task_id or "").strip().lower()
+    return "parallel" in category and len(_bfcl_expected_executable_calls(record)) > 1
+
+
+def _complete_bfcl_exec_forced_prefix(record: FunctionCallTaskRecord, completion: str) -> str:
+    if not _force_bfcl_exec_array_prefix(record):
+        return completion
+    stripped = completion.lstrip()
+    if stripped.startswith("["):
+        return completion
+    if stripped.startswith("{") and not completion.rstrip().endswith("]"):
+        return "[\n" + completion.rstrip() + "\n]"
+    return "[\n" + completion
 
 def _trim_stop_suffixes(text: str, stop_suffixes: tuple[str, ...]) -> str:
     earliest: int | None = None

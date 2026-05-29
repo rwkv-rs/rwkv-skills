@@ -177,7 +177,10 @@ class BrowseCompPlusJudgeMetrics:
 def browsecomp_plus_ground_truth_path() -> Path:
     override = _first_env("RWKV_BROWSECOMP_PLUS_GROUND_TRUTH", "BROWSECOMP_PLUS_GROUND_TRUTH")
     if override:
-        return Path(override).expanduser().resolve()
+        path = Path(override).expanduser().resolve()
+        if path.is_dir():
+            path = path / "browsecomp_plus_decrypted.jsonl"
+        return path
     for candidate in (
         DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT / "data" / "browsecomp_plus_decrypted.jsonl",
         REPO_ROOT / "data" / "browsecomp_plus" / "test.jsonl",
@@ -190,7 +193,10 @@ def browsecomp_plus_ground_truth_path() -> Path:
 def browsecomp_plus_qrel_evidence_path() -> Path:
     override = _first_env("RWKV_BROWSECOMP_PLUS_QREL_EVIDENCE", "BROWSECOMP_PLUS_QREL_EVIDENCE")
     if override:
-        return Path(override).expanduser().resolve()
+        path = Path(override).expanduser().resolve()
+        if path.is_dir():
+            path = path / "qrel_evidence.txt"
+        return path
     for candidate in (
         DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT / "topics-qrels" / "qrel_evidence.txt",
         REPO_ROOT / "references" / "BrowseComp-Plus" / "topics-qrels" / "qrel_evidence.txt",

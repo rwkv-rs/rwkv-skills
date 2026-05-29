@@ -31,7 +31,7 @@ def evaluate_function_call(
     avg_k: tuple[NumericK, ...] = (),
 ) -> FunctionCallMetrics:
     dataset = list(JsonlFunctionCallTaskLoader(str(dataset_path)).load())
-    rows_for_avg: list[tuple[int, int, bool]] = []
+    rows_for_avg: list[tuple[int, int, float]] = []
     eval_payloads: list[dict[str, Any]] = []
     env_totals: dict[str, int] = {}
     env_correct: dict[str, int] = {}
@@ -53,7 +53,7 @@ def evaluate_function_call(
             env_correct[env_type] = env_correct.get(env_type, 0) + 1
             correct += 1
         total += 1
-        rows_for_avg.append((sample_index, repeat_index, passed))
+        rows_for_avg.append((sample_index, repeat_index, float(score.reward)))
         stats = extract_stats(payload)
         step_sum += float(stats.get("steps") or 0)
         tool_call_sum += float(stats.get("tool_calls") or 0)

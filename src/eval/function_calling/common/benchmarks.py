@@ -6,6 +6,7 @@ from typing import Literal
 FunctionCallingSubtype = Literal["one_step", "agent"]
 
 ONE_STEP_METRIC_KEYS: tuple[str, ...] = (
+    "avg@1",
     "success_rate",
     "name_match",
     "argument_match",
@@ -13,6 +14,7 @@ ONE_STEP_METRIC_KEYS: tuple[str, ...] = (
     "extra_call",
 )
 COMPLEXFUNC_METRIC_KEYS: tuple[str, ...] = (
+    "avg@1",
     "success_rate",
     "official_score",
     "call_accuracy",
@@ -21,6 +23,7 @@ COMPLEXFUNC_METRIC_KEYS: tuple[str, ...] = (
     "extra_call",
 )
 AGENT_METRIC_KEYS: tuple[str, ...] = (
+    "avg@1",
     "success_rate",
     "official_score",
     "avg_steps",
@@ -50,6 +53,9 @@ FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
     ),
     "function_one_step_apibank_l1": FunctionCallingBenchmarkSpec(
         "function_one_step_apibank_l1", "one_step", "apibank", ONE_STEP_METRIC_KEYS
+    ),
+    "function_one_step_apibank_l2": FunctionCallingBenchmarkSpec(
+        "function_one_step_apibank_l2", "one_step", "apibank", ONE_STEP_METRIC_KEYS
     ),
     "function_one_step_complexfuncbench_subset": FunctionCallingBenchmarkSpec(
         "function_one_step_complexfuncbench_subset",
@@ -84,6 +90,7 @@ FUNCTION_CALLING_DATASET_PREFIXES: tuple[str, ...] = (
     "browsecomp_plus",
 )
 FUNCTION_CALLING_EXPLICIT_ONLY_JOBS: tuple[str, ...] = (
+    "function_agent_apibank_l2",
     "function_agent_agentbench_db",
     "function_agent_agentbench_kg",
 )

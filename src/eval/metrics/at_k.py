@@ -56,17 +56,17 @@ def compute_pass_at_k(
 
 
 def compute_avg_at_k(
-    rows: Iterable[tuple[int, int, bool]],
+    rows: Iterable[tuple[int, int, bool | float | int]],
     ks: Sequence[NumericK],
 ) -> dict[str, float]:
     seen: set[tuple[int, int]] = set()
-    grouped: dict[int, list[tuple[int, bool]]] = defaultdict(list)
-    for sample_index, repeat_index, passed in rows:
+    grouped: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for sample_index, repeat_index, score in rows:
         key = (int(sample_index), int(repeat_index))
         if key in seen:
             continue
         seen.add(key)
-        grouped[int(sample_index)].append((int(repeat_index), bool(passed)))
+        grouped[int(sample_index)].append((int(repeat_index), float(score)))
 
     metrics: dict[str, float] = {}
     for k in ks:
@@ -75,7 +75,7 @@ def compute_avg_at_k(
         number = float(k)
         if number <= 0:
             continue
-        correct = 0
+        score_sum = 0.0
         total = 0
         for entries in grouped.values():
             ordered = sorted(entries, key=lambda pair: pair[0])
@@ -87,10 +87,10 @@ def compute_avg_at_k(
             else:
                 take = max(1, math.ceil(len(ordered) * number))
                 selected = ordered[:take]
-            correct += sum(1 for _, flag in selected if flag)
+            score_sum += sum(value for _, value in selected)
             total += take
         if total > 0:
-            metrics[f"avg@{format_k_value(k)}"] = correct / total
+            metrics[f"avg@{format_k_value(k)}"] = score_sum / total
     return metrics
 
 

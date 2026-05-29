@@ -13,6 +13,8 @@ FUNCTION_CALL_JOB_NAMES_BY_BENCHMARK: dict[str, tuple[str, ...]] = {
     "toolalpaca_eval_real": ("function_one_step_toolalpaca",),
     "apibank_level1": ("function_one_step_apibank_l1",),
     "apibank_l1": ("function_one_step_apibank_l1",),
+    "apibank_level2": ("function_one_step_apibank_l2",),
+    "apibank_l2": ("function_one_step_apibank_l2",),
     "complexfuncbench_subset": ("function_one_step_complexfuncbench_subset",),
 }
 

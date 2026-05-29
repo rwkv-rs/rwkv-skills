@@ -114,19 +114,11 @@ def load_bfcl_ast_rows_from_sources(
             "instruction": instruction,
             "tools": [_normalize_tool_schema(tool) for tool in _coerce_list(item.get("function"))],
             "expected_tool_calls": _normalize_bfcl_ground_truth_calls(ground_truth),
-            "scorer": {
-                "type": "bfcl_exec" if is_exec else "simple_tool_call",
-                "ground_truth": ground_truth,
-                "execution_result_type": execution_result_type,
-            },
             "metadata": {
                 "source_format": "official_bfcl_v4_exec" if is_exec else "official_bfcl_v4_ast",
                 "category": category,
                 "source_path": str(Path(question_path)),
                 "possible_answer_path": str(Path(possible_answer_path)),
-                "bfcl_ground_truth": ground_truth,
-                "bfcl_execution_result_type": execution_result_type,
-                "expected_executable_calls": ground_truth,
                 "execution_result_type": execution_result_type,
             },
         }

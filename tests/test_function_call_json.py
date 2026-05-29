@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
 from src.eval.evaluators.function_call import FunctionCallPipeline
-from src.eval.function_calling.one_step.bfcl_exec import evaluate_bfcl_executable_calls
+from src.eval.function_calling.one_step.bfcl_exec import _execution_result_matches, evaluate_bfcl_executable_calls
 from src.eval.function_calling.one_step.toolalpaca import (
     execute_toolalpaca_actions,
     local_calls_to_official_actions,
@@ -156,8 +156,82 @@ def test_bfcl_exec_scorer_accepts_bfcl_matrix_argument_names(tmp_path) -> None:
             }
         ],
     )
-    assert result.details["official_bfcl_exec_source"] == "ShishirPatil/gorilla@28a0f42"
-    assert result.details["official_check"]["valid"] is True
+    assert "official_check" not in result.details
+    assert result.details["call_matches"][0]["ok"] is True
+    assert result.details["decoded_execution_results"][0]["success"] is True
+
+
+
+def test_bfcl_exec_parallel_multiple_uses_partial_execution_reward(tmp_path) -> None:
+    path = tmp_path / "bfcl_exec_parallel_multiple.jsonl"
+    row = _simple_tool_call_row()
+    row["task_id"] = "exec_parallel_multiple_0"
+    row["tools"] = [
+        {
+            "name": "math_factorial",
+            "description": "Factorial.",
+            "parameters": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]},
+        },
+        {
+            "name": "calculate_triangle_area",
+            "description": "Triangle area.",
+            "parameters": {
+                "type": "object",
+                "properties": {"base": {"type": "number"}, "height": {"type": "number"}},
+                "required": ["base", "height"],
+            },
+        },
+    ]
+    row["expected_tool_calls"] = [
+        {"name": "math_factorial", "arguments": {"n": 5}, "argument_options": {"n": [5]}},
+        {
+            "name": "calculate_triangle_area",
+            "arguments": {"base": 3, "height": 4},
+            "argument_options": {"base": [3], "height": [4]},
+        },
+    ]
+    row["scorer"] = {
+        "type": "bfcl_exec",
+        "ground_truth": ["math_factorial(n=5)", "calculate_triangle_area(base=3, height=4)"],
+        "execution_result_type": ["exact_match", "exact_match"],
+    }
+    row["metadata"] = {"category": "exec_parallel_multiple"}
+    path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    metrics = evaluate_function_call(
+        [
+            {
+                "sample_index": 0,
+                "repeat_index": 0,
+                "final_answer": '[{"name":"math_factorial","arguments":{"n":5}}]',
+            }
+        ],
+        dataset_path=str(path),
+        avg_k=(1,),
+    )
+
+    assert metrics.success_rate == 0.0
+    assert metrics.avg_at_k == {"avg@1": 0.5}
+    assert metrics.payloads and metrics.payloads[0]["is_passed"] is False
+    record = JsonlFunctionCallTaskLoader(path).load()[0]
+    result = evaluate_bfcl_executable_calls(
+        record,
+        [{"name": "math_factorial", "arguments": {"n": 5}}],
+    )
+    assert result.reward == 0.5
+    assert "official_check" not in result.details
+    assert sum(1 for item in result.details["call_matches"] if item.get("ok")) == 1
+    assert len([item for item in result.details["call_matches"] if item.get("reason") == "missing_call"]) == 1
+
+
+def test_bfcl_exec_structural_match_allows_extra_decoded_dict_keys() -> None:
+    ok, reason = _execution_result_matches(
+        {"valid": True, "value": {"result": 1, "extra": "kept"}},
+        {"valid": True, "value": {"result": 99}},
+        "structural_match",
+    )
+
+    assert (ok, reason) == (True, "ok")
 
 
 def test_bfcl_exec_scorer_does_not_fallback_to_argument_identity(tmp_path) -> None:
@@ -192,7 +266,7 @@ def test_bfcl_exec_scorer_does_not_fallback_to_argument_identity(tmp_path) -> No
     )
 
     assert metrics.success_rate == 0.0
-    assert metrics.payloads[0]["fail_reason"] == "bfcl_exec:official_ground_truth_execution_failed"
+    assert metrics.payloads[0]["fail_reason"].startswith("call_0:expected_execution_error")
 
 
 def test_bfcl_exec_prompt_puts_strict_schema_in_system(tmp_path) -> None:
@@ -464,6 +538,7 @@ def test_function_call_scheduler_exposes_new_function_call_jobs() -> None:
     assert JOB_CATALOGUE["function_one_step_bfcl_exec"].is_cot is False
     assert JOB_CATALOGUE["function_one_step_toolalpaca"].is_cot is False
     assert JOB_CATALOGUE["function_one_step_apibank_l1"].is_cot is False
+    assert JOB_CATALOGUE["function_one_step_apibank_l2"].is_cot is False
     assert JOB_CATALOGUE["function_one_step_complexfuncbench_subset"].is_cot is False
     assert JOB_CATALOGUE["function_agent_apibank_l2"].is_cot is False
     assert JOB_CATALOGUE["function_agent_browsecomp_plus"].is_cot is False
@@ -471,15 +546,15 @@ def test_function_call_scheduler_exposes_new_function_call_jobs() -> None:
     assert _resolve_job_list(("function_one_step_bfcl_ast",), None, None) == ("function_one_step_bfcl_ast",)
     for job_name in (
         "function_one_step_apibank_l1",
+        "function_one_step_apibank_l2",
         "function_one_step_complexfuncbench_subset",
-        "function_agent_apibank_l2",
         "function_agent_browsecomp_plus",
     ):
         assert JOB_CATALOGUE[job_name].domain == "function_call"
         assert job_name in JOB_ORDER
         assert _resolve_job_list((job_name,), None, None) == (job_name,)
     assert detect_job_from_dataset("apibank_l1_test", is_cot=False) == "function_one_step_apibank_l1"
-    assert detect_job_from_dataset("apibank_l2_test", is_cot=False) == "function_agent_apibank_l2"
+    assert detect_job_from_dataset("apibank_l2_test", is_cot=False) == "function_one_step_apibank_l2"
     assert (
         detect_job_from_dataset("complexfuncbench_subset_test", is_cot=False)
         == "function_one_step_complexfuncbench_subset"
@@ -505,6 +580,7 @@ def test_function_call_eval_uses_new_one_step_job_names(
     monkeypatch.setenv("RWKV_SKILLS_JOB_NAME", "function_one_step_bfcl_exec")
     assert simple_tool_call_job_name("bfcl_multiple_test") == "function_one_step_bfcl_ast"
     assert simple_tool_call_job_name("apibank_l1_test") == "function_one_step_apibank_l1"
+    assert simple_tool_call_job_name("apibank_l2_test") == "function_one_step_apibank_l2"
     assert simple_tool_call_job_name("complexfuncbench_subset_test") == "function_one_step_complexfuncbench_subset"
 
 
@@ -684,6 +760,105 @@ def test_apibank_level2_env_runs_expected_trace(monkeypatch, tmp_path) -> None:
     assert results[-1].done is True
     assert results[-1].score == 1.0
     assert results[-1].success is True
+
+
+def test_create_apibank_level2_env_uses_record_root_by_default(monkeypatch, tmp_path) -> None:
+    from src.eval.function_calling.agent.adapters import apibank as apibank_agent
+
+    root = tmp_path / "api-bank"
+    root.mkdir()
+    (root / "evaluator.py").write_text("", encoding="utf-8")
+    row = {
+        "task_id": "apibank_l2__fake",
+        "env": {"type": "apibank_level2", "official_root": str(root)},
+        "metadata": {
+            "apibank_history": [
+                {"role": "User", "text": "Find a calculator."},
+                {
+                    "role": "API",
+                    "api_name": "ToolSearcher",
+                    "param_dict": {"keywords": "calculator"},
+                    "result": {"api_name": "ToolSearcher", "input": {"keywords": "calculator"}},
+                },
+            ]
+        },
+    }
+
+    def _unexpected_default_config():  # pragma: no cover - only fails on regression
+        raise AssertionError("default config should not override the record official_root")
+
+    monkeypatch.setattr(apibank_agent, "ApiBankLevel2AdapterConfig", _unexpected_default_config)
+
+    env = apibank_agent.create_apibank_level2_env(row)
+
+    assert env.root == root
+
+
+def test_prepare_apibank_level2_uses_one_step_rows(monkeypatch, tmp_path) -> None:
+    from src.eval.datasets.data_prepper.function_call import apibank as apibank_prepper
+
+    root = tmp_path / "api-bank"
+    source_dir = root / "lv1-lv2-samples" / "level-1-given-desc"
+    source_dir.mkdir(parents=True)
+    apis_dir = root / "apis"
+    apis_dir.mkdir()
+    (root / "evaluator.py").write_text("", encoding="utf-8")
+    (apis_dir / "calculator.py").write_text(
+        "class Calculator:\n"
+        "    description = 'Calculator API.'\n"
+        "    input_parameters = {'formula': {'type': 'str', 'description': 'Formula.'}}\n"
+        "    output_parameters = {'result': {'type': 'int', 'description': 'Result.'}}\n",
+        encoding="utf-8",
+    )
+    history = [
+        {"role": "User", "text": "Calculate 1+1."},
+        {
+            "role": "API",
+            "api_name": "Calculator",
+            "param_dict": {"formula": "1+1"},
+            "result": {
+                "api_name": "Calculator",
+                "input": {"formula": "1+1"},
+                "output": 2,
+                "exception": None,
+            },
+        },
+        {"role": "AI", "text": "The result is 2."},
+        {"role": "User", "text": "Now calculate 2+2."},
+        {
+            "role": "API",
+            "api_name": "Calculator",
+            "param_dict": {"formula": "2+2"},
+            "result": {
+                "api_name": "Calculator",
+                "input": {"formula": "2+2"},
+                "output": 4,
+                "exception": None,
+            },
+        },
+    ]
+    sample = source_dir / "Calculator-level-2-test.jsonl"
+    sample.write_text("\n".join(json.dumps(row) for row in history) + "\n", encoding="utf-8")
+    monkeypatch.setattr(apibank_prepper, "apibank_source_root", lambda: root)
+
+    paths = apibank_prepper.prepare_apibank_level2(tmp_path / "out")
+    rows = [json.loads(line) for line in paths[0].read_text(encoding="utf-8").splitlines()]
+
+    assert len(rows) == 2
+    assert rows[0]["task_id"] == "apibank_level2__Calculator-level-2-test_001"
+    assert rows[1]["task_id"] == "apibank_level2__Calculator-level-2-test_004"
+    assert "env" not in rows[0]
+    assert "scorer" not in rows[0]
+    assert rows[0]["instruction"].startswith("Conversation history:\nUser: Calculate 1+1.")
+    assert rows[0]["instruction"].endswith("Return the next API call only.")
+    assert "Function output [Calculator(formula='1+1')]: 2" in rows[1]["instruction"]
+    assert "\"api_name\"" not in rows[1]["instruction"]
+    assert "\"input\"" not in rows[1]["instruction"]
+    assert "\"output\"" not in rows[1]["instruction"]
+    assert "\"exception\"" not in rows[1]["instruction"]
+    assert rows[0]["metadata"]["source_dir"].endswith("level-1-given-desc")
+    assert "apibank_official_root" not in rows[0]["metadata"]
+    assert rows[0]["expected_tool_calls"][0]["name"] == "Calculator"
 
 
 def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> None:
@@ -954,6 +1129,24 @@ def test_browsecomp_plus_judge_reads_benchmark_toml(monkeypatch) -> None:
     assert judge.api_mode == "chat"
     assert judge.base_url == "https://api.ablai.top/v1/chat/completions"
     assert judge.max_output_tokens == 1024
+
+
+def test_browsecomp_plus_judge_env_paths_accept_directories(monkeypatch, tmp_path) -> None:
+    from src.eval.function_calling.agent.adapters.browsecomp_plus_judge import (
+        browsecomp_plus_ground_truth_path,
+        browsecomp_plus_qrel_evidence_path,
+    )
+
+    data_dir = tmp_path / "data"
+    qrel_dir = tmp_path / "topics-qrels"
+    data_dir.mkdir()
+    qrel_dir.mkdir()
+    monkeypatch.setenv("BROWSECOMP_PLUS_GROUND_TRUTH", str(data_dir))
+    monkeypatch.setenv("BROWSECOMP_PLUS_QREL_EVIDENCE", str(qrel_dir))
+
+    assert browsecomp_plus_ground_truth_path() == data_dir / "browsecomp_plus_decrypted.jsonl"
+    assert browsecomp_plus_qrel_evidence_path() == qrel_dir / "qrel_evidence.txt"
+
 
 
 def test_browsecomp_plus_openai_judge_uses_chat_completions_endpoint(tmp_path) -> None:

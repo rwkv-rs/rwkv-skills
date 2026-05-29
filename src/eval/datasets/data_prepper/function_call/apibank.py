@@ -4,9 +4,6 @@ import os
 from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALL_REGISTRY
-from src.eval.function_calling.agent.adapters.apibank import (
-    load_apibank_level2_rows_from_source_dir,
-)
 from src.eval.function_calling.one_step.apibank import (
     DEFAULT_OFFICIAL_APIBANK_ROOT,
     load_api_bank_rows_from_source,
@@ -28,7 +25,12 @@ def apibank_source_root() -> Path:
         return Path(override).expanduser().resolve()
     for candidate in (
         REPO_ROOT / "references" / "API-Bank",
+        REPO_ROOT / "references" / "DAMO-ConvAI" / "api-bank",
+        REPO_ROOT.parent / "GitHub" / "rwkv-skills" / "references" / "API-Bank",
+        REPO_ROOT.parent / "GitHub" / "rwkv-skills" / "references" / "DAMO-ConvAI" / "api-bank",
         REPO_ROOT.parent / "API-Bank",
+        Path("/tmp/ref-DAMO-ConvAI/api-bank"),
+        Path("/tmp/rwkv-official-refs/DAMO-ConvAI/api-bank"),
         DEFAULT_OFFICIAL_APIBANK_ROOT,
     ):
         if candidate.exists():
@@ -59,16 +61,7 @@ def _prepare_apibank_level(output_root: Path, dataset_name: str, *, level: int) 
 
 
 def _prepare_apibank_l2(output_root: Path, dataset_name: str) -> list[Path]:
-    root = apibank_source_root()
-    source_dir = root / "lv1-lv2-samples" / "level-2-toolsearcher"
-    rows = load_apibank_level2_rows_from_source_dir(
-        source_dir,
-        official_root=root,
-        dataset_name=dataset_name,
-    )
-    target = output_root / dataset_name / "test.jsonl"
-    write_jsonl(target, rows)
-    return [target]
+    return _prepare_apibank_level(output_root, dataset_name, level=2)
 
 
 @FUNCTION_CALL_REGISTRY.register("apibank_level1")
@@ -82,7 +75,7 @@ def prepare_apibank_level1(output_root: Path, split: str = "test") -> list[Path]
 def prepare_apibank_level2(output_root: Path, split: str = "test") -> list[Path]:
     if split != "test":
         raise ValueError("apibank_level2 only provides test split")
-    return _prepare_apibank_level(output_root, "apibank_level2", level=2)
+    return _prepare_apibank_l2(output_root, "apibank_level2")
 
 
 @FUNCTION_CALL_REGISTRY.register("apibank_l1")

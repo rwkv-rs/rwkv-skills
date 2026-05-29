@@ -317,8 +317,7 @@ def create_apibank_level2_env(
     *,
     config: ApiBankLevel2AdapterConfig | None = None,
 ) -> ApiBankLevel2Env:
-    cfg = config or ApiBankLevel2AdapterConfig()
-    return ApiBankLevel2Env(record, official_root=cfg.official_root)
+    return ApiBankLevel2Env(record, official_root=config.official_root if config else None)
 
 
 def expected_apibank_level2_actions(record: FunctionCallTaskRecord | Mapping[str, Any]) -> list[ToolAction]:

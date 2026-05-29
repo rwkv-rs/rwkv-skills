@@ -366,6 +366,14 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         domain="function_call",
         batch_flag="--batch-size",
     ),
+    "function_one_step_apibank_l2": JobSpec(
+        name="function_one_step_apibank_l2",
+        module="src.bin.eval_function_call",
+        dataset_slugs=APIBANK_L2_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
     "function_one_step_complexfuncbench_subset": JobSpec(
         name="function_one_step_complexfuncbench_subset",
         module="src.bin.eval_function_call",
@@ -377,7 +385,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
     "function_agent_apibank_l2": JobSpec(
         name="function_agent_apibank_l2",
         module="src.bin.eval_function_call_agent",
-        dataset_slugs=APIBANK_L2_DATASET_SLUGS,
+        dataset_slugs=(),
         is_cot=False,
         domain="function_call",
         batch_flag="--batch-size",

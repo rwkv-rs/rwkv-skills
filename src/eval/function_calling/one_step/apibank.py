@@ -115,7 +115,7 @@ def _load_apibank_rows(
             arguments = dict(item.get("param_dict") if isinstance(item.get("param_dict"), Mapping) else {})
             rows.append(
                 {
-                    "task_id": f"{dataset_name}__{path.stem}__{item_index:03d}",
+                    "task_id": f"{dataset_name}__{path.stem}_{item_index:03d}",
                     "instruction": _render_apibank_history(history[:item_index]),
                     "tools": tools,
                     "expected_tool_calls": [
@@ -125,20 +125,14 @@ def _load_apibank_rows(
                             "argument_options": {key: [value] for key, value in arguments.items()},
                         }
                     ],
-                    "scorer": {"type": "apibank_official", "level": int(level)},
                     "metadata": {
                         "source_format": "official_api_bank",
-                        "apibank_level": int(level),
-                        "apibank_official_source": OFFICIAL_APIBANK_SOURCE,
-                        "apibank_official_root": str(official_root),
-                        "apibank_source_path": str(path),
-                        "source_dir": str(source_dir),
                         "source_path": str(path),
+                        "source_dir": str(source_dir),
                         "level": int(level),
                         "turn_index": item_index,
                         "api_name": api_name,
                         "expected_result": item.get("result"),
-                        "apibank_ground_truth_result": item.get("result"),
                     },
                 }
             )
@@ -166,8 +160,10 @@ def evaluate_apibank_official_calls(
     }
     if parse_error:
         return SimpleToolCallEvaluation(0.0, False, parse_error, details)
-    if len(expected) != 1 or len(decoded_calls) != 1:
-        return SimpleToolCallEvaluation(0.0, False, "apibank_official:call_count_mismatch", details)
+    if len(expected) != 1:
+        return SimpleToolCallEvaluation(0.0, False, "apibank_official:expected_call_count_mismatch", details)
+    if not decoded_calls:
+        return SimpleToolCallEvaluation(0.0, False, "missing_call", details)
     actual = decoded_calls[0]
     expected_call = expected[0]
     api_name = str(actual.get("name") or "")
@@ -268,9 +264,22 @@ def _render_apibank_history(history: Sequence[Mapping[str, Any]]) -> str:
                 name=str(item.get("api_name") or ""),
                 arguments=dict(item.get("param_dict") if isinstance(item.get("param_dict"), Mapping) else {}),
             )
-            result = item.get("result")
-            rendered.append(f"API: {apibank_action_text(action)} Response: {result}")
-    return "\n".join(rendered).strip()
+            result = json.dumps(_apibank_history_result_payload(item.get("result")), ensure_ascii=False)
+            rendered.append(f"Function output {apibank_action_text(action)}: {result}")
+    body = "\n".join(rendered).strip()
+    if body:
+        return f"Conversation history:\n{body}\nReturn the next API call only."
+    return "Conversation history:\nReturn the next API call only."
+
+
+def _apibank_history_result_payload(result: Any) -> Any:
+    if not isinstance(result, Mapping):
+        return result
+    if not {"api_name", "input", "output", "exception"}.issubset(set(result)):
+        return result
+    if result.get("exception") not in (None, ""):
+        return {"error": result.get("exception")}
+    return result.get("output")
 
 
 def _api_description_to_tool_schema(
