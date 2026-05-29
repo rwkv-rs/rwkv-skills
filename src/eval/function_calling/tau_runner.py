@@ -493,6 +493,11 @@ def _run_tau(
         tool_routing_config=tool_routing_config,
         prompt_max_chars=prompt_max_chars,
     )
+    sampling_payload["tau_adapter"] = {
+        "semantic_fallbacks": False,
+        "format_conversion": True,
+        "state_prefix_cache": bool(str(getattr(args, "engine_mode", "") or "").strip() == "lightning"),
+    }
     tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
     history_max_chars = max(0, min(int(args.history_max_chars), tau_history_cap))
     user_model = None

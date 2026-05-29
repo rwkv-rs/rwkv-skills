@@ -196,6 +196,35 @@ def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: 
     assert "RWKV_EVAL_RUN_MODE" not in os.environ
 
 
+def test_local_model_config_passes_lightning_state_cache_args(monkeypatch, tmp_path: Path) -> None:
+    config = main_module.RunConfig.from_mapping(
+        {
+            "dataset": {"name": "mmlu"},
+            "model": {
+                "path": "weights/model.pth",
+                "device": "cuda:0",
+                "engine_mode": "lightning",
+                "state_db_path": "tmp/state-cache.sqlite3",
+            },
+            "runner": {"cot_mode": "cot"},
+        }
+    )
+
+    dataset_path = tmp_path / "mmlu" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    resolved = main_module.resolve_run_config(config)
+
+    assert "--model-path" in resolved.argv
+    assert "weights/model.pth" in resolved.argv
+    assert "--engine-mode" in resolved.argv
+    assert "lightning" in resolved.argv
+    assert "--state-db-path" in resolved.argv
+    assert "tmp/state-cache.sqlite3" in resolved.argv
+
+
 def test_run_from_config_prefers_explicit_contracts_over_env(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {

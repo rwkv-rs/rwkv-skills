@@ -147,6 +147,8 @@ class DatasetSection:
 class ModelSection:
     path: str | None = None
     device: str = "cuda"
+    engine_mode: str | None = None
+    state_db_path: str | None = None
     infer_base_url: str | None = None
     infer_model: str | None = None
     infer_api_key: str = ""
@@ -158,6 +160,8 @@ class ModelSection:
         return cls(
             path=_maybe_str(payload.get("path")),
             device=_maybe_str(payload.get("device")) or "cuda",
+            engine_mode=_maybe_str(payload.get("engine_mode")),
+            state_db_path=_maybe_str(payload.get("state_db_path")),
             infer_base_url=_maybe_str(payload.get("infer_base_url")),
             infer_model=_maybe_str(payload.get("infer_model")),
             infer_api_key=_maybe_str(payload.get("infer_api_key")) or "",
@@ -566,6 +570,8 @@ def _append_repeatable(argv: list[str], flag: str, values: Sequence[object]) -> 
 def _append_backend_args(argv: list[str], model: ModelSection) -> None:
     if model.path:
         argv.extend(["--model-path", model.path, "--device", model.device])
+        _append_flag(argv, "--engine-mode", model.engine_mode)
+        _append_flag(argv, "--state-db-path", model.state_db_path)
         return
     if model.infer_base_url:
         argv.extend(["--infer-base-url", model.infer_base_url])

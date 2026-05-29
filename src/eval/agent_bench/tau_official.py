@@ -30,51 +30,6 @@ from src.infer.sampling import SamplingConfig
 
 RESPOND_TOOL_NAME = "respond"
 DEFAULT_TAU_PROMPT_MAX_CHARS = 24576
-TAU_RESPOND_ALIASES = {
-    "done",
-    "final",
-    "final_answer",
-    "final_response",
-    "stop",
-}
-TAU_USER_REQUEST_ALIASES = {
-    "ask_for_confirmation": "Please confirm how you would like to proceed.",
-    "ask_for_reservation_id": "Could you please provide the reservation ID?",
-    "ask_for_user_id": "Could you please provide your user ID?",
-    "request_confirmation": "Please confirm how you would like to proceed.",
-    "request_reservation_id": "Could you please provide the reservation ID?",
-    "request_user_id": "Could you please provide your user ID?",
-}
-TAU_TOOL_NAME_ALIASES = {
-    "airline_booking_search": "search_direct_flight",
-    "airline_flight_search": "search_direct_flight",
-    "find_flights": "search_direct_flight",
-    "flight_search": "search_direct_flight",
-    "get_booking": "get_reservation_details",
-    "get_flight": "search_direct_flight",
-    "get_flights": "search_direct_flight",
-    "get_reservation": "get_reservation_details",
-    "get_reservations_by_user_id": "get_user_details",
-    "get_user_bookings": "get_user_details",
-    "get_user_info": "get_user_details",
-    "get_user_reservations": "get_user_details",
-    "list_user_reservations": "get_user_details",
-    "lookup_booking": "get_reservation_details",
-    "lookup_reservation": "get_reservation_details",
-    "lookup_user": "get_user_details",
-    "search_available_flights": "search_direct_flight",
-    "search_bookings": "get_user_details",
-    "search_flight": "search_direct_flight",
-    "search_flights": "search_direct_flight",
-    "search_one_stop_flight": "search_onestop_flight",
-    "search_onestop_flights": "search_onestop_flight",
-    "update_baggage": "update_reservation_baggages",
-    "update_baggages": "update_reservation_baggages",
-    "update_passengers": "update_reservation_passengers",
-    "update_reservation": "update_reservation_flights",
-}
-TAU_FORBIDDEN_PSEUDO_TOOLS = {"analysis", "reason", "thought", "think"}
-_TAU_RESERVATION_ID_RE = re.compile(r"\b[A-Z0-9]{6}\b")
 
 
 @dataclass(slots=True)
@@ -324,18 +279,6 @@ class RWKVTauOfficialAgent:
         try:
             name, arguments = _parse_tau_agent_decision(raw_text)
             assistant_message = self._decision_to_assistant_message(name, arguments)
-            loop_error = _repeated_assistant_decision_error(
-                history,
-                assistant_message,
-                AssistantMessage=self._AssistantMessage,
-            )
-            if loop_error:
-                parse_error = loop_error
-                self.parse_errors.append(parse_error)
-                assistant_message = self._AssistantMessage(
-                    role="assistant",
-                    content="I am unable to make progress on this task. ###STOP###",
-                )
         except Exception as exc:
             parse_error = str(exc)
             self.parse_errors.append(parse_error)
@@ -482,7 +425,6 @@ class RWKVTauOfficialAgent:
 
     def _decision_to_assistant_message(self, name: str, arguments: Mapping[str, Any]) -> Any:
         normalized_name, arguments = _normalize_tau_decision(name, arguments)
-        arguments = _normalize_tau_arguments(normalized_name, arguments)
         if normalized_name == RESPOND_TOOL_NAME:
             content = (
                 arguments.get("content")
@@ -498,7 +440,6 @@ class RWKVTauOfficialAgent:
             raise ValueError(f"unknown tau tool name: {normalized_name}")
         if normalized_name not in self._current_tool_names:
             raise ValueError(f"tau tool name not in routed tool window: {normalized_name}")
-        arguments = _filter_tau_arguments_for_tool(self._tools_by_name.get(normalized_name), arguments)
         return self._AssistantMessage(
             role="assistant",
             content=None,
@@ -740,132 +681,7 @@ def _tau_top_level_arguments(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _normalize_tau_decision(name: str, arguments: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     normalized_name = _strip_tau_requestor_prefix(name)
-    normalized_arguments = dict(arguments)
-    normalized_name, normalized_arguments = _normalize_tau_wrapper_tool(normalized_name, normalized_arguments)
-    if normalized_name in TAU_USER_REQUEST_ALIASES:
-        content = _first_text_field(
-            normalized_arguments,
-            ("content", "message", "question", "prompt", "summary", "answer"),
-        )
-        normalized_arguments = {"content": content or TAU_USER_REQUEST_ALIASES[normalized_name]}
-        normalized_name = RESPOND_TOOL_NAME
-    elif normalized_name in TAU_RESPOND_ALIASES:
-        normalized_name = RESPOND_TOOL_NAME
-        if "content" not in normalized_arguments:
-            content = _first_text_field(normalized_arguments, ("answer", "message", "summary"))
-            normalized_arguments["content"] = content or "###STOP###"
-        if "###STOP###" not in str(normalized_arguments.get("content") or ""):
-            normalized_arguments["content"] = f"{normalized_arguments['content']} ###STOP###"
-    else:
-        normalized_name = TAU_TOOL_NAME_ALIASES.get(normalized_name, normalized_name)
-        if normalized_name in TAU_FORBIDDEN_PSEUDO_TOOLS:
-            raise ValueError(f"tau pseudo tool is not executable: {normalized_name}")
-    return normalized_name, normalized_arguments
-
-
-def _normalize_tau_arguments(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    normalized = dict(arguments)
-    if name in {
-        "cancel_reservation",
-        "get_reservation_details",
-        "update_reservation_baggages",
-        "update_reservation_flights",
-        "update_reservation_passengers",
-    }:
-        _rename_first_present(
-            normalized,
-            "reservation_id",
-            ("booking_id", "reservation_code", "confirmation_number", "confirmation_code", "record_locator"),
-        )
-    if name == "get_user_details":
-        _rename_first_present(normalized, "user_id", ("customer_id", "account_id", "member_id"))
-    if name in {"search_direct_flight", "search_onestop_flight"}:
-        _rename_first_present(normalized, "date", ("departure_date", "flight_date", "travel_date"))
-        for key in ("return_date", "cabin", "cabin_class", "flight_type", "passenger_count", "passengers"):
-            normalized.pop(key, None)
-    if name in {"update_reservation_baggages", "update_reservation_flights"}:
-        _rename_first_present(normalized, "payment_id", ("payment_method", "payment", "card_id", "refund_method"))
-    if name == "update_reservation_flights":
-        _rename_first_present(normalized, "flights", ("new_flights", "flight_segments", "segments"))
-    if name == "update_reservation_passengers":
-        _rename_first_present(normalized, "passengers", ("new_passengers", "travellers", "travelers"))
-    if name == "transfer_to_human_agents":
-        summary = normalized.get("summary")
-        for key in ("content", "message", "answer"):
-            if isinstance(summary, str) and summary.strip():
-                break
-            value = normalized.get(key)
-            if isinstance(value, str) and value.strip():
-                summary = value.strip()
-        normalized = {"summary": str(summary or "").strip()}
-    return normalized
-
-
-def _filter_tau_arguments_for_tool(tool: Any | None, arguments: Mapping[str, Any]) -> dict[str, Any]:
-    if tool is None:
-        return dict(arguments)
-    schema = _normalize_tool_schema(tool)
-    parameters = schema.get("parameters")
-    if not isinstance(parameters, Mapping):
-        parameters = schema.get("arguments")
-    if not isinstance(parameters, Mapping):
-        return dict(arguments)
-    properties = parameters.get("properties")
-    if not isinstance(properties, Mapping) or not properties:
-        return dict(arguments)
-    allowed = {str(key) for key in properties}
-    return {str(key): value for key, value in arguments.items() if str(key) in allowed}
-
-
-def _normalize_tau_wrapper_tool(name: str, arguments: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
-    if name != "airline_agent_tool":
-        return name, dict(arguments)
-    normalized = dict(arguments)
-    action_details = normalized.get("action_details")
-    if isinstance(action_details, str) and action_details.strip():
-        try:
-            action_details = json.loads(action_details)
-        except json.JSONDecodeError:
-            action_details = {}
-    if not isinstance(action_details, Mapping):
-        action_details = {}
-    merged = {**normalized, **dict(action_details)}
-    action = str(merged.get("action") or merged.get("intent") or "").strip().lower()
-    query = " ".join(
-        str(merged.get(key) or "")
-        for key in ("query", "content", "message", "summary")
-        if merged.get(key)
-    )
-    reservation_id = merged.get("reservation_id") or merged.get("booking_id")
-    if not reservation_id:
-        match = _TAU_RESERVATION_ID_RE.search(query)
-        if match:
-            reservation_id = match.group(0)
-    if action in {"cancel", "cancellation"} or "cancel" in query.lower():
-        args = {"reservation_id": reservation_id} if reservation_id else dict(merged)
-        return "cancel_reservation", args
-    if action in {"lookup", "get_reservation", "reservation"} and reservation_id:
-        return "get_reservation_details", {"reservation_id": reservation_id}
-    if action in {"get_user", "lookup_user"} and merged.get("user_id"):
-        return "get_user_details", {"user_id": merged["user_id"]}
-    return name, dict(arguments)
-
-
-def _rename_first_present(arguments: dict[str, Any], canonical: str, aliases: Sequence[str]) -> None:
-    if canonical in arguments and arguments[canonical] not in (None, ""):
-        return
-    for alias in aliases:
-        if alias in arguments and arguments[alias] not in (None, ""):
-            arguments[canonical] = arguments.pop(alias)
-            return
-
-
-def _first_text_field(arguments: Mapping[str, Any], keys: Sequence[str]) -> str | None:
-    for key in keys:
-        value = arguments.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
+    return normalized_name, dict(arguments)
 
 
 def _tau_messages_to_prompt_messages(
@@ -922,41 +738,6 @@ def _render_tau_tool_call(tool_call: Any) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
-
-
-def _repeated_assistant_decision_error(history: Sequence[Any], message: Any, *, AssistantMessage: Any) -> str | None:
-    signature = _assistant_decision_signature(message)
-    if not signature:
-        return None
-    previous_count = 0
-    for item in history:
-        role = str(getattr(item, "role", "") or "").strip().lower()
-        if not isinstance(item, AssistantMessage) and role != "assistant":
-            continue
-        if _assistant_decision_signature(item) == signature:
-            previous_count += 1
-    if previous_count >= 2:
-        return f"tau repeated agent decision loop guard: {signature[:160]}"
-    return None
-
-
-def _assistant_decision_signature(message: Any) -> str:
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        rows = []
-        for call in tool_calls:
-            rows.append(
-                {
-                    "name": str(getattr(call, "name", "") or ""),
-                    "arguments": dict(getattr(call, "arguments", {}) or {}),
-                }
-            )
-        return "tool:" + json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    content = normalize_rwkv_text(str(getattr(message, "content", "") or "")).strip()
-    if not content or "###STOP###" in content:
-        return ""
-    lowered = re.sub(r"\s+", " ", content.lower())
-    return "content:" + lowered[:240]
 
 
 def _normalize_tool_schema(tool: Any) -> dict[str, Any]:

@@ -1,5 +1,5 @@
 [run]
-id = "tau3_airline_g1g_parallel_chunk_router_3k_newapi_20260529"
+id = "tau3_airline_g1g_parallel_chunk_router_3k_strict_20260529"
 job = "function_tau3_bench"
 run_mode = "rerun"
 max_samples = 50

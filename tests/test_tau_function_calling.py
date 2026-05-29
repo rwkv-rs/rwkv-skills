@@ -11,11 +11,7 @@ from src.eval.agent_bench.tau_official import (
     RWKVTauOfficialAgent,
     build_tau_official_agent_system_prompt,
     configure_tau_nl_assertions_judge,
-    _filter_tau_arguments_for_tool,
-    _normalize_tau_decision,
-    _normalize_tau_arguments,
     _parse_tau_agent_decision,
-    _repeated_assistant_decision_error,
     _tau_litellm_model_name,
     _tau_llm_timeout_args,
 )
@@ -145,113 +141,29 @@ def test_tau_official_parser_accepts_top_level_content_as_arguments() -> None:
     assert arguments == {"content": "Done ###STOP###"}
 
 
-def test_tau_official_parser_normalizes_common_airline_tool_aliases() -> None:
+def test_tau_official_parser_keeps_semantic_tool_alias_unmodified() -> None:
     name, arguments = _parse_tau_agent_decision(
         '{"name":"search_flights","arguments":{"origin":"JFK","destination":"LAX","departure_date":"2024-05-01","return_date":null,"cabin":"economy"}}'
     )
 
-    assert name == "search_direct_flight"
-    assert _normalize_tau_arguments(name, arguments) == {
+    assert name == "search_flights"
+    assert arguments == {
         "origin": "JFK",
         "destination": "LAX",
-        "date": "2024-05-01",
+        "departure_date": "2024-05-01",
+        "return_date": None,
+        "cabin": "economy",
     }
 
 
-def test_tau_official_parser_normalizes_airline_booking_search_alias() -> None:
-    name, arguments = _parse_tau_agent_decision(
-        '{"name":"airline_booking_search","arguments":{"origin":"JFK","destination":"LAX","departure_date":"2024-05-01","cabin_class":"business"}}'
-    )
-
-    assert name == "search_direct_flight"
-    assert _normalize_tau_arguments(name, arguments) == {
-        "origin": "JFK",
-        "destination": "LAX",
-        "date": "2024-05-01",
-    }
-
-
-def test_tau_official_parser_normalizes_airline_wrapper_cancel_action() -> None:
+def test_tau_official_parser_keeps_wrapper_tool_unmodified() -> None:
     name, arguments = _parse_tau_agent_decision(
         '{"name":"airline_agent_tool","arguments":{"action_details":{"action":"cancel","reservation_id":"IFOYYZ"},"user_id":"aarav_ahmed_6699","query":"Cancel reservation IFOYYZ"}}'
     )
 
-    assert name == "cancel_reservation"
-    assert arguments == {"reservation_id": "IFOYYZ"}
-
-
-def test_tau_official_argument_normalization_and_schema_filtering() -> None:
-    tool = {
-        "name": "search_direct_flight",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "origin": {"type": "string"},
-                "destination": {"type": "string"},
-                "date": {"type": "string"},
-            },
-        },
-    }
-
-    arguments = _normalize_tau_arguments(
-        "search_direct_flight",
-        {
-            "origin": "JFK",
-            "destination": "LAX",
-            "departure_date": "2024-05-01",
-            "return_date": "2024-05-05",
-            "cabin": "economy",
-            "unexpected": "drop",
-        },
-    )
-
-    assert _filter_tau_arguments_for_tool(tool, arguments) == {
-        "origin": "JFK",
-        "destination": "LAX",
-        "date": "2024-05-01",
-    }
-
-
-def test_tau_official_decision_rejects_pseudo_think_tool() -> None:
-    try:
-        _normalize_tau_decision("think", {"thought": "Call get_reservation_details next."})
-    except ValueError as exc:
-        assert "pseudo tool" in str(exc)
-    else:  # pragma: no cover - defensive
-        raise AssertionError("expected pseudo tool rejection")
-
-
-def test_tau_official_repeated_decision_guard_detects_same_tool_call() -> None:
-    tool_call = lambda: SimpleNamespace(name="get_user_details", arguments={"user_id": "mei_brown_7075"})
-    history = [
-        SimpleNamespace(role="assistant", content=None, tool_calls=[tool_call()]),
-        SimpleNamespace(role="assistant", content=None, tool_calls=[tool_call()]),
-    ]
-    message = SimpleNamespace(role="assistant", content=None, tool_calls=[tool_call()])
-
-    error = _repeated_assistant_decision_error(history, message, AssistantMessage=SimpleNamespace)
-
-    assert error is not None
-    assert "loop guard" in error
-
-
-def test_tau_official_repeated_decision_guard_ignores_stop_message() -> None:
-    history = [
-        SimpleNamespace(role="assistant", content="Done. ###STOP###", tool_calls=[]),
-        SimpleNamespace(role="assistant", content="Done. ###STOP###", tool_calls=[]),
-    ]
-    message = SimpleNamespace(role="assistant", content="Done. ###STOP###", tool_calls=[])
-
-    assert _repeated_assistant_decision_error(history, message, AssistantMessage=SimpleNamespace) is None
-
-
-def test_tau_official_transfer_to_human_keeps_only_summary_argument() -> None:
-    arguments = _normalize_tau_arguments(
-        "transfer_to_human_agents",
-        {"content": "Please help with cancellation.", "summary": "Cancellation needs human support."},
-    )
-
-    assert arguments == {"summary": "Cancellation needs human support."}
+    assert name == "airline_agent_tool"
+    assert arguments["action_details"] == {"action": "cancel", "reservation_id": "IFOYYZ"}
+    assert arguments["user_id"] == "aarav_ahmed_6699"
 
 
 def test_parse_tau_rejects_plain_text_final_answer() -> None:
