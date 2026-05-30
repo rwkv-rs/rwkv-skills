@@ -371,6 +371,11 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     seed: int | None = None
     n: int | None = None
+    stop_tokens: list[int] | None = None
+    ban_tokens: list[int] | None = None
+    pad_zero: bool | None = None
+    no_penalty_token_ids: list[int] | None = None
+    prefill_chunk_size: int | None = Field(default=None, ge=1)
 
 
 def chat_message_content_to_text(content: str | list[ChatMessageTextPart] | None) -> str:

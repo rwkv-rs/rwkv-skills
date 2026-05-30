@@ -86,6 +86,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         help="Timeout for official tau user/judge LLM calls; mirrors RWKV_TAU_LLM_TIMEOUT_S",
     )
+    parser.add_argument("--user-model", help="Model name for official tau user simulator")
+    parser.add_argument("--user-api-key", help="API key for official tau user simulator")
+    parser.add_argument("--user-base-url", help="OpenAI-compatible base URL for official tau user simulator")
+    parser.add_argument("--judge-model", help="Model name for official tau NL assertion judge")
+    parser.add_argument("--judge-api-key", help="API key for official tau NL assertion judge")
+    parser.add_argument("--judge-base-url", help="OpenAI-compatible base URL for official tau NL assertion judge")
+    parser.add_argument("--judge-max-workers", type=int, help="Reserved for judge clients that support worker pools")
     parser.add_argument(
         "--disable-checker",
         action="store_true",

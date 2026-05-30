@@ -1,19 +1,19 @@
 [run]
-id = "tau3_airline_g1g_lexical_chunk_3k_strict_20260529"
+id = "tau3_airline_g1g_lexical_chunk_3k_opt_20260529"
 job = "function_tau3_bench"
 run_mode = "rerun"
 max_samples = 50
-batch_size = 4
+batch_size = 2
 
 [dataset]
 name = "tau3_bench_airline"
 split = "base"
 
 [model]
-infer_base_url = "http://127.0.0.1:19081"
+infer_base_url = "http://127.0.0.1:19081/openai"
 infer_model = "rwkv7-g1g-7.2b-20260523-ctx8192"
 infer_timeout_s = 900
-infer_max_workers = 12
+infer_max_workers = 8
 
 [runner]
 result_store = "json"
@@ -21,20 +21,24 @@ benchmark_kind = "tau3_bench"
 prompt_style = "rwkv_official_json"
 tool_catalog_format = "json"
 avg_ks = [1]
-history_max_chars = 4200
-prompt_max_chars = 3072
+user_model = "gpt-4.1-mini"
+user_base_url = "https://next-token.cc/v1"
+judge_model = "gpt-4.1"
+judge_base_url = "https://next-token.cc/v1"
+history_max_chars = 3000
+prompt_max_chars = 4096
 long_doc_mode = "lexical"
 long_doc_max_chars = 650
 long_doc_overlap_lines = 1
 long_doc_min_chars = 600
 long_doc_max_evidence_chunks = 2
-long_doc_max_evidence_chars = 1800
+long_doc_max_evidence_chars = 1500
 tool_router_mode = "lexical"
-tool_router_max_tools = 6
+tool_router_max_tools = 5
 tool_router_trigger_tool_count = 1
 tool_router_trigger_catalog_chars = 1
-tool_router_context_chars = 2400
-tool_router_description_chars = 140
+tool_router_context_chars = 2000
+tool_router_description_chars = 110
 max_steps = 80
 max_tool_errors = 10
 decision_max_tokens = 384

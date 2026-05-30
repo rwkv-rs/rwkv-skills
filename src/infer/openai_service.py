@@ -113,6 +113,11 @@ def prepare_chat_completion_request(request: ChatCompletionRequest) -> PreparedC
         logprobs=max(1, int(request.top_logprobs or 0)) if request.logprobs else None,
         candidate_token_texts=request.candidate_token_texts,
         seed=request.seed,
+        stop_tokens=request.stop_tokens,
+        ban_tokens=request.ban_tokens,
+        pad_zero=request.pad_zero,
+        no_penalty_token_ids=request.no_penalty_token_ids,
+        prefill_chunk_size=request.prefill_chunk_size,
     )
     return PreparedChatCompletionRequest(
         completion_request=completion_request,

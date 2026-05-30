@@ -29,6 +29,7 @@ path = "weights/model.pth"
 device = "cuda:1"
 
 [runner]
+result_store = "json"
 cot_mode = "cot"
 db_write_queue = 2048
 extra_args = ["--foo", "bar"]
@@ -45,6 +46,7 @@ extra_args = ["--foo", "bar"]
     assert config.dataset.split == "test"
     assert config.model.path == "weights/model.pth"
     assert config.model.device == "cuda:1"
+    assert config.runner.result_store == "json"
     assert config.runner.cot_mode == "cot"
     assert config.runner.db_write_queue == 2048
     assert config.runner.extra_args == ("--foo", "bar")
@@ -121,6 +123,10 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
                 "tool_router_max_tools": 8,
                 "tool_router_parallel_chunk_tools": 3,
                 "tool_router_parallel_batch_size": 5,
+                "user_model": "gpt-5.4-mini",
+                "user_base_url": "https://next-token.cc/v1",
+                "judge_model": "gpt-5.4",
+                "judge_base_url": "https://next-token.cc/v1",
             },
         }
     )
@@ -153,6 +159,45 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert "3" in resolved.argv
     assert "--tool-router-parallel-batch-size" in resolved.argv
     assert "5" in resolved.argv
+    assert "--user-model" in resolved.argv
+    assert "gpt-5.4-mini" in resolved.argv
+    assert "--user-base-url" in resolved.argv
+    assert "https://next-token.cc/v1" in resolved.argv
+    assert "--judge-model" in resolved.argv
+    assert "gpt-5.4" in resolved.argv
+    assert "--judge-base-url" in resolved.argv
+
+
+def test_resolve_run_config_can_select_json_result_store(monkeypatch, tmp_path: Path) -> None:
+    config = main_module.RunConfig.from_mapping(
+        {
+            "dataset": {"name": "tau3_bench_airline"},
+            "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
+            "runner": {
+                "result_store": "json",
+                "benchmark_kind": "tau3_bench",
+                "prompt_style": "rwkv_official_json",
+            },
+        }
+    )
+
+    dataset_path = tmp_path / "tau3_bench_airline" / "base.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text("[]\n", encoding="utf-8")
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    resolved = main_module.resolve_run_config(config)
+
+    assert resolved.env["RWKV_EVAL_STORE"] == "json"
+    assert "RWKV_EVAL_STORE" not in main_module.resolve_run_config(
+        main_module.RunConfig.from_mapping(
+            {
+                "dataset": {"name": "tau3_bench_airline"},
+                "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
+                "runner": {"benchmark_kind": "tau3_bench"},
+            }
+        )
+    ).env
 
 
 def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: Path) -> None:
@@ -225,7 +270,7 @@ def test_local_model_config_passes_lightning_state_cache_args(monkeypatch, tmp_p
     assert "tmp/state-cache.sqlite3" in resolved.argv
 
 
-def test_run_from_config_prefers_explicit_contracts_over_env(monkeypatch, tmp_path: Path) -> None:
+def test_run_from_config_passes_contracts_and_patches_env(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
             "run": {"run_mode": "resume"},
@@ -258,8 +303,8 @@ def test_run_from_config_prefers_explicit_contracts_over_env(monkeypatch, tmp_pa
     result = main_module.run_from_config(config)
 
     assert result == 0
-    assert captured["job_name_env"] is None
-    assert captured["run_mode_env"] is None
+    assert captured["job_name_env"] == "multi_choice_cot"
+    assert captured["run_mode_env"] == "resume"
     assert captured["run_context"].job_name == "multi_choice_cot"
     assert captured["run_context"].run_mode.value == "resume"
     assert captured["task_spec"].runner_name == "multi_choice_cot"

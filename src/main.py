@@ -172,6 +172,7 @@ class ModelSection:
 
 @dataclass(frozen=True, slots=True)
 class RunnerSection:
+    result_store: str | None = None
     cot_mode: str | None = None
     judge_mode: str | None = None
     benchmark_kind: str | None = None
@@ -218,6 +219,9 @@ class RunnerSection:
     top_p: float | None = None
     eval_timeout: float | None = None
     eval_workers: int | None = None
+    user_model: str | None = None
+    user_api_key: str | None = None
+    user_base_url: str | None = None
     judge_model: str | None = None
     judge_api_key: str | None = None
     judge_base_url: str | None = None
@@ -227,6 +231,7 @@ class RunnerSection:
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "RunnerSection":
         return cls(
+            result_store=_maybe_str(payload.get("result_store")),
             cot_mode=_maybe_str(payload.get("cot_mode")),
             judge_mode=_maybe_str(payload.get("judge_mode")),
             benchmark_kind=_maybe_str(payload.get("benchmark_kind")),
@@ -306,6 +311,9 @@ class RunnerSection:
             top_p=_maybe_float(payload.get("top_p"), field_name="runner.top_p"),
             eval_timeout=_maybe_float(payload.get("eval_timeout"), field_name="runner.eval_timeout"),
             eval_workers=_maybe_int(payload.get("eval_workers"), field_name="runner.eval_workers"),
+            user_model=_maybe_str(payload.get("user_model")),
+            user_api_key=_maybe_str(payload.get("user_api_key")),
+            user_base_url=_maybe_str(payload.get("user_base_url")),
             judge_model=_maybe_str(payload.get("judge_model")),
             judge_api_key=_maybe_str(payload.get("judge_api_key")),
             judge_base_url=_maybe_str(payload.get("judge_base_url")),
@@ -444,6 +452,9 @@ def resolve_run_config(config: RunConfig) -> ResolvedRun:
         run_id=config.run.id,
     )
     env = run_context.env_overrides(dataset_slug=dataset_slug)
+    if config.runner.result_store:
+        env = dict(env)
+        env["RWKV_EVAL_STORE"] = config.runner.result_store
     return ResolvedRun(
         config=config,
         benchmark=benchmark,
@@ -694,6 +705,13 @@ def _build_runner_argv(
         _append_flag(argv, "--tool-router-description-chars", runner_cfg.tool_router_description_chars)
         _append_flag(argv, "--tool-router-parallel-chunk-tools", runner_cfg.tool_router_parallel_chunk_tools)
         _append_flag(argv, "--tool-router-parallel-batch-size", runner_cfg.tool_router_parallel_batch_size)
+        _append_flag(argv, "--user-model", runner_cfg.user_model)
+        _append_flag(argv, "--user-api-key", runner_cfg.user_api_key)
+        _append_flag(argv, "--user-base-url", runner_cfg.user_base_url)
+        _append_flag(argv, "--judge-model", runner_cfg.judge_model)
+        _append_flag(argv, "--judge-api-key", runner_cfg.judge_api_key)
+        _append_flag(argv, "--judge-base-url", runner_cfg.judge_base_url)
+        _append_flag(argv, "--judge-max-workers", runner_cfg.judge_max_workers)
         _append_repeatable(argv, "--avg-k", runner_cfg.avg_ks)
         if runner.name == "function_browsecomp":
             _append_flag(argv, "--cot-max-tokens", runner_cfg.cot_max_tokens)
@@ -731,13 +749,13 @@ def run_from_config(config: RunConfig) -> int:
     if not callable(target_main):
         raise TypeError(f"runner module {resolved.module!r} does not expose callable main()")
     explicit_kwargs = _explicit_contract_kwargs(target_main=target_main, resolved=resolved)
-    if explicit_kwargs:
-        result = target_main(
-            list(resolved.argv),
-            **explicit_kwargs,
-        )
-    else:
-        with _patched_environ(resolved.env):
+    with _patched_environ(resolved.env):
+        if explicit_kwargs:
+            result = target_main(
+                list(resolved.argv),
+                **explicit_kwargs,
+            )
+        else:
             result = target_main(list(resolved.argv))
     return int(result)
 

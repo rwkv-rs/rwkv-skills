@@ -9,8 +9,7 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from src.db.async_writer import CompletionWriteWorker
-from src.db.database import init_db
-from src.db.eval_db_service import EvalDbService
+from src.db.eval_service import create_eval_service, init_eval_store
 from src.eval.benchmark_registry import CoTMode
 from src.eval.evaluating import TaskRunController, TaskRunState, attempt_tuple, prepare_task_execution
 from src.eval.execution_plan import AttemptKey, avg_k_metric_key
@@ -30,7 +29,7 @@ AttemptTuple = tuple[int, int, int]
 
 @dataclass(slots=True)
 class FunctionCallingRunContext:
-    service: EvalDbService
+    service: object
     runtime: TaskRunController
     writer: CompletionWriteWorker
     task_id: str
@@ -234,8 +233,8 @@ def prepare_function_calling_run(
     run_context: "RunContext | None" = None,
     judger_model_name: str | None = None,
 ) -> FunctionCallingRunContext:
-    init_db(DEFAULT_DB_CONFIG)
-    service = EvalDbService()
+    init_eval_store(DEFAULT_DB_CONFIG)
+    service = create_eval_service()
     resolved_job_name = run_context.job_name if run_context is not None else job_name
     task_state = prepare_task_execution(
         service=service,

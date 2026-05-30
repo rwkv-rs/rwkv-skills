@@ -450,6 +450,32 @@ def _requires_tau_user_model(records: Sequence[TauManifestRecord]) -> bool:
     return any(not _is_lightweight_tau_record(record) for record in records)
 
 
+def _apply_tau_model_overrides(args: argparse.Namespace) -> None:
+    overrides = {
+        "USER_MODEL_NAME": getattr(args, "user_model", None),
+        "USER_API_KEY": getattr(args, "user_api_key", None),
+        "USER_BASE_URL": getattr(args, "user_base_url", None),
+        "JUDGE_MODEL": getattr(args, "judge_model", None),
+        "JUDGE_API_KEY": getattr(args, "judge_api_key", None),
+        "JUDGE_BASE_URL": getattr(args, "judge_base_url", None),
+    }
+    for env_name, raw_value in overrides.items():
+        value = str(raw_value or "").strip()
+        if value:
+            os.environ[env_name] = value
+
+
+def _tau_runtime_model_metadata(user_model: Any | None, judge_model: Any | None) -> dict[str, Any]:
+    return {
+        "user_model": getattr(user_model, "model_name", None),
+        "user_base_url": getattr(user_model, "base_url", None),
+        "judge_model": getattr(judge_model, "model_name", None),
+        "judge_base_url": getattr(judge_model, "base_url", None),
+        "static_user": user_model is None,
+        "judge_configured": judge_model is not None,
+    }
+
+
 def _run_tau(
     args: argparse.Namespace,
     run: ResolvedFunctionCallingRun,
@@ -503,9 +529,11 @@ def _run_tau(
     user_model = None
     judge_model = None
     if _requires_tau_user_model(records):
+        _apply_tau_model_overrides(args)
         user_model = resolve_required_user_model_config()
         judge_model = resolve_judge_model_config(default_model=user_model.model_name) or user_model
         apply_openai_env(user_model)
+    sampling_payload["tau_official_runtime"] = _tau_runtime_model_metadata(user_model, judge_model)
 
     runtime_cache: dict[str, TauOfficialRuntime] = {}
 

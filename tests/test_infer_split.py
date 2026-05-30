@@ -626,7 +626,7 @@ def test_sse_payload_encoder_emits_done_marker() -> None:
     assert encode_sse_comment("ping").decode("utf-8") == ": ping\n\n"
 
 
-def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scoring(monkeypatch) -> None:
+def test_remote_backend_uses_chat_completions_for_generate_and_caches_choice_scoring(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(
             base_url="127.0.0.1:8081",
@@ -637,6 +637,15 @@ def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scor
 
     def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
         calls.append((url, payload))
+        if url.endswith("/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
         if url.endswith("/completions"):
             return {
                 "choices": [
@@ -673,9 +682,9 @@ def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scor
     assert len(outputs) == 1
     assert outputs[0].text == "answer"
     assert outputs[0].finish_reason == "stop_token"
-    assert calls[0][0].endswith("/completions")
-    assert calls[0][1]["prompt"] == "prompt"
-    assert "messages" not in calls[0][1]
+    assert calls[0][0].endswith("/chat/completions")
+    assert calls[0][1]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert "prompt" not in calls[0][1]
     assert calls[0][1]["top_k"] == 42
     assert calls[0][1]["penalty_decay"] == 0.95
     assert calls[0][1]["stop_tokens"] == [0]
@@ -693,6 +702,48 @@ def test_remote_backend_uses_text_completions_and_caches_unsupported_choice_scor
         payload for _url, payload in calls if payload.get("candidate_token_texts") == [" A", " B"]
     ]
     assert len(choice_scoring_calls) == 1
+
+
+def test_remote_backend_falls_back_to_text_completions_for_generate(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/chat/completions"):
+            raise RemoteHTTPError(404, "missing")
+        if url.endswith("/completions"):
+            return {
+                "choices": [
+                    {
+                        "text": "legacy answer",
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["prompt"],
+        sampling=SamplingConfig(max_generate_tokens=4, temperature=0.0, top_p=0.8),
+        batch_size=1,
+        show_progress=False,
+    )
+
+    assert outputs[0].text == "legacy answer"
+    assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/chat/completions"
+    assert calls[0][1]["messages"] == [{"role": "user", "content": "prompt"}]
+    assert calls[0][1]["temperature"] == 0.001
+    assert calls[0][1]["top_p"] == 0.8
+    assert calls[1][0] == "http://127.0.0.1:19081/openai/v1/completions"
+    assert calls[1][1]["prompt"] == "prompt"
 
 
 def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:

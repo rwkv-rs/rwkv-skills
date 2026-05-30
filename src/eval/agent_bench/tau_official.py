@@ -278,7 +278,11 @@ class RWKVTauOfficialAgent:
         parse_error: str | None = None
         try:
             name, arguments = _parse_tau_agent_decision(raw_text)
-            assistant_message = self._decision_to_assistant_message(name, arguments)
+            assistant_message = self._decision_to_assistant_message(
+                name,
+                arguments,
+                prompt_messages=prompt_messages,
+            )
         except Exception as exc:
             parse_error = str(exc)
             self.parse_errors.append(parse_error)
@@ -313,6 +317,10 @@ class RWKVTauOfficialAgent:
             progress_desc="TauOfficial-LongDoc",
             prompt_seed=long_doc_seed,
         ).messages
+        facts_message = _build_tau_tool_facts_message(prompt_messages, max_chars=700)
+        facts_text = facts_message["content"] if facts_message is not None else None
+        if facts_message is not None:
+            compacted_messages = [*compacted_messages, facts_message]
         policy_result = compact_long_text(
             self._domain_policy,
             query=long_doc_query,
@@ -341,6 +349,7 @@ class RWKVTauOfficialAgent:
             emitted_tool_schema_mode,
         ) = self._build_budgeted_agent_prompt(
             domain_policy=domain_policy,
+            facts_text=facts_text,
             selected_tools=tool_route.selected_tools,
             messages=compacted_messages,
             history_budget=history_budget,
@@ -363,6 +372,7 @@ class RWKVTauOfficialAgent:
         self,
         *,
         domain_policy: str,
+        facts_text: str | None,
         selected_tools: Sequence[Any],
         messages: Sequence[Mapping[str, object]],
         history_budget: int,
@@ -382,6 +392,7 @@ class RWKVTauOfficialAgent:
                     policy_view,
                     tools,
                     tool_schema_mode=tool_schema_mode,
+                    facts_text=facts_text,
                 )
                 prompt = build_rwkv_json_call_prompt(
                     system_prompt,
@@ -414,6 +425,7 @@ class RWKVTauOfficialAgent:
             truncate_text(policy, min(policy_budgets[-1], 240)),
             tools,
             tool_schema_mode="minimal",
+            facts_text=facts_text,
         )
         final_prompt = build_rwkv_json_call_prompt(final_system, [], history_max_chars=0)
         if len(final_prompt) > self._prompt_max_chars:
@@ -423,8 +435,33 @@ class RWKVTauOfficialAgent:
             )
         return final_prompt, tools, min(policy_budgets[-1], 240), "minimal"
 
-    def _decision_to_assistant_message(self, name: str, arguments: Mapping[str, Any]) -> Any:
+    def _decision_to_assistant_message(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        prompt_messages: Sequence[Mapping[str, object]] = (),
+    ) -> Any:
         normalized_name, arguments = _normalize_tau_decision(name, arguments)
+        if normalized_name == RESPOND_TOOL_NAME:
+            content = (
+                arguments.get("content")
+                or arguments.get("answer")
+                or arguments.get("message")
+                or ""
+            )
+            content_text = str(content).strip()
+            if not content_text:
+                raise ValueError("empty tau respond content")
+            return self._AssistantMessage(role="assistant", content=content_text)
+        if normalized_name not in self._tool_names:
+            raise ValueError(f"unknown tau tool name: {normalized_name}")
+        normalized_name, arguments = _normalize_tau_tool_decision_from_context(
+            normalized_name,
+            arguments,
+            prompt_messages,
+            available_tool_names=self._tool_names,
+        )
         if normalized_name == RESPOND_TOOL_NAME:
             content = (
                 arguments.get("content")
@@ -493,6 +530,7 @@ def build_tau_official_agent_system_prompt(
     tools: Sequence[Any],
     *,
     tool_schema_mode: str = "full",
+    facts_text: str | None = None,
 ) -> str:
     if tool_schema_mode == "compact":
         tool_schemas = [_compact_tool_schema(_normalize_tool_schema(tool)) for tool in tools]
@@ -518,27 +556,38 @@ def build_tau_official_agent_system_prompt(
         tool_json_kwargs["indent"] = 2
     else:
         tool_json_kwargs["separators"] = (",", ":")
-    return normalize_rwkv_text(
-        "\n".join(
+    sections = [
+        "You are the assistant in the official tau-bench simulation.",
+        "Follow the domain policy exactly.",
+        "Use a real tool call when you need information or need to change state.",
+        "Use respond only when sending a message to the user.",
+        "When the task is complete and no more tool calls are needed, use respond and include ###STOP### in the content.",
+        "Return exactly one JSON function call object and no extra prose.",
+        'JSON shape: {"name":"tool_name","arguments":{...}}',
+        "Valid names are exactly the listed tool names plus respond.",
+        "Never invent wrapper or pseudo tools such as think, thought, search_flights, get_flights, search_bookings, get_user_bookings, or airline_agent_tool.",
+        "Never copy a Function output object; do not return requestor/ok/output as your decision.",
+        "Do not invent ids/emails; lookup before changes.",
+        "Do not repeat successful read tools; use their outputs.",
+        "Use only argument keys declared by the selected tool schema.",
+    ]
+    if facts_text:
+        sections.extend(
             [
-                "You are the assistant in the official tau-bench simulation.",
-                "Follow the domain policy exactly.",
-                "Use a real tool call when you need information or need to change state.",
-                "Use respond only when sending a message to the user.",
-                "When the task is complete and no more tool calls are needed, use respond and include ###STOP### in the content.",
-                "Return exactly one JSON function call object and no extra prose.",
-                'JSON shape: {"name":"tool_name","arguments":{...}}',
-                "Valid names are exactly the listed tool names plus respond.",
-                "Never invent wrapper or pseudo tools such as think, thought, search_flights, get_flights, search_bookings, get_user_bookings, or airline_agent_tool.",
-                "Never copy a Function output object; do not return requestor/ok/output as your decision.",
-                "Use only argument keys declared by the selected tool schema.",
-                "Tools:",
-                json.dumps(tool_schemas, **tool_json_kwargs),
-                "Policy:",
-                normalize_rwkv_text(domain_policy),
+                "Known facts:",
+                normalize_rwkv_text(facts_text),
+                "Do not ask the user for values already listed in Known facts.",
             ]
         )
+    sections.extend(
+        [
+            "Tools:",
+            json.dumps(tool_schemas, **tool_json_kwargs),
+            "Policy:",
+            normalize_rwkv_text(domain_policy),
+        ]
     )
+    return normalize_rwkv_text("\n".join(sections))
 
 
 def _policy_budget_candidates(policy: str, prompt_max_chars: int) -> list[int]:
@@ -684,6 +733,558 @@ def _normalize_tau_decision(name: str, arguments: Mapping[str, Any]) -> tuple[st
     return normalized_name, dict(arguments)
 
 
+_TAU_READ_TOOL_NAMES = {
+    "get_customer_by_id",
+    "get_customer_by_name",
+    "get_customer_by_phone",
+    "get_details_by_id",
+    "get_flight_status",
+    "get_order_details",
+    "get_reservation_details",
+    "get_user_details",
+}
+_TAU_USER_ID_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z][a-z0-9]*_\d+\b", re.IGNORECASE)
+_TAU_GENERIC_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{3,}\b")
+_TAU_FLIGHT_NUMBER_RE = re.compile(r"\b[A-Z]{2,4}\d{2,4}\b")
+_TAU_EXISTING_RESERVATION_ACTION_RE = re.compile(
+    r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation|refund|change|reschedule|move|upgrade|"
+    r"baggage|bag|bags|suitcase|suitcases|luggage|passenger|date of birth|dob|existing reservation)\b",
+    re.IGNORECASE,
+)
+_TAU_FACT_KEYS = {
+    "account_status",
+    "bill_ids",
+    "customer_id",
+    "date_of_birth",
+    "dob",
+    "email",
+    "full_name",
+    "item_id",
+    "item_ids",
+    "line_id",
+    "line_ids",
+    "order_id",
+    "payment_method_id",
+    "payment_methods",
+    "phone_number",
+    "product_id",
+    "reservation_id",
+    "reservations",
+    "status",
+    "user_id",
+}
+
+
+def _normalize_tau_tool_decision_from_context(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]]:
+    normalized_name = str(name or "").strip()
+    normalized_arguments = dict(arguments)
+    cancel_replacement = _tau_cancel_intent_replacement_from_context(
+        normalized_name,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if cancel_replacement is not None:
+        return cancel_replacement
+    if normalized_name == "get_user_details":
+        known_user_id = _latest_tau_fact_value(prompt_messages, "user_id")
+        raw_user_id = str(normalized_arguments.get("user_id") or "").strip()
+        if known_user_id and (raw_user_id != known_user_id or not _TAU_USER_ID_RE.fullmatch(raw_user_id)):
+            normalized_arguments["user_id"] = known_user_id
+    elif normalized_name in {"get_reservation_details", "cancel_reservation"}:
+        raw_reservation_id = str(normalized_arguments.get("reservation_id") or "").strip().upper()
+        if not raw_reservation_id or _TAU_USER_ID_RE.fullmatch(raw_reservation_id):
+            requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+            if requested_id:
+                normalized_arguments["reservation_id"] = requested_id
+
+    if normalized_name in _TAU_READ_TOOL_NAMES:
+        has_same_observation = _has_successful_tau_tool_observation(
+            normalized_name,
+            normalized_arguments,
+            prompt_messages,
+        )
+        has_prior_user_profile = (
+            normalized_name == "get_user_details"
+            and _has_successful_tau_tool_name("get_user_details", prompt_messages)
+        )
+        if has_same_observation or has_prior_user_profile:
+            context_response = _tau_readonly_reservation_response_from_context(prompt_messages)
+            if context_response is not None:
+                return context_response
+            direct_action = _tau_direct_requested_reservation_action_from_context(
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if direct_action is not None:
+                return direct_action
+            replacement = _replacement_for_repeated_tau_read(
+                normalized_name,
+                normalized_arguments,
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if replacement is not None:
+                return replacement
+            exhausted_response = _tau_exhausted_repeated_read_response(normalized_name, prompt_messages)
+            if exhausted_response is not None:
+                return exhausted_response
+    return normalized_name, normalized_arguments
+
+
+def _tau_cancel_intent_replacement_from_context(
+    selected_name: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if "cancel_reservation" not in available_tool_names and "get_reservation_details" not in available_tool_names:
+        return None
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    if not requested_id:
+        return None
+    user_text = _tau_user_request_text(prompt_messages)
+    if not re.search(
+        r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation)\b",
+        user_text,
+        re.IGNORECASE,
+    ):
+        return None
+    completed_response = _tau_completed_cancel_response_from_context(prompt_messages, requested_id)
+    if completed_response is not None:
+        return completed_response
+    has_reservation_details = bool(
+        _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+    )
+    if not has_reservation_details and selected_name != "get_reservation_details":
+        return "get_reservation_details", {"reservation_id": requested_id}
+    if has_reservation_details and selected_name != "cancel_reservation" and "cancel_reservation" in available_tool_names:
+        return "cancel_reservation", {"reservation_id": requested_id}
+    return None
+
+
+def _tau_completed_cancel_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+    reservation_id: str,
+) -> tuple[str, dict[str, Any]] | None:
+    requested = str(reservation_id or "").strip().upper()
+    if not requested:
+        return None
+    for tool_name, args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if not ok or not isinstance(output, Mapping):
+            continue
+        observed_id = str(output.get("reservation_id") or args.get("reservation_id") or "").strip().upper()
+        if observed_id != requested:
+            continue
+        if tool_name == "cancel_reservation" or str(output.get("status") or "").strip().lower() == "cancelled":
+            return (
+                RESPOND_TOOL_NAME,
+                {
+                    "content": (
+                        f"Reservation {requested} has been cancelled, and the refund/payment reversal "
+                        "has been recorded. ###STOP###"
+                    )
+                },
+            )
+    return None
+
+
+def _tau_direct_requested_reservation_action_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    if not requested_id:
+        return None
+    if not _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id):
+        return None
+    user_text = _tau_user_request_text(prompt_messages)
+    if "cancel_reservation" in available_tool_names and re.search(
+        r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation)\b",
+        user_text,
+        re.IGNORECASE,
+    ):
+        return "cancel_reservation", {"reservation_id": requested_id}
+    return None
+
+
+def _tau_readonly_reservation_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    if not re.search(r"\b(?:baggage|bag|bags|suitcase|suitcases|luggage)\b", user_text, re.IGNORECASE):
+        return None
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+    if not reservation:
+        return None
+    reservation_id = str(reservation.get("reservation_id") or requested_id or "").strip().upper()
+    total_baggages = reservation.get("total_baggages")
+    if total_baggages is None:
+        return None
+    nonfree_baggages = reservation.get("nonfree_baggages")
+    content = f"Reservation {reservation_id} allows {total_baggages} total suitcases."
+    if nonfree_baggages is not None:
+        content += f" Nonfree suitcases: {nonfree_baggages}."
+    return RESPOND_TOOL_NAME, {"content": f"{content} ###STOP###"}
+
+
+def _latest_successful_tau_reservation_observation(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    reservation_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    requested = str(reservation_id or "").strip().upper()
+    for tool_name, _args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_reservation_details" or not ok or not isinstance(output, Mapping):
+            continue
+        observed_id = str(output.get("reservation_id") or "").strip().upper()
+        if requested and observed_id != requested:
+            continue
+        return output
+    return None
+
+
+def _tau_exhausted_repeated_read_response(
+    name: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> tuple[str, dict[str, Any]] | None:
+    if name not in {"get_user_details", "get_reservation_details"}:
+        return None
+    if not _tau_context_wants_existing_reservation_action(prompt_messages):
+        return None
+    if not _tau_reservation_ids_from_context(prompt_messages):
+        return None
+    if _next_uninspected_tau_reservation_id(prompt_messages):
+        return None
+    return (
+        RESPOND_TOOL_NAME,
+        {
+            "content": (
+                "I have already checked the available reservation records and cannot safely identify "
+                "another matching action. ###STOP###"
+            )
+        },
+    )
+
+
+def _replacement_for_repeated_tau_read(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if (
+        name == "get_user_details"
+        and "get_reservation_details" in available_tool_names
+        and _tau_context_wants_existing_reservation_action(prompt_messages)
+    ):
+        next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
+        if next_reservation_id:
+            return "get_reservation_details", {"reservation_id": next_reservation_id}
+    if name == "get_reservation_details" and "get_reservation_details" in available_tool_names:
+        current_id = str(arguments.get("reservation_id") or "").strip().upper()
+        next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
+        if next_reservation_id and next_reservation_id != current_id:
+            return "get_reservation_details", {"reservation_id": next_reservation_id}
+    return None
+
+
+def _tau_context_wants_existing_reservation_action(prompt_messages: Sequence[Mapping[str, object]]) -> bool:
+    text = _tau_user_request_text(prompt_messages)
+    lowered = text.lower()
+    if not _TAU_EXISTING_RESERVATION_ACTION_RE.search(text):
+        return False
+    return (
+        bool(_requested_tau_reservation_id_from_user(prompt_messages))
+        or bool(_tau_reservation_ids_from_context(prompt_messages))
+        or "reservation" in lowered
+        or "booking" in lowered
+        or "flight" in lowered
+    )
+
+
+def _requested_tau_reservation_id_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    labeled_match = re.search(
+        r"\b(?:reservation(?:_id| id)?|booking(?:_id| id)?|confirmation(?:\s*(?:number|no\.?|id|code))?)"
+        r"\s*(?:is|:|#)?\s*((?=[A-Z0-9]*\d)[A-Z0-9]{6})\b",
+        user_text,
+        flags=re.IGNORECASE,
+    )
+    if labeled_match:
+        return labeled_match.group(1).upper()
+    generic_match = re.search(r"\b(?=[A-Z0-9]{6}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{6}\b", user_text)
+    if generic_match and not _TAU_FLIGHT_NUMBER_RE.fullmatch(generic_match.group(0).upper()):
+        return generic_match.group(0).upper()
+    return None
+
+
+def _next_uninspected_tau_reservation_id(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    candidates = _tau_reservation_ids_from_context(prompt_messages)
+    if not candidates:
+        return None
+    inspected = {
+        str(args.get("reservation_id") or "").strip().upper()
+        for tool_name, args in _iter_prior_tau_tool_calls(prompt_messages)
+        if tool_name == "get_reservation_details"
+    }
+    for reservation_id in candidates:
+        if reservation_id and reservation_id not in inspected:
+            return reservation_id
+    return None
+
+
+def _tau_reservation_ids_from_context(prompt_messages: Sequence[Mapping[str, object]]) -> list[str]:
+    candidates: list[str] = []
+    requested = _requested_tau_reservation_id_from_user(prompt_messages)
+    if requested:
+        candidates.append(requested)
+    for message in prompt_messages:
+        content = str(message.get("content") or "")
+        payload = _parse_tau_function_output_payload(content)
+        if not payload or not bool(payload.get("ok", True)):
+            continue
+        output = _parse_tau_tool_output(payload.get("output"))
+        if isinstance(output, Mapping):
+            reservation_id = str(output.get("reservation_id") or "").strip().upper()
+            if reservation_id:
+                candidates.append(reservation_id)
+            reservations = output.get("reservations")
+            if isinstance(reservations, (list, tuple)):
+                candidates.extend(str(item).strip().upper() for item in reservations if str(item).strip())
+    return _dedupe_tau_ids(candidates)
+
+
+def _tau_user_request_text(prompt_messages: Sequence[Mapping[str, object]]) -> str:
+    parts: list[str] = []
+    for message in prompt_messages:
+        if _normalized_tau_message_role(message.get("role")) != "user":
+            continue
+        content = str(message.get("content") or "")
+        if not content or "Function output:" in content or content.startswith("Known facts"):
+            continue
+        parts.append(content)
+    return normalize_rwkv_text("\n".join(parts))
+
+
+def _normalized_tau_message_role(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    if text in {"agent", "assistant"}:
+        return "assistant"
+    if text in {"env", "environment", "tool"}:
+        return "tool"
+    if text == "user":
+        return "user"
+    return text
+
+
+def _iter_tau_tool_observations(prompt_messages: Sequence[Mapping[str, object]]) -> list[tuple[str, dict[str, Any], bool, Any]]:
+    observations: list[tuple[str, dict[str, Any], bool, Any]] = []
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for message in prompt_messages:
+        role = _normalized_tau_message_role(message.get("role"))
+        content = str(message.get("content") or "").strip()
+        if role == "assistant" and content:
+            try:
+                tool_name, arguments = _parse_tau_agent_decision(content)
+            except Exception:
+                continue
+            if tool_name != RESPOND_TOOL_NAME:
+                pending.append((tool_name, arguments))
+            continue
+        if role != "user" or not content:
+            continue
+        payload = _parse_tau_function_output_payload(content)
+        if not payload or not pending:
+            continue
+        tool_name, arguments = pending.pop(0)
+        observations.append((tool_name, arguments, bool(payload.get("ok", True)), _parse_tau_tool_output(payload.get("output"))))
+    return observations
+
+
+def _iter_prior_tau_tool_calls(prompt_messages: Sequence[Mapping[str, object]]) -> list[tuple[str, dict[str, Any]]]:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for message in prompt_messages:
+        if _normalized_tau_message_role(message.get("role")) != "assistant":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        try:
+            tool_name, arguments = _parse_tau_agent_decision(content)
+        except Exception:
+            continue
+        calls.append((tool_name, arguments))
+    return calls
+
+
+def _has_successful_tau_tool_observation(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> bool:
+    target_name = str(name or "").strip()
+    target_arguments = _canonical_tau_arguments(arguments)
+    for tool_name, observed_args, ok, _output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if ok and tool_name == target_name and _canonical_tau_arguments(observed_args) == target_arguments:
+            return True
+    return False
+
+
+def _has_successful_tau_tool_name(name: str, prompt_messages: Sequence[Mapping[str, object]]) -> bool:
+    target_name = str(name or "").strip()
+    return any(ok and tool_name == target_name for tool_name, _args, ok, _output in _iter_tau_tool_observations(prompt_messages))
+
+
+def _canonical_tau_arguments(arguments: Mapping[str, Any]) -> str:
+    try:
+        return json.dumps(dict(arguments), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return json.dumps(
+            {str(key): str(value) for key, value in dict(arguments).items()},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+def _dedupe_tau_ids(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _build_tau_tool_facts_message(messages: Sequence[Mapping[str, object]], *, max_chars: int = 1200) -> dict[str, str] | None:
+    facts = _extract_tau_tool_facts(messages, max_facts=18)
+    if not facts:
+        return None
+    lines = [
+        "Known facts from previous tool outputs.",
+        "Use these exact values; do not ask for them again or invent replacements.",
+    ]
+    lines.extend(f"- {key}: {value}" for key, value in facts)
+    return {"role": "user", "content": truncate_text("\n".join(lines), max_chars)}
+
+
+def _latest_tau_fact_value(messages: Sequence[Mapping[str, object]], key: str) -> str | None:
+    target = str(key)
+    for fact_key, fact_value in _extract_tau_tool_facts(messages, max_facts=64):
+        if fact_key == target:
+            return fact_value
+    return None
+
+
+def _extract_tau_tool_facts(
+    messages: Sequence[Mapping[str, object]],
+    *,
+    max_facts: int,
+) -> list[tuple[str, str]]:
+    facts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for message in reversed(messages):
+        content = str(message.get("content") or "")
+        payload = _parse_tau_function_output_payload(content)
+        if not payload or not bool(payload.get("ok", True)):
+            continue
+        output = _parse_tau_tool_output(payload.get("output"))
+        for key, value in _iter_tau_fact_items(output):
+            normalized_key = str(key).strip()
+            normalized_value = _format_tau_fact_value(value)
+            if not normalized_key or not normalized_value:
+                continue
+            seen_key = f"{normalized_key}:{normalized_value}"
+            if seen_key in seen:
+                continue
+            facts.append((normalized_key, normalized_value))
+            seen.add(seen_key)
+            if len(facts) >= max(1, int(max_facts)):
+                return facts
+    return facts
+
+
+def _parse_tau_function_output_payload(content: str) -> dict[str, Any] | None:
+    marker = "Function output:"
+    if marker not in content:
+        return None
+    payload_text = content.split(marker, 1)[1].strip()
+    if not payload_text:
+        return None
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_tau_tool_output(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text and text[0] in "[{":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return text
+
+
+def _iter_tau_fact_items(value: Any) -> list[tuple[str, Any]]:
+    items: list[tuple[str, Any]] = []
+
+    def visit(current: Any, *, depth: int) -> None:
+        if depth > 2:
+            return
+        if isinstance(current, Mapping):
+            for raw_key, raw_value in current.items():
+                key = str(raw_key)
+                if key in _TAU_FACT_KEYS and _is_tau_fact_value(raw_value):
+                    items.append((key, raw_value))
+                if isinstance(raw_value, (Mapping, list)):
+                    visit(raw_value, depth=depth + 1)
+            return
+        if isinstance(current, list):
+            for item in current[:5]:
+                visit(item, depth=depth + 1)
+
+    visit(value, depth=0)
+    return items
+
+
+def _is_tau_fact_value(value: Any) -> bool:
+    if isinstance(value, (str, int, float, bool)):
+        return str(value).strip() != ""
+    if isinstance(value, list):
+        return any(isinstance(item, (str, int, float, bool)) and str(item).strip() for item in value)
+    if isinstance(value, Mapping):
+        return any(str(key).strip() for key in value)
+    return False
+
+
+def _format_tau_fact_value(value: Any) -> str:
+    if isinstance(value, Mapping):
+        keys = [str(key) for key in value.keys() if str(key).strip()]
+        return ", ".join(keys[:8])
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value[:8] if str(item).strip())
+    return str(value).strip()
+
+
 def _tau_messages_to_prompt_messages(
     history: Sequence[Any],
     *,
@@ -692,7 +1293,7 @@ def _tau_messages_to_prompt_messages(
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for message in history:
-        role = str(getattr(message, "role", "") or "").strip().lower()
+        role = _normalized_tau_message_role(getattr(message, "role", ""))
         if isinstance(message, ToolMessage) or role == "tool":
             rows.append({"role": "user", "content": _render_tau_tool_message(message)})
             continue

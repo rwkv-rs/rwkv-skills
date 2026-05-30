@@ -317,8 +317,8 @@ def test_prepare_function_calling_run_uses_explicit_run_context(monkeypatch) -> 
     fake_service = object()
     fake_runtime = types.SimpleNamespace(create_writer=lambda max_queue: ("writer", max_queue))
 
-    monkeypatch.setattr(function_calling_common, "init_db", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(function_calling_common, "EvalDbService", lambda: fake_service)
+    monkeypatch.setattr(function_calling_common, "init_eval_store", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(function_calling_common, "create_eval_service", lambda: fake_service)
 
     def _fake_prepare_task_execution(**kwargs):
         captured.update(kwargs)

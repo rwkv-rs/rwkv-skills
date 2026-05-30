@@ -252,6 +252,7 @@ class RemoteInferenceConfig:
     max_retries: int = 3
     retry_initial_delay_s: float = 1.0
     retry_max_delay_s: float = 10.0
+    prefer_chat_completions: bool = True
 
     def completions_url(self) -> str:
         return f"{normalize_api_base(self.base_url)}/completions"
@@ -403,14 +404,37 @@ class RemoteInferenceBackend:
             payload["seed"] = int(seed)
         if stop_suffixes:
             payload["stop"] = list(stop_suffixes)
-        response = self._post_json(self.config.completions_url(), payload)
+        if self.config.prefer_chat_completions:
+            try:
+                response = self._post_json(
+                    self.config.chat_completions_url(),
+                    _chat_payload_from_completion_payload(payload, prompt),
+                )
+                is_chat_response = True
+            except RemoteHTTPError as exc:
+                if exc.status_code not in {404, 405}:
+                    raise
+                response = self._post_json(self.config.completions_url(), payload)
+                is_chat_response = False
+        else:
+            try:
+                response = self._post_json(self.config.completions_url(), payload)
+                is_chat_response = False
+            except RemoteHTTPError as exc:
+                if exc.status_code not in {404, 405}:
+                    raise
+                response = self._post_json(
+                    self.config.chat_completions_url(),
+                    _chat_payload_from_completion_payload(payload, prompt),
+                )
+                is_chat_response = True
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
             raise RuntimeError("remote infer response missing choices")
         choice0 = choices[0]
         if not isinstance(choice0, dict):
             raise RuntimeError("remote infer response choice format is invalid")
-        text = _extract_completion_choice_text(choice0)
+        text = _extract_chat_choice_text(choice0) if is_chat_response else _extract_completion_choice_text(choice0)
         return GenerationOutput(
             prompt_index=prompt_index,
             prompt=prompt,
@@ -460,6 +484,37 @@ class RemoteInferenceBackend:
         if isinstance(last_exc, urllib_error.URLError):
             raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc.reason}") from last_exc
         raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc}") from last_exc
+
+
+def _chat_payload_from_completion_payload(payload: dict[str, object], prompt: str) -> dict[str, object]:
+    chat_payload: dict[str, object] = {
+        "model": payload["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": payload["max_tokens"],
+        "temperature": max(float(payload.get("temperature", 0.001) or 0.001), 0.001),
+    }
+    if "top_p" in payload:
+        chat_payload["top_p"] = payload["top_p"]
+    if "top_k" in payload:
+        chat_payload["top_k"] = payload["top_k"]
+    for key in (
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "penalty_decay",
+        "stop_tokens",
+        "ban_tokens",
+        "pad_zero",
+        "no_penalty_token_ids",
+        "prefill_chunk_size",
+    ):
+        if key in payload:
+            chat_payload[key] = payload[key]
+    if "seed" in payload:
+        chat_payload["seed"] = payload["seed"]
+    if "stop" in payload:
+        chat_payload["stop"] = payload["stop"]
+    return chat_payload
 
 
 def _extract_completion_choice_text(choice: dict[str, object]) -> str:

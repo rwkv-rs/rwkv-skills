@@ -106,9 +106,13 @@ def _tau_v3_spec(output_root: Path, *, dataset_name: str, domain: str, split: st
     )
 
 
+def _is_tau3_light_split_supported(split: str) -> bool:
+    return split in {"base", "test"}
+
+
 def _tau_v3_light_mock_spec(output_root: Path, *, dataset_name: str, split: str) -> LocalRowsDatasetSpec:
-    if split != "base":
-        raise ValueError(f"{dataset_name} only provides base split")
+    if not _is_tau3_light_split_supported(split):
+        raise ValueError(f"{dataset_name} only provides base/test split aliases")
 
     def _load() -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -137,8 +141,8 @@ def _tau_v3_light_mock_long_context_spec(
     dataset_name: str,
     split: str,
 ) -> LocalRowsDatasetSpec:
-    if split != "base":
-        raise ValueError(f"{dataset_name} only provides base split")
+    if not _is_tau3_light_split_supported(split):
+        raise ValueError(f"{dataset_name} only provides base/test split aliases")
 
     def _load() -> list[dict[str, Any]]:
         return _tau3_mock_long_context_rows()
