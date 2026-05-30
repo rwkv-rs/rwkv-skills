@@ -687,7 +687,7 @@ def test_remote_backend_uses_chat_completions_for_generate_and_caches_choice_sco
     assert "prompt" not in calls[0][1]
     assert calls[0][1]["top_k"] == 42
     assert calls[0][1]["penalty_decay"] == 0.95
-    assert calls[0][1]["stop_tokens"] == [0]
+    assert calls[0][1]["stop_tokens"] == ["0"]
     assert calls[0][1]["ban_tokens"] == [123]
     assert calls[0][1]["pad_zero"] is False
     assert calls[0][1]["no_penalty_token_ids"] == [33, 10]

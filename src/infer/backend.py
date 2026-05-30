@@ -502,7 +502,6 @@ def _chat_payload_from_completion_payload(payload: dict[str, object], prompt: st
         "frequency_penalty",
         "repetition_penalty",
         "penalty_decay",
-        "stop_tokens",
         "ban_tokens",
         "pad_zero",
         "no_penalty_token_ids",
@@ -510,6 +509,10 @@ def _chat_payload_from_completion_payload(payload: dict[str, object], prompt: st
     ):
         if key in payload:
             chat_payload[key] = payload[key]
+    if "stop_tokens" in payload:
+        # The current RWKV chat serving schema accepts token ids as strings,
+        # while the local/legacy completion path keeps them as ints.
+        chat_payload["stop_tokens"] = [str(token_id) for token_id in payload["stop_tokens"]]  # type: ignore[index]
     if "seed" in payload:
         chat_payload["seed"] = payload["seed"]
     if "stop" in payload:
