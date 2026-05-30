@@ -66,6 +66,35 @@ class InferenceEngine:
             preserve_prompt_whitespace,
         )
 
+    def score_next_token(
+        self,
+        prompt: str,
+        token_ids: Sequence[int],
+        *,
+        pad_zero: bool = False,
+        preserve_prompt_whitespace: bool = False,
+    ) -> list[float]:
+        if not token_ids:
+            return []
+
+        vocab_size = _infer_vocab_size(self.model)
+        invalid = [int(token_id) for token_id in token_ids if int(token_id) < 0 or int(token_id) >= vocab_size]
+        if invalid:
+            raise ValueError(f"非法 token id: {invalid[:4]}")
+
+        normalized_prompt = prompt if preserve_prompt_whitespace else _normalize_prompt(prompt)
+        tokens = self.tokenizer.encode(normalized_prompt)
+        if pad_zero:
+            tokens = [0] + tokens
+        if not tokens:
+            tokens = [0]
+
+        state = self.model.generate_zero_state(1)
+        with torch.no_grad():
+            logits = self.model.forward_batch([tokens], state).float()
+            values = logits[0, [int(token_id) for token_id in token_ids]]
+        return [float(value) for value in values.detach().cpu().tolist()]
+
 
 def _normalize_prompt(prompt: str) -> str:
     return prompt.strip()
