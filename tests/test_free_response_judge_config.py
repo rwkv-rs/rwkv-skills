@@ -116,7 +116,6 @@ class MathJudgeRoutingTest(unittest.TestCase):
                 canonical_slug("math_500_test"),
                 canonical_slug("answer_judge_test"),
                 canonical_slug("gaokao2023en_test"),
-                canonical_slug("college_math_test"),
                 canonical_slug("comp_math_24_25_test"),
                 canonical_slug("minerva_math_test"),
                 canonical_slug("amc23_test"),
@@ -139,12 +138,15 @@ class MathJudgeRoutingTest(unittest.TestCase):
         for slug in expected_exact:
             self.assertEqual(detect_job_from_dataset(slug, True), "free_response")
 
-    def test_college_math_and_olympiadbench_use_boxed_final_prompt_for_judge(self) -> None:
-        for config_name in ("college_math", "olympiadbench"):
-            data = tomllib.loads(Path(f"configs/{config_name}.toml").read_text())
-            final_prompt = data["final"]["final_prompt_template"]
-            self.assertTrue(final_prompt.rstrip().endswith(r"\(\boxed{"))
-            self.assertEqual(detect_job_from_dataset(f"{config_name}_test", True), "free_response_judge")
+    def test_college_math_routes_to_exact_free_response(self) -> None:
+        self.assertIn(canonical_slug("college_math_test"), MATH_DATASET_SLUGS_FOR_FREE_RESPONSE)
+        self.assertEqual(detect_job_from_dataset("college_math_test", True), "free_response")
+
+    def test_olympiadbench_uses_boxed_final_prompt_for_judge(self) -> None:
+        data = tomllib.loads(Path("configs/olympiadbench.toml").read_text())
+        final_prompt = data["final"]["final_prompt_template"]
+        self.assertTrue(final_prompt.rstrip().endswith(r"\(\boxed{"))
+        self.assertEqual(detect_job_from_dataset("olympiadbench_test", True), "free_response_judge")
 
 
 class _FakeJudgeClient:

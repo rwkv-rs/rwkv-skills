@@ -153,7 +153,6 @@ _LLM_JUDGE_DATASET_CANDIDATES: Final[tuple[str, ...]] = tuple(
         "math_500_test",
         "answer_judge_test",
         "gaokao2023en_test",
-        "college_math_test",
         "comp_math_24_25_test",
         "minerva_math_test",
         "amc23_test",
@@ -207,17 +206,19 @@ TOOLALPACA_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
 APIBANK_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
     canonical_slug(slug)
     for slug in (
-        "apibank_level1_test",
+        "apibank_l1_test",
         "apibank_level2_test",
+        "apibank_l2_test",
     )
 )
 APIBANK_L1_DATASET_SLUGS: Final[tuple[str, ...]] = (
-    canonical_slug("apibank_level1_test"),
     canonical_slug("apibank_l1_test"),
 )
 APIBANK_L2_DATASET_SLUGS: Final[tuple[str, ...]] = (
-    canonical_slug("apibank_level2_test"),
     canonical_slug("apibank_l2_test"),
+)
+APIBANK_LEVEL2_AGENT_DATASET_SLUGS: Final[tuple[str, ...]] = (
+    canonical_slug("apibank_level2_test"),
 )
 COMPLEXFUNCBENCH_SUBSET_DATASET_SLUGS: Final[tuple[str, ...]] = (
     canonical_slug("complexfuncbench_subset_test"),
@@ -385,7 +386,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
     "function_agent_apibank_l2": JobSpec(
         name="function_agent_apibank_l2",
         module="src.bin.eval_function_call_agent",
-        dataset_slugs=(),
+        dataset_slugs=APIBANK_LEVEL2_AGENT_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
         batch_flag="--batch-size",

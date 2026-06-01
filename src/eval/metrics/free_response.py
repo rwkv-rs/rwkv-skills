@@ -310,9 +310,11 @@ def evaluate_free_response(
     answers: list[str] = []
     ref_answers: list[str] = []
     judge_inputs: list[tuple[str, str, str]] = []
+    judge_input_indices: list[int] = []
 
     # First pass: compute exact + gather judge inputs
     for payload in _iter_completions(completions):
+        payload_idx = len(payloads)
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         if sample_index < 0 or sample_index >= len(dataset):
             prediction = ""
@@ -334,24 +336,30 @@ def evaluate_free_response(
         answer = _normalize_text(prediction)
         answers.append(answer)
         ref_answers.append(reference)
-        if judge is not None:
+        if judge is not None and not exact:
             judge_inputs.append((question, reference, answer))
+            judge_input_indices.append(payload_idx)
 
-    judge_flags: list[bool] | None = None
+    judge_flags_by_index: dict[int, bool] | None = None
     if judge is not None:
-        judge_flags = judge.judge(judge_inputs)
+        judge_flags_by_index = {}
+        if judge_inputs:
+            judged_flags = judge.judge(judge_inputs)
+            judge_flags_by_index.update(zip(judge_input_indices, judged_flags, strict=True))
 
     # Second pass: write eval rows
     rows_for_at_k: list[tuple[int, int, bool]] = []
     total_exact = sum(1 for flag in exact_flags if flag)
-    total_judge = sum(1 for flag in (judge_flags or []) if flag) if judge_flags is not None else 0
+    total_judge = total_exact
+    if judge_flags_by_index is not None:
+        total_judge += sum(1 for flag in judge_flags_by_index.values() if flag)
 
     eval_payloads: list[dict] = []
     for idx, payload in enumerate(payloads):
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
-        if judge_flags is not None:
-            passed = bool(judge_flags[idx])
+        if judge_flags_by_index is not None:
+            passed = bool(exact_flags[idx]) or bool(judge_flags_by_index.get(idx, False))
         else:
             passed = bool(exact_flags[idx])
         rows_for_at_k.append((sample_index, repeat_index, passed))
@@ -367,7 +375,7 @@ def evaluate_free_response(
     samples = len(payloads)
     exact_accuracy = total_exact / samples if samples else 0.0
     judge_accuracy = (
-        (total_judge / samples) if (judge_flags is not None and samples) else None
+        (total_judge / samples) if (judge_flags_by_index is not None and samples) else None
     )
     return FreeResponseEvaluation(
         exact_accuracy=exact_accuracy,

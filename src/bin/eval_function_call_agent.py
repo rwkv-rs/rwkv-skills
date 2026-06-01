@@ -24,11 +24,12 @@ from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path
 from src.infer.model import ModelLoadConfig
 
 
 AGENT_JOB_BY_DATASET: dict[str, str] = {
+    "apibank_level2_test": "function_agent_apibank_l2",
     "browsecomp_plus_test": "function_agent_browsecomp_plus",
 }
 
@@ -47,7 +48,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    slug = infer_dataset_slug_from_path(str(dataset_path))
+    scheduler_slug = os.environ.get("RWKV_SKILLS_DATASET_SLUG")
+    slug = canonical_slug(scheduler_slug or infer_dataset_slug_from_path(str(dataset_path)))
     model_name = Path(args.model_path).stem
     records, _resolved = load_agent_records(str(dataset_path), args.max_samples)
     if not records:

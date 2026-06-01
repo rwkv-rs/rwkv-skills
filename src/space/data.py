@@ -265,6 +265,25 @@ def _infer_domain(dataset_slug: str, *, is_cot: bool, task: str | None) -> str:
     return "其他"
 
 
+_FREE_RESPONSE_TASK_ALIASES: dict[str, set[str]] = {
+    "free_response": {"free_response", "eval_free_response"},
+    "free_response_judge": {"free_response_judge", "eval_free_response_judge"},
+}
+
+
+def _matches_current_free_response_route(dataset: str, *, is_cot: bool, task: str | None) -> bool:
+    expected_job = detect_job_from_dataset(dataset, is_cot=is_cot)
+    expected_tasks = _FREE_RESPONSE_TASK_ALIASES.get(expected_job or "")
+    if expected_tasks is None:
+        return True
+    if not task:
+        return True
+    task_key = canonical_slug(task)
+    if task_key in _FREE_RESPONSE_TASK_ALIASES["free_response"] | _FREE_RESPONSE_TASK_ALIASES["free_response_judge"]:
+        return task_key in expected_tasks
+    return True
+
+
 def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> ScoreEntry | None:
     dataset = canonical_slug(str(payload.get("dataset", "")).strip())
     model = str(payload.get("model", "")).strip()
@@ -275,6 +294,8 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
 
     is_cot = bool(payload.get("cot", False))
     task = str(payload.get("task")).strip() if payload.get("task") else None
+    if not _matches_current_free_response_route(dataset, is_cot=is_cot, task=task):
+        return None
     task_id = _parse_int(payload.get("task_id"), field="task_id", default=None, errors=errors)
     metrics = _normalize_metrics(payload, dataset=dataset, is_cot=is_cot, task=task)
     created_at = _parse_created_at(payload.get("created_at"))

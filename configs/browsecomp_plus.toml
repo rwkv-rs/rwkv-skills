@@ -3,12 +3,13 @@ avg_k = [1]
 report_avg_k = [1]
 
 [default.browsecomp_plus_judge]
-base_url = "https://api.ablai.top/v1/chat/completions"
+base_url = "https://next-token.cc/v1"
 model = "gpt-5.4-mini"
 api_mode = "chat"
 max_output_tokens = 1024
 timeout_s = 120
 
+api_key = "sk-230RPR8qZKjQOzVBTfkt8aqTdaXFVCHyOLmq5gniCJggvsvY"
 [tool]
 template = "instruction_following_default"
 max_generate_tokens = 1024

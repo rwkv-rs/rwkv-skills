@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable, Sequence
 
+from src.eval.scheduler.jobs import detect_job_from_dataset
+
 from .data import FUNCTION_CALL_DATASET_PREFIXES, FUNCTION_CALL_JOBS, ScoreEntry
 from .constants import (
     AIME_BASES,
@@ -558,6 +560,11 @@ def _is_multi_choice_entry(entry: ScoreEntry) -> bool:
 
 
 def _prefer_llm_judge(entry: ScoreEntry) -> bool:
+    current_job = detect_job_from_dataset(entry.dataset, is_cot=entry.cot)
+    if current_job == "free_response":
+        return False
+    if current_job == "free_response_judge":
+        return True
     task = (entry.task or "").lower()
     if "judge" in task:
         return True

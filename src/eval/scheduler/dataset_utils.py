@@ -20,6 +20,11 @@ DATASET_SLUG_ALIASES: dict[str, str] = {
     "lcb": "livecodebench_test",
     "mmmlu": "mmmlu_test",
     "cmmlu": "cmmlu_test",
+    # APIBank Level-1 has only the one-step form in this repo. Level-2 is not
+    # aliased because `apibank_level2` is the official multi-turn agent task,
+    # while `apibank_l2` is the one-step tool-call adaptation.
+    "apibank_level1": "apibank_l1_test",
+    "apibank_level1_test": "apibank_l1_test",
 }
 
 _CANONICALIZE_SPLIT_NAMES = {

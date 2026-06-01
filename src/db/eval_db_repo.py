@@ -223,7 +223,7 @@ class EvalDbRepository:
         include_param_search: bool,
     ) -> list[dict[str, Any]]:
         row_number = func.row_number().over(
-            partition_by=(Task.model_id, Task.benchmark_id, Score.is_cot),
+            partition_by=(Task.model_id, Task.benchmark_id, Score.is_cot, Task.evaluator),
             order_by=(Score.created_at.desc(), Score.score_id.desc()),
         ).label("rn")
         subquery = (

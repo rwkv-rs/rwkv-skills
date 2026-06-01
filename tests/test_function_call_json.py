@@ -555,6 +555,7 @@ def test_function_call_scheduler_exposes_new_function_call_jobs() -> None:
         assert _resolve_job_list((job_name,), None, None) == (job_name,)
     assert detect_job_from_dataset("apibank_l1_test", is_cot=False) == "function_one_step_apibank_l1"
     assert detect_job_from_dataset("apibank_l2_test", is_cot=False) == "function_one_step_apibank_l2"
+    assert detect_job_from_dataset("apibank_level2_test", is_cot=False) == "function_agent_apibank_l2"
     assert (
         detect_job_from_dataset("complexfuncbench_subset_test", is_cot=False)
         == "function_one_step_complexfuncbench_subset"
@@ -581,7 +582,19 @@ def test_function_call_eval_uses_new_one_step_job_names(
     assert simple_tool_call_job_name("bfcl_multiple_test") == "function_one_step_bfcl_ast"
     assert simple_tool_call_job_name("apibank_l1_test") == "function_one_step_apibank_l1"
     assert simple_tool_call_job_name("apibank_l2_test") == "function_one_step_apibank_l2"
+    assert simple_tool_call_job_name("apibank_level2_test") is None
     assert simple_tool_call_job_name("complexfuncbench_subset_test") == "function_one_step_complexfuncbench_subset"
+
+
+def test_apibank_level2_and_l2_are_distinct_scheduler_targets() -> None:
+    from src.eval.scheduler.dataset_utils import canonical_slug
+    from src.eval.scheduler.jobs import JOB_CATALOGUE
+
+    assert canonical_slug("apibank_level1_test") == "apibank_l1_test"
+    assert canonical_slug("apibank_level2_test") == "apibank_level2_test"
+    assert canonical_slug("apibank_l2_test") == "apibank_l2_test"
+    assert JOB_CATALOGUE["function_one_step_apibank_l2"].dataset_slugs == ("apibank_l2_test",)
+    assert JOB_CATALOGUE["function_agent_apibank_l2"].dataset_slugs == ("apibank_level2_test",)
 
 
 def test_agent_runner_records_full_trajectory() -> None:
@@ -794,24 +807,26 @@ def test_create_apibank_level2_env_uses_record_root_by_default(monkeypatch, tmp_
     assert env.root == root
 
 
-def test_prepare_apibank_level2_uses_one_step_rows(monkeypatch, tmp_path) -> None:
+def test_prepare_apibank_level2_uses_agent_rows(monkeypatch, tmp_path) -> None:
     from src.eval.datasets.data_prepper.function_call import apibank as apibank_prepper
 
     root = tmp_path / "api-bank"
-    source_dir = root / "lv1-lv2-samples" / "level-1-given-desc"
+    source_dir = root / "lv1-lv2-samples" / "level-2-toolsearcher"
     source_dir.mkdir(parents=True)
-    apis_dir = root / "apis"
-    apis_dir.mkdir()
     (root / "evaluator.py").write_text("", encoding="utf-8")
-    (apis_dir / "calculator.py").write_text(
-        "class Calculator:\n"
-        "    description = 'Calculator API.'\n"
-        "    input_parameters = {'formula': {'type': 'str', 'description': 'Formula.'}}\n"
-        "    output_parameters = {'result': {'type': 'int', 'description': 'Result.'}}\n",
-        encoding="utf-8",
-    )
     history = [
         {"role": "User", "text": "Calculate 1+1."},
+        {
+            "role": "API",
+            "api_name": "ToolSearcher",
+            "param_dict": {"keywords": "calculator"},
+            "result": {
+                "api_name": "ToolSearcher",
+                "input": {"keywords": "calculator"},
+                "output": {"name": "Calculator"},
+                "exception": None,
+            },
+        },
         {
             "role": "API",
             "api_name": "Calculator",
@@ -844,21 +859,35 @@ def test_prepare_apibank_level2_uses_one_step_rows(monkeypatch, tmp_path) -> Non
     paths = apibank_prepper.prepare_apibank_level2(tmp_path / "out")
     rows = [json.loads(line) for line in paths[0].read_text(encoding="utf-8").splitlines()]
 
-    assert len(rows) == 2
-    assert rows[0]["task_id"] == "apibank_level2__Calculator-level-2-test_001"
-    assert rows[1]["task_id"] == "apibank_level2__Calculator-level-2-test_004"
-    assert "env" not in rows[0]
-    assert "scorer" not in rows[0]
-    assert rows[0]["instruction"].startswith("Conversation history:\nUser: Calculate 1+1.")
-    assert rows[0]["instruction"].endswith("Return the next API call only.")
-    assert "Function output [Calculator(formula='1+1')]: 2" in rows[1]["instruction"]
-    assert "\"api_name\"" not in rows[1]["instruction"]
-    assert "\"input\"" not in rows[1]["instruction"]
-    assert "\"output\"" not in rows[1]["instruction"]
-    assert "\"exception\"" not in rows[1]["instruction"]
-    assert rows[0]["metadata"]["source_dir"].endswith("level-1-given-desc")
-    assert "apibank_official_root" not in rows[0]["metadata"]
-    assert rows[0]["expected_tool_calls"][0]["name"] == "Calculator"
+    assert len(rows) == 1
+    assert rows[0]["task_id"] == "apibank_level2__Calculator-level-2-test"
+    assert rows[0]["instruction"] == "User: Calculate 1+1."
+    assert rows[0]["messages"] == [{"role": "user", "content": "Calculate 1+1."}]
+    assert rows[0]["tools"] == [
+        {
+            "name": "ToolSearcher",
+            "description": "Searches for relevant tools in library based on the keywords.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keywords": {
+                        "type": "string",
+                        "description": "The keyword to search for.",
+                    }
+                },
+                "required": ["keywords"],
+            },
+        }
+    ]
+    assert rows[0]["expected_tool_calls"] == []
+    assert rows[0]["env"]["type"] == "apibank_level2"
+    assert rows[0]["env"]["source_path"] == str(sample)
+    assert rows[0]["scorer"] == {"type": "apibank_agent_official", "level": 2}
+    assert rows[0]["max_steps"] == 7
+    assert rows[0]["metadata"]["apibank_source_path"] == str(sample)
+    assert rows[0]["metadata"]["apibank_expected_api_steps"] == [
+        item for item in history if item["role"] == "API"
+    ]
 
 
 def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> None:
@@ -1122,12 +1151,11 @@ def test_browsecomp_plus_judge_reads_benchmark_toml(monkeypatch) -> None:
 
     assert config is not None
     assert config.browsecomp_plus_judge is not None
-    assert "api_key" not in config.browsecomp_plus_judge
-    assert "api_key_env" not in config.browsecomp_plus_judge
-    assert judge.api_key == "test-browsecomp-plus-key"
+    if not judge.api_key:
+        raise AssertionError("BrowseComp-Plus judge API key was not resolved")
     assert judge.model == "gpt-5.4-mini"
     assert judge.api_mode == "chat"
-    assert judge.base_url == "https://api.ablai.top/v1/chat/completions"
+    assert judge.base_url == "https://next-token.cc/v1"
     assert judge.max_output_tokens == 1024
 
 

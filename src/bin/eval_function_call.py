@@ -25,7 +25,7 @@ from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
+from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path
 from src.infer.model import ModelLoadConfig
 
 DEFAULT_AVG_K: tuple[NumericK, ...] = ()
@@ -88,7 +88,8 @@ def _simple_tool_call_job_name(slug: str) -> str | None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
-    slug = infer_dataset_slug_from_path(str(dataset_path))
+    scheduler_slug = os.environ.get("RWKV_SKILLS_DATASET_SLUG")
+    slug = canonical_slug(scheduler_slug or infer_dataset_slug_from_path(str(dataset_path)))
     model_name = Path(args.model_path).stem
     records = JsonlFunctionCallTaskLoader(str(dataset_path)).load()
     if any(not record.expected_tool_calls for record in records):

@@ -123,6 +123,88 @@ def test_judge_receives_extracted_final_stage_answer_for_structured_refs(tmp_pat
     assert "Student's Answer: 1" not in judge.client.prompts[0]
 
 
+def test_judge_skips_exact_matches_and_keeps_them_passed(tmp_path) -> None:
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text(
+        '{"question":"q1","answer":"7"}\n{"question":"q2","answer":"9"}\n',
+        encoding="utf-8",
+    )
+    judge = LLMJudge(
+        LLMJudgeConfig(
+            api_key="k",
+            model="m",
+            max_workers=1,
+            max_retries=0,
+            backoff_base=0.0,
+        )
+    )
+    judge.client = _CapturingJudgeClient("True")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "Final answer:",
+                "completion1": "7",
+            },
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 1,
+                "repeat_index": 0,
+                "prompt1": "Final answer:",
+                "completion1": "8",
+            },
+        ],
+        dataset_path=dataset,
+        judge=judge,
+    )
+
+    assert evaluation.exact_accuracy == 0.5
+    assert evaluation.judge_accuracy == 1.0
+    assert [row[2] for row in evaluation.rows] == [True, True]
+    assert len(judge.client.prompts) == 1
+    assert "Question: q2" in judge.client.prompts[0]
+    assert "Student's Answer: 8" in judge.client.prompts[0]
+
+
+def test_exact_matches_pass_even_when_judge_would_reject(tmp_path) -> None:
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text('{"question":"q","answer":"255"}\n', encoding="utf-8")
+    judge = LLMJudge(
+        LLMJudgeConfig(
+            api_key="k",
+            model="m",
+            max_workers=1,
+            max_retries=0,
+            backoff_base=0.0,
+        )
+    )
+    judge.client = _CapturingJudgeClient("False")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "Final answer:",
+                "completion1": "255",
+            }
+        ],
+        dataset_path=dataset,
+        judge=judge,
+    )
+
+    assert evaluation.judge_accuracy == 1.0
+    assert evaluation.rows == [(0, 0, True)]
+    assert judge.client.prompts == []
+
+
 class _CapturingJudgeClient:
     def __init__(self, response: str) -> None:
         self.prompts: list[str] = []

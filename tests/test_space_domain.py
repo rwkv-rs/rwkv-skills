@@ -3,8 +3,14 @@ from pathlib import Path
 
 from src.eval.scheduler.jobs import JOB_CATALOGUE, detect_job_from_dataset
 from src.space.constants import TableCellMeta
-from src.space.data import ScoreEntry, _infer_domain
-from src.space.metrics import _cell_metric_value, _cell_numeric_value, _field_primary_score, _metric_score
+from src.space.data import ScoreEntry, _infer_domain, _score_entry_from_db
+from src.space.metrics import (
+    _cell_metric_value,
+    _cell_numeric_value,
+    _detail_rows_for_entry,
+    _field_primary_score,
+    _metric_score,
+)
 from src.space.tables import _split_rows_by_suspect
 
 
@@ -33,6 +39,58 @@ def test_bfcl_and_toolalpaca_scheduler_jobs_are_nocot() -> None:
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=False) == "function_one_step_bfcl_exec"
     assert detect_job_from_dataset("toolalpaca_eval_real_test", is_cot=False) == "function_one_step_toolalpaca"
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=True) is None
+
+
+def _db_score_payload(dataset: str, task: str, metrics: dict[str, float]) -> dict[str, object]:
+    return {
+        "task_id": 1,
+        "dataset": dataset,
+        "model": "rwkv7-g1f-13.3b-20260415-ctx8192",
+        "metrics": metrics,
+        "samples": 100,
+        "problems": 100,
+        "created_at": datetime(2026, 1, 1),
+        "log_path": "",
+        "cot": True,
+        "task": task,
+    }
+
+
+def test_space_db_loader_keeps_only_current_free_response_route() -> None:
+    college_exact = _score_entry_from_db(
+        _db_score_payload("college_math_test", "eval_free_response", {"exact_accuracy": 0.8, "avg@2": 0.8}),
+        errors=None,
+    )
+    assert college_exact is not None
+    assert _score_entry_from_db(
+        _db_score_payload("college_math_test", "eval_free_response_judge", {"judge_accuracy": 0.9, "avg@2": 0.9}),
+        errors=None,
+    ) is None
+
+    assert _score_entry_from_db(
+        _db_score_payload("math_500_test", "eval_free_response", {"exact_accuracy": 0.7, "avg@4": 0.7}),
+        errors=None,
+    ) is None
+    assert _score_entry_from_db(
+        _db_score_payload("math_500_test", "eval_free_response_judge", {"judge_accuracy": 0.75, "avg@4": 0.75}),
+        errors=None,
+    ) is not None
+
+
+def test_college_math_space_detail_uses_exact_method() -> None:
+    entry = _score_entry_from_db(
+        _db_score_payload(
+            "college_math_test",
+            "eval_free_response",
+            {"exact_accuracy": 0.8, "judge_accuracy": 0.9, "avg@2": 0.85},
+        ),
+        errors=None,
+    )
+    assert entry is not None
+
+    rows = _detail_rows_for_entry(entry)
+
+    assert rows == [("college_math_cot", "exact_match", "avg@2", 0.8)]
 
 
 def test_split_rows_by_suspect_remaps_cell_meta() -> None:
