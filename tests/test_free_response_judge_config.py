@@ -142,10 +142,10 @@ class MathJudgeRoutingTest(unittest.TestCase):
         self.assertIn(canonical_slug("college_math_test"), MATH_DATASET_SLUGS_FOR_FREE_RESPONSE)
         self.assertEqual(detect_job_from_dataset("college_math_test", True), "free_response")
 
-    def test_olympiadbench_uses_boxed_final_prompt_for_judge(self) -> None:
-        data = tomllib.loads(Path("configs/olympiadbench.toml").read_text())
-        final_prompt = data["final"]["final_prompt_template"]
-        self.assertTrue(final_prompt.rstrip().endswith(r"\(\boxed{"))
+    def test_free_response_generation_uses_only_eod_stop_token(self) -> None:
+        data = tomllib.loads(Path("configs/_templates.toml").read_text())
+        self.assertEqual(data["free_response_cot_default"]["stop_tokens"], [0])
+        self.assertEqual(data["math_cot_default"]["stop_tokens"], [0])
         self.assertEqual(detect_job_from_dataset("olympiadbench_test", True), "free_response_judge")
 
 

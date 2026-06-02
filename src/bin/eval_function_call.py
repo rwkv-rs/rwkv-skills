@@ -20,7 +20,7 @@ from src.eval.function_calling.common.benchmarks import function_calling_benchma
 from src.eval.function_calling.one_step.jobs import simple_tool_call_job_name
 from src.eval.function_calling.one_step.pipeline import FunctionCallPipeline
 from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
-from src.eval.metrics.function_call import evaluate_function_call
+from src.eval.metrics.function_call import FunctionCallMetrics, evaluate_function_call
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -83,6 +83,29 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
 
 def _simple_tool_call_job_name(slug: str) -> str | None:
     return simple_tool_call_job_name(slug)
+
+
+def _score_metrics_for_job(
+    job_name: str,
+    metrics: FunctionCallMetrics,
+    avg_payload: dict[str, float],
+) -> dict[str, float]:
+    base_metrics = {
+        "success_rate": metrics.success_rate,
+        "avg_steps": metrics.avg_steps,
+        "avg_tool_calls": metrics.avg_tool_calls,
+    }
+    if job_name != "function_one_step_complexfuncbench_subset":
+        return {**avg_payload, **base_metrics}
+
+    score_metrics = {
+        "official_score": metrics.success_rate,
+        **base_metrics,
+    }
+    call_accuracy = (metrics.avg_at_k or {}).get("avg@1")
+    if call_accuracy is not None:
+        score_metrics["call_accuracy"] = call_accuracy
+    return score_metrics
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -186,12 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         slug,
         is_cot=False,
         model_name=model_name,
-        metrics={
-            **avg_payload,
-            "success_rate": metrics.success_rate,
-            "avg_steps": metrics.avg_steps,
-            "avg_tool_calls": metrics.avg_tool_calls,
-        },
+        metrics=_score_metrics_for_job(job_name, metrics, avg_payload),
         samples=metrics.samples,
         task=job_name,
         task_details={

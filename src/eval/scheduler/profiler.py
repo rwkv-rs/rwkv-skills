@@ -268,6 +268,13 @@ class BatchProfiler:
         probe_env = env.copy()
         probe_env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
         probe_env["CUDA_VISIBLE_DEVICES"] = gpu
+        for key in (
+            "RWKV_SESSION_ID",
+            "RWKV_SESSION_TASK_ID",
+            "RWKV_SKILLS_TASK_ID",
+            "RWKV_SKILLS_VERSION_ID",
+        ):
+            probe_env.pop(key, None)
 
         joined = ",".join(str(value) for value in candidates)
         print(f"🔍 Probing batch size for {job_id} on cuda:{gpu} (candidates: {joined})")

@@ -1,30 +1,41 @@
 from __future__ import annotations
 
-"""Free-form QA 评估流水线：读数据 -> 两阶段生成 -> JSONL 导出。"""
+"""Free-response full-generation pipeline."""
 
-from dataclasses import dataclass
-from typing import Callable, Iterable
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
-from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
+from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import GenerationOutput, InferenceEngine
-from src.infer.model import ModelLoadConfig, load_rwkv_model
 from src.infer.sampling import SamplingConfig
 from .common import SampleRecord, StageRecord, sample_repeat_seed
 
+if TYPE_CHECKING:
+    from src.infer.model import ModelLoadConfig
 
-def _render_cot_prompt(template: str, question: str) -> str:
+
+USER_SENTINEL = "\nUser:"
+FREE_RESPONSE_STOP_TOKENS = (0,)
+
+
+def _render_prompt(template: str, question: str) -> str:
     return template.replace("<Q>", question.lstrip()).rstrip(" ")
+
+
+def _clip_user_sentinel(text: str) -> str:
+    return text.split(USER_SENTINEL, 1)[0] if USER_SENTINEL in text else text
 
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
 Assistant: <think"""
 
-DEFAULT_FINAL_PROMPT = """<Q><COT>
-Therefore, the answer is \\(\\boxed{"""
+DEFAULT_DIRECT_PROMPT = """User: <Q>
+
+Assistant:"""
 
 
 @dataclass(slots=True)
@@ -36,7 +47,9 @@ class FreeResponsePipelineResult:
 
 
 class FreeResponsePipeline:
-    def __init__(self, model_config: ModelLoadConfig) -> None:
+    def __init__(self, model_config: "ModelLoadConfig") -> None:
+        from src.infer.model import load_rwkv_model
+
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path
@@ -45,10 +58,8 @@ class FreeResponsePipeline:
         self,
         dataset_path: str,
         *,
-        cot_prompt_template: str = DEFAULT_COT_PROMPT,
-        final_answer_template: str = DEFAULT_FINAL_PROMPT,
-        cot_sampling: SamplingConfig,
-        final_sampling: SamplingConfig,
+        prompt_template: str = DEFAULT_COT_PROMPT,
+        generation_sampling: SamplingConfig,
         batch_size: int = 64,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
@@ -100,41 +111,47 @@ class FreeResponsePipeline:
             )
         else:
             remaining_entries = expanded
+
+        generation_sampling = replace(generation_sampling, stop_tokens=FREE_RESPONSE_STOP_TOKENS)
+        sampling_config = normalize_sampling_config_by_stage([(1, generation_sampling)])
+
         if probe_only:
-            cot_prompts = [
-                _render_cot_prompt(cot_prompt_template, record.question) for _, record, _ in remaining_entries
-            ]
+            prompts = [_render_prompt(prompt_template, record.question) for _, record, _ in remaining_entries]
             probe_seeds = [
                 sample_repeat_seed(problem_idx, sample_id, stage=1)
                 for problem_idx, _record, sample_id in remaining_entries
             ]
             _ = self.engine.generate(
-                cot_prompts,
-                sampling=final_sampling,
+                prompts,
+                sampling=generation_sampling,
                 batch_size=batch_size,
-                progress_desc="Generating answers",
+                progress_desc="Generating full responses",
                 probe_only=probe_only,
+                prompt_stop_suffixes=[(USER_SENTINEL,) for _ in prompts],
                 prompt_seeds=probe_seeds,
             )
             return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, [])
 
-        sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling), (2, final_sampling)])
         payloads: list[dict] = []
         chunk_size = max(1, int(batch_size))
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            cot_prompts = [
-                _render_cot_prompt(cot_prompt_template, record.question) for _, record, _ in chunk
-            ]
+            prompts = [_render_prompt(prompt_template, record.question) for _, record, _ in chunk]
 
-            def _on_cot_complete(output: GenerationOutput) -> None:
+            def _on_complete(output: GenerationOutput) -> None:
                 local_idx = output.prompt_index
                 if local_idx < 0 or local_idx >= len(chunk):
                     return
                 problem_idx, _record, sample_id = chunk[local_idx]
-                cot_stage = StageRecord(
-                    prompt=cot_prompts[local_idx],
-                    completion=output.text,
+                clipped_text = _clip_user_sentinel(output.text)
+                stats = {
+                    "truncated": bool(output.truncated or output.finish_reason == "max_tokens"),
+                    "stop_detail": output.finish_detail or "",
+                    "generated_token_count": len(output.token_ids),
+                }
+                stage = StageRecord(
+                    prompt=prompts[local_idx],
+                    completion=clipped_text,
                     stop_reason=output.finish_reason,
                 )
                 payload = SampleRecord(
@@ -143,61 +160,8 @@ class FreeResponsePipeline:
                     sample_index=problem_idx,
                     repeat_index=sample_id,
                     sampling_config=sampling_config,
-                    stages=[cot_stage],
-                ).as_payload()
-                payload["_stage"] = "cot"
-                if on_record is not None:
-                    on_record(payload)
-
-            cot_outputs = self.engine.generate(
-                cot_prompts,
-                sampling=cot_sampling,
-                batch_size=min(batch_size, len(cot_prompts)),
-                progress_desc="Generating CoT",
-                on_complete=_on_cot_complete,
-                prompt_seeds=[
-                    sample_repeat_seed(problem_idx, sample_id, stage=1)
-                    for problem_idx, _record, sample_id in chunk
-                ],
-            )
-            cot_by_idx = {item.prompt_index: item for item in cot_outputs}
-
-            final_prompts: list[str] = []
-            for local_idx in range(len(chunk)):
-                cot_seq = cot_by_idx.get(local_idx)
-                cot_text = cot_seq.text if cot_seq else ""
-                prompt = final_answer_template.replace("<Q>", cot_prompts[local_idx]).replace("<COT>", cot_text)
-                final_prompts.append(prompt)
-
-            def _on_final_complete(output: GenerationOutput) -> None:
-                local_idx = output.prompt_index
-                if local_idx < 0 or local_idx >= len(chunk):
-                    return
-                cot_seq = cot_by_idx.get(local_idx)
-                if cot_seq is None:
-                    return
-                problem_idx, _record, sample_id = chunk[local_idx]
-                prior_context = f"{cot_prompts[local_idx]}{cot_seq.text}"
-                delta_prompt2 = prompt_delta(final_prompts[local_idx], prior_context)
-                stages = [
-                    StageRecord(
-                        prompt=cot_prompts[local_idx],
-                        completion=cot_seq.text,
-                        stop_reason=cot_seq.finish_reason,
-                    ),
-                    StageRecord(
-                        prompt=delta_prompt2,
-                        completion=output.text,
-                        stop_reason=output.finish_reason,
-                    ),
-                ]
-                payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=problem_idx,
-                    repeat_index=sample_id,
-                    sampling_config=sampling_config,
-                    stages=stages,
+                    stages=[stage],
+                    stats=stats,
                 ).as_payload()
                 payload["_stage"] = "answer"
                 if on_record is not None:
@@ -205,13 +169,14 @@ class FreeResponsePipeline:
                 payloads.append(payload)
 
             _ = self.engine.generate(
-                final_prompts,
-                sampling=final_sampling,
-                batch_size=min(batch_size, len(final_prompts)),
-                progress_desc="Generating answers",
-                on_complete=_on_final_complete,
+                prompts,
+                sampling=generation_sampling,
+                batch_size=min(batch_size, len(prompts)),
+                progress_desc="Generating full responses",
+                on_complete=_on_complete,
+                prompt_stop_suffixes=[(USER_SENTINEL,) for _ in prompts],
                 prompt_seeds=[
-                    sample_repeat_seed(problem_idx, sample_id, stage=2)
+                    sample_repeat_seed(problem_idx, sample_id, stage=1)
                     for problem_idx, _record, sample_id in chunk
                 ],
             )
@@ -230,4 +195,11 @@ class FreeResponsePipeline:
         return records, infer_dataset_slug_from_path(dataset_path)
 
 
-__all__ = ["FreeResponsePipeline", "FreeResponsePipelineResult"]
+__all__ = [
+    "DEFAULT_COT_PROMPT",
+    "DEFAULT_DIRECT_PROMPT",
+    "FREE_RESPONSE_STOP_TOKENS",
+    "FreeResponsePipeline",
+    "FreeResponsePipelineResult",
+    "USER_SENTINEL",
+]

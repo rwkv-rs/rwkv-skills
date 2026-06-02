@@ -113,17 +113,38 @@ def _collect_pass_metrics(source: Any) -> dict[str, float]:
     return collected
 
 
+def _normalize_metric_map(raw_metrics: dict[str, Any]) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    for key, value in raw_metrics.items():
+        canonical = _canonical_pass_key(str(key))
+        if canonical:
+            parsed = _numeric(value)
+            metrics[canonical] = parsed if parsed is not None else value
+        else:
+            metrics[key] = value
+    return metrics
+
+
+def _is_grouped_free_response_metrics(raw_metrics: dict[str, Any]) -> bool:
+    return any(isinstance(raw_metrics.get(group), dict) for group in ("strategy_a", "strategy_b", "strategy_c"))
+
+
 def _normalize_metrics(payload: dict[str, Any], *, dataset: str, is_cot: bool, task: str | None) -> dict[str, Any]:
     raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
     metrics: dict[str, Any] = {}
     if isinstance(raw_metrics, dict):
-        for key, value in raw_metrics.items():
-            canonical = _canonical_pass_key(str(key))
-            if canonical:
-                parsed = _numeric(value)
-                metrics[canonical] = parsed if parsed is not None else value
-            else:
-                metrics[key] = value
+        if _is_grouped_free_response_metrics(raw_metrics):
+            grouped: dict[str, Any] = {}
+            for group in ("strategy_a", "strategy_b", "strategy_c"):
+                group_metrics = raw_metrics.get(group)
+                if isinstance(group_metrics, dict):
+                    grouped[group] = _normalize_metric_map(group_metrics)
+            strategy_a = grouped.get("strategy_a")
+            if isinstance(strategy_a, dict):
+                metrics.update(strategy_a)
+            metrics["_metric_groups"] = grouped
+        else:
+            metrics.update(_normalize_metric_map(raw_metrics))
 
     job_name = detect_job_from_dataset(dataset, is_cot=is_cot)
     slug = canonical_slug(dataset)

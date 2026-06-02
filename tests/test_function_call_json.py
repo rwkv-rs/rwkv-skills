@@ -950,6 +950,34 @@ def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> Non
     assert result.details["call_accuracy"] == 1.0
 
 
+def test_complexfuncbench_score_payload_uses_strict_success_as_official_score() -> None:
+    from src.bin.eval_function_call import _score_metrics_for_job
+    from src.eval.metrics.function_call import FunctionCallMetrics
+
+    metrics = FunctionCallMetrics(
+        success_rate=0.0,
+        avg_steps=1.0,
+        avg_tool_calls=0.0,
+        avg_at_k={"avg@1": 0.18},
+        samples=100,
+    )
+
+    score_metrics = _score_metrics_for_job(
+        "function_one_step_complexfuncbench_subset",
+        metrics,
+        {"avg@1": 0.18},
+    )
+
+    assert score_metrics == {
+        "official_score": 0.0,
+        "success_rate": 0.0,
+        "avg_steps": 1.0,
+        "avg_tool_calls": 0.0,
+        "call_accuracy": 0.18,
+    }
+    assert "avg@1" not in score_metrics
+
+
 def test_browsecomp_plus_env_exports_official_run_payload() -> None:
     from src.eval.function_calling.agent.adapters.browsecomp_plus import (
         BrowseCompPlusEnv,

@@ -7,14 +7,13 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from src.eval.k_values import NumericK, filter_metrics_by_k, max_generation_k
+from src.eval.k_values import NumericK, max_generation_k
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.metrics.free_response import (
     DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
     LLMJudge,
     LLMJudgeConfig,
-    compute_pass_at_k,
-    compute_avg_at_k,
+    build_grouped_metrics_payload,
     evaluate_free_response,
 )
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
@@ -30,7 +29,6 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.export_results import export_version_results
 from src.eval.evaluators.free_response import (
     DEFAULT_COT_PROMPT,
-    DEFAULT_FINAL_PROMPT,
     FreeResponsePipeline,
 )
 from src.infer.model import ModelLoadConfig
@@ -72,8 +70,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
-    parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
-    parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
+    parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
+    parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
+    parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--db-write-queue", type=int, default=16, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
@@ -151,20 +150,14 @@ def _resolve_max_samples(slug: str, model_name: str, args: argparse.Namespace) -
     return config.max_samples if config is not None else None
 
 
-def _resolve_prompt_templates(slug: str, model_name: str) -> tuple[str, str]:
+def _resolve_prompt_template(slug: str, model_name: str) -> str:
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
-    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
     cot_prompt = (
         cot_config.cot_prompt_template
         if cot_config is not None and cot_config.cot_prompt_template
         else DEFAULT_COT_PROMPT
     )
-    final_prompt = (
-        final_config.final_prompt_template
-        if final_config is not None and final_config.final_prompt_template
-        else DEFAULT_FINAL_PROMPT
-    )
-    return cot_prompt, final_prompt
+    return cot_prompt
 
 
 def _resolve_judge_prompt_template(slug: str, model_name: str) -> str | None:
@@ -187,27 +180,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_pass_k = _report_pass_k(slug, model_name, pass_k_final)
     report_avg_k = _report_avg_k(slug, model_name, avg_k_final)
     sample_limit = _resolve_max_samples(slug, model_name, args)
-    cot_prompt_template, final_prompt_template = _resolve_prompt_templates(slug, model_name)
+    prompt_template = _resolve_prompt_template(slug, model_name)
     judge_prompt_template = _resolve_judge_prompt_template(slug, model_name)
 
-    cot_sampling = resolve_sampling_config(
+    generation_sampling = resolve_sampling_config(
         slug,
         model_name,
         stage="cot",
         fallback_templates="free_response_cot_default",
     )
-    final_sampling = resolve_sampling_config(
-        slug,
-        model_name,
-        stage="final",
-        fallback_templates="free_response_final_default",
-    )
-    if cot_sampling is None or final_sampling is None:
+    if generation_sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
-    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
-    final_sampling = final_sampling.clamp(args.final_max_tokens)
+    generation_sampling = generation_sampling.clamp(args.max_tokens or args.cot_max_tokens)
     generate_pass_k = (1,) if args.probe_only else pass_k_final
     samples_per_task = max(max_generation_k(pass_k_final), max_generation_k(avg_k_final), 1)
+
+    if args.probe_only:
+        batch_size = max(1, args.batch_size)
+        _ = pipeline.run(
+            dataset_path=str(dataset_path),
+            prompt_template=prompt_template,
+            generation_sampling=generation_sampling,
+            batch_size=batch_size,
+            sample_limit=batch_size,
+            pad_to_batch=True,
+            pass_k=(1,),
+            samples_per_task=1,
+            probe_only=True,
+        )
+        print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
+        return 0
+
     init_orm(DEFAULT_DB_CONFIG)
 
     service = EvalDbService()
@@ -228,8 +231,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         force_new_task=force_new_task,
     )
     sampling_payload = {
-        "cot": sampling_config_to_dict(cot_sampling),
-        "final": sampling_config_to_dict(final_sampling),
+        "generation": sampling_config_to_dict(generation_sampling),
     }
     task_id = service.create_task_from_context(
         ctx=ctx,
@@ -243,24 +245,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     os.environ["RWKV_SKILLS_TASK_ID"] = task_id
     os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
-
-    if args.probe_only:
-        batch_size = max(1, args.batch_size)
-        _ = pipeline.run(
-            dataset_path=str(dataset_path),
-            cot_prompt_template=cot_prompt_template,
-            final_answer_template=final_prompt_template,
-            cot_sampling=cot_sampling,
-            final_sampling=final_sampling,
-            batch_size=batch_size,
-            sample_limit=batch_size,
-            pad_to_batch=True,
-            pass_k=(1,),
-            samples_per_task=1,
-            probe_only=True,
-        )
-        print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
-        return 0
 
     # Evaluate from canonical completions (no reference/metrics fields inside).
     judge_model = (
@@ -314,10 +298,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = pipeline.run(
             dataset_path=str(dataset_path),
-            cot_prompt_template=cot_prompt_template,
-            final_answer_template=final_prompt_template,
-            cot_sampling=cot_sampling,
-            final_sampling=final_sampling,
+            prompt_template=prompt_template,
+            generation_sampling=generation_sampling,
             batch_size=max(1, args.batch_size),
             sample_limit=sample_limit,
             pass_k=generate_pass_k,
@@ -349,45 +331,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset_path=str(dataset_path),
         judge=judge,
     )
-    judge_stats = judge.last_run_stats
-    if judge_stats is not None and judge_stats.total > 0:
-        if judge_stats.error_count:
+    for group, group_stats in evaluation.judge_stats_by_group.items():
+        if int(group_stats.get("error_count", 0) or 0):
             print(
                 "⚠️ LLM judge 存在异常样本："
-                f"{judge_stats.error_count}/{judge_stats.total} "
-                f"(invalid_output={judge_stats.invalid_output_count}, "
-                f"request_error={judge_stats.request_error_count})"
+                f"{group} "
+                f"{group_stats.get('error_count')}/{group_stats.get('total')} "
+                f"(invalid_output={group_stats.get('invalid_output_count')}, "
+                f"request_error={group_stats.get('request_error_count')})"
             )
-            if judge_stats.request_error_examples:
+            request_error_examples = group_stats.get("request_error_examples")
+            if isinstance(request_error_examples, list) and request_error_examples:
                 print("⚠️ request_error 示例：")
-                for item in judge_stats.request_error_examples:
+                for item in request_error_examples:
                     print(f"  - {item}")
-            if judge_stats.invalid_output_examples:
+            invalid_output_examples = group_stats.get("invalid_output_examples")
+            if isinstance(invalid_output_examples, list) and invalid_output_examples:
                 print("⚠️ invalid_output 示例：")
-                for item in judge_stats.invalid_output_examples:
+                for item in invalid_output_examples:
                     print(f"  - {item}")
-    pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k_final)
-    avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k_final)
-    if evaluation.judge_accuracy is None:
-        raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
-    metrics_payload = {"judge_accuracy": evaluation.judge_accuracy}
-    pass_payload = filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
-    if report_pass_k and not pass_payload:
-        pass_payload = pass_metrics_all or {}
-    if pass_payload:
-        metrics_payload.update(pass_payload)
-    avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
-    if report_avg_k and not avg_payload:
-        avg_payload = avg_metrics_all or {}
-    if avg_payload:
-        metrics_payload.update(avg_payload)
-    task_details: dict[str, object] = {}
-    if judge_stats is not None:
-        task_details["judge_stats"] = judge_stats.as_dict()
-    if pass_metrics_all and pass_payload != pass_metrics_all:
-        task_details["pass_curve"] = pass_metrics_all
-    if avg_metrics_all and avg_payload != avg_metrics_all:
-        task_details["avg_curve"] = avg_metrics_all
+    metrics_payload, task_details = build_grouped_metrics_payload(
+        evaluation,
+        pass_k=pass_k_final,
+        avg_k=avg_k_final,
+        report_pass_k=report_pass_k,
+        report_avg_k=report_avg_k,
+    )
     service.ingest_eval_payloads(
         payloads=evaluation.payloads,
         task_id=task_id,

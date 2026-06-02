@@ -38,6 +38,8 @@ class GenerationOutput:
     token_ids: list[int]
     text: str
     finish_reason: str
+    finish_detail: str | None = None
+    truncated: bool = False
 
 
 __all__ = ["SamplingConfig", "GenerationOutput"]

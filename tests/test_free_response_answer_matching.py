@@ -1,105 +1,46 @@
 from __future__ import annotations
 
+import re
+
+from src.eval.metrics import free_response as fr
 from src.eval.metrics.free_response import (
     LLMJudge,
     LLMJudgeConfig,
-    _extract_answer_from_final_stage,
-    _is_exact_match,
-    _strip_thinking_for_answer,
+    STRATEGY_GROUPS,
+    build_grouped_metrics_payload,
     evaluate_free_response,
 )
 
 
-def test_exact_match_requires_extracted_answer_text() -> None:
-    assert _is_exact_match("9", "9")
-    assert not _is_exact_match(r"Therefore, the answer is \(\\boxed{9", "9")
-    assert not _is_exact_match("100", "9")
+def _patch_math_verify(monkeypatch) -> None:
+    def parse(text: str):
+        if text.startswith("$\\boxed{"):
+            return [("gold", text.removeprefix("$\\boxed{").removesuffix("}$"))]
+        if "requires_unclosed_repair" in text and "</think>" in text and "Therefore, the final answer is " in text:
+            return [("pred", "7")]
+        if "requires_truncated_repair" in text and "\nTherefore, the final answer is " in text:
+            return [("pred", "7")]
+        boxes = re.findall(r"\\boxed\{([^{}]+)\}", text)
+        if boxes:
+            return [("pred", boxes[-1])]
+        return []
+
+    def verify(gold, pred, *, strict: bool = False):
+        _ = strict
+        if not gold or not pred:
+            return False
+        return gold[-1][-1] == pred[-1][-1]
+
+    monkeypatch.setattr(fr, "_load_math_verify", lambda: (parse, verify))
 
 
-def test_legacy_text_exact_match_is_not_case_folded() -> None:
-    assert _is_exact_match("Evelyn", "Evelyn")
-    assert not _is_exact_match("Briana", "Evelyn")
-    assert not _is_exact_match("evelyn", "Evelyn")
-
-
-def test_strip_thinking_ignores_hidden_reasoning() -> None:
-    text = "<think>maybe 42</think>\nFinal answer: 7"
-    assert _strip_thinking_for_answer(text) == "Final answer: 7"
-    assert _strip_thinking_for_answer("<think>unfinished 42") == ""
-
-
-def test_extract_answer_uses_final_prompt_boxed_brace_format() -> None:
-    prompt = "\n</think>\nTherefore, the final answer is \\(\\boxed{"
-    completion = r"C=\dfrac{\pi}{3}}\)."
-
-    assert _extract_answer_from_final_stage(prompt, completion) == r"C=\dfrac{\pi}{3}"
-
-
-def test_extract_answer_closes_unclosed_inner_wrapper() -> None:
-    prompt = "\n</think>\nTherefore, the final answer is \\(\\boxed{"
-
-    assert _extract_answer_from_final_stage(prompt, r"-1-\sqrt{3") == r"-1-\sqrt{3}"
-    assert _extract_answer_from_final_stage(prompt, r"3") == "3"
-
-
-def test_extract_answer_supports_original_latex_paren_stage_format() -> None:
-    assert _extract_answer_from_final_stage("Final answer: \\(", r"x+1\).") == "x+1"
-
-
-def test_extract_answer_keeps_stage_output_when_prompt_has_no_wrapper() -> None:
-    assert _extract_answer_from_final_stage("Final answer:", "x=2") == "x=2"
-
-
-def test_judge_receives_frontend_answer_not_reasoning(tmp_path) -> None:
-    dataset = tmp_path / "free.jsonl"
-    dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
-    judge = LLMJudge(
-        LLMJudgeConfig(
-            api_key="k",
-            model="m",
-            max_workers=1,
-            max_retries=0,
-            backoff_base=0.0,
-        )
-    )
-    judge.client = _CapturingJudgeClient("False")
-
-    evaluation = evaluate_free_response(
-        [
-            {
-                "benchmark_name": "free",
-                "dataset_split": "test",
-                "sample_index": 0,
-                "repeat_index": 0,
-                "prompt1": "Final answer:",
-                "completion1": "<think>the answer might be 42</think>\nFinal answer: 7",
-            }
-        ],
-        dataset_path=dataset,
-        judge=judge,
-    )
-
-    assert evaluation.payloads[0]["answer"] == "Final answer: 7"
-    assert "Student's Answer: Final answer: 7" in judge.client.prompts[0]
-    assert "42" not in judge.client.prompts[0]
-
-
-def test_judge_receives_extracted_final_stage_answer_for_structured_refs(tmp_path) -> None:
+def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"
     dataset.write_text(
-        '{"question":"Solve the inequality.","answer":"$\\\\{x|-2\\\\leq x < 1\\\\}$"}\n',
+        '{"question":"q1","answer":"7"}\n{"question":"q2","answer":"9"}\n',
         encoding="utf-8",
     )
-    judge = LLMJudge(
-        LLMJudgeConfig(
-            api_key="k",
-            model="m",
-            max_workers=1,
-            max_retries=0,
-            backoff_base=0.0,
-        )
-    )
-    judge.client = _CapturingJudgeClient("True")
 
     evaluation = evaluate_free_response(
         [
@@ -108,22 +49,100 @@ def test_judge_receives_extracted_final_stage_answer_for_structured_refs(tmp_pat
                 "dataset_split": "test",
                 "sample_index": 0,
                 "repeat_index": 0,
-                "prompt1": "p",
-                "completion1": "reasoning",
-                "prompt2": "\n</think>\nTherefore, the final answer is \\(\\boxed{",
-                "completion2": "[-2,\\,1)}\\).",
+                "prompt1": "User: q1\n\nAssistant: <think",
+                "completion1": "<think>work</think>\nFinal answer: \\boxed{7}",
+                "stop_reason1": "stop_condition",
+                "stats": {"truncated": False, "stop_detail": "token_0"},
+            },
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 1,
+                "repeat_index": 0,
+                "prompt1": "User: q2\n\nAssistant: <think",
+                "completion1": "<think>work</think>\nFinal answer: \\boxed{8}",
+                "stop_reason1": "max_tokens",
+                "stats": {"truncated": True, "stop_detail": "max_tokens"},
+            },
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert set(evaluation.metrics_by_group) == set(STRATEGY_GROUPS)
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.5
+    assert evaluation.metrics_by_group["strategy_a"]["stop_rate"] == 0.5
+    assert evaluation.rows_by_group["strategy_a"] == [(0, 0, True), (1, 0, False)]
+    assert {payload["eval_group"] for payload in evaluation.payloads} == set(STRATEGY_GROUPS)
+
+    metrics_payload, task_details = build_grouped_metrics_payload(
+        evaluation,
+        pass_k=(1,),
+        avg_k=(1,),
+        report_pass_k=(1,),
+        report_avg_k=(1,),
+    )
+    assert metrics_payload["strategy_a"]["avg@1"] == 0.5
+    assert metrics_payload["strategy_b"]["stop_rate"] == 0.5
+    assert task_details == {}
+
+
+def test_strategy_b_repairs_unclosed_think_for_scoring_only(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User: q\n\nAssistant: <think",
+                "completion1": "requires_unclosed_repair",
+                "stop_reason1": "max_tokens",
+                "stats": {"truncated": True, "stop_detail": "max_tokens"},
             }
         ],
         dataset_path=dataset,
-        judge=judge,
+        judge=None,
     )
 
-    assert evaluation.payloads[0]["answer"] == "[-2,\\,1)"
-    assert "Student's Answer: [-2,\\,1)" in judge.client.prompts[0]
-    assert "Student's Answer: 1" not in judge.client.prompts[0]
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.metrics_by_group["strategy_b"]["exact_accuracy"] == 1.0
+    assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
 
 
-def test_judge_skips_exact_matches_and_keeps_them_passed(tmp_path) -> None:
+def test_strategy_c_repairs_truncated_answer_region(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User: q\n\nAssistant: <think",
+                "completion1": "</think>\nrequires_truncated_repair",
+                "stop_reason1": "max_tokens",
+                "stats": {"truncated": True, "stop_detail": "max_tokens"},
+            }
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.metrics_by_group["strategy_b"]["exact_accuracy"] == 0.0
+    assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
+
+
+def test_math_verify_pass_skips_judge_per_strategy_group(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"
     dataset.write_text(
         '{"question":"q1","answer":"7"}\n{"question":"q2","answer":"9"}\n',
@@ -147,62 +166,30 @@ def test_judge_skips_exact_matches_and_keeps_them_passed(tmp_path) -> None:
                 "dataset_split": "test",
                 "sample_index": 0,
                 "repeat_index": 0,
-                "prompt1": "Final answer:",
-                "completion1": "7",
+                "prompt1": "p",
+                "completion1": "\\boxed{7}",
+                "stop_reason1": "stop_condition",
             },
             {
                 "benchmark_name": "free",
                 "dataset_split": "test",
                 "sample_index": 1,
                 "repeat_index": 0,
-                "prompt1": "Final answer:",
-                "completion1": "8",
+                "prompt1": "p",
+                "completion1": "\\boxed{8}",
+                "stop_reason1": "stop_condition",
             },
         ],
         dataset_path=dataset,
         judge=judge,
     )
 
-    assert evaluation.exact_accuracy == 0.5
-    assert evaluation.judge_accuracy == 1.0
-    assert [row[2] for row in evaluation.rows] == [True, True]
-    assert len(judge.client.prompts) == 1
-    assert "Question: q2" in judge.client.prompts[0]
-    assert "Student's Answer: 8" in judge.client.prompts[0]
-
-
-def test_exact_matches_pass_even_when_judge_would_reject(tmp_path) -> None:
-    dataset = tmp_path / "free.jsonl"
-    dataset.write_text('{"question":"q","answer":"255"}\n', encoding="utf-8")
-    judge = LLMJudge(
-        LLMJudgeConfig(
-            api_key="k",
-            model="m",
-            max_workers=1,
-            max_retries=0,
-            backoff_base=0.0,
-        )
-    )
-    judge.client = _CapturingJudgeClient("False")
-
-    evaluation = evaluate_free_response(
-        [
-            {
-                "benchmark_name": "free",
-                "dataset_split": "test",
-                "sample_index": 0,
-                "repeat_index": 0,
-                "prompt1": "Final answer:",
-                "completion1": "255",
-            }
-        ],
-        dataset_path=dataset,
-        judge=judge,
-    )
-
-    assert evaluation.judge_accuracy == 1.0
-    assert evaluation.rows == [(0, 0, True)]
-    assert judge.client.prompts == []
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.5
+    assert evaluation.metrics_by_group["strategy_a"]["judge_accuracy"] == 1.0
+    assert [row[2] for row in evaluation.rows_by_group["strategy_a"]] == [True, True]
+    assert len(judge.client.prompts) == 3
+    assert all("Question: q2" in prompt for prompt in judge.client.prompts)
+    assert all("Student's Answer:" in prompt for prompt in judge.client.prompts)
 
 
 class _CapturingJudgeClient:

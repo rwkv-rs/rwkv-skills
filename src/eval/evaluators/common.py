@@ -39,6 +39,7 @@ class SampleRecord:
     repeat_index: int
     stages: list[StageRecord]
     sampling_config: dict = field(default_factory=dict)
+    stats: dict = field(default_factory=dict)
 
     def as_payload(self) -> dict:
         payload = {
@@ -48,6 +49,8 @@ class SampleRecord:
             "repeat_index": int(self.repeat_index),
             "sampling_config": self.sampling_config or {},
         }
+        if self.stats:
+            payload["stats"] = dict(self.stats)
         for idx, stage in enumerate(self.stages, start=1):
             payload[f"prompt{idx}"] = stage.prompt
             payload[f"completion{idx}"] = stage.completion

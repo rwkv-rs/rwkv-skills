@@ -57,6 +57,9 @@ def _trial_from_config_path(path: str) -> tuple[str, str] | None:
 
 
 def _select_metric(metrics: dict[str, Any]) -> tuple[str, float]:
+    strategy_a = metrics.get("strategy_a")
+    if isinstance(strategy_a, dict):
+        metrics = strategy_a
     avg_keys = sorted(
         (key for key in metrics if key.startswith("avg@")),
         key=lambda item: float(item.removeprefix("avg@")),

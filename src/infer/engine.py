@@ -270,22 +270,36 @@ def _continuous_batching(
             if new_token is None:
                 continue
             reached_stop = new_token in stop_tokens
-            matched_stop_suffix = False
+            matched_stop_suffix: str | None = None
             if not reached_stop:
                 task.pending_tokens.append(new_token)
                 task.generated_tokens.append(new_token)
-                matched_stop_suffix = _matches_stop_suffix(
+                matched_stop_suffix = _matched_stop_suffix(
                     _decode_tokens(tokenizer, task.generated_tokens),
                     task.stop_suffixes,
                 )
             reached_length = len(task.generated_tokens) >= (sampling.max_generate_tokens if not probe_only else 1)
-            if reached_stop or matched_stop_suffix or reached_length:
+            if reached_stop or matched_stop_suffix is not None or reached_length:
+                if reached_stop:
+                    finish_reason = "stop_condition"
+                    finish_detail = "token_0" if int(new_token) == 0 else f"token_{int(new_token)}"
+                    truncated = False
+                elif matched_stop_suffix is not None:
+                    finish_reason = "stop_condition"
+                    finish_detail = "user_sentinel" if matched_stop_suffix == "\nUser:" else "text_sentinel"
+                    truncated = False
+                else:
+                    finish_reason = "max_tokens"
+                    finish_detail = "max_tokens"
+                    truncated = True
                 output = GenerationOutput(
                     prompt_index=task.prompt_index,
                     prompt=task.prompt,
                     token_ids=list(task.generated_tokens),
                     text="",
-                    finish_reason="stop_token" if (reached_stop or matched_stop_suffix) else "max_length",
+                    finish_reason=finish_reason,
+                    finish_detail=finish_detail,
+                    truncated=truncated,
                 )
                 if on_complete is not None and not probe_only:
                     output.text = _decode_tokens(tokenizer, output.token_ids)
@@ -420,10 +434,13 @@ def _normalize_stop_suffixes(stop_suffixes: Sequence[str] | None) -> tuple[str, 
     return tuple(str(item) for item in (stop_suffixes or ()) if str(item))
 
 
-def _matches_stop_suffix(text: str, stop_suffixes: Sequence[str]) -> bool:
+def _matched_stop_suffix(text: str, stop_suffixes: Sequence[str]) -> str | None:
     if not text or not stop_suffixes:
-        return False
-    return any(suffix in text for suffix in stop_suffixes)
+        return None
+    for suffix in stop_suffixes:
+        if suffix in text:
+            return suffix
+    return None
 
 
 __all__ = ["InferenceEngine", "GenerationOutput"]

@@ -217,6 +217,32 @@ def _format_tooltip_lines(title: str, items: list[tuple[str, float]]) -> str | N
     return "\n".join(lines)
 
 
+def _grouped_metric_tooltip(entry: ScoreEntry) -> str | None:
+    groups = entry.metrics.get("_metric_groups")
+    if not isinstance(groups, dict):
+        return None
+    lines = ["指标明细"]
+    for group in ("strategy_a", "strategy_b", "strategy_c"):
+        metrics = groups.get(group)
+        if not isinstance(metrics, dict):
+            continue
+        parts: list[str] = []
+        for key in ("exact_accuracy", "judge_accuracy", "avg@64", "avg@16", "avg@8", "avg@4", "avg@1", "pass@8", "pass@1", "stop_rate"):
+            value = metrics.get(key)
+            num = _numeric_value(value)
+            if num is None:
+                continue
+            score = _score_to_percent(num)
+            if score is None:
+                continue
+            parts.append(f"{key}: {score:.1f}%")
+        if parts:
+            lines.append(f"{group}: " + " / ".join(parts))
+    if len(lines) <= 1:
+        return None
+    return "\n".join(lines)
+
+
 def _mmlu_tooltip(entry: ScoreEntry) -> str | None:
     details = entry.task_details or {}
     accuracy_by_subject = details.get("accuracy_by_subject")
@@ -252,6 +278,9 @@ def _ifeval_tooltip(entry: ScoreEntry) -> str | None:
 
 
 def _metric_fallback_tooltip(entry: ScoreEntry) -> str | None:
+    grouped = _grouped_metric_tooltip(entry)
+    if grouped:
+        return grouped
     items = _sorted_numeric_items(entry.metrics, limit=8)
     return _format_tooltip_lines("指标明细", items)
 

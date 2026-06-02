@@ -11,6 +11,7 @@ from src.space.metrics import (
     _field_primary_score,
     _metric_score,
 )
+from src.space.tables import _tooltip_for_entry
 from src.space.tables import _split_rows_by_suspect
 
 
@@ -93,6 +94,52 @@ def test_college_math_space_detail_uses_exact_method() -> None:
     assert rows == [("college_math_cot", "exact_match", "avg@2", 0.8)]
 
 
+def test_space_uses_strategy_a_for_grouped_free_response_metrics() -> None:
+    entry = _score_entry_from_db(
+        _db_score_payload(
+            "college_math_test",
+            "eval_free_response",
+            {
+                "strategy_a": {"exact_accuracy": 0.8, "avg@2": 0.8, "stop_rate": 0.1},
+                "strategy_b": {"exact_accuracy": 0.85, "avg@2": 0.85, "stop_rate": 0.1},
+                "strategy_c": {"exact_accuracy": 0.9, "avg@2": 0.9, "stop_rate": 0.1},
+            },
+        ),
+        errors=None,
+    )
+    assert entry is not None
+
+    assert entry.metrics["exact_accuracy"] == 0.8
+    assert _cell_metric_value(entry, dataset_base="college_math") == "80.0%"
+    assert _cell_numeric_value(entry, dataset_base="college_math") == 0.8
+    tooltip = _tooltip_for_entry(entry)
+    assert tooltip is not None
+    assert "strategy_a" in tooltip
+    assert "strategy_c" in tooltip
+    assert "stop_rate: 10.0%" in tooltip
+
+
+def test_space_uses_llm_judge_for_grouped_judge_metrics() -> None:
+    entry = _score_entry_from_db(
+        _db_score_payload(
+            "math_500_test",
+            "eval_free_response_judge",
+            {
+                "strategy_a": {"exact_accuracy": 0.3, "judge_accuracy": 0.7, "avg@4": 0.7, "stop_rate": 0.2},
+                "strategy_b": {"exact_accuracy": 0.4, "judge_accuracy": 0.75, "avg@4": 0.75, "stop_rate": 0.2},
+                "strategy_c": {"exact_accuracy": 0.45, "judge_accuracy": 0.8, "avg@4": 0.8, "stop_rate": 0.2},
+            },
+        ),
+        errors=None,
+    )
+    assert entry is not None
+
+    rows = _detail_rows_for_entry(entry)
+
+    assert rows == [("math_500_cot", "llm_judge", "avg@4", 0.7)]
+    assert _field_primary_score(entry) == 0.7
+
+
 def test_split_rows_by_suspect_remaps_cell_meta() -> None:
     rows = [
         ["normal", "10.0", ("+1.0", "cell-delta-pos")],
@@ -119,10 +166,16 @@ def test_split_rows_by_suspect_remaps_cell_meta() -> None:
     assert suspect_meta == {(0, 2): meta}
 
 
-def _function_call_score_entry(metrics: dict[str, float]) -> ScoreEntry:
+def _function_call_score_entry(
+    metrics: dict[str, float],
+    *,
+    dataset: str = "bfcl_exec_parallel_multiple_test",
+    task: str = "function_one_step_bfcl_exec",
+    task_details: dict[str, object] | None = None,
+) -> ScoreEntry:
     return ScoreEntry(
         task_id=123,
-        dataset="bfcl_exec_parallel_multiple_test",
+        dataset=dataset,
         model="rwkv7-g1f-13.3b-20260415-ctx8192",
         metrics=metrics,
         samples=40,
@@ -130,8 +183,8 @@ def _function_call_score_entry(metrics: dict[str, float]) -> ScoreEntry:
         created_at=datetime(2026, 5, 28),
         log_path="",
         cot=False,
-        task="function_one_step_bfcl_exec",
-        task_details=None,
+        task=task,
+        task_details=task_details,
         path=Path("<test>"),
         relative_path=Path("<test>"),
         domain="function_call系列",
@@ -149,3 +202,30 @@ def test_function_call_scores_prefer_avg_at_1_over_success_rate() -> None:
     assert _cell_numeric_value(entry, dataset_base="bfcl_exec_parallel_multiple") == 0.5
     assert _metric_score(entry) == 0.5
     assert _field_primary_score(entry) == 0.5
+
+
+def test_complexfuncbench_scores_prefer_strict_success_over_partial_reward() -> None:
+    entry = _function_call_score_entry(
+        {"success_rate": 0.0, "avg@1": 0.18},
+        dataset="complexfuncbench_subset_test",
+        task="function_one_step_complexfuncbench_subset",
+    )
+
+    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "success_rate 0.0%"
+    assert _cell_numeric_value(entry, dataset_base="complexfuncbench_subset") == 0.0
+    assert _metric_score(entry) == 0.0
+    assert _field_primary_score(entry) == 0.0
+
+
+def test_complexfuncbench_scores_prefer_official_score_when_present() -> None:
+    entry = _function_call_score_entry(
+        {"official_score": 0.06, "success_rate": 0.06, "avg@1": 0.155, "call_accuracy": 0.155},
+        dataset="complexfuncbench_subset_test",
+        task="function_one_step_complexfuncbench_subset",
+        task_details={"benchmark": "complexfuncbench"},
+    )
+
+    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "official_score 6.0%"
+    assert _cell_numeric_value(entry, dataset_base="complexfuncbench_subset") == 0.06
+    assert _metric_score(entry) == 0.06
+    assert _field_primary_score(entry) == 0.06

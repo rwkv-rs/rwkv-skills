@@ -66,6 +66,17 @@ def _is_function_calling_entry(entry: ScoreEntry) -> bool:
     )
 
 
+def _is_complexfuncbench_entry(entry: ScoreEntry, *, dataset_base: str | None = None) -> bool:
+    task_key = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(entry.task or "")).strip("_")
+    base = (dataset_base or _dataset_base(entry.dataset)).lower()
+    details = entry.task_details if isinstance(entry.task_details, dict) else {}
+    return (
+        base.startswith("complexfuncbench")
+        or task_key == "function_one_step_complexfuncbench_subset"
+        or str(details.get("benchmark") or "").lower() == "complexfuncbench"
+    )
+
+
 def _benchmark_name(entry: ScoreEntry) -> str:
     return f"{_dataset_base(entry.dataset)}_{_method_tag(entry.cot, domain=entry.domain, task=entry.task)}"
 
@@ -206,6 +217,10 @@ def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) 
     metrics = entry.metrics
 
     if _is_function_calling_entry(entry):
+        if _is_complexfuncbench_entry(entry, dataset_base=base):
+            key, value = _preferred_numeric(metrics, ("official_score", "success_rate"))
+            if key:
+                return key, value
         avg_key = _preferred_avg_metric_key(metrics)
         if avg_key:
             return avg_key, _numeric_value(metrics.get(avg_key))
@@ -437,6 +452,11 @@ def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
         return None
 
     if _is_function_calling_entry(entry):
+        if _is_complexfuncbench_entry(entry, dataset_base=base):
+            for key in ("official_score", "success_rate"):
+                formatted = _format_specific(key)
+                if formatted is not None:
+                    return f"{key} {formatted}"
         avg_key = _preferred_avg_metric_key(metrics)
         if avg_key:
             formatted = _format_specific(avg_key)
@@ -489,6 +509,11 @@ def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float
         return _numeric_value(metrics.get(key))
 
     if _is_function_calling_entry(entry):
+        if _is_complexfuncbench_entry(entry, dataset_base=base):
+            for key in ("official_score", "success_rate"):
+                value = _numeric_specific(key)
+                if value is not None:
+                    return value
         avg_key = _preferred_avg_metric_key(metrics)
         if avg_key:
             value = _numeric_specific(avg_key)

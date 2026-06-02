@@ -14,9 +14,8 @@ ONE_STEP_METRIC_KEYS: tuple[str, ...] = (
     "extra_call",
 )
 COMPLEXFUNC_METRIC_KEYS: tuple[str, ...] = (
-    "avg@1",
-    "success_rate",
     "official_score",
+    "success_rate",
     "call_accuracy",
     "parse_error_rate",
     "missing_call",

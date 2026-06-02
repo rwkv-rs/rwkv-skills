@@ -26,6 +26,9 @@ DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
 
 
 def _objective_from_metrics(metrics: dict[str, Any]) -> float:
+    strategy_a = metrics.get("strategy_a")
+    if isinstance(strategy_a, dict):
+        metrics = strategy_a
     judge = metrics.get("judge_accuracy")
     if isinstance(judge, (int, float)):
         return float(judge)

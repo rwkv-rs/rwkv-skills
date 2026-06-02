@@ -376,6 +376,20 @@ class EvalDbRepository:
         rows = session.execute(stmt).all()
         return {int(row[0]) for row in rows}
 
+    def fetch_existing_eval_keys(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+    ) -> set[tuple[int, str]]:
+        stmt = (
+            select(Eval.completions_id, Eval.eval_group)
+            .join(Completion, Completion.completions_id == Eval.completions_id)
+            .where(Completion.task_id == task_id)
+        )
+        rows = session.execute(stmt).all()
+        return {(int(row[0]), str(row[1] or "strategy_a")) for row in rows}
+
     def fetch_score_by_task(
         self,
         session: Session,
@@ -469,6 +483,7 @@ class EvalDbRepository:
         columns: list[Any] = [
             Completion.sample_index.label("sample_index"),
             Completion.repeat_index.label("repeat_index"),
+            Eval.eval_group.label("eval_group"),
             Eval.is_passed.label("is_passed"),
             Eval.answer.label("answer"),
             Eval.ref_answer.label("ref_answer"),
@@ -485,6 +500,7 @@ class EvalDbRepository:
             .order_by(
                 Completion.sample_index.asc(),
                 Completion.repeat_index.asc(),
+                Eval.eval_group.asc(),
                 Eval.eval_id.asc(),
             )
         )
@@ -566,6 +582,7 @@ class EvalDbRepository:
             ref_answer=payload.get("ref_answer"),
             is_passed=bool(payload.get("is_passed", False)),
             fail_reason=payload.get("fail_reason"),
+            eval_group=str(payload.get("eval_group") or "strategy_a"),
             created_at=created_at,
         )
         session.add(eval_row)
@@ -625,6 +642,45 @@ class EvalDbRepository:
         session.flush()
         return int(task.task_id)
 
+    def insert_session_task(
+        self,
+        session: Session,
+        *,
+        config_path: str | None,
+        evaluator: str,
+        is_param_search: bool,
+        created_at: datetime,
+        status: str,
+        git_hash: str,
+        model_id: int,
+        benchmark_id: int,
+        desc: str | None,
+        sampling_config: dict[str, Any] | None,
+        log_path: str,
+        session_id: str,
+        session_git_hash: str,
+        session_status: str,
+    ) -> int:
+        task = Task(
+            config_path=config_path,
+            evaluator=evaluator,
+            is_param_search=is_param_search,
+            created_at=created_at,
+            status=status,
+            git_hash=git_hash,
+            model_id=model_id,
+            benchmark_id=benchmark_id,
+            desc=desc,
+            sampling_config=sampling_config,
+            log_path=log_path,
+            session_id=session_id,
+            session_git_hash=session_git_hash,
+            session_status=session_status,
+        )
+        session.add(task)
+        session.flush()
+        return int(task.task_id)
+
     def update_task_session_status(
         self,
         session: Session,
@@ -634,6 +690,38 @@ class EvalDbRepository:
     ) -> None:
         stmt = update(Task).where(Task.task_id == task_id).values(session_status=session_status)
         session.execute(stmt)
+
+    def update_session_task_runtime(
+        self,
+        session: Session,
+        *,
+        task_id: int,
+        session_id: str,
+        benchmark_id: int,
+        model_id: int,
+        is_param_search: bool,
+        desc: str | None,
+        sampling_config: dict[str, Any] | None,
+        log_path: str,
+    ) -> int | None:
+        stmt = (
+            update(Task)
+            .where(
+                Task.task_id == task_id,
+                Task.session_id == session_id,
+                Task.benchmark_id == benchmark_id,
+                Task.model_id == model_id,
+                Task.is_param_search == is_param_search,
+            )
+            .values(
+                status="running",
+                desc=desc,
+                sampling_config=sampling_config,
+                log_path=log_path,
+            )
+            .returning(Task.task_id)
+        )
+        return session.execute(stmt).scalar_one_or_none()
 
     def find_pending_task_by_session(
         self,

@@ -254,9 +254,20 @@ class EvalDbService:
         if ctx.model_id is None:
             raise RuntimeError(f"model 记录不存在: {model}")
 
-        # Check if there's a pre-created pending task from session
+        # Prefer the exact task row created by the scheduler for this launched job.
         session_id = os.environ.get("RWKV_SESSION_ID")
         if session_id:
+            session_task_id = self._bind_scheduler_task_from_env(
+                session_id=session_id,
+                ctx=ctx,
+                dataset=dataset,
+                model=model,
+                is_param_search=is_param_search,
+                sampling_config=sampling_config,
+            )
+            if session_task_id is not None:
+                return str(session_task_id)
+
             pending_task_id = self.find_pending_task_by_session(
                 session_id=session_id,
                 dataset=dataset,
@@ -264,7 +275,7 @@ class EvalDbService:
                 is_param_search=is_param_search,
             )
             if pending_task_id:
-                # Update the pre-created task with runtime info
+                # Legacy resume path for older sessions that still have pending task rows.
                 desc = os.environ.get("RWKV_TASK_DESC")
                 log_path = os.environ.get("RWKV_SKILLS_LOG_PATH", "")
                 with get_session() as session:
@@ -311,6 +322,49 @@ class EvalDbService:
                 log_path=os.environ.get("RWKV_SKILLS_LOG_PATH", ""),
             )
         return str(task_id)
+
+    def _bind_scheduler_task_from_env(
+        self,
+        *,
+        session_id: str,
+        ctx: ResumeContext,
+        dataset: str,
+        model: str,
+        is_param_search: bool,
+        sampling_config: dict[str, Any] | None,
+    ) -> int | None:
+        raw = os.environ.get("RWKV_SESSION_TASK_ID", "").strip()
+        if not raw:
+            return None
+        if ctx.benchmark_id is None:
+            raise self._missing_benchmark_error(dataset=dataset)
+        if ctx.model_id is None:
+            raise RuntimeError(f"model 记录不存在: {model}")
+        try:
+            task_id = int(raw)
+        except ValueError as exc:
+            raise RuntimeError(f"RWKV_SESSION_TASK_ID must be an integer, got {raw!r}") from exc
+        desc = os.environ.get("RWKV_TASK_DESC")
+        log_path = os.environ.get("RWKV_SKILLS_LOG_PATH", "")
+        with get_session() as session:
+            updated_task_id = self._repo.update_session_task_runtime(
+                session,
+                task_id=task_id,
+                session_id=session_id,
+                benchmark_id=ctx.benchmark_id,
+                model_id=ctx.model_id,
+                is_param_search=is_param_search,
+                desc=desc,
+                sampling_config=sampling_config,
+                log_path=log_path,
+            )
+        if updated_task_id is None:
+            raise RuntimeError(
+                "RWKV_SESSION_TASK_ID did not match the scheduler-created task: "
+                f"task_id={task_id}, session_id={session_id!r}, "
+                f"dataset={dataset!r}, model={model!r}, is_param_search={is_param_search}"
+            )
+        return int(updated_task_id)
 
     def get_or_create_task(
         self,
@@ -505,25 +559,27 @@ class EvalDbService:
         inserted = 0
         pending_rows = 0
         pending_chars = 0
-        pending_payloads: list[tuple[int, dict[str, Any]]] = []
+        pending_payloads: list[tuple[int, str, dict[str, Any]]] = []
         created_at = self._now_cn()
         task_id_int = int(task_id)
         with get_session() as session:
             mapping = self._repo.fetch_completion_id_map(session, task_id=task_id_int)
-            existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
+            existing_eval_keys = self._repo.fetch_existing_eval_keys(
                 session,
                 task_id=task_id_int,
             )
         for payload in payloads:
             sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
             repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+            eval_group = str(payload.get("eval_group") or "strategy_a")
 
             completions_id = mapping.get((sample_index, repeat_index))
-            if completions_id is None or completions_id in existing_eval_ids:
+            eval_key = (completions_id, eval_group) if completions_id is not None else None
+            if completions_id is None or eval_key in existing_eval_keys:
                 continue
 
-            pending_payloads.append((completions_id, payload))
-            existing_eval_ids.add(completions_id)
+            pending_payloads.append((completions_id, eval_group, payload))
+            existing_eval_keys.add((completions_id, eval_group))
             pending_rows += 1
             pending_chars += self._estimate_eval_payload_chars(payload)
 
@@ -549,19 +605,20 @@ class EvalDbService:
         self,
         *,
         task_id: int,
-        rows: Sequence[tuple[int, dict[str, Any]]],
+        rows: Sequence[tuple[int, str, dict[str, Any]]],
         created_at: datetime,
     ) -> int:
         if not rows:
             return 0
         with get_session() as session:
-            known_ids = self._repo.fetch_existing_eval_completion_ids(
+            known_keys = self._repo.fetch_existing_eval_keys(
                 session,
                 task_id=task_id,
             )
             inserted = 0
-            for completions_id, payload in rows:
-                if completions_id in known_ids:
+            for completions_id, eval_group, payload in rows:
+                key = (completions_id, eval_group)
+                if key in known_keys:
                     continue
                 self._repo.insert_eval(
                     session,
@@ -569,7 +626,7 @@ class EvalDbService:
                     payload=payload,
                     created_at=created_at,
                 )
-                known_ids.add(completions_id)
+                known_keys.add(key)
                 inserted += 1
         return inserted
 
@@ -804,6 +861,7 @@ class EvalDbService:
             payload: dict[str, Any] = {
                 "sample_index": int(mapping.get("sample_index", 0)),
                 "repeat_index": int(mapping.get("repeat_index", 0)),
+                "eval_group": str(mapping.get("eval_group") or "strategy_a"),
                 "is_passed": bool(mapping.get("is_passed", False)),
                 "answer": str(mapping.get("answer") or ""),
                 "ref_answer": str(mapping.get("ref_answer") or ""),
@@ -854,7 +912,7 @@ class EvalDbService:
         job_name: str,
         is_param_search: bool,
     ) -> int:
-        """Pre-create a pending task record for a session queue item."""
+        """Legacy helper for old session queues that already model pending tasks."""
         benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
         model = normalize_model_name(model)
         normalized = _normalize_model_identifier(model)
@@ -909,6 +967,81 @@ class EvalDbService:
                 benchmark_id=benchmark_id,
                 session_id=session_id,
                 session_git_hash=git_hash,
+            )
+        return task_id
+
+    def create_scheduler_task(
+        self,
+        *,
+        session_id: str,
+        git_hash: str,
+        dataset: str,
+        model: str,
+        job_name: str,
+        is_param_search: bool,
+        desc: str | None,
+        log_path: str,
+    ) -> int:
+        """Create one DB task for a job that the scheduler is about to launch."""
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        model = normalize_model_name(model)
+        normalized = _normalize_model_identifier(model)
+        arch, data_version, num_params = _parse_model_tags(normalized)
+        if not arch or not data_version or not num_params:
+            fallback_arch, fallback_data, fallback_params = self._fallback_parse_model_tags(model)
+            arch = arch or fallback_arch
+            data_version = data_version or fallback_data
+            num_params = num_params or fallback_params
+        arch_version = arch or "unknown"
+        data_version = data_version or "unknown"
+        num_params = num_params or "unknown"
+
+        with get_session() as session:
+            benchmark_id = self._repo.get_benchmark_id(
+                session, benchmark_name=benchmark_name, benchmark_split=benchmark_split
+            )
+            if benchmark_id is None:
+                raise self._missing_benchmark_error(dataset=dataset)
+
+            model_id = self._repo.get_model_id(
+                session,
+                model_name=model,
+                arch_version=arch_version,
+                data_version=data_version,
+                num_params=num_params,
+            )
+            if model_id is None:
+                model_id = self._repo.insert_model(
+                    session,
+                    model_name=model,
+                    arch_version=arch_version,
+                    data_version=data_version,
+                    num_params=num_params,
+                )
+
+            config_path = config_path_for_benchmark(benchmark_name, model)
+            if config_path.exists():
+                config_path_str = str(config_path)
+            else:
+                fallback_path = config_path_for_benchmark(benchmark_name, None)
+                config_path_str = str(fallback_path) if fallback_path.exists() else None
+
+            task_id = self._repo.insert_session_task(
+                session,
+                config_path=config_path_str,
+                evaluator=job_name,
+                is_param_search=is_param_search,
+                created_at=self._now_cn(),
+                status="running",
+                git_hash=git_hash,
+                model_id=model_id,
+                benchmark_id=benchmark_id,
+                desc=desc,
+                sampling_config=None,
+                log_path=log_path,
+                session_id=session_id,
+                session_git_hash=git_hash,
+                session_status="running",
             )
         return task_id
 

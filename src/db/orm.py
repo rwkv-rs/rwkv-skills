@@ -251,12 +251,16 @@ class Eval(Base):
     ref_answer: Mapped[str] = mapped_column(Text, nullable=False)
     is_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     fail_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    eval_group: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(6), nullable=False)
 
     # Relationships
     completion: Mapped["Completion"] = relationship("Completion", back_populates="evals", lazy="select")
 
-    __table_args__ = (Index("idx_eval_completion", "completions_id"),)
+    __table_args__ = (
+        Index("idx_eval_completion", "completions_id"),
+        Index("uq_eval_completion_group", "completions_id", "eval_group", unique=True),
+    )
 
 
 class Score(Base):

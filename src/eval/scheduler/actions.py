@@ -139,9 +139,8 @@ def action_dispatch(opts: DispatchOptions) -> None:
     batch_profiler = BatchProfiler(batch_cache)
     job_priority = _job_priority_map(opts.job_priority)
 
-    # Create session for this dispatch run
+    # Create a session label for task records launched by this dispatch run.
     session_id = _generate_session_id()
-    # Pre-create pending tasks for session tracking
     from src.db.orm import init_orm
     from src.db.eval_db_service import EvalDbService, _get_cached_git_sha
     from .config import DEFAULT_DB_CONFIG
@@ -151,53 +150,6 @@ def action_dispatch(opts: DispatchOptions) -> None:
     git_hash = _get_cached_git_sha()
     print(f"📋 Session ID: {session_id}")
     print(f"📋 Git Hash: {git_hash}")
-
-    # Build initial queue to pre-create tasks
-    completed, score_records = scan_completed_jobs(opts.log_dir)
-    failed = {record.key for record in score_records.values() if getattr(record, "missing_artifacts", False)}
-    running_entries = load_running(opts.pid_dir)
-    overwrite_mode = opts.overwrite
-    completed_for_queue = set() if overwrite_mode else set(completed)
-
-    initial_queue = build_queue(
-        model_globs=opts.model_globs,
-        job_order=opts.job_order,
-        completed=completed_for_queue,
-        failed=failed,
-        running=running_entries.keys(),
-        skip_dataset_slugs=opts.skip_dataset_slugs,
-        only_dataset_slugs=opts.only_dataset_slugs,
-        model_select=opts.model_select,
-        min_param_b=opts.min_param_b,
-        max_param_b=opts.max_param_b,
-        enable_param_search=opts.enable_param_search,
-        model_name_patterns=opts.model_name_patterns,
-    )
-
-    # If resume mode: filter to exact (dataset_slug, model_name, job_name) triples
-    if opts.only_job_triples:
-        initial_queue = [
-            item for item in initial_queue
-            if (item.dataset_slug, item.model_path.stem, item.job_name) in opts.only_job_triples
-        ]
-
-    # Pre-create pending task records for session tracking
-    task_id_map: dict[str, int] = {}  # job_id -> task_id
-    for item in initial_queue:
-        try:
-            task_id = service.create_pending_task(
-                session_id=session_id,
-                git_hash=git_hash,
-                dataset=item.dataset_slug,
-                model=item.model_path.stem,
-                job_name=item.job_name,
-                is_param_search=False,
-            )
-            task_id_map[item.job_id] = task_id
-        except Exception as e:
-            print(f"⚠️  Failed to pre-create task for {item.job_id}: {e}")
-
-    print(f"📋 Pre-created {len(task_id_map)} pending tasks for session {session_id}")
 
     FAILURE_MONITOR.reset()
     pending_since: dict[str, float] = {}
@@ -395,6 +347,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                             continue
                 pid_path.unlink(missing_ok=True)
 
+            task_desc = f"job={item.job_name}, dataset={dataset_slug}"
             env = os.environ.copy()
             env.update(
                 {
@@ -403,22 +356,14 @@ def action_dispatch(opts: DispatchOptions) -> None:
                     "RWKV_SKILLS_MODEL_PATH": str(item.model_path),
                     "RWKV_SKILLS_DATASET": str(dataset_path),
                     "RWKV_SKILLS_DATASET_SLUG": dataset_slug,
-                    "RWKV_TASK_DESC": f"job={item.job_name}, dataset={dataset_slug}",
+                    "RWKV_TASK_DESC": task_desc,
                     "RUN_LOG_DIR": str(opts.log_dir),
                     "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
+                    "RWKV_SKILLS_LOG_PATH": str(console_log_path),
                     "RWKV_SCHEDULER_OVERWRITE": "1" if opts.overwrite else "0",
                     "RWKV_SESSION_ID": session_id,
                 }
             )
-            # Pass session task_id if pre-created
-            session_task_id = task_id_map.get(item.job_id)
-            if session_task_id is not None:
-                env["RWKV_SESSION_TASK_ID"] = str(session_task_id)
-                # Update session_status to running
-                try:
-                    service.update_task_session_status(task_id=str(session_task_id), session_status="running")
-                except Exception:
-                    pass
             if opts.disable_checker:
                 env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
             if opts.benchmark_config_root is not None:
@@ -440,6 +385,29 @@ def action_dispatch(opts: DispatchOptions) -> None:
             extra_args = item.extra_args
             if opts.overwrite and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
                 extra_args = extra_args + ("--overwrite",)
+
+            try:
+                session_task_id = service.create_scheduler_task(
+                    session_id=session_id,
+                    git_hash=git_hash,
+                    dataset=dataset_slug,
+                    model=item.model_path.stem,
+                    job_name=item.job_name,
+                    is_param_search=False,
+                    desc=task_desc,
+                    log_path=str(console_log_path),
+                )
+            except Exception as exc:
+                log_job_event(
+                    "job_error",
+                    item.job_id,
+                    reason="create_scheduler_task_failed",
+                    dataset_slug=dataset_slug,
+                    model_path=str(item.model_path),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            env["RWKV_SESSION_TASK_ID"] = str(session_task_id)
 
             command = build_command(
                 job,
@@ -472,6 +440,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 model_slug=item.model_slug,
                 console_log_path=str(console_log_path),
                 gpu=gpu,
+                task_id=session_task_id,
             )
 
             process = launch_job(
@@ -498,6 +467,7 @@ def action_dispatch(opts: DispatchOptions) -> None:
                 model_path=str(item.model_path),
                 gpu=f"cuda:{gpu}",
                 pid=process.pid,
+                task_id=session_task_id,
                 wait_s=wait_s,
             )
 

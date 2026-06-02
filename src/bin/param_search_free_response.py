@@ -12,7 +12,7 @@ from typing import Sequence
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
-from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
+from src.eval.metrics.free_response import build_grouped_metrics_payload, evaluate_free_response
 from src.eval.param_search.cot_grid import COT_GRID, grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
@@ -49,23 +49,6 @@ def _sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     return normalized
 
 
-def _filter_metrics_by_k(metric_map: dict[str, float] | None, ks: tuple[int, ...], prefix: str) -> dict[str, float]:
-    if not metric_map or not ks:
-        return {}
-    allowed = {int(k) for k in ks if int(k) > 0}
-    filtered: dict[str, float] = {}
-    for key, value in metric_map.items():
-        if not key.startswith(prefix):
-            continue
-        suffix_text = key[len(prefix) :]
-        if not suffix_text.isdigit():
-            continue
-        suffix = int(suffix_text)
-        if suffix in allowed:
-            filtered[key] = value
-    return filtered
-
-
 def _max_k(values: Sequence[int] | None) -> int:
     return max(values) if values else 0
 
@@ -87,8 +70,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
-    parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
-    parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
+    parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
+    parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
+    parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--para-grid",
@@ -151,29 +135,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if expected_count is None:
         expected_count = _count_records(dataset_path, args.max_samples) * samples_per_task
 
-    cot_sampling = resolve_sampling_config(
+    generation_sampling = resolve_sampling_config(
         slug,
         model_name,
         stage="cot",
         fallback_templates="free_response_cot_default",
     )
-    final_sampling = resolve_sampling_config(
-        slug,
-        model_name,
-        stage="final",
-        fallback_templates="free_response_final_default",
-    )
-    if cot_sampling is None or final_sampling is None:
+    if generation_sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
-    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
-    final_sampling = final_sampling.clamp(args.final_max_tokens)
+    generation_sampling = generation_sampling.clamp(args.max_tokens or args.cot_max_tokens)
 
     if args.probe_only:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run(
             dataset_path=str(dataset_path),
-            cot_sampling=cot_sampling,
-            final_sampling=final_sampling,
+            generation_sampling=generation_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
             pad_to_batch=True,
@@ -192,11 +168,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_score: float | None = None
     best_trial: int | None = None
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling, grid=args.para_grid):
+    for trial_idx, trial_generation, params in iter_cot_sampling_grid(generation_sampling, grid=args.para_grid):
         print(f"🔍 trial {trial_idx}: {slug}")
         sampling_payload = {
-            "cot": sampling_config_to_dict(trial_cot),
-            "final": sampling_config_to_dict(final_sampling),
+            "generation": sampling_config_to_dict(trial_generation),
         }
         task_id = db_service.get_or_create_task(
             job_name="param_search_free_response",
@@ -217,8 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             result = pipeline.run(
                 dataset_path=str(dataset_path),
-                cot_sampling=trial_cot,
-                final_sampling=final_sampling,
+                generation_sampling=trial_generation,
                 batch_size=max(1, args.batch_size),
                 sample_limit=args.max_samples,
                 pass_k=pass_k,
@@ -240,31 +214,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset_path=str(dataset_path),
             judge=None,
         )
-        pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
-        avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
-        metrics_payload: dict[str, object] = {
-            "exact_accuracy": float(evaluation.exact_accuracy),
-            "judge_accuracy": evaluation.judge_accuracy,
-        }
-        pass_payload = _filter_metrics_by_k(pass_metrics_all, pass_k, "pass@") or (pass_metrics_all or {})
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = _filter_metrics_by_k(avg_metrics_all, avg_k, "avg@") or (avg_metrics_all or {})
-        if avg_payload:
-            metrics_payload.update(avg_payload)
+        metrics_payload, metric_details = build_grouped_metrics_payload(
+            evaluation,
+            pass_k=pass_k,
+            avg_k=avg_k,
+            report_pass_k=pass_k,
+            report_avg_k=avg_k,
+        )
 
         task_details: dict[str, object] = {
             "param_search_trial": {
                 "trial": int(trial_idx),
                 "params": params,
-                "cot_sampling": _sampling_config_to_dict(trial_cot),
-                "final_sampling": _sampling_config_to_dict(final_sampling),
+                "generation_sampling": _sampling_config_to_dict(trial_generation),
             },
         }
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            task_details["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            task_details["avg_curve"] = avg_metrics_all
+        task_details.update(metric_details)
 
         payload = make_score_payload(
             slug,
@@ -286,7 +251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_id=task_id,
         )
 
-        objective = float(metrics_payload.get("exact_accuracy", 0.0))
+        objective = float(metrics_payload.get("strategy_a", {}).get("exact_accuracy", 0.0))
         param_key = json.dumps(params, sort_keys=True, ensure_ascii=False)
         if best_score is None or objective > best_score:
             best_score = objective

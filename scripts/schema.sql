@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS eval (
     ref_answer TEXT NOT NULL,
     is_passed BOOLEAN NOT NULL,
     fail_reason TEXT NOT NULL,
+    eval_group VARCHAR(64) NOT NULL,
     created_at TIMESTAMP(6) NOT NULL
 );
 
@@ -66,6 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_completions_task ON completions(task_id);
 CREATE INDEX IF NOT EXISTS idx_eval_completion ON eval(completions_id);
 CREATE INDEX IF NOT EXISTS idx_scores_task ON scores(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_completions_sample ON completions(task_id, sample_index, repeat_index);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_eval_completion_group ON eval(completions_id, eval_group);
 
 CREATE OR REPLACE VIEW view_model_version AS
 SELECT
