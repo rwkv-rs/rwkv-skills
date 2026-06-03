@@ -7,8 +7,6 @@ import json
 from datetime import datetime
 from typing import Any
 
-from src.db.eval_db_service import EvalDbService
-
 from .constants import (
     EVAL_CONTEXT_PREVIEW_LIMIT,
     EVAL_FETCH_ROWS,
@@ -16,11 +14,19 @@ from .constants import (
     EVAL_PAGE_SIZE,
     EVAL_PRELOAD_ROWS,
 )
+from .db_profiles import DEFAULT_PROFILE, get_eval_context_for_profile, list_eval_records_for_profile
 from .vocab import token_id_to_display
 
 
 def _html(text: Any) -> str:
     return html_module.escape(str(text), quote=True)
+
+
+def _db_profile_from_meta(meta: dict[str, Any] | None) -> str:
+    if not isinstance(meta, dict):
+        return DEFAULT_PROFILE
+    value = meta.get("db_profile")
+    return value if isinstance(value, str) and value else DEFAULT_PROFILE
 
 
 def _parse_click_payload(payload: str) -> str | None:
@@ -221,7 +227,8 @@ def _start_eval_records_load(
         return _render_eval_records_html(meta=meta, records=[], only_wrong=only_wrong), cell_id, [], _empty_eval_loader_state(), False
 
     try:
-        first_batch = EvalDbService().list_eval_records_for_space(
+        first_batch = list_eval_records_for_profile(
+            profile=_db_profile_from_meta(meta),
             task_id=str(task_id),
             only_wrong=bool(only_wrong),
             limit=EVAL_PRELOAD_ROWS + EVAL_OVERSCAN_ROWS,
@@ -242,6 +249,7 @@ def _start_eval_records_load(
         "page_size": EVAL_FETCH_ROWS,
         "has_more": has_more,
         "meta": meta,
+        "db_profile": _db_profile_from_meta(meta),
     }
     html = _render_eval_records_html(
         meta=meta,
@@ -285,7 +293,8 @@ def _continue_eval_records_load(
     page_size = max(1, page_size)
 
     try:
-        next_batch = EvalDbService().list_eval_records_for_space(
+        next_batch = list_eval_records_for_profile(
+            profile=str(state.get("db_profile") or _db_profile_from_meta(meta)),
             task_id=str(task_id),
             only_wrong=only_wrong,
             limit=page_size + EVAL_OVERSCAN_ROWS,
@@ -391,7 +400,8 @@ def _build_context_event_payload(
         return base_event
 
     try:
-        context_value = EvalDbService().get_eval_context_for_space(
+        context_value = get_eval_context_for_profile(
+            profile=_db_profile_from_meta(meta),
             task_id=str(task_id),
             sample_index=sample_index,
             repeat_index=repeat_index,

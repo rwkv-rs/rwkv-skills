@@ -250,6 +250,7 @@ class TableCellMeta:
     model: str | None
     tooltip: str | None
     clickable: bool
+    db_profile: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -262,6 +263,7 @@ class TableCellMeta:
             "model": self.model,
             "tooltip": self.tooltip,
             "clickable": self.clickable,
+            "db_profile": self.db_profile,
         }
 
 

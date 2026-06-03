@@ -26,6 +26,7 @@ from .constants import (
     _normalize_table_view,
 )
 from .data import ScoreEntry, parse_model_signature
+from .db_profiles import math_db_enabled
 from .metrics import (
     _cell_metric_value,
     _cell_numeric_value,
@@ -60,6 +61,11 @@ from .selection import (
 def _html(text: Any) -> str:
     """Escape text for safe HTML rendering."""
     return html.escape(str(text), quote=True)
+
+
+def _db_profile_for_entry(entry: ScoreEntry) -> str | None:
+    value = entry.extra.get("db_profile")
+    return str(value) if isinstance(value, str) and value else None
 
 
 _PAREN_RE = re.compile(r"\s*\(.*?\)")
@@ -102,6 +108,9 @@ def _render_summary(
     db_host = os.environ.get("PG_HOST", DEFAULT_DB_CONFIG.host)
     db_port = os.environ.get("PG_PORT", str(DEFAULT_DB_CONFIG.port))
     db_name = os.environ.get("PG_DBNAME", DEFAULT_DB_CONFIG.dbname)
+    math_db_host = os.environ.get("SPACE_MATH_PG_HOST", db_host)
+    math_db_port = os.environ.get("SPACE_MATH_PG_PORT", db_port)
+    math_db_name = os.environ.get("SPACE_MATH_PG_DBNAME", "")
 
     if not all_entries:
         return (
@@ -127,6 +136,8 @@ def _render_summary(
         f"- 可见数据集：{len(visible)} / 总分数记录：{len(all_entries)}",
         "- 排序：架构 > 参数量 > data_version（G0→…→G1g）> domain > dataset / task",
     ]
+    if math_db_enabled():
+        lines.append(f"- Math 数据源覆盖：PostgreSQL (`{math_db_host}:{math_db_port}/{math_db_name}`)，仅影响 Math 表和其 eval/context 详情")
     if selection.aggregated_models:
         lines.extend(_summarise_snapshots(selection.aggregated_models))
     for warn in warnings or ():
@@ -437,6 +448,7 @@ def _build_benchmark_detail_latest_table(
                 model=entry.model,
                 tooltip=_tooltip_for_entry(entry),
                 clickable=entry.task_id is not None,
+                db_profile=_db_profile_for_entry(entry),
             )
 
         rows.append(row)
@@ -578,6 +590,7 @@ def _build_benchmark_detail_delta_table(
                     model=prev_entry.model,
                     tooltip=_tooltip_for_entry(prev_entry),
                     clickable=prev_entry.task_id is not None,
+                    db_profile=_db_profile_for_entry(prev_entry),
                 )
 
             if latest_point is not None:
@@ -599,6 +612,7 @@ def _build_benchmark_detail_delta_table(
                     model=latest_entry.model,
                     tooltip=_tooltip_for_entry(latest_entry),
                     clickable=latest_entry.task_id is not None,
+                    db_profile=_db_profile_for_entry(latest_entry),
                 )
 
         avg_delta = sum(delta_values) / len(delta_values) if delta_values else float("-inf")

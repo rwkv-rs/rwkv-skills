@@ -18,6 +18,14 @@ from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import detect_job_from_dataset
 
+from .db_profiles import (
+    DEFAULT_PROFILE,
+    MATH_DOMAIN,
+    MATH_PROFILE,
+    fetch_latest_scores_for_profile,
+    math_db_enabled,
+)
+
 
 ARCH_VERSIONS = ("rwkv7", "rwkv7a", "rwkv7b")
 DATA_VERSIONS = (
@@ -305,7 +313,12 @@ def _matches_current_free_response_route(dataset: str, *, is_cot: bool, task: st
     return True
 
 
-def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> ScoreEntry | None:
+def _score_entry_from_db(
+    payload: dict[str, Any],
+    errors: list[str] | None,
+    *,
+    db_profile: str = DEFAULT_PROFILE,
+) -> ScoreEntry | None:
     dataset = canonical_slug(str(payload.get("dataset", "")).strip())
     model = str(payload.get("model", "")).strip()
     if not dataset or not model:
@@ -343,6 +356,7 @@ def _score_entry_from_db(payload: dict[str, Any], errors: list[str] | None) -> S
         "is_param_search",
     }
     extra = {k: v for k, v in payload.items() if k not in known_keys}
+    extra["db_profile"] = db_profile
     relative = Path(str(task_id)) if task_id is not None else DB_PLACEHOLDER_PATH
 
     return ScoreEntry(
@@ -385,10 +399,29 @@ def load_scores(errors: list[str] | None = None) -> list[ScoreEntry]:
         payload = dict(row) if isinstance(row, Mapping) else None
         if payload is None:
             continue
-        entry = _score_entry_from_db(payload, errors)
+        entry = _score_entry_from_db(payload, errors, db_profile=DEFAULT_PROFILE)
         if entry is not None:
             entries.append(entry)
-    return entries
+
+    if not math_db_enabled():
+        return entries
+
+    non_math_entries = [entry for entry in entries if entry.domain != MATH_DOMAIN]
+    try:
+        math_rows = fetch_latest_scores_for_profile(profile=MATH_PROFILE, include_param_search=False)
+    except Exception as exc:  # noqa: BLE001
+        _record_error(f"读取 math 专用数据库分数失败: {exc}", errors)
+        return non_math_entries
+
+    math_entries: list[ScoreEntry] = []
+    for row in math_rows:
+        payload = dict(row) if isinstance(row, Mapping) else None
+        if payload is None:
+            continue
+        entry = _score_entry_from_db(payload, errors, db_profile=MATH_PROFILE)
+        if entry is not None and entry.domain == MATH_DOMAIN:
+            math_entries.append(entry)
+    return non_math_entries + math_entries
 
 
 def pick_latest_model(entries: Iterable[ScoreEntry]) -> str | None:
