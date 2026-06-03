@@ -14,17 +14,18 @@ ONE_STEP_METRIC_KEYS: tuple[str, ...] = (
     "extra_call",
 )
 COMPLEXFUNC_METRIC_KEYS: tuple[str, ...] = (
+    "avg@1",
     "official_score",
     "success_rate",
     "call_accuracy",
+    "completeness",
+    "correctness",
     "parse_error_rate",
-    "missing_call",
-    "extra_call",
 )
 AGENT_METRIC_KEYS: tuple[str, ...] = (
     "avg@1",
-    "success_rate",
     "official_score",
+    "success_rate",
     "avg_steps",
     "invalid_action_rate",
     "timeout_rate",
@@ -56,14 +57,14 @@ FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
     "function_one_step_apibank_l2": FunctionCallingBenchmarkSpec(
         "function_one_step_apibank_l2", "one_step", "apibank", ONE_STEP_METRIC_KEYS
     ),
-    "function_one_step_complexfuncbench_subset": FunctionCallingBenchmarkSpec(
-        "function_one_step_complexfuncbench_subset",
-        "one_step",
-        "complexfuncbench",
-        COMPLEXFUNC_METRIC_KEYS,
-    ),
     "function_agent_apibank_l2": FunctionCallingBenchmarkSpec(
         "function_agent_apibank_l2", "agent", "apibank", AGENT_METRIC_KEYS
+    ),
+    "function_agent_complexfuncbench": FunctionCallingBenchmarkSpec(
+        "function_agent_complexfuncbench",
+        "agent",
+        "complexfuncbench",
+        COMPLEXFUNC_METRIC_KEYS,
     ),
     "function_agent_browsecomp_plus": FunctionCallingBenchmarkSpec(
         "function_agent_browsecomp_plus",

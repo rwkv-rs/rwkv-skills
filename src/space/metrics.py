@@ -72,7 +72,7 @@ def _is_complexfuncbench_entry(entry: ScoreEntry, *, dataset_base: str | None = 
     details = entry.task_details if isinstance(entry.task_details, dict) else {}
     return (
         base.startswith("complexfuncbench")
-        or task_key == "function_one_step_complexfuncbench_subset"
+        or task_key == "function_agent_complexfuncbench"
         or str(details.get("benchmark") or "").lower() == "complexfuncbench"
     )
 
@@ -217,16 +217,18 @@ def _best_numeric_metric(entry: ScoreEntry, *, dataset_base: str | None = None) 
     metrics = entry.metrics
 
     if _is_function_calling_entry(entry):
+        avg_key = _preferred_avg_metric_key(metrics)
+        if avg_key:
+            return avg_key, _numeric_value(metrics.get(avg_key))
         if _is_complexfuncbench_entry(entry, dataset_base=base):
             key, value = _preferred_numeric(metrics, ("official_score", "success_rate"))
             if key:
                 return key, value
-        avg_key = _preferred_avg_metric_key(metrics)
-        if avg_key:
-            return avg_key, _numeric_value(metrics.get(avg_key))
+            return None, None
         key, value = _preferred_numeric(metrics, ("official_score", "success_rate"))
         if key:
             return key, value
+        return None, None
 
     if base.startswith("aime"):
         key, value = _preferred_numeric(metrics, ("pass@8", "avg@16"))
@@ -452,20 +454,22 @@ def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
         return None
 
     if _is_function_calling_entry(entry):
-        if _is_complexfuncbench_entry(entry, dataset_base=base):
-            for key in ("official_score", "success_rate"):
-                formatted = _format_specific(key)
-                if formatted is not None:
-                    return f"{key} {formatted}"
         avg_key = _preferred_avg_metric_key(metrics)
         if avg_key:
             formatted = _format_specific(avg_key)
             if formatted is not None:
                 return f"{avg_key} {formatted}"
+        if _is_complexfuncbench_entry(entry, dataset_base=base):
+            for key in ("official_score", "success_rate"):
+                formatted = _format_specific(key)
+                if formatted is not None:
+                    return f"{key} {formatted}"
+            return "—"
         for key in ("official_score", "success_rate"):
             formatted = _format_specific(key)
             if formatted is not None:
                 return f"{key} {formatted}"
+        return "—"
 
     if _is_multi_choice_entry(entry):
         preferred_k = _preferred_k_metric(metrics)
@@ -509,20 +513,22 @@ def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float
         return _numeric_value(metrics.get(key))
 
     if _is_function_calling_entry(entry):
-        if _is_complexfuncbench_entry(entry, dataset_base=base):
-            for key in ("official_score", "success_rate"):
-                value = _numeric_specific(key)
-                if value is not None:
-                    return value
         avg_key = _preferred_avg_metric_key(metrics)
         if avg_key:
             value = _numeric_specific(avg_key)
             if value is not None:
                 return value
+        if _is_complexfuncbench_entry(entry, dataset_base=base):
+            for key in ("official_score", "success_rate"):
+                value = _numeric_specific(key)
+                if value is not None:
+                    return value
+            return None
         for key in ("official_score", "success_rate"):
             value = _numeric_specific(key)
             if value is not None:
                 return value
+        return None
 
     if _is_multi_choice_entry(entry):
         preferred_k = _preferred_k_metric(metrics)
@@ -639,6 +645,12 @@ def _score_for_eval_method(entry: ScoreEntry, method: str, k_metric: str) -> flo
 
 def _detail_rows_for_entry(entry: ScoreEntry) -> list[tuple[str, str, str, float | None]]:
     benchmark = _benchmark_name(entry)
+    if _is_function_calling_entry(entry):
+        metric_key, value = _best_numeric_metric(entry, dataset_base=_dataset_base(entry.dataset))
+        if metric_key is None or value is None:
+            return []
+        return [(benchmark, "function_call", metric_key, value)]
+
     k_metric = _preferred_k_metric(entry.metrics)
     methods: list[str] = []
     if _is_multi_choice_entry(entry):
@@ -671,7 +683,7 @@ def _field_primary_score(entry: ScoreEntry) -> float | None:
 
 def _detail_sort_key(row_key: tuple[str, str, str]) -> tuple[Any, ...]:
     benchmark, method, k_metric = row_key
-    method_rank = {"llm_judge": 0, "exact_match": 1, "logits": 2}.get(method, 9)
+    method_rank = {"llm_judge": 0, "exact_match": 1, "logits": 2, "function_call": 3}.get(method, 9)
     parsed = _parse_k_metric(k_metric)
     if parsed is None:
         k_rank = (9, 0)

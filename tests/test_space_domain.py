@@ -202,30 +202,51 @@ def test_function_call_scores_prefer_avg_at_1_over_success_rate() -> None:
     assert _cell_numeric_value(entry, dataset_base="bfcl_exec_parallel_multiple") == 0.5
     assert _metric_score(entry) == 0.5
     assert _field_primary_score(entry) == 0.5
+    assert _detail_rows_for_entry(entry) == [
+        ("bfcl_exec_parallel_multiple_nocot", "function_call", "avg@1", 0.5)
+    ]
 
 
 def test_complexfuncbench_scores_prefer_strict_success_over_partial_reward() -> None:
     entry = _function_call_score_entry(
-        {"success_rate": 0.0, "avg@1": 0.18},
+        {"avg@1": 0.0, "success_rate": 0.0, "call_accuracy": 0.18},
         dataset="complexfuncbench_subset_test",
-        task="function_one_step_complexfuncbench_subset",
+        task="function_agent_complexfuncbench",
     )
 
-    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "success_rate 0.0%"
+    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "avg@1 0.0%"
     assert _cell_numeric_value(entry, dataset_base="complexfuncbench_subset") == 0.0
     assert _metric_score(entry) == 0.0
     assert _field_primary_score(entry) == 0.0
 
 
-def test_complexfuncbench_scores_prefer_official_score_when_present() -> None:
+def test_complexfuncbench_scores_prefer_avg_at_1_when_present() -> None:
     entry = _function_call_score_entry(
-        {"official_score": 0.06, "success_rate": 0.06, "avg@1": 0.155, "call_accuracy": 0.155},
+        {"avg@1": 0.06, "official_score": 0.06, "success_rate": 0.06, "call_accuracy": 0.155},
         dataset="complexfuncbench_subset_test",
-        task="function_one_step_complexfuncbench_subset",
+        task="function_agent_complexfuncbench",
         task_details={"benchmark": "complexfuncbench"},
     )
 
-    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "official_score 6.0%"
+    assert _cell_metric_value(entry, dataset_base="complexfuncbench_subset") == "avg@1 6.0%"
     assert _cell_numeric_value(entry, dataset_base="complexfuncbench_subset") == 0.06
     assert _metric_score(entry) == 0.06
     assert _field_primary_score(entry) == 0.06
+    assert _detail_rows_for_entry(entry) == [
+        ("complexfuncbench_subset_nocot", "function_call", "avg@1", 0.06)
+    ]
+
+
+def test_function_call_scores_do_not_fallback_to_diagnostic_metrics() -> None:
+    entry = _function_call_score_entry(
+        {"avg_steps": 5.0, "timeout_rate": 0.2},
+        dataset="browsecomp_plus_test",
+        task="function_agent_browsecomp_plus",
+        task_details={"benchmark": "browsecomp_plus"},
+    )
+
+    assert _cell_metric_value(entry, dataset_base="browsecomp_plus") == "—"
+    assert _cell_numeric_value(entry, dataset_base="browsecomp_plus") is None
+    assert _metric_score(entry) is None
+    assert _field_primary_score(entry) is None
+    assert _detail_rows_for_entry(entry) == []

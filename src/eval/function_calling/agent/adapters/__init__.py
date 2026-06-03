@@ -7,4 +7,5 @@ __all__ = [
     "apibank",
     "browsecomp_plus",
     "browsecomp_plus_judge",
+    "complexfuncbench",
 ]

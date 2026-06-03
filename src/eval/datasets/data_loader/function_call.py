@@ -149,11 +149,10 @@ class JsonlFunctionCallTaskLoader(
             "bfcl_exec",
             "toolalpaca_official",
             "apibank_official",
-            "complexfuncbench_subset",
         }:
             raise ValueError(
                 f"{self.path}: function_call 仅支持 simple_tool_call/bfcl_exec/toolalpaca_official/"
-                f"apibank_official/complexfuncbench_subset scorer, "
+                f"apibank_official scorer, "
                 f"payload={payload}"
             )
 

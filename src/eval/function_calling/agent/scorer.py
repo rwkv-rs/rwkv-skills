@@ -17,7 +17,7 @@ class AgentScore:
 @dataclass(slots=True)
 class FunctionCallAgentMetrics:
     success_rate: float
-    official_score: float
+    official_score: float | None
     avg_steps: float
     invalid_action_rate: float
     timeout_rate: float
@@ -30,6 +30,7 @@ def evaluate_function_call_agent(completions: Iterable[dict[str, Any]]) -> Funct
     total = 0
     success_count = 0
     score_sum = 0.0
+    score_count = 0
     step_sum = 0.0
     invalid_actions = 0
     parse_errors = 0
@@ -46,21 +47,15 @@ def evaluate_function_call_agent(completions: Iterable[dict[str, Any]]) -> Funct
         score = _numeric(payload.get("official_score"), None)
         if score is None:
             score = _numeric(details.get("score"), None)
-        score_unavailable = bool(details.get("official_score_unavailable"))
-        final_env_details = details.get("final_env_details")
-        if isinstance(final_env_details, dict):
-            score_unavailable = score_unavailable or bool(final_env_details.get("official_score_unavailable"))
         success = bool(payload.get("success"))
         if not success and score is not None:
             success = score > 0.0
-        if score is None and score_unavailable:
-            score = 0.0
-        if score is None:
-            score = 1.0 if success else 0.0
 
         total += 1
         success_count += 1 if success else 0
-        score_sum += float(score)
+        if score is not None:
+            score_sum += float(score)
+            score_count += 1
         step_sum += steps
         invalid_actions += invalid_count
         parse_errors += parse_count
@@ -80,7 +75,7 @@ def evaluate_function_call_agent(completions: Iterable[dict[str, Any]]) -> Funct
     denominator_steps = step_sum if step_sum > 0 else float(total or 1)
     return FunctionCallAgentMetrics(
         success_rate=success_count / total if total else 0.0,
-        official_score=score_sum / total if total else 0.0,
+        official_score=score_sum / score_count if score_count else None,
         avg_steps=step_sum / total if total else 0.0,
         invalid_action_rate=invalid_actions / denominator_steps if total else 0.0,
         timeout_rate=timeouts / total if total else 0.0,

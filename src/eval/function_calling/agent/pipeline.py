@@ -15,6 +15,9 @@ from src.eval.function_calling.agent.adapters.browsecomp_plus import (
     browsecomp_plus_run_from_agent_details,
     create_browsecomp_plus_env,
 )
+from src.eval.function_calling.agent.adapters.complexfuncbench import (
+    create_complexfuncbench_official_env,
+)
 from src.eval.function_calling.agent.runner import AgentRunConfig, run_function_calling_agent
 from src.eval.function_calling.common.payload import (
     FunctionCallRunStats,
@@ -136,6 +139,17 @@ class FunctionCallAgentPipeline:
                 official_score=result.score,
                 details=result.details,
             )
+            if str(record.env.get("type") or "") == "complexfuncbench_official":
+                final_env_details = result.details.get("final_env_details")
+                if isinstance(final_env_details, Mapping):
+                    final_response = final_env_details.get("final_response")
+                    if isinstance(final_response, str):
+                        payload["final_answer"] = final_response
+                    payload["complexfuncbench_official_result"] = {
+                        key: final_env_details.get(key)
+                        for key in ("message", "count_dict", "resp_eval", "call_accuracy")
+                        if key in final_env_details
+                    }
             browsecomp_plus_run = browsecomp_plus_run_from_agent_details(result.details)
             if browsecomp_plus_run is not None:
                 payload["browsecomp_plus_run"] = browsecomp_plus_run
@@ -151,6 +165,8 @@ class FunctionCallAgentPipeline:
         observation: Any,
         step: int,
     ) -> str:
+        if str(record.env.get("type") or "") == "complexfuncbench_official":
+            return _make_complexfuncbench_prompt(record, events, observation, step)
         tools_json = json.dumps(record.tools or [], ensure_ascii=False, indent=2)
         trajectory = _render_agent_trajectory(events)
         current = str(getattr(observation, "content", "") or "")
@@ -172,6 +188,8 @@ def create_agent_env(record: FunctionCallTaskRecord):
         return create_apibank_level2_env(record)
     if env_type == "browsecomp_plus":
         return create_browsecomp_plus_env(record)
+    if env_type == "complexfuncbench_official":
+        return create_complexfuncbench_official_env(record)
     raise NotImplementedError(f"Unsupported function-calling agent env.type: {env_type}")
 
 
@@ -263,6 +281,31 @@ def _render_agent_trajectory(events: list[Mapping[str, Any]]) -> str:
         elif event_type == "error":
             rendered.append(f"Error: {content}")
     return "\n".join(part for part in rendered if part.strip()).strip()
+
+
+def _make_complexfuncbench_prompt(
+    record: FunctionCallTaskRecord,
+    events: list[Mapping[str, Any]],
+    observation: Any,
+    step: int,
+) -> str:
+    tools_json = json.dumps(record.tools or [], ensure_ascii=False, indent=2)
+    trajectory = _render_agent_trajectory(events)
+    current = str(getattr(observation, "content", "") or "")
+    return (
+        "You are running the official ComplexFuncBench function-calling task.\n"
+        "Return only JSON and no extra text.\n"
+        'For one call, use {"name":"ToolName","arguments":{"arg":"value"}}.\n'
+        "For multiple calls in the same assistant turn, return a JSON array of those objects.\n"
+        "After all official sandbox observations indicate the required calls are complete, "
+        'call {"name":"final_answer","arguments":{"answer":"..."}}.\n'
+        "Available tools:\n"
+        f"{tools_json}\n\n"
+        f"Trajectory:\n{trajectory}\n\n"
+        f"Current observation:\n{current}\n\n"
+        f"Step: {step}\n\n"
+        "Assistant: <think>\n</think>\n```json\n"
+    )
 
 
 def _trim_stop_suffixes(text: str, stop_suffixes: tuple[str, ...]) -> str:

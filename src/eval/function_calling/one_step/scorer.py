@@ -49,12 +49,6 @@ def score_one_step_prediction(
         )
 
         result = evaluate_apibank_official_calls(record, decoded_calls, parse_error=parse_error)
-    elif uses_complexfuncbench_scorer(record):
-        from src.eval.function_calling.one_step.complexfuncbench import (
-            evaluate_complexfuncbench_subset_calls,
-        )
-
-        result = evaluate_complexfuncbench_subset_calls(record, decoded_calls, parse_error=parse_error)
     elif uses_toolalpaca_official_scorer(record):
         from src.eval.function_calling.one_step.toolalpaca import (
             evaluate_toolalpaca_official_calls,
@@ -127,14 +121,6 @@ def uses_apibank_official_scorer(record: FunctionCallTaskRecord) -> bool:
     )
 
 
-def uses_complexfuncbench_scorer(record: FunctionCallTaskRecord) -> bool:
-    from src.eval.function_calling.one_step.complexfuncbench import (
-        uses_complexfuncbench_scorer as _uses_complexfuncbench_scorer,
-    )
-
-    return _uses_complexfuncbench_scorer(record)
-
-
 def record_env_type(record: FunctionCallTaskRecord | None) -> str:
     if record is None:
         return "unknown"
@@ -168,6 +154,5 @@ __all__ = [
     "score_one_step_prediction",
     "uses_apibank_official_scorer",
     "uses_bfcl_exec_scorer",
-    "uses_complexfuncbench_scorer",
     "uses_toolalpaca_official_scorer",
 ]

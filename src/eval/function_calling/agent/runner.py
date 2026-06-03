@@ -98,8 +98,8 @@ def run_function_calling_agent(
                 break
             continue
 
-        for call_index, call in enumerate(parsed.calls):
-            action = ToolAction.from_tool_call(call)
+        actions = [ToolAction.from_tool_call(call) for call in parsed.calls]
+        for call_index, action in enumerate(actions):
             events.append(
                 FunctionCallEvent(
                     type="action",
@@ -109,6 +109,37 @@ def run_function_calling_agent(
                     metadata={"step": step, "call_index": call_index},
                 )
             )
+
+        step_many = getattr(env, "step_many", None)
+        if callable(step_many):
+            result = step_many(actions)
+            observation = result.observation
+            final_score = result.score if result.score is not None else final_score
+            final_success = result.success if result.success is not None else final_success
+            if result.details:
+                final_env_details = dict(result.details)
+            events.append(
+                FunctionCallEvent(
+                    type="env_result",
+                    role="environment",
+                    content=observation.content,
+                    metadata={
+                        "step": step,
+                        "call_count": len(actions),
+                        "done": result.done,
+                        "score": result.score,
+                        "success": result.success,
+                        "details": dict(result.details),
+                        "observation_metadata": dict(observation.metadata),
+                    },
+                )
+            )
+            if result.done:
+                finish_reason = "done"
+                break
+            continue
+
+        for call_index, action in enumerate(actions):
             result = env.step(action)
             observation = result.observation
             final_score = result.score if result.score is not None else final_score

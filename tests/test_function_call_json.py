@@ -539,15 +539,15 @@ def test_function_call_scheduler_exposes_new_function_call_jobs() -> None:
     assert JOB_CATALOGUE["function_one_step_toolalpaca"].is_cot is False
     assert JOB_CATALOGUE["function_one_step_apibank_l1"].is_cot is False
     assert JOB_CATALOGUE["function_one_step_apibank_l2"].is_cot is False
-    assert JOB_CATALOGUE["function_one_step_complexfuncbench_subset"].is_cot is False
     assert JOB_CATALOGUE["function_agent_apibank_l2"].is_cot is False
+    assert JOB_CATALOGUE["function_agent_complexfuncbench"].is_cot is False
     assert JOB_CATALOGUE["function_agent_browsecomp_plus"].is_cot is False
     assert "function_one_step_bfcl_ast" in JOB_ORDER
     assert _resolve_job_list(("function_one_step_bfcl_ast",), None, None) == ("function_one_step_bfcl_ast",)
     for job_name in (
         "function_one_step_apibank_l1",
         "function_one_step_apibank_l2",
-        "function_one_step_complexfuncbench_subset",
+        "function_agent_complexfuncbench",
         "function_agent_browsecomp_plus",
     ):
         assert JOB_CATALOGUE[job_name].domain == "function_call"
@@ -558,7 +558,7 @@ def test_function_call_scheduler_exposes_new_function_call_jobs() -> None:
     assert detect_job_from_dataset("apibank_level2_test", is_cot=False) == "function_agent_apibank_l2"
     assert (
         detect_job_from_dataset("complexfuncbench_subset_test", is_cot=False)
-        == "function_one_step_complexfuncbench_subset"
+        == "function_agent_complexfuncbench"
     )
     assert detect_job_from_dataset("browsecomp_plus_test", is_cot=False) == "function_agent_browsecomp_plus"
     assert detect_job_from_dataset("bfcl_exec_multiple_test", is_cot=False) == "function_one_step_bfcl_exec"
@@ -583,7 +583,7 @@ def test_function_call_eval_uses_new_one_step_job_names(
     assert simple_tool_call_job_name("apibank_l1_test") == "function_one_step_apibank_l1"
     assert simple_tool_call_job_name("apibank_l2_test") == "function_one_step_apibank_l2"
     assert simple_tool_call_job_name("apibank_level2_test") is None
-    assert simple_tool_call_job_name("complexfuncbench_subset_test") == "function_one_step_complexfuncbench_subset"
+    assert simple_tool_call_job_name("complexfuncbench_subset_test") is None
 
 
 def test_apibank_level2_and_l2_are_distinct_scheduler_targets() -> None:
@@ -890,14 +890,87 @@ def test_prepare_apibank_level2_uses_agent_rows(monkeypatch, tmp_path) -> None:
     ]
 
 
-def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> None:
-    from src.eval.datasets.data_loader.function_call import JsonlFunctionCallTaskLoader
+def test_complexfuncbench_loader_and_official_agent_env(monkeypatch, tmp_path) -> None:
     from src.eval.datasets.data_prepper.function_call.complexfuncbench import (
         prepare_complexfuncbench_subset,
     )
-    from src.eval.function_calling.one_step.complexfuncbench import (
-        evaluate_complexfuncbench_subset_calls,
+    from src.eval.function_calling.agent.adapters.complexfuncbench import (
+        ComplexFuncBenchOfficialEnv,
     )
+    from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline, load_agent_records
+    from src.eval.function_calling.agent.runner import run_function_calling_agent
+
+    class FakeCompare:
+        def __init__(self, runner):
+            self.runner = runner
+            self.free_function_list = []
+            self.free_functions = {}
+            self.predict_lengths = []
+
+        def add_free_function(self, _convs):
+            self.free_functions = {}
+
+        def compare_turn_prediction(self, _functions, _history, predict, golden, golden_obs):
+            self.predict_lengths.append(len(predict))
+            success_map = {}
+            success_matched = []
+            for index, call in enumerate(predict):
+                if index < len(golden) and call == golden[index]:
+                    success_map[index] = golden_obs[index]
+                    success_matched.append(golden[index])
+            return [], success_map, success_matched, {}
+
+    class FakeRunner:
+        def __init__(self):
+            self.CompareClass = FakeCompare(self)
+            self.free_function_list = []
+            self.unexpect_call_resp = {"api_status": True, "content": "unexpected"}
+            self.fc_chain = []
+            self.obs_chain = []
+            self.turn_id = 0
+            self.correct_count = 0
+            self.golden_fcs = []
+            self.golden_obs = []
+
+        def init_golden(self, convs):
+            self.fc_chain = []
+            self.obs_chain = []
+            for turn in convs:
+                if "function_call" in turn:
+                    self.fc_chain.append(turn["function_call"])
+                elif turn.get("role") == "observation":
+                    self.obs_chain.append(turn["content"])
+            self.golden_fcs = list(self.fc_chain[0])
+            self.golden_obs = list(self.obs_chain[0])
+
+        def process_matches(self, success_matched):
+            for matched in success_matched:
+                if matched in self.golden_fcs:
+                    index = self.golden_fcs.index(matched)
+                    self.golden_fcs.pop(index)
+                    self.golden_obs.pop(index)
+            if success_matched:
+                self.turn_id += 1
+
+        def get_success_turn(self, _remain_fcs, _total_fcs):
+            return self.turn_id
+
+        def return_result(self, messages, error_info=None):
+            if error_info:
+                return messages, error_info, self.turn_id, self.correct_count
+            if self.turn_id >= len(self.fc_chain) and not self.golden_fcs:
+                return messages, "Success.", len(self.fc_chain), self.correct_count
+            return messages, {"error_type": "stop_early", "content": "Stop early."}, self.turn_id, self.correct_count
+
+    class FakeSandbox:
+        def __init__(self):
+            self.runner = FakeRunner()
+
+        def create_model_runner(self):
+            return self.runner
+
+        def run_response_eval(self, _official_row, _final_response):
+            return {"complete": {"score": 2}, "correct": {"score": 2}}
 
     source_root = tmp_path / "ComplexFuncBench"
     source_dir = source_root / "data"
@@ -916,17 +989,27 @@ def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> Non
                             "properties": {"city": {"type": "string"}, "adults": {"type": "integer"}},
                             "required": ["city", "adults"],
                         },
-                    }
+                    },
+                    {
+                        "name": "BookHotel",
+                        "description": "Book hotels.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"hotel_id": {"type": "string"}},
+                            "required": ["hotel_id"],
+                        },
+                    },
                 ],
                 "conversations": [
                     {"role": "user", "content": "Find a hotel in Paris for two adults."},
                     {
                         "role": "assistant",
                         "function_call": [
-                            {"name": "SearchHotel", "arguments": {"city": "Paris", "adults": 2}}
+                            {"name": "SearchHotel", "arguments": {"city": "Paris", "adults": 2}},
+                            {"name": "BookHotel", "arguments": {"hotel_id": "h1"}},
                         ],
                     },
-                    {"role": "tool", "content": [{"hotel": "ok"}]},
+                    {"role": "observation", "content": [{"hotel_id": "h1"}, {"status": "booked"}]},
                 ],
             },
             ensure_ascii=False,
@@ -937,45 +1020,71 @@ def test_complexfuncbench_subset_loader_and_scorer(monkeypatch, tmp_path) -> Non
     monkeypatch.setenv("RWKV_COMPLEXFUNC_SOURCE_ROOT", str(source_root))
 
     paths = prepare_complexfuncbench_subset(tmp_path / "out", "test")
-    records = JsonlFunctionCallTaskLoader(paths[0]).load()
-    record = list(records)[0]
-    result = evaluate_complexfuncbench_subset_calls(
-        record,
-        [{"name": "SearchHotel", "arguments": {"city": "Paris", "adults": 2}}],
+    records, _ = load_agent_records(str(paths[0]))
+    record = records[0]
+    pipeline = object.__new__(FunctionCallAgentPipeline)
+    prompt = pipeline._make_prompt(record, [], type("Obs", (), {"content": record.instruction})(), 0)
+    sandbox = FakeSandbox()
+    result = run_function_calling_agent(
+        ComplexFuncBenchOfficialEnv(record, sandbox=sandbox),
+        lambda _events, _observation, step: [
+            json.dumps(
+                [
+                    {"name": "SearchHotel", "arguments": {"city": "Paris", "adults": 2}},
+                    {"name": "BookHotel", "arguments": {"hotel_id": "h1"}},
+                ]
+            ),
+            json.dumps({"name": "final_answer", "arguments": {"answer": "Booked."}}),
+        ][step],
     )
 
     assert record.task_id == "complexfuncbench_subset__case-1"
-    assert record.scorer["type"] == "complexfuncbench_subset"
-    assert result.is_passed is True
-    assert result.details["call_accuracy"] == 1.0
+    assert record.env["type"] == "complexfuncbench_official"
+    assert record.scorer["type"] == "complexfuncbench_official"
+    assert record.expected_tool_calls == []
+    assert record.metadata["complexfuncbench_total_call_num"] == 2
+    assert any(tool["name"] == "final_answer" for tool in record.tools)
+    assert "JSON array" in prompt
+    assert result.success is True
+    assert result.score == 1.0
+    assert sandbox.runner.CompareClass.predict_lengths == [2]
+    assert result.details["final_env_details"]["count_dict"]["correct_call_num"] == 2
 
 
-def test_complexfuncbench_score_payload_uses_strict_success_as_official_score() -> None:
-    from src.bin.eval_function_call import _score_metrics_for_job
-    from src.eval.metrics.function_call import FunctionCallMetrics
-
-    metrics = FunctionCallMetrics(
-        success_rate=0.0,
-        avg_steps=1.0,
-        avg_tool_calls=0.0,
-        avg_at_k={"avg@1": 0.18},
-        samples=100,
+def test_complexfuncbench_official_metrics_aggregate_success_and_call_accuracy() -> None:
+    from src.eval.function_calling.agent.adapters.complexfuncbench import (
+        summarize_complexfuncbench_official_payloads,
     )
 
-    score_metrics = _score_metrics_for_job(
-        "function_one_step_complexfuncbench_subset",
-        metrics,
-        {"avg@1": 0.18},
+    metrics = summarize_complexfuncbench_official_payloads(
+        [
+            {
+                "success": True,
+                "agent_details": {
+                    "final_env_details": {
+                        "message": "Success.",
+                        "count_dict": {"correct_call_num": 2, "total_call_num": 2},
+                        "resp_eval": {"complete": {"score": 2}, "correct": {"score": 1}},
+                    }
+                },
+            },
+            {
+                "success": False,
+                "agent_details": {
+                    "final_env_details": {
+                        "message": {"error_type": "stop_early"},
+                        "count_dict": {"correct_call_num": 1, "total_call_num": 2},
+                        "resp_eval": {"complete": {"score": 1}, "correct": {"score": 0}},
+                    }
+                },
+            },
+        ]
     )
 
-    assert score_metrics == {
-        "official_score": 0.0,
-        "success_rate": 0.0,
-        "avg_steps": 1.0,
-        "avg_tool_calls": 0.0,
-        "call_accuracy": 0.18,
-    }
-    assert "avg@1" not in score_metrics
+    assert metrics.success_rate == 0.5
+    assert metrics.call_accuracy == 0.75
+    assert metrics.completeness == 1.5
+    assert metrics.correctness == 0.5
 
 
 def test_browsecomp_plus_env_exports_official_run_payload() -> None:
@@ -1320,6 +1429,33 @@ def test_agent_metrics_use_trajectory_payload() -> None:
     assert metrics.invalid_action_rate == 0.0
     assert metrics.timeout_rate == 0.0
     assert metrics.parse_error_rate == 0.0
+    assert metrics.payloads and metrics.payloads[0]["is_passed"] is True
+
+
+def test_agent_metrics_do_not_fallback_when_official_score_missing() -> None:
+    from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
+
+    metrics = evaluate_function_call_agent(
+        [
+            {
+                "benchmark_name": "browsecomp_plus",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "final_answer": "final answer without judge score",
+                "success": True,
+                "stats": {"steps": 1},
+                "agent_details": {
+                    "steps": 1,
+                    "official_score_unavailable": True,
+                    "finish_reason": "done",
+                },
+            }
+        ]
+    )
+
+    assert metrics.success_rate == 1.0
+    assert metrics.official_score is None
     assert metrics.payloads and metrics.payloads[0]["is_passed"] is True
 
 

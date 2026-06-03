@@ -4,16 +4,16 @@ import os
 from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALL_REGISTRY
-from src.eval.function_calling.one_step.complexfuncbench import (
-    DEFAULT_COMPLEXFUNC_SUBSET_SIZE,
-    load_complexfuncbench_subset_rows_from_source,
+from src.eval.function_calling.agent.adapters.complexfuncbench import (
+    DEFAULT_COMPLEXFUNC_MAX_ROWS,
+    load_complexfuncbench_rows_from_source,
 )
 from src.eval.scheduler.config import REPO_ROOT
 
 from ..data_utils import download_file, write_jsonl
 
 _COMPLEXFUNC_HF_URL = (
-    "https://huggingface.co/datasets/THUDM/ComplexFuncBench/resolve/main/ComplexFuncBench.jsonl"
+    "https://huggingface.co/datasets/zai-org/ComplexFuncBench/resolve/main/ComplexFuncBench.jsonl"
 )
 
 
@@ -57,9 +57,11 @@ def prepare_complexfuncbench_subset(output_root: Path, split: str = "test") -> l
         raise ValueError("complexfuncbench_subset only provides test split")
     dataset_name = "complexfuncbench_subset"
     source_path = _source_path(output_root, dataset_name)
-    max_rows = int(os.environ.get("RWKV_COMPLEXFUNC_SUBSET_SIZE", str(DEFAULT_COMPLEXFUNC_SUBSET_SIZE)))
-    rows = load_complexfuncbench_subset_rows_from_source(
+    official_root = complexfuncbench_source_root()
+    max_rows = int(os.environ.get("RWKV_COMPLEXFUNC_SUBSET_SIZE", str(DEFAULT_COMPLEXFUNC_MAX_ROWS)))
+    rows = load_complexfuncbench_rows_from_source(
         source_path,
+        official_root=official_root,
         dataset_name=dataset_name,
         max_rows=max_rows,
     )

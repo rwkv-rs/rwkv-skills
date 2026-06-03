@@ -17,6 +17,9 @@ from src.eval.function_calling.agent.adapters.browsecomp_plus_judge import (
     default_browsecomp_plus_eval_dir,
     evaluate_browsecomp_plus_completions,
 )
+from src.eval.function_calling.agent.adapters.complexfuncbench import (
+    summarize_complexfuncbench_official_payloads,
+)
 from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline, load_agent_records
 from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
 from src.eval.function_calling.common.benchmarks import function_calling_benchmark_spec
@@ -30,6 +33,7 @@ from src.infer.model import ModelLoadConfig
 
 AGENT_JOB_BY_DATASET: dict[str, str] = {
     "apibank_level2_test": "function_agent_apibank_l2",
+    "complexfuncbench_subset_test": "function_agent_complexfuncbench",
     "browsecomp_plus_test": "function_agent_browsecomp_plus",
 }
 
@@ -64,7 +68,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stage="tool",
         fallback_templates="instruction_following_default",
     )
-    if sampling is not None:
+    if sampling is not None and job_name != "function_agent_complexfuncbench":
         sampling = sampling.clamp(768)
     if sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
@@ -133,14 +137,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         metrics = evaluate_function_call_agent(completions_payloads)
         eval_payloads = metrics.payloads or []
         score_metrics: dict[str, Any] = {
-            "avg@1": metrics.official_score,
-            "success_rate": metrics.success_rate,
-            "official_score": metrics.official_score,
             "avg_steps": metrics.avg_steps,
             "invalid_action_rate": metrics.invalid_action_rate,
             "timeout_rate": metrics.timeout_rate,
             "parse_error_rate": metrics.parse_error_rate,
         }
+        if metrics.official_score is not None:
+            score_metrics["avg@1"] = metrics.official_score
+            score_metrics["official_score"] = metrics.official_score
+            score_metrics["success_rate"] = metrics.success_rate
         benchmark_spec = function_calling_benchmark_spec(job_name)
         task_details: dict[str, Any] = {
             "subtype": benchmark_spec.subtype if benchmark_spec else "agent",
@@ -171,7 +176,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             task_details["browsecomp_plus_eval_dir"] = str(judge_eval_dir)
 
+        if job_name == "function_agent_complexfuncbench":
+            complex_metrics = summarize_complexfuncbench_official_payloads(completions_payloads)
+            score_metrics["avg@1"] = complex_metrics.success_rate
+            score_metrics["success_rate"] = complex_metrics.success_rate
+            score_metrics["official_score"] = complex_metrics.success_rate
+            score_metrics["call_accuracy"] = complex_metrics.call_accuracy
+            score_metrics["completeness"] = complex_metrics.completeness
+            score_metrics["correctness"] = complex_metrics.correctness
+            score_metrics["response_eval_samples"] = float(complex_metrics.response_eval_samples)
+            task_details["complexfuncbench_official"] = {
+                "call_accuracy": complex_metrics.call_accuracy,
+                "response_eval_samples": complex_metrics.response_eval_samples,
+            }
+
         service.ingest_eval_payloads(payloads=eval_payloads, task_id=task_id)
+        if score_metrics.get("official_score") is None:
+            raise RuntimeError(f"{job_name} produced no official score; refusing to record fallback score")
         score_payload = make_score_payload(
             slug,
             is_cot=False,

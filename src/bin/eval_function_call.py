@@ -90,22 +90,13 @@ def _score_metrics_for_job(
     metrics: FunctionCallMetrics,
     avg_payload: dict[str, float],
 ) -> dict[str, float]:
+    _ = job_name
     base_metrics = {
         "success_rate": metrics.success_rate,
         "avg_steps": metrics.avg_steps,
         "avg_tool_calls": metrics.avg_tool_calls,
     }
-    if job_name != "function_one_step_complexfuncbench_subset":
-        return {**avg_payload, **base_metrics}
-
-    score_metrics = {
-        "official_score": metrics.success_rate,
-        **base_metrics,
-    }
-    call_accuracy = (metrics.avg_at_k or {}).get("avg@1")
-    if call_accuracy is not None:
-        score_metrics["call_accuracy"] = call_accuracy
-    return score_metrics
+    return {**avg_payload, **base_metrics}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -119,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"{slug} 不是 simple tool-call 数据集")
     job_name = _simple_tool_call_job_name(str(slug))
     if job_name is None:
-        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank/ComplexFuncBench 数据集: {slug}")
+        raise ValueError(f"function_call one-step 仅支持 BFCL/ToolAlpaca/API-Bank 数据集: {slug}")
     sampling = resolve_sampling_config(
         slug,
         model_name,
