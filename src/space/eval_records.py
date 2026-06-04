@@ -132,7 +132,7 @@ def _render_eval_records_html(
 
     header_cells = "".join(
         f"<th>{name}</th>"
-        for name in ("#", "group", "model_output", "ref_answer", "is_passed", "fail_reason", "context")
+        for name in ("#", "model_output", "ref_answer", "is_passed", "fail_reason", "context")
     )
     body_rows: list[str] = []
     sorted_rows = sorted(
@@ -176,7 +176,6 @@ def _render_eval_records_html(
         cells = "".join(
             [
                 f"<td>{_html(sample_index)}/{_html(repeat_index)}</td>",
-                f"<td>{_html(row.get('eval_group') or '')}</td>",
                 f"<td>{_html(row.get('answer') or '')}</td>",
                 f"<td>{_html(row.get('ref_answer') or '')}</td>",
                 f'<td class="{pass_class}">{pass_text}</td>',

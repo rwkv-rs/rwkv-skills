@@ -12,7 +12,7 @@ from typing import Sequence
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.evaluators.free_response import FreeResponsePipeline
-from src.eval.metrics.free_response import build_grouped_metrics_payload, evaluate_free_response
+from src.eval.metrics.free_response import attach_strategy_task_ids, build_grouped_metrics_payload, evaluate_free_response
 from src.eval.param_search.cot_grid import COT_GRID, grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
@@ -214,6 +214,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset_path=str(dataset_path),
             judge=None,
         )
+        strategy_task_ids = db_service.ingest_eval_payload_groups(
+            task_id=task_id,
+            completion_payloads=completions_payloads,
+            payloads_by_group=evaluation.payloads_by_group,
+            primary_group=evaluation.primary_group,
+        )
         metrics_payload, metric_details = build_grouped_metrics_payload(
             evaluation,
             pass_k=pass_k,
@@ -221,6 +227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_pass_k=pass_k,
             report_avg_k=avg_k,
         )
+        attach_strategy_task_ids(metrics_payload, strategy_task_ids)
 
         task_details: dict[str, object] = {
             "param_search_trial": {
@@ -241,7 +248,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             task="free_response",
             task_details=task_details,
         )
-        db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
         db_service.record_score_payload(
             payload=payload,
             task_id=task_id,
@@ -251,7 +257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_id=task_id,
         )
 
-        objective = float(metrics_payload.get("strategy_a", {}).get("exact_accuracy", 0.0))
+        objective = float(metrics_payload.get("exact_accuracy", 0.0))
         param_key = json.dumps(params, sort_keys=True, ensure_ascii=False)
         if best_score is None or objective > best_score:
             best_score = objective

@@ -15,3 +15,13 @@ wheels/
 /data
 /results.7z
 config_backup
+
+# Local agent and experiment artifacts
+.memsearch/
+.memsearch.toml
+AI.md
+/runs/
+
+# Long-document experiments: keep reusable code, not corpora or generated outputs
+/rwkv-long-doc-evidence-qa/runs/
+/rwkv-long-doc-evidence-qa/*.txt

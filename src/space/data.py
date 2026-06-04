@@ -20,10 +20,6 @@ from src.eval.scheduler.jobs import detect_job_from_dataset
 
 from .db_profiles import (
     DEFAULT_PROFILE,
-    MATH_DOMAIN,
-    MATH_PROFILE,
-    fetch_latest_scores_for_profile,
-    math_db_enabled,
 )
 
 
@@ -133,8 +129,24 @@ def _normalize_metric_map(raw_metrics: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
+STRATEGY_GROUPS = ("strategy_a", "strategy_b", "strategy_c")
+LEGACY_STRATEGY_GROUPS = ("raw_strict", "close_think", "final_cue_rescue")
+
+
+def _strategy_metric_groups(raw_metrics: dict[str, Any]) -> dict[str, Any]:
+    source = raw_metrics.get("strategy_metrics")
+    if not isinstance(source, dict):
+        source = raw_metrics
+    grouped: dict[str, Any] = {}
+    for group in (*STRATEGY_GROUPS, *LEGACY_STRATEGY_GROUPS):
+        group_metrics = source.get(group) if isinstance(source, dict) else None
+        if isinstance(group_metrics, dict):
+            grouped[group] = _normalize_metric_map(group_metrics)
+    return grouped
+
+
 def _is_grouped_free_response_metrics(raw_metrics: dict[str, Any]) -> bool:
-    return any(isinstance(raw_metrics.get(group), dict) for group in ("strategy_a", "strategy_b", "strategy_c"))
+    return bool(_strategy_metric_groups(raw_metrics))
 
 
 def _normalize_metrics(payload: dict[str, Any], *, dataset: str, is_cot: bool, task: str | None) -> dict[str, Any]:
@@ -142,14 +154,10 @@ def _normalize_metrics(payload: dict[str, Any], *, dataset: str, is_cot: bool, t
     metrics: dict[str, Any] = {}
     if isinstance(raw_metrics, dict):
         if _is_grouped_free_response_metrics(raw_metrics):
-            grouped: dict[str, Any] = {}
-            for group in ("strategy_a", "strategy_b", "strategy_c"):
-                group_metrics = raw_metrics.get(group)
-                if isinstance(group_metrics, dict):
-                    grouped[group] = _normalize_metric_map(group_metrics)
-            strategy_a = grouped.get("strategy_a")
-            if isinstance(strategy_a, dict):
-                metrics.update(strategy_a)
+            grouped = _strategy_metric_groups(raw_metrics)
+            primary = grouped.get("strategy_a") or grouped.get("raw_strict")
+            if isinstance(primary, dict):
+                metrics.update(primary)
             metrics["_metric_groups"] = grouped
         else:
             metrics.update(_normalize_metric_map(raw_metrics))
@@ -403,25 +411,7 @@ def load_scores(errors: list[str] | None = None) -> list[ScoreEntry]:
         if entry is not None:
             entries.append(entry)
 
-    if not math_db_enabled():
-        return entries
-
-    non_math_entries = [entry for entry in entries if entry.domain != MATH_DOMAIN]
-    try:
-        math_rows = fetch_latest_scores_for_profile(profile=MATH_PROFILE, include_param_search=False)
-    except Exception as exc:  # noqa: BLE001
-        _record_error(f"读取 math 专用数据库分数失败: {exc}", errors)
-        return non_math_entries
-
-    math_entries: list[ScoreEntry] = []
-    for row in math_rows:
-        payload = dict(row) if isinstance(row, Mapping) else None
-        if payload is None:
-            continue
-        entry = _score_entry_from_db(payload, errors, db_profile=MATH_PROFILE)
-        if entry is not None and entry.domain == MATH_DOMAIN:
-            math_entries.append(entry)
-    return non_math_entries + math_entries
+    return entries
 
 
 def pick_latest_model(entries: Iterable[ScoreEntry]) -> str | None:

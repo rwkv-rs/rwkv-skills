@@ -376,20 +376,6 @@ class EvalDbRepository:
         rows = session.execute(stmt).all()
         return {int(row[0]) for row in rows}
 
-    def fetch_existing_eval_keys(
-        self,
-        session: Session,
-        *,
-        task_id: int,
-    ) -> set[tuple[int, str]]:
-        stmt = (
-            select(Eval.completions_id, Eval.eval_group)
-            .join(Completion, Completion.completions_id == Eval.completions_id)
-            .where(Completion.task_id == task_id)
-        )
-        rows = session.execute(stmt).all()
-        return {(int(row[0]), str(row[1] or "strategy_a")) for row in rows}
-
     def fetch_score_by_task(
         self,
         session: Session,
@@ -483,7 +469,6 @@ class EvalDbRepository:
         columns: list[Any] = [
             Completion.sample_index.label("sample_index"),
             Completion.repeat_index.label("repeat_index"),
-            Eval.eval_group.label("eval_group"),
             Eval.is_passed.label("is_passed"),
             Eval.answer.label("answer"),
             Eval.ref_answer.label("ref_answer"),
@@ -500,7 +485,6 @@ class EvalDbRepository:
             .order_by(
                 Completion.sample_index.asc(),
                 Completion.repeat_index.asc(),
-                Eval.eval_group.asc(),
                 Eval.eval_id.asc(),
             )
         )
@@ -582,7 +566,6 @@ class EvalDbRepository:
             ref_answer=payload.get("ref_answer"),
             is_passed=bool(payload.get("is_passed", False)),
             fail_reason=payload.get("fail_reason"),
-            eval_group=str(payload.get("eval_group") or "strategy_a"),
             created_at=created_at,
         )
         session.add(eval_row)

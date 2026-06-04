@@ -19,6 +19,7 @@ from src.eval.metrics.free_response import (
     DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
     LLMJudge,
     LLMJudgeConfig,
+    attach_strategy_task_ids,
     build_grouped_metrics_payload,
     evaluate_free_response,
 )
@@ -278,6 +279,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             dataset_path=str(dataset_path),
             judge=judge,
         )
+        strategy_task_ids = db_service.ingest_eval_payload_groups(
+            task_id=task_id,
+            completion_payloads=completions_payloads,
+            payloads_by_group=evaluation.payloads_by_group,
+            primary_group=evaluation.primary_group,
+        )
         metrics_payload, metric_details = build_grouped_metrics_payload(
             evaluation,
             pass_k=pass_k,
@@ -285,6 +292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_pass_k=pass_k,
             report_avg_k=avg_k,
         )
+        attach_strategy_task_ids(metrics_payload, strategy_task_ids)
 
         task_details: dict[str, object] = {
             "param_search_trial": {
@@ -305,7 +313,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             task="free_response_judge",
             task_details=task_details,
         )
-        db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
         db_service.record_score_payload(
             payload=payload,
             task_id=task_id,
@@ -315,11 +322,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_id=task_id,
         )
 
-        strategy_a = metrics_payload.get("strategy_a", {})
         objective = (
-            float(strategy_a["judge_accuracy"])
-            if isinstance(strategy_a, dict) and strategy_a.get("judge_accuracy") is not None
-            else float(strategy_a.get("exact_accuracy", 0.0)) if isinstance(strategy_a, dict) else 0.0
+            float(metrics_payload["judge_accuracy"])
+            if metrics_payload.get("judge_accuracy") is not None
+            else float(metrics_payload.get("exact_accuracy", 0.0))
         )
         param_key = json.dumps(params, sort_keys=True, ensure_ascii=False)
         if best_score is None or objective > best_score:

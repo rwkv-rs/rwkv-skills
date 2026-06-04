@@ -26,7 +26,6 @@ from .constants import (
     _normalize_table_view,
 )
 from .data import ScoreEntry, parse_model_signature
-from .db_profiles import math_db_enabled
 from .metrics import (
     _cell_metric_value,
     _cell_numeric_value,
@@ -108,9 +107,6 @@ def _render_summary(
     db_host = os.environ.get("PG_HOST", DEFAULT_DB_CONFIG.host)
     db_port = os.environ.get("PG_PORT", str(DEFAULT_DB_CONFIG.port))
     db_name = os.environ.get("PG_DBNAME", DEFAULT_DB_CONFIG.dbname)
-    math_db_host = os.environ.get("SPACE_MATH_PG_HOST", db_host)
-    math_db_port = os.environ.get("SPACE_MATH_PG_PORT", db_port)
-    math_db_name = os.environ.get("SPACE_MATH_PG_DBNAME", "")
 
     if not all_entries:
         return (
@@ -136,8 +132,6 @@ def _render_summary(
         f"- 可见数据集：{len(visible)} / 总分数记录：{len(all_entries)}",
         "- 排序：架构 > 参数量 > data_version（G0→…→G1g）> domain > dataset / task",
     ]
-    if math_db_enabled():
-        lines.append(f"- Math 数据源覆盖：PostgreSQL (`{math_db_host}:{math_db_port}/{math_db_name}`)，仅影响 Math 表和其 eval/context 详情")
     if selection.aggregated_models:
         lines.extend(_summarise_snapshots(selection.aggregated_models))
     for warn in warnings or ():
@@ -233,7 +227,7 @@ def _grouped_metric_tooltip(entry: ScoreEntry) -> str | None:
     if not isinstance(groups, dict):
         return None
     lines = ["指标明细"]
-    for group in ("strategy_a", "strategy_b", "strategy_c"):
+    for group in ("strategy_a", "strategy_b", "strategy_c", "raw_strict", "close_think", "final_cue_rescue"):
         metrics = groups.get(group)
         if not isinstance(metrics, dict):
             continue

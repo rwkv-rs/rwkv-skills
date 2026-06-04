@@ -27,6 +27,11 @@ STRATEGY_A = "strategy_a"
 STRATEGY_B = "strategy_b"
 STRATEGY_C = "strategy_c"
 STRATEGY_GROUPS = (STRATEGY_A, STRATEGY_B, STRATEGY_C)
+STRATEGY_LABELS = {
+    STRATEGY_A: "strategy_a",
+    STRATEGY_B: "strategy_b",
+    STRATEGY_C: "strategy_c",
+}
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _PREFERRED_ANSWER_KEYS = (
@@ -118,6 +123,7 @@ class FreeResponseEvaluation:
     rows_by_group: dict[str, list[tuple[int, int, bool]]]
     samples: int
     payloads: list[dict]
+    payloads_by_group: dict[str, list[dict]] = field(default_factory=dict)
     judge_stats_by_group: dict[str, dict[str, object]] = field(default_factory=dict)
     primary_group: str = STRATEGY_A
 
@@ -319,6 +325,8 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
             answer=display_answer,
             fail_reason=f"prediction_parse_error:{type(exc).__name__}",
         )
+    if pred:
+        display_answer = _short_text(_parsed_answer_text(pred))
     try:
         passed = bool(pred and verify(gold, pred, strict=False))
     except Exception as exc:  # noqa: BLE001
@@ -332,6 +340,16 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
         answer=display_answer,
         fail_reason="" if passed else "math_verify_false",
     )
+
+
+def _parsed_answer_text(parsed: Any) -> str:
+    if isinstance(parsed, (list, tuple)) and parsed:
+        item = parsed[-1]
+    else:
+        item = parsed
+    if isinstance(item, (list, tuple)) and item:
+        item = item[-1]
+    return str(item)
 
 
 def _completion_text(payload: dict[str, Any]) -> str:
@@ -368,7 +386,9 @@ def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
     unclosed_think = has_think and not has_close
     truncated = _is_truncated(payload)
 
-    if group in {STRATEGY_B, STRATEGY_C} and unclosed_think:
+    if group == STRATEGY_B and unclosed_think:
+        return f"{text.rstrip()}\n</think>"
+    if group == STRATEGY_C and unclosed_think:
         return f"{text.rstrip()}\n</think>\n{REPAIR_FINAL_CUE}"
     if group == STRATEGY_C and truncated and (not has_think or has_close):
         return f"{text.rstrip()}\n{REPAIR_FINAL_CUE}"
@@ -455,11 +475,13 @@ def evaluate_free_response(
     rows_by_group: dict[str, list[tuple[int, int, bool]]] = {}
     metrics_by_group: dict[str, dict[str, float]] = {}
     eval_payloads: list[dict] = []
+    eval_payloads_by_group: dict[str, list[dict]] = {}
     samples = len(completion_payloads)
     stop_rate = _stop_rate(completion_payloads)
 
     for group in STRATEGY_GROUPS:
         records = grouped[group]
+        group_payloads: list[dict] = []
         rows = [
             (record.sample_index, record.repeat_index, bool(record.final_passed))
             for record in records
@@ -478,22 +500,25 @@ def evaluate_free_response(
             )
         metrics_by_group[group] = metrics
         for record in records:
-            eval_payloads.append(
+            group_payloads.append(
                 make_eval_payload(
                     record.source_payload,
                     is_passed=record.final_passed,
                     fail_reason=record.fail_reason,
                     answer=record.display_answer,
                     ref_answer=record.reference,
-                    eval_group=group,
                 )
             )
+        eval_payloads_by_group[group] = group_payloads
+        if group == STRATEGY_A:
+            eval_payloads.extend(group_payloads)
 
     return FreeResponseEvaluation(
         metrics_by_group=metrics_by_group,
         rows_by_group=rows_by_group,
         samples=samples,
         payloads=eval_payloads,
+        payloads_by_group=eval_payloads_by_group,
         judge_stats_by_group=judge_stats_by_group,
     )
 
@@ -505,43 +530,112 @@ def build_grouped_metrics_payload(
     avg_k: tuple[NumericK, ...],
     report_pass_k: tuple[int, ...] = (),
     report_avg_k: tuple[NumericK, ...] = (),
-) -> tuple[dict[str, dict[str, float]], dict[str, object]]:
-    metrics_payload: dict[str, dict[str, float]] = {}
-    strategy_curves: dict[str, dict[str, dict[str, float]]] = {}
+) -> tuple[dict[str, object], dict[str, object]]:
+    group = evaluation.primary_group
+    rows = evaluation.rows_by_group.get(group, [])
+    metrics_payload: dict[str, object] = dict(evaluation.metrics_by_group.get(group, {}))
+    strategy_metrics: dict[str, dict[str, float]] = {}
+    pass_metrics_all = compute_pass_at_k(rows, pass_k)
+    avg_metrics_all = compute_avg_at_k(rows, avg_k)
 
-    for group in STRATEGY_GROUPS:
-        rows = evaluation.rows_by_group.get(group, [])
-        group_metrics = dict(evaluation.metrics_by_group.get(group, {}))
-        pass_metrics_all = compute_pass_at_k(rows, pass_k)
-        avg_metrics_all = compute_avg_at_k(rows, avg_k)
+    pass_payload = filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
+    if report_pass_k and not pass_payload:
+        pass_payload = pass_metrics_all or {}
+    if pass_payload:
+        metrics_payload.update(pass_payload)
 
-        pass_payload = filter_metrics_by_k(pass_metrics_all, report_pass_k, "pass@")
-        if report_pass_k and not pass_payload:
-            pass_payload = pass_metrics_all or {}
-        if pass_payload:
-            group_metrics.update(pass_payload)
+    avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
+    if report_avg_k and not avg_payload:
+        avg_payload = avg_metrics_all or {}
+    if avg_payload:
+        metrics_payload.update(avg_payload)
 
-        avg_payload = filter_metrics_by_k(avg_metrics_all, report_avg_k, "avg@")
-        if report_avg_k and not avg_payload:
-            avg_payload = avg_metrics_all or {}
-        if avg_payload:
-            group_metrics.update(avg_payload)
+    for strategy in STRATEGY_GROUPS:
+        strategy_rows = evaluation.rows_by_group.get(strategy, [])
+        group_metrics = dict(evaluation.metrics_by_group.get(strategy, {}))
+        group_pass_all = compute_pass_at_k(strategy_rows, pass_k)
+        group_avg_all = compute_avg_at_k(strategy_rows, avg_k)
 
-        curves: dict[str, dict[str, float]] = {}
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            curves["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            curves["avg_curve"] = avg_metrics_all
-        if curves:
-            strategy_curves[group] = curves
-        metrics_payload[group] = group_metrics
+        group_pass_payload = filter_metrics_by_k(group_pass_all, report_pass_k, "pass@")
+        if report_pass_k and not group_pass_payload:
+            group_pass_payload = group_pass_all or {}
+        if group_pass_payload:
+            group_metrics.update(group_pass_payload)
+
+        group_avg_payload = filter_metrics_by_k(group_avg_all, report_avg_k, "avg@")
+        if report_avg_k and not group_avg_payload:
+            group_avg_payload = group_avg_all or {}
+        if group_avg_payload:
+            group_metrics.update(group_avg_payload)
+
+        strategy_metrics[strategy] = group_metrics
+    metrics_payload["strategy_metrics"] = strategy_metrics
+    metrics_payload["strategy_diagnostics"] = _build_strategy_diagnostics(evaluation)
 
     task_details: dict[str, object] = {}
-    if strategy_curves:
-        task_details["strategy_curves"] = strategy_curves
-    if evaluation.judge_stats_by_group:
-        task_details["judge_stats_by_group"] = evaluation.judge_stats_by_group
+    primary_judge_stats = evaluation.judge_stats_by_group.get(group)
+    if primary_judge_stats:
+        task_details["judge_stats"] = primary_judge_stats
+    if pass_metrics_all and pass_payload != pass_metrics_all:
+        task_details["pass_curve"] = pass_metrics_all
+    if avg_metrics_all and avg_payload != avg_metrics_all:
+        task_details["avg_curve"] = avg_metrics_all
     return metrics_payload, task_details
+
+
+def attach_strategy_task_ids(metrics_payload: dict[str, object], task_ids: dict[str, int | str]) -> dict[str, object]:
+    metrics_payload["strategy_task_ids"] = {key: int(value) for key, value in task_ids.items()}
+    return metrics_payload
+
+
+def _build_strategy_diagnostics(evaluation: FreeResponseEvaluation) -> dict[str, dict[str, float]]:
+    primary_records = _records_by_key(evaluation.payloads_by_group.get(evaluation.primary_group, []))
+    diagnostics: dict[str, dict[str, float]] = {}
+    for strategy in STRATEGY_GROUPS:
+        if strategy == evaluation.primary_group:
+            continue
+        rows = evaluation.payloads_by_group.get(strategy, [])
+        changed = 0
+        rescued = 0
+        harmed = 0
+        compared = 0
+        for payload in rows:
+            key = (
+                strict_nonneg_int(payload.get("sample_index"), "sample_index"),
+                strict_nonneg_int(payload.get("repeat_index"), "repeat_index"),
+            )
+            primary = primary_records.get(key)
+            if primary is None:
+                continue
+            compared += 1
+            primary_answer = _normalize_text(str(primary.get("answer") or ""))
+            strategy_answer = _normalize_text(str(payload.get("answer") or ""))
+            if primary_answer != strategy_answer:
+                changed += 1
+            primary_passed = bool(primary.get("is_passed"))
+            strategy_passed = bool(payload.get("is_passed"))
+            if not primary_passed and strategy_passed:
+                rescued += 1
+            if primary_passed and not strategy_passed:
+                harmed += 1
+        denominator = compared or 1
+        diagnostics[strategy] = {
+            "changed_answer_rate": changed / denominator,
+            "rescued_rate": rescued / denominator,
+            "harmed_rate": harmed / denominator,
+        }
+    return diagnostics
+
+
+def _records_by_key(payloads: list[dict]) -> dict[tuple[int, int], dict]:
+    records: dict[tuple[int, int], dict] = {}
+    for payload in payloads:
+        key = (
+            strict_nonneg_int(payload.get("sample_index"), "sample_index"),
+            strict_nonneg_int(payload.get("repeat_index"), "repeat_index"),
+        )
+        records[key] = payload
+    return records
 
 
 __all__ = [
@@ -554,7 +648,9 @@ __all__ = [
     "STRATEGY_B",
     "STRATEGY_C",
     "STRATEGY_GROUPS",
+    "STRATEGY_LABELS",
     "FreeResponseEvaluation",
+    "attach_strategy_task_ids",
     "build_grouped_metrics_payload",
     "compute_avg_at_k",
     "compute_pass_at_k",

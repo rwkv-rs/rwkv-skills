@@ -559,27 +559,25 @@ class EvalDbService:
         inserted = 0
         pending_rows = 0
         pending_chars = 0
-        pending_payloads: list[tuple[int, str, dict[str, Any]]] = []
+        pending_payloads: list[tuple[int, dict[str, Any]]] = []
         created_at = self._now_cn()
         task_id_int = int(task_id)
         with get_session() as session:
             mapping = self._repo.fetch_completion_id_map(session, task_id=task_id_int)
-            existing_eval_keys = self._repo.fetch_existing_eval_keys(
+            existing_eval_ids = self._repo.fetch_existing_eval_completion_ids(
                 session,
                 task_id=task_id_int,
             )
         for payload in payloads:
             sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
             repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
-            eval_group = str(payload.get("eval_group") or "strategy_a")
 
             completions_id = mapping.get((sample_index, repeat_index))
-            eval_key = (completions_id, eval_group) if completions_id is not None else None
-            if completions_id is None or eval_key in existing_eval_keys:
+            if completions_id is None or completions_id in existing_eval_ids:
                 continue
 
-            pending_payloads.append((completions_id, eval_group, payload))
-            existing_eval_keys.add((completions_id, eval_group))
+            pending_payloads.append((completions_id, payload))
+            existing_eval_ids.add(completions_id)
             pending_rows += 1
             pending_chars += self._estimate_eval_payload_chars(payload)
 
@@ -605,20 +603,19 @@ class EvalDbService:
         self,
         *,
         task_id: int,
-        rows: Sequence[tuple[int, str, dict[str, Any]]],
+        rows: Sequence[tuple[int, dict[str, Any]]],
         created_at: datetime,
     ) -> int:
         if not rows:
             return 0
         with get_session() as session:
-            known_keys = self._repo.fetch_existing_eval_keys(
+            known_ids = self._repo.fetch_existing_eval_completion_ids(
                 session,
                 task_id=task_id,
             )
             inserted = 0
-            for completions_id, eval_group, payload in rows:
-                key = (completions_id, eval_group)
-                if key in known_keys:
+            for completions_id, payload in rows:
+                if completions_id in known_ids:
                     continue
                 self._repo.insert_eval(
                     session,
@@ -626,9 +623,70 @@ class EvalDbService:
                     payload=payload,
                     created_at=created_at,
                 )
-                known_keys.add(key)
+                known_ids.add(completions_id)
                 inserted += 1
         return inserted
+
+    def ingest_eval_payload_groups(
+        self,
+        *,
+        task_id: str,
+        completion_payloads: Sequence[dict[str, Any]],
+        payloads_by_group: Mapping[str, Sequence[dict[str, Any]]],
+        primary_group: str,
+    ) -> dict[str, int]:
+        """Persist strategy eval rows without adding a grouping column.
+
+        The primary strategy uses the generation task.  Other strategies get
+        hidden diagnostic tasks that duplicate the completion rows and store
+        their eval rows under distinct task IDs.
+        """
+        parent_task_id = int(task_id)
+        task_ids: dict[str, int] = {}
+
+        primary_payloads = list(payloads_by_group.get(primary_group, ()))
+        self.ingest_eval_payloads(payloads=primary_payloads, task_id=str(parent_task_id))
+        task_ids[primary_group] = parent_task_id
+
+        for group, payloads in payloads_by_group.items():
+            if group == primary_group:
+                continue
+            strategy_task_id = self.create_eval_strategy_task(
+                parent_task_id=parent_task_id,
+                strategy=group,
+            )
+            self.insert_completion_payloads_batch(
+                payloads=completion_payloads,
+                task_id=str(strategy_task_id),
+            )
+            self.ingest_eval_payloads(payloads=list(payloads), task_id=str(strategy_task_id))
+            self.update_task_status(task_id=str(strategy_task_id), status="completed")
+            task_ids[group] = strategy_task_id
+
+        return task_ids
+
+    def create_eval_strategy_task(self, *, parent_task_id: int, strategy: str) -> int:
+        with get_session() as session:
+            parent = self._repo.fetch_task(session, task_id=int(parent_task_id))
+            if parent is None:
+                raise RuntimeError(f"parent task not found: {parent_task_id}")
+            parent_desc = str(parent.get("desc") or "")
+            desc_parts = [part for part in (parent_desc, f"parent_task_id={parent_task_id}", f"eval_strategy={strategy}") if part]
+            task_id = self._repo.insert_task(
+                session,
+                config_path=parent.get("config_path"),
+                evaluator=f"{parent.get('evaluator') or 'eval'}:{strategy}",
+                is_param_search=True,
+                created_at=self._now_cn(),
+                status="running",
+                git_hash=str(parent.get("git_hash") or _get_cached_git_sha()),
+                model_id=int(parent["model_id"]),
+                benchmark_id=int(parent["benchmark_id"]),
+                desc="; ".join(desc_parts),
+                sampling_config=parent.get("sampling_config") if isinstance(parent.get("sampling_config"), dict) else None,
+                log_path=str(parent.get("log_path") or ""),
+            )
+        return int(task_id)
 
     def record_score_payload(
         self,
@@ -861,7 +919,6 @@ class EvalDbService:
             payload: dict[str, Any] = {
                 "sample_index": int(mapping.get("sample_index", 0)),
                 "repeat_index": int(mapping.get("repeat_index", 0)),
-                "eval_group": str(mapping.get("eval_group") or "strategy_a"),
                 "is_passed": bool(mapping.get("is_passed", False)),
                 "answer": str(mapping.get("answer") or ""),
                 "ref_answer": str(mapping.get("ref_answer") or ""),

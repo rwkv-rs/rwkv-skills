@@ -13,6 +13,7 @@ from src.eval.metrics.free_response import (
     DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE,
     LLMJudge,
     LLMJudgeConfig,
+    attach_strategy_task_ids,
     build_grouped_metrics_payload,
     evaluate_free_response,
 )
@@ -350,6 +351,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("⚠️ invalid_output 示例：")
                 for item in invalid_output_examples:
                     print(f"  - {item}")
+    strategy_task_ids = service.ingest_eval_payload_groups(
+        task_id=task_id,
+        completion_payloads=completions_payloads,
+        payloads_by_group=evaluation.payloads_by_group,
+        primary_group=evaluation.primary_group,
+    )
     metrics_payload, task_details = build_grouped_metrics_payload(
         evaluation,
         pass_k=pass_k_final,
@@ -357,10 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_pass_k=report_pass_k,
         report_avg_k=report_avg_k,
     )
-    service.ingest_eval_payloads(
-        payloads=evaluation.payloads,
-        task_id=task_id,
-    )
+    attach_strategy_task_ids(metrics_payload, strategy_task_ids)
     score_payload = make_score_payload(
         slug,
         is_cot=True,

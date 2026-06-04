@@ -73,7 +73,8 @@ def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch,
     assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.5
     assert evaluation.metrics_by_group["strategy_a"]["stop_rate"] == 0.5
     assert evaluation.rows_by_group["strategy_a"] == [(0, 0, True), (1, 0, False)]
-    assert {payload["eval_group"] for payload in evaluation.payloads} == set(STRATEGY_GROUPS)
+    assert len(evaluation.payloads) == 2
+    assert all("eval_group" not in payload for payload in evaluation.payloads)
 
     metrics_payload, task_details = build_grouped_metrics_payload(
         evaluation,
@@ -82,8 +83,8 @@ def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch,
         report_pass_k=(1,),
         report_avg_k=(1,),
     )
-    assert metrics_payload["strategy_a"]["avg@1"] == 0.5
-    assert metrics_payload["strategy_b"]["stop_rate"] == 0.5
+    assert metrics_payload["avg@1"] == 0.5
+    assert metrics_payload["stop_rate"] == 0.5
     assert task_details == {}
 
 
@@ -110,7 +111,7 @@ def test_strategy_b_repairs_unclosed_think_for_scoring_only(monkeypatch, tmp_pat
     )
 
     assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
-    assert evaluation.metrics_by_group["strategy_b"]["exact_accuracy"] == 1.0
+    assert evaluation.metrics_by_group["strategy_b"]["exact_accuracy"] == 0.0
     assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
 
 

@@ -125,7 +125,6 @@ def make_eval_payload(
     fail_reason: str | None = None,
     answer: str | None = None,
     ref_answer: str | None = None,
-    eval_group: str = "strategy_a",
 ) -> dict[str, Any]:
     """Build a canonical `results/eval` line from a `results/completions` line."""
     passed = bool(is_passed)
@@ -146,7 +145,6 @@ def make_eval_payload(
         "ref_answer": "" if ref_answer is None else str(ref_answer),
         "is_passed": passed,
         "fail_reason": reason,
-        "eval_group": str(eval_group or "strategy_a"),
     }
 
 
