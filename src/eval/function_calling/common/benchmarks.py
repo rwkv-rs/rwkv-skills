@@ -72,6 +72,18 @@ FUNCTION_CALLING_BENCHMARK_SPECS: dict[str, FunctionCallingBenchmarkSpec] = {
         "browsecomp_plus",
         AGENT_METRIC_KEYS,
     ),
+    "function_tau2_bench": FunctionCallingBenchmarkSpec(
+        "function_tau2_bench",
+        "agent",
+        "tau2_bench",
+        AGENT_METRIC_KEYS,
+    ),
+    "function_tau3_bench": FunctionCallingBenchmarkSpec(
+        "function_tau3_bench",
+        "agent",
+        "tau3_bench",
+        AGENT_METRIC_KEYS,
+    ),
     "function_agent_agentbench_db": FunctionCallingBenchmarkSpec(
         "function_agent_agentbench_db", "agent", "agentbench", AGENT_METRIC_KEYS
     ),
@@ -88,6 +100,8 @@ FUNCTION_CALLING_DATASET_PREFIXES: tuple[str, ...] = (
     "agentbench_",
     "complexfuncbench_",
     "browsecomp_plus",
+    "tau2_bench_",
+    "tau3_bench_",
 )
 FUNCTION_CALLING_EXPLICIT_ONLY_JOBS: tuple[str, ...] = (
     "function_agent_apibank_l2",

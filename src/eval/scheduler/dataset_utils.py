@@ -25,6 +25,15 @@ DATASET_SLUG_ALIASES: dict[str, str] = {
     # while `apibank_l2` is the one-step tool-call adaptation.
     "apibank_level1": "apibank_l1_test",
     "apibank_level1_test": "apibank_l1_test",
+    # Legacy TAU launch artifacts used `<task_set>_base`; the official
+    # scheduler/display identity is the task-set slug itself.
+    "tau2_bench_airline_base": "tau2_bench_airline",
+    "tau2_bench_retail_base": "tau2_bench_retail",
+    "tau2_bench_telecom_base": "tau2_bench_telecom",
+    "tau3_bench_airline_base": "tau3_bench_airline",
+    "tau3_bench_banking_knowledge_base": "tau3_bench_banking_knowledge",
+    "tau3_bench_retail_base": "tau3_bench_retail",
+    "tau3_bench_telecom_base": "tau3_bench_telecom",
 }
 
 _CANONICALIZE_SPLIT_NAMES = {
@@ -34,6 +43,7 @@ _CANONICALIZE_SPLIT_NAMES = {
     "val",
     "dev",
     "devtest",
+    "base",
     "main",
     "science",
     "verified",
@@ -88,6 +98,8 @@ def split_benchmark_and_split(dataset_slug: str) -> tuple[str, str]:
 
 
 def make_dataset_slug(name: str, split: str) -> str:
+    if not str(split or "").strip():
+        return canonical_slug(name)
     return canonical_slug(f"{name}_{split}")
 
 

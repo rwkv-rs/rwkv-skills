@@ -5,18 +5,16 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from src.eval.benchmark_config import BenchmarkModelConfig
 from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 from src.eval.evaluators.common import sample_repeat_seed
-from src.eval.function_calling.agent.adapters.apibank import create_apibank_level2_env
-from src.eval.function_calling.agent.adapters.browsecomp_plus import (
-    browsecomp_plus_run_from_agent_details,
-    create_browsecomp_plus_env,
-)
-from src.eval.function_calling.agent.adapters.complexfuncbench import (
-    create_complexfuncbench_official_env,
+from src.eval.function_calling.agent.adapters.registry import (
+    FunctionCallAgentAdapter,
+    create_agent_env,
+    prompt_adapter_for_env,
+    render_agent_trajectory,
 )
 from src.eval.function_calling.agent.runner import AgentRunConfig, run_function_calling_agent
 from src.eval.function_calling.common.payload import (
@@ -24,6 +22,11 @@ from src.eval.function_calling.common.payload import (
     build_agent_completion_payload,
 )
 from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
+from src.eval.function_calling.tool_router import (
+    ToolRoutingConfig,
+    route_tools_for_prompt,
+    tool_routing_config_from_benchmark_config,
+)
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.infer.engine import InferenceEngine
@@ -60,15 +63,16 @@ class FunctionCallAgentPipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int]] | None = None,
         config: BenchmarkModelConfig | None = None,
+        tool_routing_config: ToolRoutingConfig | None = None,
         on_record: Callable[[dict[str, Any]], None] | None = None,
     ) -> FunctionCallAgentPipelineResult:
-        _ = config
         _ = batch_size
         records, resolved_name = load_agent_records(dataset_path, sample_limit)
         dataset_name = dataset_name or resolved_name
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         repeats = max(1, int(samples_per_task or 1))
         skip_keys = skip_keys or set()
+        resolved_tool_routing_config = tool_routing_config or tool_routing_config_from_benchmark_config(config)
 
         entries: list[tuple[int, FunctionCallTaskRecord, int]] = []
         for idx, record in enumerate(records):
@@ -92,12 +96,22 @@ class FunctionCallAgentPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict[str, Any]] = []
         for record_idx, record, sample_id in entries:
+            adapter = prompt_adapter_for_env(str(record.env.get("type") or ""))
             env = create_agent_env(record)
             prompts: list[str] = []
             completions: list[str] = []
+            tool_routes: list[dict[str, Any]] = []
 
             def _generate_action(events, observation, step):
-                prompt = self._make_prompt(record, events, observation, step)
+                prompt = self._make_prompt(
+                    record,
+                    events,
+                    observation,
+                    step,
+                    tool_routing_config=resolved_tool_routing_config,
+                    tool_route_sink=tool_routes,
+                    adapter=adapter,
+                )
                 prompts.append(prompt)
                 outputs = self.engine.generate(
                     [prompt],
@@ -123,6 +137,9 @@ class FunctionCallAgentPipeline:
                 prompt_chars=sum(len(prompt) for prompt in prompts),
                 completion_chars=sum(len(completion) for completion in completions),
             )
+            details = dict(result.details)
+            if tool_routes:
+                details["tool_routes"] = tool_routes
             payload = build_agent_completion_payload(
                 benchmark_name=benchmark_name,
                 dataset_split=dataset_split,
@@ -137,22 +154,10 @@ class FunctionCallAgentPipeline:
                 scorer_type=str(record.scorer.get("type") or ""),
                 success=result.success,
                 official_score=result.score,
-                details=result.details,
+                details=details,
             )
-            if str(record.env.get("type") or "") == "complexfuncbench_official":
-                final_env_details = result.details.get("final_env_details")
-                if isinstance(final_env_details, Mapping):
-                    final_response = final_env_details.get("final_response")
-                    if isinstance(final_response, str):
-                        payload["final_answer"] = final_response
-                    payload["complexfuncbench_official_result"] = {
-                        key: final_env_details.get(key)
-                        for key in ("message", "count_dict", "resp_eval", "call_accuracy")
-                        if key in final_env_details
-                    }
-            browsecomp_plus_run = browsecomp_plus_run_from_agent_details(result.details)
-            if browsecomp_plus_run is not None:
-                payload["browsecomp_plus_run"] = browsecomp_plus_run
+            if adapter.augment_payload is not None:
+                adapter.augment_payload(payload, result.details)
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
@@ -164,33 +169,24 @@ class FunctionCallAgentPipeline:
         events: list[Mapping[str, Any]],
         observation: Any,
         step: int,
+        *,
+        tool_routing_config: ToolRoutingConfig | None = None,
+        tool_route_sink: list[dict[str, Any]] | None = None,
+        adapter: FunctionCallAgentAdapter | None = None,
     ) -> str:
-        if str(record.env.get("type") or "") == "complexfuncbench_official":
-            return _make_complexfuncbench_prompt(record, events, observation, step)
-        tools_json = json.dumps(record.tools or [], ensure_ascii=False, indent=2)
-        trajectory = _render_agent_trajectory(events)
-        current = str(getattr(observation, "content", "") or "")
-        return (
-            "You are controlling tools in a function-calling environment.\n"
-            "Respond with exactly one JSON tool call and no extra text.\n"
-            'Use this shape: {"name":"ToolName","arguments":{"arg":"value"}}\n'
-            "Available tools:\n"
-            f"{tools_json}\n\n"
-            f"Trajectory:\n{trajectory}\n\n"
-            f"Current observation:\n{current}\n\n"
-            "Assistant: <think>\n</think>\n```json\n"
+        tools = list(record.tools or [])
+        env_type = str(record.env.get("type") or "")
+        resolved_adapter = adapter or prompt_adapter_for_env(env_type)
+        route = route_tools_for_prompt(
+            tools,
+            _tool_route_context_messages(record, events, observation, step),
+            config=tool_routing_config,
+            control_tool_names=resolved_adapter.control_tool_names,
         )
-
-
-def create_agent_env(record: FunctionCallTaskRecord):
-    env_type = str(record.env.get("type") or "")
-    if env_type == "apibank_level2":
-        return create_apibank_level2_env(record)
-    if env_type == "browsecomp_plus":
-        return create_browsecomp_plus_env(record)
-    if env_type == "complexfuncbench_official":
-        return create_complexfuncbench_official_env(record)
-    raise NotImplementedError(f"Unsupported function-calling agent env.type: {env_type}")
+        selected_tools = route.selected_tools
+        if route.mode != "off" and tool_route_sink is not None:
+            tool_route_sink.append({"step": int(step), **route.trace_payload()})
+        return resolved_adapter.render_prompt(record, events, observation, step, selected_tools)
 
 
 def load_agent_records(
@@ -215,6 +211,10 @@ def load_agent_records(
 
 def _agent_record_from_payload(payload: Mapping[str, Any], *, index: int) -> FunctionCallTaskRecord:
     task_id = payload.get("task_id") or payload.get("id") or f"function_agent_{index}"
+    metadata = _dict_value(payload.get("metadata"))
+    for key in ("domain", "index", "task", "benchmark_version", "tau_policy", "source_path"):
+        if key in payload and key not in metadata:
+            metadata[key] = payload[key]
     return FunctionCallTaskRecord(
         task_id=str(task_id),
         instruction=str(payload.get("instruction") or ""),
@@ -226,7 +226,7 @@ def _agent_record_from_payload(payload: Mapping[str, Any], *, index: int) -> Fun
         attachments=_list_of_dicts(payload.get("attachments") or payload.get("files")),
         max_steps=_positive_int(payload.get("max_steps")),
         time_limit_s=_positive_float(payload.get("time_limit_s")),
-        metadata=_dict_value(payload.get("metadata")),
+        metadata=metadata,
     )
 
 
@@ -258,55 +258,28 @@ def _positive_float(value: Any) -> float | None:
     return None
 
 
-def _render_agent_trajectory(events: list[Mapping[str, Any]]) -> str:
-    rendered: list[str] = []
-    for event in events:
-        event_type = str(event.get("type") or "")
-        content = str(event.get("content") or "")
-        if event_type == "observation":
-            rendered.append(f"Environment: {content}")
-        elif event_type == "model_output":
-            rendered.append(f"Assistant action: {content}")
-        elif event_type == "action":
-            rendered.append(
-                "Tool call: "
-                + json.dumps(
-                    {"name": event.get("name"), "arguments": event.get("arguments") or {}},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-        elif event_type == "env_result":
-            rendered.append(f"Environment: {content}")
-        elif event_type == "error":
-            rendered.append(f"Error: {content}")
-    return "\n".join(part for part in rendered if part.strip()).strip()
-
-
-def _make_complexfuncbench_prompt(
+def _tool_route_context_messages(
     record: FunctionCallTaskRecord,
-    events: list[Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]],
     observation: Any,
     step: int,
-) -> str:
-    tools_json = json.dumps(record.tools or [], ensure_ascii=False, indent=2)
-    trajectory = _render_agent_trajectory(events)
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    if record.instruction:
+        messages.append({"role": "user", "content": record.instruction})
+    for message in record.messages[-4:]:
+        role = str(message.get("role") or "user")
+        content = str(message.get("content") or "")
+        if content:
+            messages.append({"role": role, "content": content})
+    trajectory = render_agent_trajectory(list(events))
+    if trajectory:
+        messages.append({"role": "assistant", "content": trajectory})
     current = str(getattr(observation, "content", "") or "")
-    return (
-        "You are running the official ComplexFuncBench function-calling task.\n"
-        "Return only JSON and no extra text.\n"
-        'For one call, use {"name":"ToolName","arguments":{"arg":"value"}}.\n'
-        "For multiple calls in the same assistant turn, return a JSON array of those objects.\n"
-        "After all official sandbox observations indicate the required calls are complete, "
-        'call {"name":"final_answer","arguments":{"answer":"..."}}.\n'
-        "Available tools:\n"
-        f"{tools_json}\n\n"
-        f"Trajectory:\n{trajectory}\n\n"
-        f"Current observation:\n{current}\n\n"
-        f"Step: {step}\n\n"
-        "Assistant: <think>\n</think>\n```json\n"
-    )
-
+    if current:
+        messages.append({"role": "user", "content": current})
+    messages.append({"role": "user", "content": f"step={int(step)}"})
+    return messages
 
 def _trim_stop_suffixes(text: str, stop_suffixes: tuple[str, ...]) -> str:
     earliest: int | None = None

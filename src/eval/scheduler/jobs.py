@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Iterable, Sequence
 
+from src.eval.agent_bench.tau_specs import (
+    TAU2_BENCH_DATASET_SLUGS as RAW_TAU2_BENCH_DATASET_SLUGS,
+    TAU3_BENCH_DATASET_SLUGS as RAW_TAU3_BENCH_DATASET_SLUGS,
+    TAU_BENCH_DEFAULT_SPLITS,
+)
 from src.eval.datasets.data_prepper.data_manager import (
     available_code_generation_datasets,
     available_function_call_datasets,
@@ -21,6 +26,7 @@ from src.eval.function_calling.common.benchmarks import (
 from .dataset_utils import (
     DATASET_SLUG_ALIASES,
     canonical_slug,
+    infer_dataset_slug_from_path,
     make_dataset_slug,
     safe_slug,
 )
@@ -50,7 +56,7 @@ CODE_DEFAULT_SPLITS: dict[str, str] = {
     "human_eval_cn": "test",
     "livecodebench": "test",
 }
-FUNCTION_CALL_DEFAULT_SPLITS: dict[str, str] = {}
+FUNCTION_CALL_DEFAULT_SPLITS: dict[str, str] = dict(TAU_BENCH_DEFAULT_SPLITS)
 
 
 @dataclass(frozen=True)
@@ -226,6 +232,12 @@ COMPLEXFUNCBENCH_SUBSET_DATASET_SLUGS: Final[tuple[str, ...]] = (
 BROWSECOMP_PLUS_DATASET_SLUGS: Final[tuple[str, ...]] = (
     canonical_slug("browsecomp_plus_test"),
 )
+TAU2_BENCH_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug) for slug in RAW_TAU2_BENCH_DATASET_SLUGS
+)
+TAU3_BENCH_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
+    canonical_slug(slug) for slug in RAW_TAU3_BENCH_DATASET_SLUGS
+)
 JOB_CATALOGUE: dict[str, JobSpec] = {
     "multi_choice_plain": JobSpec(
         name="multi_choice_plain",
@@ -399,6 +411,22 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         domain="function_call",
         batch_flag="--batch-size",
     ),
+    "function_tau2_bench": JobSpec(
+        name="function_tau2_bench",
+        module="src.bin.eval_function_call_agent",
+        dataset_slugs=TAU2_BENCH_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
+    "function_tau3_bench": JobSpec(
+        name="function_tau3_bench",
+        module="src.bin.eval_function_call_agent",
+        dataset_slugs=TAU3_BENCH_DATASET_SLUGS,
+        is_cot=False,
+        domain="function_call",
+        batch_flag="--batch-size",
+    ),
     "function_agent_agentbench_db": JobSpec(
         name="function_agent_agentbench_db",
         module="src.bin.eval_function_call_agent",
@@ -453,7 +481,7 @@ def locate_dataset(slug: str, *, search: Sequence[Path], output_root: Path) -> P
     prepared_paths = prepare_dataset(spec.dataset, output_root, spec.split)
     refresh_dataset_index(search)
     for path in prepared_paths:
-        detected = canonical_slug(path.stem)
+        detected = canonical_slug(infer_dataset_slug_from_path(str(path)))
         if detected == canonical:
             record_dataset_samples(path, dataset_slug=canonical)
             return path

@@ -8,4 +8,5 @@ __all__ = [
     "browsecomp_plus",
     "browsecomp_plus_judge",
     "complexfuncbench",
+    "registry",
 ]

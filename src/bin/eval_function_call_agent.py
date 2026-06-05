@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -11,6 +12,7 @@ from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
 from src.db.orm import init_orm
+from src.eval.agent_bench.tau_specs import TAU_AGENT_JOB_BY_DATASET
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.function_calling.agent.adapters.browsecomp_plus_judge import (
     BrowseCompPlusJudgeConfig,
@@ -22,20 +24,40 @@ from src.eval.function_calling.agent.adapters.complexfuncbench import (
 )
 from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline, load_agent_records
 from src.eval.function_calling.agent.scorer import evaluate_function_call_agent
+from src.eval.function_calling.agent.tau_official_runner import (
+    TauOfficialAgentPipeline,
+    TauOfficialRunnerOptions,
+)
 from src.eval.function_calling.common.benchmarks import function_calling_benchmark_spec
+from src.eval.function_calling.long_context_router import (
+    long_context_routing_config_from_args,
+    long_context_routing_config_from_benchmark_config,
+)
+from src.eval.function_calling.tool_router import (
+    tool_routing_config_from_args,
+    tool_routing_config_from_benchmark_config,
+)
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import canonical_slug, infer_dataset_slug_from_path
-from src.infer.model import ModelLoadConfig
 
 
 AGENT_JOB_BY_DATASET: dict[str, str] = {
     "apibank_level2_test": "function_agent_apibank_l2",
     "complexfuncbench_subset_test": "function_agent_complexfuncbench",
     "browsecomp_plus_test": "function_agent_browsecomp_plus",
+    **TAU_AGENT_JOB_BY_DATASET,
 }
+TAU_AGENT_JOBS = frozenset(TAU_AGENT_JOB_BY_DATASET.values())
+
+
+@dataclass(slots=True)
+class LocalModelLoadConfig:
+    weights_path: str
+    device: str = "cuda"
+    tokenizer_path: str | None = None
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -46,6 +68,73 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1, help="Reserved for scheduler compatibility")
     parser.add_argument("--max-samples", type=int, help="Limit number of tasks for quick runs")
     parser.add_argument("--db-write-queue", type=int, default=1024, help="DB completion write queue max size")
+    parser.add_argument("--tool-router-mode", choices=("off", "lexical"), help="Tool window router mode")
+    parser.add_argument("--tool-router-max-tools", type=int, help="Maximum tools exposed after routing")
+    parser.add_argument("--tool-router-trigger-tool-count", type=int, help="Route when tool count reaches this value")
+    parser.add_argument("--tool-router-trigger-catalog-chars", type=int, help="Route when catalog JSON reaches this size")
+    parser.add_argument("--tool-router-context-chars", type=int, help="Recent context characters used by the router")
+    parser.add_argument("--tool-router-description-chars", type=int, help="Per-tool description chars used by the router")
+    parser.add_argument(
+        "--long-context-router-mode",
+        "--long-doc-mode",
+        dest="long_context_router_mode",
+        choices=("off", "lexical"),
+        help="Long context router mode",
+    )
+    parser.add_argument(
+        "--long-context-min-chars",
+        "--long-doc-min-chars",
+        dest="long_context_min_chars",
+        type=int,
+        help="Compact text at or above this character length",
+    )
+    parser.add_argument(
+        "--long-context-chunk-chars",
+        "--long-doc-max-chars",
+        dest="long_context_chunk_chars",
+        type=int,
+        help="Chunk size for lexical long-context compaction",
+    )
+    parser.add_argument(
+        "--long-context-overlap-lines",
+        "--long-doc-overlap-lines",
+        dest="long_context_overlap_lines",
+        type=int,
+        help="Line overlap between lexical chunks",
+    )
+    parser.add_argument(
+        "--long-context-max-evidence-chunks",
+        "--long-doc-max-evidence-chunks",
+        dest="long_context_max_evidence_chunks",
+        type=int,
+        help="Maximum selected evidence chunks",
+    )
+    parser.add_argument(
+        "--long-context-max-evidence-chars",
+        "--long-doc-max-evidence-chars",
+        dest="long_context_max_evidence_chars",
+        type=int,
+        help="Maximum selected evidence characters",
+    )
+    parser.add_argument(
+        "--long-context-query-chars",
+        "--long-doc-query-chars",
+        dest="long_context_query_chars",
+        type=int,
+        help="Recent query characters used by long-context router",
+    )
+    parser.add_argument("--history-max-chars", type=int, help="TAU official trajectory history character budget")
+    parser.add_argument("--prompt-max-chars", type=int, help="TAU official rendered prompt character budget")
+    parser.add_argument("--max-steps", type=int, help="TAU official max simulation steps")
+    parser.add_argument("--max-tool-errors", type=int, help="TAU official max tool/runtime errors before stopping")
+    parser.add_argument("--decision-max-tokens", type=int, help="TAU official per-step generation token budget")
+    parser.add_argument("--max-repeated-tool-calls", type=int, help="TAU official repeated tool-call guard threshold")
+    parser.add_argument("--user-model", help="TAU official user simulator model name")
+    parser.add_argument("--user-api-key", help="TAU official user simulator API key")
+    parser.add_argument("--user-base-url", help="TAU official user simulator OpenAI-compatible base URL")
+    parser.add_argument("--judge-model", help="TAU official NL assertion judge model name")
+    parser.add_argument("--judge-api-key", help="TAU official NL assertion judge API key")
+    parser.add_argument("--judge-base-url", help="TAU official NL assertion judge OpenAI-compatible base URL")
     return parser.parse_args(argv)
 
 
@@ -62,22 +151,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     if job_name is None:
         raise ValueError(f"function_call agent 暂不支持数据集: {slug}")
     benchmark_config = resolve_benchmark_model_config(slug, model_name, stage="tool")
+    tool_routing_config = tool_routing_config_from_args(
+        args,
+        base=tool_routing_config_from_benchmark_config(benchmark_config),
+    )
     sampling = resolve_sampling_config(
         slug,
         model_name,
         stage="tool",
         fallback_templates="instruction_following_default",
     )
-    if sampling is not None and job_name != "function_agent_complexfuncbench":
+    is_tau_job = job_name in TAU_AGENT_JOBS
+    if sampling is not None and job_name != "function_agent_complexfuncbench" and not is_tau_job:
         sampling = sampling.clamp(768)
     if sampling is None:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
-    pipeline = FunctionCallAgentPipeline(ModelLoadConfig(weights_path=args.model_path, device=args.device))
+    tau_options = TauOfficialRunnerOptions.from_sources(args, benchmark_config) if is_tau_job else None
+    long_context_mode = tool_routing_config.mode if is_tau_job and tool_routing_config.enabled else "off"
+    long_context_routing_config = long_context_routing_config_from_args(
+        args,
+        base=long_context_routing_config_from_benchmark_config(
+            benchmark_config,
+            fallback_mode=long_context_mode,
+        ),
+    )
+    if is_tau_job:
+        pipeline = TauOfficialAgentPipeline(_model_load_config(weights_path=args.model_path, device=args.device))
+    else:
+        pipeline = FunctionCallAgentPipeline(_model_load_config(weights_path=args.model_path, device=args.device))
 
     init_orm(DEFAULT_DB_CONFIG)
     service = EvalDbService()
-    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1"
+    force_new_task = os.environ.get("RWKV_SCHEDULER_OVERWRITE") == "1" or (
+        is_tau_job and os.environ.get("RWKV_TAU_FORCE_NEW_TASK") == "1"
+    )
     ctx = service.get_resume_context(
         dataset=str(slug),
         model=model_name,
@@ -107,15 +215,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     if expected_count is None:
         expected_count = len(records)
     try:
-        result = pipeline.run(
-            dataset_path=str(dataset_path),
-            sampling=sampling,
-            batch_size=max(1, args.batch_size),
-            sample_limit=args.max_samples,
-            samples_per_task=1,
-            skip_keys=ctx.completed_keys,
-            on_record=writer.enqueue,
-        )
+        if is_tau_job:
+            result = pipeline.run(
+                dataset_path=str(dataset_path),
+                sampling=sampling,
+                options=tau_options,
+                dataset_name=str(slug),
+                sample_limit=args.max_samples,
+                samples_per_task=1,
+                skip_keys=ctx.completed_keys,
+                tool_routing_config=tool_routing_config,
+                long_context_routing_config=long_context_routing_config,
+                on_record=writer.enqueue,
+            )
+        else:
+            result = pipeline.run(
+                dataset_path=str(dataset_path),
+                sampling=sampling,
+                batch_size=max(1, args.batch_size),
+                sample_limit=args.max_samples,
+                samples_per_task=1,
+                skip_keys=ctx.completed_keys,
+                config=benchmark_config,
+                tool_routing_config=tool_routing_config,
+                on_record=writer.enqueue,
+            )
     except BaseException:
         try:
             writer.close()
@@ -221,6 +345,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     export_version_results(service, task_id=task_id)
     print(f"✅ function_call agent done: {result.sample_count} samples")
     return 0
+
+
+def _model_load_config(*, weights_path: str, device: str) -> Any:
+    return LocalModelLoadConfig(weights_path=weights_path, device=device)
 
 
 if __name__ == "__main__":  # pragma: no cover

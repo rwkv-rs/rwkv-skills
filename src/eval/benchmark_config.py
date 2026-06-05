@@ -38,6 +38,21 @@ _STRING_FIELDS = {
     "cot_prompt_template",
     "final_prompt_template",
     "judge_prompt_template",
+    "user_model",
+    "user_api_key",
+    "user_base_url",
+    "judge_model",
+    "judge_api_key",
+    "judge_base_url",
+}
+_CONFIG_KEY_ALIASES = {
+    "long_doc_mode": "long_context_router_mode",
+    "long_doc_min_chars": "long_context_min_chars",
+    "long_doc_max_chars": "long_context_chunk_chars",
+    "long_doc_overlap_lines": "long_context_overlap_lines",
+    "long_doc_max_evidence_chunks": "long_context_max_evidence_chunks",
+    "long_doc_max_evidence_chars": "long_context_max_evidence_chars",
+    "long_doc_query_chars": "long_context_query_chars",
 }
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
@@ -57,6 +72,31 @@ class BenchmarkModelConfig:
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
+    tool_router_mode: str | None = None
+    tool_router_max_tools: int | None = None
+    tool_router_trigger_tool_count: int | None = None
+    tool_router_trigger_catalog_chars: int | None = None
+    tool_router_context_chars: int | None = None
+    tool_router_description_chars: int | None = None
+    long_context_router_mode: str | None = None
+    long_context_min_chars: int | None = None
+    long_context_chunk_chars: int | None = None
+    long_context_overlap_lines: int | None = None
+    long_context_max_evidence_chunks: int | None = None
+    long_context_max_evidence_chars: int | None = None
+    long_context_query_chars: int | None = None
+    history_max_chars: int | None = None
+    prompt_max_chars: int | None = None
+    max_steps: int | None = None
+    max_tool_errors: int | None = None
+    decision_max_tokens: int | None = None
+    max_repeated_tool_calls: int | None = None
+    user_model: str | None = None
+    user_api_key: str | None = None
+    user_base_url: str | None = None
+    judge_model: str | None = None
+    judge_api_key: str | None = None
+    judge_base_url: str | None = None
 
     def apply_sampling(self, base: SamplingConfig) -> SamplingConfig:
         if not self.sampling_overrides:
@@ -310,8 +350,34 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
+    tool_router_mode: str | None = None
+    tool_router_max_tools: int | None = None
+    tool_router_trigger_tool_count: int | None = None
+    tool_router_trigger_catalog_chars: int | None = None
+    tool_router_context_chars: int | None = None
+    tool_router_description_chars: int | None = None
+    long_context_router_mode: str | None = None
+    long_context_min_chars: int | None = None
+    long_context_chunk_chars: int | None = None
+    long_context_overlap_lines: int | None = None
+    long_context_max_evidence_chunks: int | None = None
+    long_context_max_evidence_chars: int | None = None
+    long_context_query_chars: int | None = None
+    history_max_chars: int | None = None
+    prompt_max_chars: int | None = None
+    max_steps: int | None = None
+    max_tool_errors: int | None = None
+    decision_max_tokens: int | None = None
+    max_repeated_tool_calls: int | None = None
+    user_model: str | None = None
+    user_api_key: str | None = None
+    user_base_url: str | None = None
+    judge_model: str | None = None
+    judge_api_key: str | None = None
+    judge_base_url: str | None = None
 
-    for key, raw in table.items():
+    for raw_key, raw in table.items():
+        key = _CONFIG_KEY_ALIASES.get(str(raw_key), str(raw_key))
         if key in _INT_FIELDS:
             value = _coerce_int(raw)
         elif key in _FLOAT_FIELDS:
@@ -350,6 +416,81 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "browsecomp_plus_judge":
             browsecomp_plus_judge = _coerce_str_mapping(raw)
             continue
+        elif key == "tool_router_mode":
+            tool_router_mode = _coerce_str(raw)
+            continue
+        elif key == "tool_router_max_tools":
+            tool_router_max_tools = _coerce_int(raw)
+            continue
+        elif key == "tool_router_trigger_tool_count":
+            tool_router_trigger_tool_count = _coerce_int(raw)
+            continue
+        elif key == "tool_router_trigger_catalog_chars":
+            tool_router_trigger_catalog_chars = _coerce_int(raw)
+            continue
+        elif key == "tool_router_context_chars":
+            tool_router_context_chars = _coerce_int(raw)
+            continue
+        elif key == "tool_router_description_chars":
+            tool_router_description_chars = _coerce_int(raw)
+            continue
+        elif key == "long_context_router_mode":
+            long_context_router_mode = _coerce_str(raw)
+            continue
+        elif key == "long_context_min_chars":
+            long_context_min_chars = _coerce_int(raw)
+            continue
+        elif key == "long_context_chunk_chars":
+            long_context_chunk_chars = _coerce_int(raw)
+            continue
+        elif key == "long_context_overlap_lines":
+            long_context_overlap_lines = _coerce_int(raw)
+            continue
+        elif key == "long_context_max_evidence_chunks":
+            long_context_max_evidence_chunks = _coerce_int(raw)
+            continue
+        elif key == "long_context_max_evidence_chars":
+            long_context_max_evidence_chars = _coerce_int(raw)
+            continue
+        elif key == "long_context_query_chars":
+            long_context_query_chars = _coerce_int(raw)
+            continue
+        elif key == "history_max_chars":
+            history_max_chars = _coerce_int(raw)
+            continue
+        elif key == "prompt_max_chars":
+            prompt_max_chars = _coerce_int(raw)
+            continue
+        elif key == "max_steps":
+            max_steps = _coerce_int(raw)
+            continue
+        elif key == "max_tool_errors":
+            max_tool_errors = _coerce_int(raw)
+            continue
+        elif key == "decision_max_tokens":
+            decision_max_tokens = _coerce_int(raw)
+            continue
+        elif key == "max_repeated_tool_calls":
+            max_repeated_tool_calls = _coerce_int(raw)
+            continue
+        elif key == "user_model":
+            user_model = _coerce_str(raw)
+            continue
+        elif key == "user_api_key":
+            user_api_key = _coerce_str(raw)
+            continue
+        elif key == "user_base_url":
+            user_base_url = _coerce_str(raw)
+            continue
+        elif key == "judge_model":
+            judge_model = _coerce_str(raw)
+            continue
+        elif key == "judge_api_key":
+            judge_api_key = _coerce_str(raw)
+            continue
+        elif key == "judge_base_url":
+            judge_base_url = _coerce_str(raw)
+            continue
         else:
             continue
         if value is not None:
@@ -367,6 +508,31 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         final_prompt_template=final_prompt_template,
         judge_prompt_template=judge_prompt_template,
         browsecomp_plus_judge=browsecomp_plus_judge,
+        tool_router_mode=tool_router_mode,
+        tool_router_max_tools=tool_router_max_tools,
+        tool_router_trigger_tool_count=tool_router_trigger_tool_count,
+        tool_router_trigger_catalog_chars=tool_router_trigger_catalog_chars,
+        tool_router_context_chars=tool_router_context_chars,
+        tool_router_description_chars=tool_router_description_chars,
+        long_context_router_mode=long_context_router_mode,
+        long_context_min_chars=long_context_min_chars,
+        long_context_chunk_chars=long_context_chunk_chars,
+        long_context_overlap_lines=long_context_overlap_lines,
+        long_context_max_evidence_chunks=long_context_max_evidence_chunks,
+        long_context_max_evidence_chars=long_context_max_evidence_chars,
+        long_context_query_chars=long_context_query_chars,
+        history_max_chars=history_max_chars,
+        prompt_max_chars=prompt_max_chars,
+        max_steps=max_steps,
+        max_tool_errors=max_tool_errors,
+        decision_max_tokens=decision_max_tokens,
+        max_repeated_tool_calls=max_repeated_tool_calls,
+        user_model=user_model,
+        user_api_key=user_api_key,
+        user_base_url=user_base_url,
+        judge_model=judge_model,
+        judge_api_key=judge_api_key,
+        judge_base_url=judge_base_url,
     )
 
 
