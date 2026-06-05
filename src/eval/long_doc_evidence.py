@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+
+from lexical_chunk_router import long_doc as lexical_long_doc
+from lexical_chunk_router.rwkv import clamp_router_sampling
 
 ALLOWED_ANSWER_FORMATS = frozenset({"scalar_string", "scalar_number_string"})
 LongDocEvidenceMode = Literal["lexical", "model_parallel"]
@@ -25,9 +27,6 @@ DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS = 4
 DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS = 6000
 DEFAULT_LONG_DOC_MODEL_MAX_TOKENS = 96
 DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE = 8
-
-_LATIN_WORD_RE = re.compile(r"[a-z0-9_]{2,}")
-_CJK_SPAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +78,7 @@ class LongDocCompactionResult:
     chunk_count: int
     selected_chunk_ids: tuple[int, ...]
     compacted: bool
+    router_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +89,7 @@ class LongDocMessageCompaction:
 
 
 def normalize_newlines(text: str) -> str:
-    return str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    return lexical_long_doc.normalize_newlines(text)
 
 
 def chunk_text_by_newline(
@@ -99,34 +99,15 @@ def chunk_text_by_newline(
     overlap_lines: int = DEFAULT_LONG_DOC_OVERLAP_LINES,
     split_long_lines: bool = True,
 ) -> list[TextChunk]:
-    if max_chars <= 0:
-        raise ValueError("max_chars must be positive")
-    if overlap_lines < 0:
-        raise ValueError("overlap_lines must be non-negative")
-
-    numbered_lines = _numbered_lines(normalize_newlines(text), max_chars=max_chars, split_long_lines=split_long_lines)
-    base = _base_chunks(numbered_lines, max_chars=max_chars)
-    chunks: list[TextChunk] = []
-    for chunk_id, (line_start, line_end, chunk_text) in enumerate(base):
-        emitted_text = chunk_text
-        effective_start = line_start
-        effective_overlap = 0
-        if chunk_id > 0 and overlap_lines:
-            prev_start, prev_end, prev_text = base[chunk_id - 1]
-            tail = prev_text.splitlines(keepends=True)[-overlap_lines:]
-            effective_start = max(prev_start, prev_end - len(tail) + 1)
-            emitted_text = "".join(tail) + chunk_text
-            effective_overlap = len(tail)
-        chunks.append(
-            TextChunk(
-                chunk_id=chunk_id,
-                text=emitted_text,
-                line_start=effective_start,
-                line_end=line_end,
-                overlap_lines=effective_overlap,
-            )
+    return [
+        _to_eval_text_chunk(chunk)
+        for chunk in lexical_long_doc.chunk_text(
+            text,
+            max_chars=max_chars,
+            overlap_lines=overlap_lines,
+            split_long_lines=split_long_lines,
         )
-    return chunks
+    ]
 
 
 def summarize_chunks(
@@ -278,19 +259,16 @@ def select_relevant_chunks(
     max_chunks: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS,
     max_chars: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS,
 ) -> list[SelectedEvidenceChunk]:
-    if not chunks or max_chunks <= 0 or max_chars <= 0:
-        return []
-    terms = _query_terms(query)
-    scored = [
-        SelectedEvidenceChunk(chunk=chunk, score=_chunk_score(chunk.text, terms, query))
-        for chunk in chunks
+    selected = lexical_long_doc.select_evidence_chunks(
+        chunks,
+        query,
+        max_chunks=max_chunks,
+        max_chars=max_chars,
+    )
+    return [
+        SelectedEvidenceChunk(chunk=_to_eval_text_chunk(item.chunk), score=item.score)
+        for item in selected
     ]
-    if terms or normalize_newlines(query).strip():
-        positive_scored = [item for item in scored if item.score > 0.0]
-        if not positive_scored:
-            return []
-        scored = positive_scored
-    return _take_evidence_chunks(scored, max_chunks=max_chunks, max_chars=max_chars)
 
 
 def select_relevant_chunks_model_parallel(
@@ -306,50 +284,23 @@ def select_relevant_chunks_model_parallel(
     progress_desc: str = "LongDocEvidence",
     prompt_seed: int | None = None,
 ) -> tuple[list[SelectedEvidenceChunk], str, str | None]:
-    from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
-
-    if not chunks or max_chunks <= 0 or max_chars <= 0:
-        return [], "model_parallel_empty", None
-    if engine is None or sampling is None:
-        fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
-        return fallback, "model_parallel_missing_engine_lexical_fallback", "missing engine/sampling"
-
-    prompts = [build_long_doc_evidence_router_prompt(chunk=chunk, query=query) for chunk in chunks]
-    try:
-        outputs = engine.generate(
-            prompts,
-            sampling=_long_doc_router_sampling(sampling, max_tokens=max_tokens),
-            batch_size=min(len(prompts), max(1, int(batch_size))),
-            progress_desc=progress_desc,
-            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
-            prompt_seeds=None if prompt_seed is None else [int(prompt_seed) + index for index in range(len(prompts))],
-            show_progress=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - compaction falls back to the deterministic selector.
-        fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
-        return fallback, "model_parallel_error_lexical_fallback", str(exc)
-
-    scored: list[SelectedEvidenceChunk] = []
-    parse_errors: list[str] = []
-    for chunk, output in zip(chunks, outputs, strict=False):
-        raw_text = str(getattr(output, "text", "") or "")
-        try:
-            relevant, score = parse_long_doc_evidence_router_response(raw_text)
-        except Exception as exc:  # noqa: BLE001 - one bad shard should not discard the whole message.
-            relevant = False
-            score = 0.0
-            parse_errors.append(f"chunk {chunk.chunk_id}: {exc}")
-        if relevant or score > 0.0:
-            scored.append(SelectedEvidenceChunk(chunk=chunk, score=max(float(score), 1.0 if relevant else 0.0)))
-
-    if scored:
-        return _take_evidence_chunks(scored, max_chunks=max_chunks, max_chars=max_chars), "model_parallel", (
-            "; ".join(parse_errors) if parse_errors else None
-        )
-
-    fallback = select_relevant_chunks(chunks, query, max_chunks=max_chunks, max_chars=max_chars)
-    reason = "model_parallel_empty_lexical_fallback" if fallback else "model_parallel_empty"
-    return fallback, reason, "; ".join(parse_errors) if parse_errors else None
+    selected, reason, error = lexical_long_doc.select_evidence_chunks_model_parallel(
+        [_to_plugin_text_chunk(chunk) for chunk in chunks],
+        query,
+        backend=engine,
+        sampling=sampling,
+        max_chunks=max_chunks,
+        max_chars=max_chars,
+        max_tokens=max_tokens,
+        batch_size=batch_size,
+        progress_desc=progress_desc,
+        prompt_seed=prompt_seed,
+    )
+    normalized_reason = reason.replace("missing_backend", "missing_engine")
+    return [
+        SelectedEvidenceChunk(chunk=_to_eval_text_chunk(item.chunk), score=item.score)
+        for item in selected
+    ], normalized_reason, error
 
 
 def _take_evidence_chunks(
@@ -377,60 +328,15 @@ def _take_evidence_chunks(
 
 
 def build_long_doc_evidence_router_prompt(*, chunk: TextChunk, query: str) -> str:
-    from src.eval.function_calling.rwkv_prompt import build_rwkv_json_call_prompt
-
-    system_prompt = normalize_newlines(
-        "\n".join(
-            [
-                "You decide whether one document chunk contains evidence needed for the next agent step.",
-                "Prefer recall over precision. Mark relevant when the chunk may help choose a tool, fill arguments, or follow policy.",
-                "Return exactly one JSON object with this shape:",
-                '{"relevant":true,"score":3,"reason":"short"}',
-                "Use score 0 for irrelevant, 1 for weakly relevant, 2 for useful, 3 for critical.",
-            ]
-        )
-    )
-    user_text = normalize_newlines(
-        "\n".join(
-            [
-                "Current task/context:",
-                str(query or "").strip()[-1600:],
-                "",
-                f"Chunk {chunk.chunk_id} lines {chunk.line_start}-{chunk.line_end}:",
-                chunk.text.strip(),
-            ]
-        )
-    )
-    return build_rwkv_json_call_prompt(system_prompt, [{"role": "user", "content": user_text}], history_max_chars=4096)
+    return lexical_long_doc.build_long_doc_router_prompt(chunk=_to_plugin_text_chunk(chunk), query=query)
 
 
 def parse_long_doc_evidence_router_response(text: str) -> tuple[bool, float]:
-    from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
-
-    candidate = extract_json_call_value_text(str(text or ""))
-    payload = json.loads(candidate)
-    if not isinstance(payload, Mapping):
-        raise ValueError("long-doc router response must be a JSON object")
-    relevant_raw = payload.get("relevant", payload.get("is_relevant", payload.get("selected", False)))
-    if isinstance(relevant_raw, str):
-        relevant = relevant_raw.strip().lower() in {"true", "yes", "y", "1", "relevant", "selected"}
-    else:
-        relevant = bool(relevant_raw)
-    try:
-        score = float(payload.get("score", 1.0 if relevant else 0.0))
-    except (TypeError, ValueError):
-        score = 1.0 if relevant else 0.0
-    return relevant, max(0.0, min(score, 3.0))
+    return lexical_long_doc.parse_long_doc_router_response(text)
 
 
 def _long_doc_router_sampling(sampling: Any, *, max_tokens: int) -> Any:
-    clamp = getattr(sampling, "clamp", None)
-    if callable(clamp):
-        try:
-            return clamp(max(1, int(max_tokens)))
-        except Exception:
-            return sampling
-    return sampling
+    return clamp_router_sampling(sampling, max_tokens=max_tokens)
 
 
 def compact_long_text(
@@ -461,6 +367,20 @@ def compact_long_text(
             chunk_count=0,
             selected_chunk_ids=(),
             compacted=False,
+        )
+    if cfg.mode != "model_parallel":
+        result = lexical_long_doc.compact_text(
+            normalized,
+            query=query,
+            config=_lexical_long_doc_config(cfg),
+            label=label,
+        )
+        return LongDocCompactionResult(
+            text=result.text,
+            original_chars=result.original_chars,
+            chunk_count=result.chunk_count,
+            selected_chunk_ids=result.selected_chunk_ids,
+            compacted=result.compacted,
         )
     chunks = chunk_text_by_newline(
         normalized,
@@ -504,6 +424,7 @@ def compact_long_text(
         chunk_count=len(chunks),
         selected_chunk_ids=tuple(item.chunk.chunk_id for item in selected),
         compacted=True,
+        router_error=error,
     )
 
 
@@ -518,6 +439,17 @@ def compact_messages_for_long_context(
     prompt_seed: int | None = None,
 ) -> LongDocMessageCompaction:
     cfg = config or LongDocEvidenceConfig()
+    if cfg.mode != "model_parallel":
+        result = lexical_long_doc.compact_messages(
+            messages,
+            query=query,
+            config=_lexical_long_doc_config(cfg),
+        )
+        return LongDocMessageCompaction(
+            messages=result.messages,
+            compacted_message_count=result.compacted_message_count,
+            selected_chunk_ids=result.selected_chunk_ids,
+        )
     normalized = [
         {
             "role": str(message.get("role") or "user").strip().lower() or "user",
@@ -563,21 +495,11 @@ def infer_query_from_messages(
     max_chars: int = 1200,
     skip_longer_than: int | None = None,
 ) -> str:
-    max_query_chars = max(1, int(max_chars))
-    length_cap = None if skip_longer_than is None else max(1, int(skip_longer_than))
-    for message in reversed(messages):
-        if str(message.get("role") or "").strip().lower() != "user":
-            continue
-        content = str(message.get("content") or "").strip()
-        if length_cap is not None and len(content) >= length_cap:
-            continue
-        if content:
-            return content[-max_query_chars:]
-    for message in reversed(messages):
-        content = str(message.get("content") or "").strip()
-        if content:
-            return content[-max_query_chars:]
-    return ""
+    return lexical_long_doc.infer_query_from_messages(
+        messages,
+        max_chars=max_chars,
+        skip_longer_than=skip_longer_than,
+    )
 
 
 def render_evidence_window(
@@ -594,8 +516,6 @@ def render_evidence_window(
         f"[Long document compacted: label={label}; original_chars={int(original_chars)}; "
         f"chunks={int(chunk_count)}; selected_chunks={len(selected)}; mode={mode}; reason={reason}]"
     )
-    if error:
-        header += f"\n[Long document router note: {str(error)[:500]}]"
     if not selected:
         return header + "\n[No evidence chunk selected.]"
     parts = [header]
@@ -650,47 +570,73 @@ def write_jsonl(path: str | Path, rows: Iterable[Mapping[str, Any]]) -> None:
             handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
 
 
-def _numbered_lines(text: str, *, max_chars: int, split_long_lines: bool) -> list[tuple[int, str]]:
-    lines: list[tuple[int, str]] = []
-    for line_no, line in enumerate(text.splitlines(keepends=True), start=1):
-        if len(line) <= max_chars:
-            lines.append((line_no, line))
-            continue
-        if not split_long_lines:
-            raise ValueError(f"line {line_no} has {len(line)} chars > max_chars={max_chars}")
-        for start in range(0, len(line), max_chars):
-            lines.append((line_no, line[start : start + max_chars]))
-    return lines
-
-
-def _base_chunks(lines: Sequence[tuple[int, str]], *, max_chars: int) -> list[tuple[int, int, str]]:
-    chunks: list[tuple[int, int, str]] = []
-    current: list[tuple[int, str]] = []
-    current_len = 0
-    for line_no, line in lines:
-        line_len = len(line)
-        if line_len > max_chars:
-            raise ValueError(f"line {line_no} has {line_len} chars > max_chars={max_chars}")
-        if current and current_len + line_len > max_chars:
-            chunks.append((current[0][0], current[-1][0], "".join(item[1] for item in current)))
-            current = []
-            current_len = 0
-        current.append((line_no, line))
-        current_len += line_len
-    if current:
-        chunks.append((current[0][0], current[-1][0], "".join(item[1] for item in current)))
-    return chunks
-
-
 def _coerce_rule_terms(value: Any) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"positive_rule terms must be a list: {value!r}")
     return tuple(str(item) for item in value)
 
 
-def _chunk_payload(chunk: TextChunk | Mapping[str, Any]) -> dict[str, Any]:
+def _lexical_long_doc_config(config: LongDocEvidenceConfig) -> lexical_long_doc.LongDocConfig:
+    return lexical_long_doc.LongDocConfig(
+        enabled=bool(config.enabled),
+        max_chunk_chars=max(1, int(config.max_chunk_chars)),
+        overlap_lines=max(0, int(config.overlap_lines)),
+        min_long_text_chars=max(1, int(config.min_long_text_chars)),
+        max_evidence_chunks=max(1, int(config.max_evidence_chunks)),
+        max_evidence_chars=max(1, int(config.max_evidence_chars)),
+    )
+
+
+def _to_eval_text_chunk(chunk: Any) -> TextChunk:
+    if isinstance(chunk, TextChunk):
+        return chunk
+    return TextChunk(
+        chunk_id=int(getattr(chunk, "chunk_id")),
+        text=str(getattr(chunk, "text")),
+        line_start=int(getattr(chunk, "line_start")),
+        line_end=int(getattr(chunk, "line_end")),
+        overlap_lines=int(getattr(chunk, "overlap_lines", 0)),
+    )
+
+
+def _to_plugin_text_chunk(chunk: Any) -> lexical_long_doc.TextChunk:
+    if isinstance(chunk, lexical_long_doc.TextChunk):
+        return chunk
+    if isinstance(chunk, TextChunk):
+        return lexical_long_doc.TextChunk(
+            chunk_id=int(chunk.chunk_id),
+            text=chunk.text,
+            line_start=int(chunk.line_start),
+            line_end=int(chunk.line_end),
+            overlap_lines=int(chunk.overlap_lines),
+        )
+    if isinstance(chunk, Mapping):
+        return lexical_long_doc.TextChunk(
+            chunk_id=int(chunk.get("chunk_id", 0)),
+            text=str(chunk.get("text", "")),
+            line_start=int(chunk.get("line_start", 0)),
+            line_end=int(chunk.get("line_end", 0)),
+            overlap_lines=int(chunk.get("overlap_lines", 0)),
+        )
+    return lexical_long_doc.TextChunk(
+        chunk_id=int(getattr(chunk, "chunk_id")),
+        text=str(getattr(chunk, "text")),
+        line_start=int(getattr(chunk, "line_start")),
+        line_end=int(getattr(chunk, "line_end")),
+        overlap_lines=int(getattr(chunk, "overlap_lines", 0)),
+    )
+
+
+def _chunk_payload(chunk: Any) -> dict[str, Any]:
     if isinstance(chunk, TextChunk):
         return chunk.to_json()
+    to_dict = getattr(chunk, "to_dict", None)
+    if callable(to_dict):
+        payload = dict(to_dict())
+        payload.setdefault("char_count", len(str(payload.get("text", ""))))
+        return payload
+    if all(hasattr(chunk, field) for field in ("chunk_id", "text", "line_start", "line_end")):
+        return _to_eval_text_chunk(chunk).to_json()
     payload = dict(chunk)
     payload.setdefault("char_count", len(str(payload.get("text", ""))))
     return payload
@@ -704,33 +650,6 @@ def _count_summary(values: Mapping[str, int]) -> dict[str, Any]:
         "avg": (sum(counts) / len(counts)) if counts else 0,
         "by_task": dict(values),
     }
-
-
-def _query_terms(query: str) -> tuple[str, ...]:
-    lowered = str(query or "").lower()
-    terms = set(_LATIN_WORD_RE.findall(lowered))
-    for span in _CJK_SPAN_RE.findall(str(query or "")):
-        if len(span) <= 8:
-            terms.add(span)
-        for size in (2, 3, 4):
-            if len(span) < size:
-                continue
-            for index in range(0, len(span) - size + 1):
-                terms.add(span[index : index + size])
-    return tuple(sorted(terms, key=lambda item: (-len(item), item)))
-
-
-def _chunk_score(text: str, terms: Sequence[str], query: str) -> float:
-    lowered = str(text or "").lower()
-    score = 0.0
-    for term in terms:
-        hits = lowered.count(term.lower())
-        if hits:
-            score += min(hits, 3) * max(1.0, len(term) / 2.0)
-    query_text = normalize_newlines(query).strip().lower()
-    if query_text and len(query_text) <= 200 and query_text in lowered:
-        score += 100.0
-    return score
 
 
 def _strip_json_fence(text: str) -> str:

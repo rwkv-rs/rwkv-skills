@@ -17,8 +17,19 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.INSTRUCTION_FOLLOWING]] == [
         "instruction_following",
     ]
+    assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.CODING]] == [
+        "code_human_eval",
+        "code_mbpp",
+        "code_mbpp_fake_cot",
+        "code_mbpp_cot",
+        "code_livecodebench",
+        "code_swe_bench",
+    ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]] == [
         "function_browsecomp",
+        "function_complexfuncbench",
+        "function_longbench",
+        "function_longcodebench",
         "function_mcp_bench",
         "function_api_bank",
         "function_agentbench",

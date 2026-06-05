@@ -60,6 +60,20 @@ def normalize_local_device(device: str) -> str:
     return str(parsed)
 
 
+def _safe_tqdm_update(progress: tqdm, amount: int = 1) -> None:
+    try:
+        progress.update(amount)
+    except (AttributeError, ValueError):
+        return
+
+
+def _safe_tqdm_close(progress: tqdm) -> None:
+    try:
+        progress.close()
+    except (AttributeError, ValueError):
+        return
+
+
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path", help="Path to RWKV weights (.pth)")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
@@ -304,28 +318,30 @@ class RemoteInferenceBackend:
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(
-                    self._generate_one,
-                    prompt_index,
-                    prompt,
-                    effective_sampling,
-                    None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
-                    None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index],
-                    prefill_chunk_size,
-                ): prompt_index
-                for prompt_index, prompt in enumerate(prompts)
-            }
-            for future in concurrent.futures.as_completed(future_map):
-                output = future.result()
-                outputs[output.prompt_index] = output
-                if on_token is not None and output.text:
-                    on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
-                if on_complete is not None and not probe_only:
-                    on_complete(output)
-                progress.update(1)
-        progress.close()
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._generate_one,
+                        prompt_index,
+                        prompt,
+                        effective_sampling,
+                        None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
+                        None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index],
+                        prefill_chunk_size,
+                    ): prompt_index
+                    for prompt_index, prompt in enumerate(prompts)
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    output = future.result()
+                    outputs[output.prompt_index] = output
+                    if on_token is not None and output.text:
+                        on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
+                    if on_complete is not None and not probe_only:
+                        on_complete(output)
+                    _safe_tqdm_update(progress, 1)
+        finally:
+            _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
 
     def score_choice_tokens(

@@ -431,8 +431,18 @@ def resolve_run_config(config: RunConfig) -> ResolvedRun:
         raise ValueError(f"unsupported run.mode: {config.run.mode!r}; expected 'eval' or 'param_search'")
     benchmark = _resolve_benchmark(config.dataset)
     dataset_slug = canonical_slug(make_dataset_slug(benchmark.dataset, config.dataset.split or benchmark.default_split))
-    dataset_path = _resolve_dataset_path(config.dataset, dataset_slug=dataset_slug)
     runner = _resolve_runner_for_config(config, benchmark)
+    run_context = RunContext(
+        job_name=runner.name,
+        run_mode=config.run.run_mode,
+        run_id=config.run.id,
+    )
+    env = run_context.env_overrides(dataset_slug=dataset_slug)
+    if config.runner.result_store:
+        env = dict(env)
+        env["RWKV_EVAL_STORE"] = config.runner.result_store
+    with _patched_environ(env):
+        dataset_path = _resolve_dataset_path(config.dataset, dataset_slug=dataset_slug)
     argv = _build_runner_argv(config, runner=runner, benchmark=benchmark, dataset_path=dataset_path)
     benchmark_name, benchmark_split = split_benchmark_and_split(dataset_slug)
     task_spec = TaskSpec(
@@ -446,15 +456,6 @@ def resolve_run_config(config: RunConfig) -> ResolvedRun:
         model_path=config.model.path,
         config_path=config.source_path,
     )
-    run_context = RunContext(
-        job_name=runner.name,
-        run_mode=config.run.run_mode,
-        run_id=config.run.id,
-    )
-    env = run_context.env_overrides(dataset_slug=dataset_slug)
-    if config.runner.result_store:
-        env = dict(env)
-        env["RWKV_EVAL_STORE"] = config.runner.result_store
     return ResolvedRun(
         config=config,
         benchmark=benchmark,
@@ -607,17 +608,23 @@ def _resolve_model_name(model: ModelSection) -> str:
 
 
 def _function_calling_benchmark_kind(job_name: str) -> str:
-    if job_name == "function_browsecomp":
-        return "browsecomp"
-    if job_name == "function_mcp_bench":
-        return "mcp_bench"
-    if job_name == "function_bfcl_v3":
-        return "bfcl_v3"
-    if job_name == "function_tau3_bench":
-        return "tau3_bench"
-    if job_name == "function_tau2_bench":
-        return "tau2_bench"
-    return "tau_bench"
+    mapping = {
+        "function_browsecomp": "browsecomp",
+        "function_longbench": "longbench",
+        "function_longcodebench": "longcodebench",
+        "function_mcp_bench": "mcp_bench",
+        "function_api_bank": "api_bank",
+        "function_agentbench": "agentbench",
+        "function_bfcl_ast": "bfcl_ast",
+        "function_bfcl_exec": "bfcl_exec",
+        "function_bfcl_v3": "bfcl_v3",
+        "function_toolalpaca": "toolalpaca",
+        "function_complexfuncbench": "complexfuncbench",
+        "function_tau3_bench": "tau3_bench",
+        "function_tau2_bench": "tau2_bench",
+        "function_tau_bench": "tau_bench",
+    }
+    return mapping.get(job_name, "tau_bench")
 
 
 def _coding_benchmark_kind(job_name: str) -> str:
@@ -625,6 +632,8 @@ def _coding_benchmark_kind(job_name: str) -> str:
         return "human_eval"
     if job_name == "code_livecodebench":
         return "livecodebench"
+    if job_name == "code_swe_bench":
+        return "swe_bench"
     return "mbpp"
 
 
@@ -655,8 +664,8 @@ def _build_runner_argv(
         _append_flag(argv, "--target-token-format", runner_cfg.target_token_format)
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
     elif group is RunnerGroup.MATHS:
-        _append_flag(argv, "--cot-max-tokens", runner_cfg.cot_max_tokens)
-        _append_flag(argv, "--final-max-tokens", runner_cfg.final_max_tokens)
+        math_max_tokens = runner_cfg.max_tokens if runner_cfg.max_tokens is not None else runner_cfg.cot_max_tokens
+        _append_flag(argv, "--max-tokens", math_max_tokens)
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
         _append_flag(argv, "--db-drain-every", runner_cfg.db_drain_every)
         _append_flag(argv, "--db-close-timeout-s", runner_cfg.db_close_timeout_s)
@@ -673,6 +682,14 @@ def _build_runner_argv(
         _append_flag(argv, "--eval-timeout", runner_cfg.eval_timeout)
         _append_flag(argv, "--eval-workers", runner_cfg.eval_workers)
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
+        _append_flag(argv, "--long-doc-mode", runner_cfg.long_doc_mode)
+        _append_flag(argv, "--long-doc-max-chars", runner_cfg.long_doc_max_chars)
+        _append_flag(argv, "--long-doc-overlap-lines", runner_cfg.long_doc_overlap_lines)
+        _append_flag(argv, "--long-doc-min-chars", runner_cfg.long_doc_min_chars)
+        _append_flag(argv, "--long-doc-max-evidence-chunks", runner_cfg.long_doc_max_evidence_chunks)
+        _append_flag(argv, "--long-doc-max-evidence-chars", runner_cfg.long_doc_max_evidence_chars)
+        _append_flag(argv, "--long-doc-model-max-tokens", runner_cfg.long_doc_model_max_tokens)
+        _append_flag(argv, "--long-doc-model-parallel-batch-size", runner_cfg.long_doc_model_parallel_batch_size)
     elif group is RunnerGroup.INSTRUCTION_FOLLOWING:
         if runner_cfg.enable_think:
             argv.append("--enable-think")
@@ -715,6 +732,8 @@ def _build_runner_argv(
         _append_repeatable(argv, "--avg-k", runner_cfg.avg_ks)
         if runner.name == "function_browsecomp":
             _append_flag(argv, "--cot-max-tokens", runner_cfg.cot_max_tokens)
+            _append_flag(argv, "--answer-max-tokens", runner_cfg.answer_max_tokens)
+        elif runner.name in {"function_longbench", "function_longcodebench"}:
             _append_flag(argv, "--answer-max-tokens", runner_cfg.answer_max_tokens)
         elif runner.name == "function_mcp_bench":
             _append_flag(argv, "--planning-max-tokens", runner_cfg.planning_max_tokens)

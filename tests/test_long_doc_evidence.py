@@ -2,15 +2,21 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from src.infer.sampling import SamplingConfig
 from src.eval.long_doc_evidence import (
     LongDocEvidenceConfig,
     TextChunk,
     build_evidence_tasks,
+    build_long_doc_evidence_router_prompt,
     chunk_text_by_newline,
     compact_long_text,
     compact_messages_for_long_context,
     infer_query_from_messages,
     parse_answer_or_null_response,
+    parse_long_doc_evidence_router_response,
+    _long_doc_router_sampling,
 )
 
 
@@ -153,6 +159,85 @@ def test_model_parallel_long_doc_compaction_uses_model_chunk_judgment() -> None:
     assert "mode=model_parallel" in result.text
     assert "special-policy ALPHA7 requires supervisor approval" in result.text
     assert "noise policy row 000" not in result.text
+
+
+def test_model_parallel_router_parse_errors_do_not_enter_prompt_text() -> None:
+    class _Engine:
+        def generate(self, prompts, **kwargs):  # noqa: ANN001, ARG002
+            return [
+                SimpleNamespace(
+                    text='{"relevant":true,"score":3}' if "case-77 answer green" in prompt else "not json",
+                    finish_reason="stop",
+                )
+                for prompt in prompts
+            ]
+
+    text = "\n".join(
+        [f"noise row {index:03d}" for index in range(20)]
+        + ["case-77 answer green"]
+        + [f"archive row {index:03d}" for index in range(20)]
+    )
+
+    result = compact_long_text(
+        text,
+        query="What is the answer for case-77?",
+        config=LongDocEvidenceConfig(
+            mode="model_parallel",
+            max_chunk_chars=120,
+            overlap_lines=1,
+            min_long_text_chars=200,
+            max_evidence_chunks=1,
+            max_evidence_chars=200,
+            model_parallel_batch_size=8,
+        ),
+        engine=_Engine(),
+        sampling=SimpleNamespace(),
+    )
+
+    assert result.router_error is not None
+    assert "not json" not in result.text
+    assert "Long document router note" not in result.text
+    assert "case-77 answer green" in result.text
+
+
+def test_long_doc_router_prompt_uses_compact_schema_without_reason_field() -> None:
+    prompt = build_long_doc_evidence_router_prompt(
+        chunk=TextChunk(chunk_id=2, text="case-77 answer green", line_start=4, line_end=4),
+        query="What is the answer for case-77?",
+    )
+
+    assert '{"relevant":true,"score":3}' in prompt
+    assert '"reason":"short"' not in prompt
+    assert "Do not include reason" in prompt
+
+
+def test_parse_long_doc_router_recovers_truncated_reason_payload() -> None:
+    response = (
+        '{\n'
+        '  "relevant": true,\n'
+        '  "score": 2,\n'
+        '  "reason": "The chunk is useful but the model keeps explaining'
+    )
+
+    assert parse_long_doc_evidence_router_response(response) == (True, 2.0)
+
+
+def test_parse_long_doc_router_rejects_partial_payload_without_score_value() -> None:
+    with pytest.raises(ValueError):
+        parse_long_doc_evidence_router_response('{"relevant":false,"score":')
+
+
+def test_long_doc_router_sampling_uses_deterministic_router_settings() -> None:
+    sampling = SamplingConfig(max_generate_tokens=256, temperature=0.3, top_k=500, top_p=0.4)
+
+    routed = _long_doc_router_sampling(sampling, max_tokens=24)
+
+    assert routed.max_generate_tokens == 24
+    assert routed.temperature == 0.001
+    assert routed.top_k == 1
+    assert routed.top_p == 1.0
+    assert routed.alpha_presence == 0.0
+    assert routed.alpha_frequency == 0.0
 
 
 def test_parse_answer_or_null_response_accepts_json_fence() -> None:

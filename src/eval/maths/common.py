@@ -69,6 +69,23 @@ def resolve_sampling_pair(
     return cot_sampling.clamp(cot_max_tokens), final_sampling.clamp(final_max_tokens)
 
 
+def resolve_generation_sampling(
+    slug: str,
+    model_name: str,
+    *,
+    max_tokens: int | None = None,
+):
+    generation_sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        stage="cot",
+        fallback_templates="free_response_cot_default",
+    )
+    if generation_sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+    return generation_sampling.clamp(max_tokens)
+
+
 def filter_avg_metrics(metric_map: dict[str, float] | None, ks: Iterable[NumericK]) -> dict[str, float]:
     return filter_metrics_by_k(metric_map, tuple(ks), "avg@")
 
@@ -89,7 +106,7 @@ def build_llm_judge(
     judge_model: str | None = None,
     judge_api_key: str | None = None,
     judge_base_url: str | None = None,
-    judge_max_workers: int = 32,
+    judge_max_workers: int | None = None,
     judge_max_tokens: int | None = None,
     required: bool = True,
 ):
@@ -114,6 +131,14 @@ def build_llm_judge(
         or os.environ.get("OPENAI_BASE_URL")
         or os.environ.get("API_BASE")
     )
+    resolved_max_workers = (
+        judge_max_workers
+        or int(
+            os.environ.get("JUDGE_MAX_WORKERS")
+            or os.environ.get("LLM_JUDGE_MAX_WORKERS")
+            or "16"
+        )
+    )
 
     if not resolved_model or not resolved_api_key:
         if required:
@@ -128,7 +153,7 @@ def build_llm_judge(
             api_key=resolved_api_key,
             model=resolved_model,
             base_url=resolved_base_url,
-            max_workers=judge_max_workers,
+            max_workers=resolved_max_workers,
             max_completion_tokens=judge_max_tokens,
         )
     )
@@ -143,5 +168,6 @@ __all__ = [
     "default_job_name",
     "filter_avg_metrics",
     "filter_pass_metrics",
+    "resolve_generation_sampling",
     "resolve_sampling_pair",
 ]

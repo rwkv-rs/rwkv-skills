@@ -508,3 +508,31 @@ def test_prepare_dataset_materializes_livecodebench_spec(tmp_path: Path, monkeyp
             "source_dataset": "livecodebench/code_generation_lite",
         },
     ]
+
+
+def test_prepare_dataset_materializes_swe_bench_lite_spec(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.code_generation.swe_bench._load_swebench_rows",
+        lambda _dataset_name, _split: [
+            {
+                "instance_id": "sympy__sympy-20590",
+                "repo": "sympy/sympy",
+                "base_commit": "abc123",
+                "problem_statement": "Fix the parser regression.",
+                "hints_text": "Look at sympify.",
+                "patch": "diff --git a/sympy/core/sympify.py b/sympy/core/sympify.py\n",
+                "test_patch": "diff --git a/test.py b/test.py\n",
+                "FAIL_TO_PASS": ["sympy/core/tests/test_sympify.py::test_case"],
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("swe_bench_lite", output_root, "test")
+
+    assert paths == [output_root / "swe_bench_lite" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "sympy__sympy-20590"
+    assert row["instance_id"] == "sympy__sympy-20590"
+    assert row["prompt"] == "Fix the parser regression."
+    assert row["harness_dataset_name"] == "princeton-nlp/SWE-bench_Lite"

@@ -15,6 +15,7 @@ dependencies = [
     "lightning>=2.5.1.post0",
     "loguru>=0.7.3",
     "matplotlib>=3.10.3",
+    "math-verify[antlr4_13_2]>=0.8.0",
     "ninja>=1.11.1.4",
     "numpy>=2.2,<2.3",
     "optuna>=4.5.0",
@@ -76,8 +77,10 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
+packages = ["src", "lexical_chunk_router"]
 include = [
+    "lexical_chunk_router/README.md",
+    "lexical_chunk_router/py.typed",
     "src/space/styles/*.css",
     "src/space/assets/**/*",
     "src/infer/rwkv7/rwkv_vocab_v20230424.txt",

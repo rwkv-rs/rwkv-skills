@@ -13,14 +13,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Sequence
 
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.evaluating import run_checker_for_task
 from src.eval.env_config import load_env_file
-from src.eval.maths.common import build_llm_judge, count_free_answer_records, filter_avg_metrics, filter_pass_metrics
-from src.eval.maths.pipeline import FreeResponsePipeline
+from src.eval.maths.common import build_llm_judge, count_free_answer_records
+from src.eval.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
 from src.eval.metrics.free_response import (
-    compute_avg_at_k,
-    compute_pass_at_k,
+    attach_strategy_task_ids,
+    build_grouped_metrics_payload,
     evaluate_free_response,
 )
 from src.eval.param_search.cot_grid import grid_size, iter_cot_sampling_grid
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
-DEFAULT_PASS_K = (1,)
+DEFAULT_PASS_K: tuple[int, ...] = ()
 DEFAULT_AVG_K: tuple[int, ...] = ()
 
 
@@ -76,8 +76,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
-    parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
-    parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
+    parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
+    parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
+    parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--probe-only",
@@ -88,7 +89,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--pass-k",
         type=int,
         action="append",
-        help="pass@k values to generate for and compute (default: 1)",
+        help="pass@k values to generate for and compute (default: none)",
     )
     parser.add_argument(
         "--avg-k",
@@ -101,6 +102,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-base-url",
         help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
+    )
+    parser.add_argument(
+        "--judge-max-workers",
+        type=int,
+        help="Max concurrent workers for LLM judge (env: JUDGE_MAX_WORKERS / LLM_JUDGE_MAX_WORKERS)",
+    )
+    parser.add_argument(
+        "--judge-max-tokens",
+        type=int,
+        help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
     return parser.parse_args(argv)
 
@@ -129,28 +140,37 @@ def main(
     samples_per_task = max(_max_k(pass_k), _max_k(avg_k), 1)
     expected_count = count_free_answer_records(dataset_path, args.max_samples) * samples_per_task
 
-    cot_sampling = resolve_sampling_config(
+    generation_sampling = resolve_sampling_config(
         slug,
         model_name,
         stage="cot",
         fallback_templates="free_response_cot_default",
     )
+    if generation_sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+    generation_sampling = generation_sampling.clamp(args.max_tokens or args.cot_max_tokens)
     final_sampling = resolve_sampling_config(
         slug,
         model_name,
         stage="final",
         fallback_templates="free_response_final_default",
     )
-    if cot_sampling is None or final_sampling is None:
-        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
-    cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
+    if final_sampling is None:
+        raise ValueError(f"缺少 final 采样配置: {slug} ({model_name})")
     final_sampling = final_sampling.clamp(args.final_max_tokens)
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    final_answer_template = (
+        final_config.final_prompt_template
+        if final_config is not None and final_config.final_prompt_template
+        else DEFAULT_FINAL_PROMPT
+    )
 
     if args.probe_only:
         batch_size = max(1, args.batch_size)
         _ = pipeline.run(
             dataset_path=str(dataset_path),
-            cot_sampling=cot_sampling,
+            generation_sampling=generation_sampling,
+            final_answer_template=final_answer_template,
             final_sampling=final_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
@@ -166,6 +186,8 @@ def main(
         judge_model=args.judge_model,
         judge_api_key=args.judge_api_key,
         judge_base_url=args.judge_base_url,
+        judge_max_workers=args.judge_max_workers,
+        judge_max_tokens=args.judge_max_tokens,
         required=False,
     )
 
@@ -179,10 +201,10 @@ def main(
 
     job_name = run_context.job_name if run_context is not None else "param_search_free_response_judge"
 
-    for trial_idx, trial_cot, params in iter_cot_sampling_grid(cot_sampling):
+    for trial_idx, trial_generation, params in iter_cot_sampling_grid(generation_sampling):
         print(f"🔍 trial {trial_idx}: {slug}")
         sampling_payload = {
-            "cot": sampling_config_to_dict(trial_cot),
+            "generation": sampling_config_to_dict(trial_generation),
             "final": sampling_config_to_dict(final_sampling),
         }
         task_id = db_service.get_or_create_task(
@@ -204,7 +226,8 @@ def main(
         try:
             result = pipeline.run(
                 dataset_path=str(dataset_path),
-                cot_sampling=trial_cot,
+                generation_sampling=trial_generation,
+                final_answer_template=final_answer_template,
                 final_sampling=final_sampling,
                 batch_size=max(1, args.batch_size),
                 sample_limit=args.max_samples,
@@ -227,31 +250,30 @@ def main(
             dataset_path=str(dataset_path),
             judge=judge,
         )
-        pass_metrics_all = compute_pass_at_k(evaluation.rows, pass_k)
-        avg_metrics_all = compute_avg_at_k(evaluation.rows, avg_k)
-        metrics_payload: dict[str, object] = {
-            "exact_accuracy": float(evaluation.exact_accuracy),
-            "judge_accuracy": float(evaluation.judge_accuracy) if evaluation.judge_accuracy is not None else None,
-        }
-        pass_payload = filter_pass_metrics(pass_metrics_all, pass_k) or (pass_metrics_all or {})
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = filter_avg_metrics(avg_metrics_all, avg_k) or (avg_metrics_all or {})
-        if avg_payload:
-            metrics_payload.update(avg_payload)
+        strategy_task_ids = db_service.ingest_eval_payload_groups(
+            task_id=task_id,
+            completion_payloads=completions_payloads,
+            payloads_by_group=evaluation.payloads_by_group,
+            primary_group=evaluation.primary_group,
+        )
+        metrics_payload, metric_details = build_grouped_metrics_payload(
+            evaluation,
+            pass_k=pass_k,
+            avg_k=avg_k,
+            report_pass_k=pass_k,
+            report_avg_k=avg_k,
+        )
+        attach_strategy_task_ids(metrics_payload, strategy_task_ids)
 
         task_details: dict[str, object] = {
             "param_search_trial": {
                 "trial": int(trial_idx),
                 "params": params,
-                "cot_sampling": _sampling_config_to_dict(trial_cot),
+                "generation_sampling": _sampling_config_to_dict(trial_generation),
                 "final_sampling": _sampling_config_to_dict(final_sampling),
             },
         }
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            task_details["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            task_details["avg_curve"] = avg_metrics_all
+        task_details.update(metric_details)
 
         payload = make_score_payload(
             slug,
@@ -263,7 +285,6 @@ def main(
             task="free_response_judge",
             task_details=task_details,
         )
-        db_service.ingest_eval_payloads(payloads=evaluation.payloads, task_id=task_id)
         run_checker_for_task(service=db_service, task_id=task_id, model_name=model_name)
         db_service.record_score_payload(
             payload=payload,

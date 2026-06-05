@@ -15,9 +15,11 @@ from src.eval.agent_bench.deps import (
 )
 
 ROOT = Path(__file__).resolve().parent
+REPO_ROOT = ROOT.parents[2]
 TAU_V1_VENDOR_ROOT = ROOT / "data" / "tau_v1"
 TAU_V2_VENDOR_ROOT = ROOT / "data" / "tau_v2"
 TAU_V2_DATA_ROOT = TAU_V2_VENDOR_ROOT / "data"
+TAU_V2_REFERENCE_ROOT = REPO_ROOT / "references" / "tau2-bench"
 
 
 @dataclass(slots=True)
@@ -59,6 +61,9 @@ def tau_v2_vendor_root() -> Path:
         if (src_root / "tau2").exists():
             return src_root
         return root
+    reference_src = TAU_V2_REFERENCE_ROOT / "src"
+    if (reference_src / "tau2").exists():
+        return reference_src
     return TAU_V2_VENDOR_ROOT
 
 
@@ -74,6 +79,9 @@ def tau_v2_data_root() -> Path:
     vendor_root = tau_v2_vendor_root()
     if vendor_root.name == "src":
         return vendor_root.parent / "data"
+    reference_data = TAU_V2_REFERENCE_ROOT / "data"
+    if (reference_data / "tau2").exists():
+        return reference_data
     return TAU_V2_DATA_ROOT
 
 

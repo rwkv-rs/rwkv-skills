@@ -19,6 +19,7 @@ _AGENT_BENCH_ROOT = Path(__file__).resolve().parent
 _TAU_V1_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v1"
 _TAU_V2_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v2"
 _TAU_V2_DATA_ROOT = _TAU_V2_VENDOR_ROOT / "data"
+_TAU_V2_REFERENCE_ROOT = _REPO_ROOT / "references" / "tau2-bench"
 
 # module name -> distribution name
 _MODULE_TO_DIST: dict[str, str] = {
@@ -240,6 +241,9 @@ def _tau_v2_vendor_root() -> Path:
         if (src_root / "tau2").exists():
             return src_root
         return root
+    reference_src = _TAU_V2_REFERENCE_ROOT / "src"
+    if (reference_src / "tau2").exists():
+        return reference_src
     return _TAU_V2_VENDOR_ROOT
 
 
@@ -255,6 +259,9 @@ def _tau_v2_data_root() -> Path:
     vendor_root = _tau_v2_vendor_root()
     if vendor_root.name == "src":
         return vendor_root.parent / "data"
+    reference_data = _TAU_V2_REFERENCE_ROOT / "data"
+    if (reference_data / "tau2").exists():
+        return reference_data
     return _TAU_V2_DATA_ROOT
 
 

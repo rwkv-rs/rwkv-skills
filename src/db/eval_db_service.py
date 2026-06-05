@@ -572,6 +572,70 @@ class EvalDbService:
             inserted += 1
         return inserted
 
+    def ingest_eval_payload_groups(
+        self,
+        *,
+        task_id: str,
+        completion_payloads: Sequence[dict[str, Any]],
+        payloads_by_group: Mapping[str, Sequence[dict[str, Any]]],
+        primary_group: str,
+    ) -> dict[str, int]:
+        """Persist strategy eval rows without adding a grouping column."""
+        parent_task_id = int(task_id)
+        task_ids: dict[str, int] = {}
+
+        primary_payloads = list(payloads_by_group.get(primary_group, ()))
+        self.ingest_eval_payloads(payloads=primary_payloads, task_id=str(parent_task_id))
+        task_ids[primary_group] = parent_task_id
+
+        for group, payloads in payloads_by_group.items():
+            if group == primary_group:
+                continue
+            strategy_task_id = self.create_eval_strategy_task(
+                parent_task_id=parent_task_id,
+                strategy=group,
+            )
+            self.insert_completion_payloads_batch(
+                payloads=completion_payloads,
+                task_id=str(strategy_task_id),
+            )
+            self.ingest_eval_payloads(payloads=list(payloads), task_id=str(strategy_task_id))
+            self.update_task_status(task_id=str(strategy_task_id), status="completed")
+            task_ids[group] = strategy_task_id
+
+        return task_ids
+
+    def create_eval_strategy_task(self, *, parent_task_id: int, strategy: str) -> int:
+        parent = self._repo.fetch_task(task_id=int(parent_task_id))
+        if parent is None:
+            raise RuntimeError(f"parent task not found: {parent_task_id}")
+
+        parent_desc = str(parent.get("desc") or "")
+        desc_parts = [
+            part
+            for part in (
+                parent_desc,
+                f"parent_task_id={parent_task_id}",
+                f"eval_strategy={strategy}",
+            )
+            if part
+        ]
+        sampling_config = parent.get("sampling_config")
+        return self._repo.insert_task(
+            config_path=parent.get("config_path"),
+            evaluator=f"{parent.get('evaluator') or 'eval'}:{strategy}",
+            is_param_search=True,
+            is_tmp=True,
+            created_at=self._now_cn(),
+            status="running",
+            git_hash=str(parent.get("git_hash") or _get_cached_git_sha()),
+            model_id=int(parent["model_id"]),
+            benchmark_id=int(parent["benchmark_id"]),
+            desc="; ".join(desc_parts),
+            sampling_config=sampling_config if isinstance(sampling_config, dict) else None,
+            log_path=str(parent.get("log_path") or ""),
+        )
+
     def record_score_payload(
         self,
         *,
@@ -704,6 +768,9 @@ class EvalDbService:
                         payload[f"prompt{idx}"] = stage.get("prompt")
                         payload[f"completion{idx}"] = stage.get("completion")
                         payload[f"stop_reason{idx}"] = stage.get("stop_reason")
+                stats = context.get("stats")
+                if isinstance(stats, dict):
+                    payload["stats"] = stats
                 agent_result = context.get("agent_result")
                 if isinstance(agent_result, dict):
                     payload["agent_result"] = agent_result
@@ -847,6 +914,9 @@ class EvalDbService:
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
+        stats = payload.get("stats")
+        if isinstance(stats, Mapping):
+            context["stats"] = dict(stats)
         for key in ("agent_result", "agent_info", "agent_trace", "task_id", "domain", "instruction"):
             value = payload.get(key)
             if value is not None:

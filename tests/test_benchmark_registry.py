@@ -71,8 +71,22 @@ def test_human_eval_family_is_no_cot_only() -> None:
     assert not supports_cot_mode("human_eval_plus_test", CoTMode.COT)
 
 
+def test_swe_bench_family_is_coding_cot_only() -> None:
+    metadata = resolve_benchmark_metadata("swe_bench_lite_test")
+
+    assert metadata.field is BenchmarkField.CODING
+    assert metadata.cot_modes == (CoTMode.COT,)
+    assert metadata.scheduler_jobs == ("code_swe_bench",)
+    assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
+    assert not supports_cot_mode("swe_bench_lite_test", CoTMode.NO_COT)
+
+
 def test_function_calling_benchmarks_are_cot_only() -> None:
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
+    complexfuncbench = resolve_benchmark_metadata("complexfuncbench_official_test")
+    longbench = resolve_benchmark_metadata("longbench_qa_test")
+    longbench_balanced = resolve_benchmark_metadata("longbench_qa_balanced_test")
+    longcodeqa = resolve_benchmark_metadata("longcodeqa_test")
     mcp_bench = resolve_benchmark_metadata("mcp_bench_test")
     apibank = resolve_benchmark_metadata("apibank_level1_test")
     agentbench = resolve_benchmark_metadata("agentbench_db_test")
@@ -81,6 +95,7 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     bfcl_exec = resolve_benchmark_metadata("bfcl_exec_simple_test")
     bfcl_v3 = resolve_benchmark_metadata("bfcl_v3_test")
     toolalpaca = resolve_benchmark_metadata("toolalpaca_eval_simulated_test")
+    complexfuncbench = resolve_benchmark_metadata("complexfuncbench_official_test")
     tau_bench = resolve_benchmark_metadata("tau_bench_airline_test")
     tau2_bench = resolve_benchmark_metadata("tau2_bench_retail_base")
     tau3_bench = resolve_benchmark_metadata("tau3_bench_banking_knowledge_base")
@@ -89,6 +104,18 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert browsecomp.field is BenchmarkField.FUNCTION_CALLING
     assert browsecomp.cot_modes == (CoTMode.COT,)
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)
+    assert complexfuncbench.field is BenchmarkField.FUNCTION_CALLING
+    assert complexfuncbench.cot_modes == (CoTMode.COT,)
+    assert complexfuncbench.scheduler_jobs == ("function_complexfuncbench",)
+    assert longbench.field is BenchmarkField.FUNCTION_CALLING
+    assert longbench.cot_modes == (CoTMode.COT,)
+    assert longbench.scheduler_jobs == ("function_longbench",)
+    assert longbench_balanced.field is BenchmarkField.FUNCTION_CALLING
+    assert longbench_balanced.cot_modes == (CoTMode.COT,)
+    assert longbench_balanced.scheduler_jobs == ("function_longbench",)
+    assert longcodeqa.field is BenchmarkField.FUNCTION_CALLING
+    assert longcodeqa.cot_modes == (CoTMode.COT,)
+    assert longcodeqa.scheduler_jobs == ("function_longcodebench",)
     assert mcp_bench.field is BenchmarkField.FUNCTION_CALLING
     assert mcp_bench.scheduler_jobs == ("function_mcp_bench",)
     assert apibank.field is BenchmarkField.FUNCTION_CALLING
@@ -107,6 +134,8 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert bfcl_v3.scheduler_jobs == ("function_bfcl_v3",)
     assert toolalpaca.field is BenchmarkField.FUNCTION_CALLING
     assert toolalpaca.scheduler_jobs == ("function_toolalpaca",)
+    assert complexfuncbench.field is BenchmarkField.FUNCTION_CALLING
+    assert complexfuncbench.scheduler_jobs == ("function_complexfuncbench",)
     assert tau_bench.field is BenchmarkField.FUNCTION_CALLING
     assert tau_bench.scheduler_jobs == ("function_tau_bench",)
     assert tau2_bench.default_split == "base"

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
+from src.eval.agent_bench import deps as tau_deps
+from src.eval.agent_bench import tasks as tau_tasks
 from src.eval.function_calling import (
     build_tau_system_prompt,
     parse_tool_call_or_final_answer,
@@ -9,9 +13,11 @@ from src.eval.function_calling import (
 )
 from src.eval.agent_bench.tau_official import (
     RWKVTauOfficialAgent,
+    _apply_tau_retail_progressive_tool_disclosure,
     _build_tau_tool_facts_message,
     build_tau_official_agent_system_prompt,
     configure_tau_nl_assertions_judge,
+    normalize_tau_official_task_payload,
     _parse_tau_agent_decision,
     _tau_litellm_model_name,
     _tau_llm_timeout_args,
@@ -26,6 +32,31 @@ from src.eval.function_calling.tool_router import ToolRoutingConfig
 from src.eval.agent_bench.tau_official import TauOfficialRuntime
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput, SamplingConfig
+
+
+def test_tau_v2_paths_prefer_repo_relative_reference_root(monkeypatch, tmp_path: Path) -> None:
+    reference_root = tmp_path / "references" / "tau2-bench"
+    (reference_root / "src" / "tau2").mkdir(parents=True)
+    (reference_root / "data" / "tau2" / "domains" / "banking_knowledge").mkdir(parents=True)
+    for name in (
+        "RWKV_TAU3_BENCH_ROOT",
+        "TAU3_BENCH_ROOT",
+        "RWKV_TAU2_BENCH_ROOT",
+        "TAU2_BENCH_ROOT",
+        "RWKV_TAU3_DATA_ROOT",
+        "TAU3_DATA_ROOT",
+        "RWKV_TAU2_DATA_ROOT",
+        "TAU2_DATA_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(tau_tasks, "TAU_V2_REFERENCE_ROOT", reference_root)
+    monkeypatch.setattr(tau_deps, "_TAU_V2_REFERENCE_ROOT", reference_root)
+
+    assert tau_tasks.tau_v2_vendor_root() == reference_root / "src"
+    assert tau_tasks.tau_v2_data_root() == reference_root / "data"
+    assert tau_tasks.tau_v3_source_available() is True
+    assert tau_deps._tau_v2_vendor_root() == reference_root / "src"
+    assert tau_deps._tau_v2_data_root() == reference_root / "data"
 
 
 def test_render_tau_user_prompt_prefers_ticket() -> None:
@@ -134,6 +165,15 @@ def test_tau_official_parser_recovers_runaway_id_after_arguments_object() -> Non
     assert arguments == {"reservation_id": "EHGLP3"}
 
 
+def test_tau_official_parser_keeps_name_when_arguments_string_is_truncated() -> None:
+    name, arguments = _parse_tau_agent_decision(
+        '```json\n{"name":"get_user_details","arguments":"{\\"user_id\\":\\"yusuf_rossi_962'
+    )
+
+    assert name == "get_user_details"
+    assert arguments == {}
+
+
 def test_tau_official_parser_accepts_top_level_content_as_arguments() -> None:
     name, arguments = _parse_tau_agent_decision(
         '{"name":"respond","content":"Done ###STOP###"}'
@@ -217,8 +257,533 @@ def test_build_tau_official_agent_system_prompt_uses_respond_and_real_tools() ->
     assert "Use a real tool call when you need information or need to change state." in prompt
     assert "Never invent wrapper or pseudo tools" in prompt
     assert "Do not invent ids/emails" in prompt
+    assert "detail tools need exact IDs" in prompt
     assert "include ###STOP###" in prompt
     assert "Follow the refund policy." in prompt
+
+
+def test_tau_official_agent_preserves_hash_prefixed_user_ids() -> None:
+    tools = [
+        {
+            "name": "get_order_details",
+            "description": "Get order details",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_order_details"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_order_details",
+        {"order_id": "W2378156"},
+        prompt_messages=[{"role": "user", "content": "I received order #W2378156 and need an exchange."}],
+    )
+
+    assert message.tool_calls[0].arguments == {"order_id": "#W2378156"}
+
+
+def test_tau_official_agent_does_not_add_hash_without_exact_user_token() -> None:
+    tools = [
+        {
+            "name": "get_order_details",
+            "description": "Get order details",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_order_details"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_order_details",
+        {"order_id": "W2378156"},
+        prompt_messages=[{"role": "user", "content": "I received order W2378156 and need an exchange."}],
+    )
+
+    assert message.tool_calls[0].arguments == {"order_id": "W2378156"}
+
+
+def test_tau_official_retail_repeated_read_guard_stops_exact_repeat_when_enabled() -> None:
+    tools = [
+        {
+            "name": "get_order_details",
+            "description": "Get order details",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        retail_repeated_read_guard=True,
+    )
+    agent._current_tool_names = {"get_order_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "I received order #W2378156 and need an exchange."},
+        {"role": "agent", "content": '{"name":"get_order_details","arguments":{"order_id":"#W2378156"}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"order_id": "#W2378156", "status": "delivered"}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_order_details",
+        {"order_id": "W2378156"},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_retail_repeated_read_guard_is_off_by_default() -> None:
+    tools = [
+        {
+            "name": "get_order_details",
+            "description": "Get order details",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_order_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "I received order #W2378156 and need an exchange."},
+        {"role": "agent", "content": '{"name":"get_order_details","arguments":{"order_id":"#W2378156"}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"order_id": "#W2378156", "status": "delivered"}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_order_details",
+        {"order_id": "W2378156"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls[0].name == "get_order_details"
+    assert message.tool_calls[0].arguments == {"order_id": "#W2378156"}
+
+
+def test_tau_official_retail_tool_use_guard_routes_product_name_to_list_tool() -> None:
+    tools = [
+        {
+            "name": "get_product_details",
+            "description": "Get product details",
+            "parameters": {
+                "type": "object",
+                "properties": {"product_id": {"type": "string"}},
+                "required": ["product_id"],
+            },
+        },
+        {
+            "name": "list_all_product_types",
+            "description": "List product types",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        retail_tool_use_guard=True,
+    )
+    agent._current_tool_names = {"get_product_details", "list_all_product_types"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_product_details",
+        {"product_id": "t-shirt"},
+        prompt_messages=[{"role": "user", "content": "How many t-shirt options are available?"}],
+    )
+
+    assert message.tool_calls[0].name == "list_all_product_types"
+    assert message.tool_calls[0].arguments == {}
+
+
+def test_tau_official_retail_tool_use_guard_repairs_invalid_order_id_from_user_hash_id() -> None:
+    tools = [
+        {
+            "name": "get_order_details",
+            "description": "Get order details",
+            "parameters": {
+                "type": "object",
+                "properties": {"order_id": {"type": "string"}},
+                "required": ["order_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        retail_tool_use_guard=True,
+    )
+    agent._current_tool_names = {"get_order_details"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_order_details",
+        {"order_id": "d_9513926"},
+        prompt_messages=[{"role": "user", "content": "I received order #W2378156 and need an exchange."}],
+    )
+
+    assert message.tool_calls[0].name == "get_order_details"
+    assert message.tool_calls[0].arguments == {"order_id": "#W2378156"}
+
+
+def test_tau_official_retail_tool_use_guard_routes_repeated_catalog_to_product_detail() -> None:
+    tools = [
+        {
+            "name": "list_all_product_types",
+            "description": "List product types",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "get_product_details",
+            "description": "Get product details",
+            "parameters": {
+                "type": "object",
+                "properties": {"product_id": {"type": "string"}},
+                "required": ["product_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        retail_tool_use_guard=True,
+    )
+    agent._current_tool_names = {"get_product_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "How many t-shirt options are available?"},
+        {"role": "agent", "content": '{"name":"list_all_product_types","arguments":{}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"T-Shirt": "9523456873"}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_product_types",
+        {},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls[0].name == "get_product_details"
+    assert message.tool_calls[0].arguments == {"product_id": "9523456873"}
+
+
+def test_tau_official_retail_tool_use_guard_prefers_earliest_catalog_match() -> None:
+    tools = [
+        {
+            "name": "list_all_product_types",
+            "description": "List product types",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "get_product_details",
+            "description": "Get product details",
+            "parameters": {
+                "type": "object",
+                "properties": {"product_id": {"type": "string"}},
+                "required": ["product_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow retail policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        retail_tool_use_guard=True,
+    )
+    agent._current_tool_names = {"get_product_details"}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "How many t-shirt options are available? I also need to return headphones.",
+        },
+        {"role": "agent", "content": '{"name":"list_all_product_types","arguments":{}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"Headphones": "6992792935", "T-Shirt": "9523456873"}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_product_types",
+        {},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls[0].name == "get_product_details"
+    assert message.tool_calls[0].arguments == {"product_id": "9523456873"}
+
+
+def test_tau_retail_progressive_disclosure_hides_order_lookup_for_product_question() -> None:
+    tools = [
+        {"name": "get_order_details", "description": "Get order details"},
+        {"name": "get_product_details", "description": "Get product details"},
+        {"name": "list_all_product_types", "description": "List product types"},
+        {"name": "transfer_to_human_agents", "description": "Transfer to human"},
+    ]
+
+    result = _apply_tau_retail_progressive_tool_disclosure(
+        tools,
+        selected_tools=tools,
+        prompt_messages=[{"role": "user", "content": "How many t-shirt options are available?"}],
+        max_tools=8,
+    )
+    names = [tool["name"] for tool in result.selected_tools]
+
+    assert result.trace["phase"] == "product_catalog_lookup"
+    assert "list_all_product_types" in names
+    assert "get_order_details" not in names
+    assert "get_product_details" not in names
+
+
+def test_tau_retail_progressive_disclosure_orders_lookup_before_catalog_when_order_id_present() -> None:
+    tools = [
+        {"name": "get_order_details", "description": "Get order details"},
+        {"name": "list_all_product_types", "description": "List product types"},
+        {"name": "transfer_to_human_agents", "description": "Transfer to human"},
+    ]
+
+    result = _apply_tau_retail_progressive_tool_disclosure(
+        tools,
+        selected_tools=tools,
+        prompt_messages=[{"role": "user", "content": "I received order #W2378156 and need an exchange."}],
+        max_tools=8,
+    )
+    names = [tool["name"] for tool in result.selected_tools]
+
+    assert result.trace["phase"] == "order_lookup"
+    assert "get_order_details" in names
+    assert "list_all_product_types" not in names
+
+
+def test_tau_retail_progressive_disclosure_exposes_product_details_after_catalog() -> None:
+    tools = [
+        {"name": "get_order_details", "description": "Get order details"},
+        {"name": "get_product_details", "description": "Get product details"},
+        {"name": "list_all_product_types", "description": "List product types"},
+        {"name": "transfer_to_human_agents", "description": "Transfer to human"},
+    ]
+    messages = [
+        {"role": "user", "content": "How many t-shirt options are available?"},
+        {"role": "agent", "content": '{"name":"list_all_product_types","arguments":{}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"T-shirt": "6086499569"}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    result = _apply_tau_retail_progressive_tool_disclosure(
+        tools,
+        selected_tools=tools,
+        prompt_messages=messages,
+        max_tools=8,
+    )
+    names = [tool["name"] for tool in result.selected_tools]
+
+    assert result.trace["phase"] == "product_detail_lookup"
+    assert "get_product_details" in names
+    assert "get_order_details" not in names
+
+
+def test_tau_retail_progressive_disclosure_uses_order_user_id_before_writes() -> None:
+    tools = [
+        {"name": "get_order_details", "description": "Get order details"},
+        {"name": "get_user_details", "description": "Get user details"},
+        {"name": "find_user_id_by_email", "description": "Find user by email"},
+        {"name": "exchange_delivered_order_items", "description": "Exchange delivered items"},
+        {"name": "transfer_to_human_agents", "description": "Transfer to human"},
+    ]
+    messages = [
+        {"role": "user", "content": "I received order #W2378156 and need to exchange the blue headphones."},
+        {"role": "agent", "content": '{"name":"get_order_details","arguments":{"order_id":"#W2378156"}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps(
+                        {
+                            "order_id": "#W2378156",
+                            "status": "delivered",
+                            "user_id": "yusuf_rossi_9626",
+                        }
+                    ),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    result = _apply_tau_retail_progressive_tool_disclosure(
+        tools,
+        selected_tools=tools,
+        prompt_messages=messages,
+        max_tools=8,
+    )
+    names = [tool["name"] for tool in result.selected_tools]
+
+    assert result.trace["phase"] == "order_known_user_lookup"
+    assert "get_user_details" in names
+    assert "find_user_id_by_email" not in names
+    assert "exchange_delivered_order_items" not in names
+
+
+def test_tau_retail_progressive_disclosure_exposes_exchange_after_order_and_user() -> None:
+    tools = [
+        {"name": "get_order_details", "description": "Get order details"},
+        {"name": "get_user_details", "description": "Get user details"},
+        {"name": "exchange_delivered_order_items", "description": "Exchange delivered items"},
+        {"name": "return_delivered_order_items", "description": "Return delivered items"},
+        {"name": "transfer_to_human_agents", "description": "Transfer to human"},
+    ]
+    messages = [
+        {"role": "user", "content": "I received order #W2378156 and need to exchange the blue headphones."},
+        {"role": "agent", "content": '{"name":"get_order_details","arguments":{"order_id":"#W2378156"}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps(
+                        {
+                            "order_id": "#W2378156",
+                            "status": "delivered",
+                            "user_id": "yusuf_rossi_9626",
+                            "items": [{"name": "Headphones", "product_id": "6992792935", "item_id": "4202497723"}],
+                        }
+                    ),
+                },
+                separators=(",", ":"),
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"yusuf_rossi_9626"}}'},
+        {
+            "role": "user",
+            "content": "Function output:\n"
+            + json.dumps(
+                {
+                    "requestor": "assistant",
+                    "ok": True,
+                    "output": json.dumps({"user_id": "yusuf_rossi_9626", "payment_methods": {"credit_card_9513926": {}}}),
+                },
+                separators=(",", ":"),
+            ),
+        },
+    ]
+
+    result = _apply_tau_retail_progressive_tool_disclosure(
+        tools,
+        selected_tools=tools,
+        prompt_messages=messages,
+        max_tools=8,
+    )
+    names = [tool["name"] for tool in result.selected_tools]
+
+    assert result.trace["phase"] == "action_or_detail"
+    assert "exchange_delivered_order_items" in names
+    assert "return_delivered_order_items" not in names
+    assert "get_order_details" not in names
 
 
 def test_tau_tool_facts_message_extracts_airline_reservation_lists_and_payments() -> None:
@@ -238,6 +803,44 @@ def test_tau_tool_facts_message_extracts_airline_reservation_lists_and_payments(
     assert "user_id: raj_sanchez_7340" in facts["content"]
     assert "reservations: MZDDS4, 60RX9E, S5IK51, OUEA45" in facts["content"]
     assert "payment_methods: credit_card_7891819" in facts["content"]
+
+
+def test_tau_tool_facts_message_preserves_retail_item_summaries() -> None:
+    order_output = {
+        "order_id": "#W2378156",
+        "items": [
+            {
+                "name": "Headphones",
+                "product_id": "6992792935",
+                "item_id": "4202497723",
+                "options": {"color": "blue", "connectivity": "wireless"},
+            },
+            {
+                "name": "Smart Watch",
+                "product_id": "6945232052",
+                "item_id": "9408160950",
+                "options": {"display": "LCD", "band material": "leather"},
+            },
+        ],
+        "payment_history": [{"payment_method_id": "credit_card_9513926"}],
+    }
+    message = {
+        "role": "user",
+        "content": "Function output:\n"
+        + json.dumps(
+            {"requestor": "assistant", "ok": True, "output": json.dumps(order_output)},
+            separators=(",", ":"),
+        ),
+    }
+
+    facts = _build_tau_tool_facts_message([message], max_chars=1200)
+
+    assert facts is not None
+    assert "order_id: #W2378156" in facts["content"]
+    assert "item: Headphones | product_id=6992792935 | item_id=4202497723" in facts["content"]
+    assert "options: color=blue, connectivity=wireless" in facts["content"]
+    assert "item: Smart Watch | product_id=6945232052 | item_id=9408160950" in facts["content"]
+    assert "payment_method_id: credit_card_9513926" in facts["content"]
 
 
 def test_tau_official_agent_repeated_user_lookup_continues_reservation_scan() -> None:
@@ -1083,6 +1686,24 @@ def test_tau3_lightweight_records_do_not_require_external_tau3_or_user_model() -
     assert not _requires_tau_user_model(records)
 
 
+def test_tau_official_task_payload_normalizes_reward_type_strings() -> None:
+    payload = {
+        "id": "mock_unit_create_task",
+        "evaluation_criteria": {
+            "reward_basis": ["RewardType.DB", "RewardType.ENV_ASSERTION", "ACTION"],
+        },
+    }
+
+    normalized = normalize_tau_official_task_payload(payload)
+
+    assert normalized["evaluation_criteria"]["reward_basis"] == ["DB", "ENV_ASSERTION", "ACTION"]
+    assert payload["evaluation_criteria"]["reward_basis"] == [
+        "RewardType.DB",
+        "RewardType.ENV_ASSERTION",
+        "ACTION",
+    ]
+
+
 def test_tau3_lightweight_mock_attempt_runs_without_user_llm() -> None:
     task = {
         "id": "mock_unit_create_task",
@@ -1116,7 +1737,7 @@ def test_tau3_lightweight_mock_attempt_runs_without_user_llm() -> None:
                     "arguments": {"task_id": "task_2", "expected_status": "pending"},
                 }
             ],
-            "reward_basis": ["DB", "ENV_ASSERTION", "ACTION"],
+            "reward_basis": ["RewardType.DB", "RewardType.ENV_ASSERTION", "RewardType.ACTION"],
         },
     }
     record = TauManifestRecord(

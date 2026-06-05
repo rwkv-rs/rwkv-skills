@@ -61,8 +61,12 @@ _FREE_RESPONSE_JUDGE_JOBS = ("free_response_judge",)
 _HUMAN_EVAL_JOBS = ("code_human_eval",)
 _MBPP_JOBS = ("code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot")
 _LIVECODEBENCH_JOBS = ("code_livecodebench",)
+_SWE_BENCH_JOBS = ("code_swe_bench",)
 _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following",)
 _BROWSECOMP_JOBS = ("function_browsecomp",)
+_COMPLEXFUNCBENCH_JOBS = ("function_complexfuncbench",)
+_LONGBENCH_JOBS = ("function_longbench",)
+_LONGCODEBENCH_JOBS = ("function_longcodebench",)
 _MCP_BENCH_JOBS = ("function_mcp_bench",)
 _API_BANK_JOBS = ("function_api_bank",)
 _AGENTBENCH_JOBS = ("function_agentbench",)
@@ -163,6 +167,16 @@ def _coding_livecodebench(name: str, *, dataset_name: str | None = None) -> Benc
     )
 
 
+def _coding_swe_bench(name: str, *, dataset_name: str | None = None) -> BenchmarkMetadata:
+    return _metadata(
+        name,
+        field=BenchmarkField.CODING,
+        cot_modes=_COT_ONLY,
+        dataset_name=dataset_name,
+        scheduler_jobs=_SWE_BENCH_JOBS,
+    )
+
+
 def _instruction_following(
     name: str,
     *,
@@ -243,6 +257,11 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("mbpp"): _coding_mbpp("mbpp"),
     canonical_slug("mbpp_plus"): _coding_mbpp("mbpp_plus"),
     canonical_slug("livecodebench"): _coding_livecodebench("livecodebench"),
+    canonical_slug("swe_bench"): _coding_swe_bench("swe_bench"),
+    canonical_slug("swe_bench_lite"): _coding_swe_bench("swe_bench_lite"),
+    canonical_slug("swe_bench_verified"): _coding_swe_bench("swe_bench_verified"),
+    canonical_slug("swe_bench_lite_oracle"): _coding_swe_bench("swe_bench_lite_oracle"),
+    canonical_slug("swe_bench_lite_bm25_13k"): _coding_swe_bench("swe_bench_lite_bm25_13k"),
     # Instruction following
     canonical_slug("ifeval"): _instruction_following("ifeval"),
     canonical_slug("ifbench"): _instruction_following("ifbench"),
@@ -252,6 +271,17 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     # Function calling
     canonical_slug("browsecomp"): _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
+    canonical_slug("complexfuncbench_official"): _function_calling(
+        "complexfuncbench_official",
+        scheduler_jobs=_COMPLEXFUNCBENCH_JOBS,
+    ),
+    canonical_slug("longbench"): _function_calling("longbench", scheduler_jobs=_LONGBENCH_JOBS),
+    canonical_slug("longbench_qa"): _function_calling("longbench_qa", scheduler_jobs=_LONGBENCH_JOBS),
+    canonical_slug("longbench_qa_balanced"): _function_calling(
+        "longbench_qa_balanced",
+        scheduler_jobs=_LONGBENCH_JOBS,
+    ),
+    canonical_slug("longcodeqa"): _function_calling("longcodeqa", scheduler_jobs=_LONGCODEBENCH_JOBS),
     canonical_slug("mcp_bench"): _function_calling("mcp_bench", scheduler_jobs=_MCP_BENCH_JOBS),
     canonical_slug("apibank_level1"): _function_calling("apibank_level1", scheduler_jobs=_API_BANK_JOBS),
     canonical_slug("apibank_level2"): _function_calling("apibank_level2", scheduler_jobs=_API_BANK_JOBS),
@@ -334,6 +364,7 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
         canonical_slug("gpqa_diamond"),
     ),
     canonical_slug("arena_hard"): (canonical_slug("arena_hard_v2"),),
+    canonical_slug("longcodebench"): (canonical_slug("longcodeqa"),),
     canonical_slug("tau_bench"): (
         canonical_slug("tau_bench_retail"),
         canonical_slug("tau_bench_airline"),
@@ -379,6 +410,10 @@ _PREFIX_FALLBACKS: tuple[tuple[tuple[str, ...], BenchmarkMetadata], ...] = (
     (
         ("mcp_bench",),
         _function_calling("mcp_bench", scheduler_jobs=_MCP_BENCH_JOBS),
+    ),
+    (
+        ("complexfuncbench",),
+        _function_calling("complexfuncbench_official", scheduler_jobs=_COMPLEXFUNCBENCH_JOBS),
     ),
 )
 

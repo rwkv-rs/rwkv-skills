@@ -3,28 +3,22 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.eval.scheduler import dataset_stats
-from src.eval.scheduler import dataset_resolver
 
 
-def test_record_dataset_samples_does_not_block_when_db_unavailable(tmp_path: Path, monkeypatch) -> None:
-    dataset = tmp_path / "tau3_bench_mock" / "base.jsonl"
-    dataset.parent.mkdir(parents=True)
-    dataset.write_text('{"task_id":"one"}\n', encoding="utf-8")
+def test_record_dataset_samples_skips_db_when_json_store(monkeypatch, tmp_path: Path) -> None:
+    dataset_path = tmp_path / "demo" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text('{"id":"x"}\n', encoding="utf-8")
+    called = False
 
-    monkeypatch.setattr(dataset_stats, "init_db", lambda _config: (_ for _ in ()).throw(RuntimeError("offline")))
+    def _fail_init_db(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+        nonlocal called
+        called = True
+        raise AssertionError("init_db should not be called in JSON store mode")
 
-    dataset_stats.record_dataset_samples(dataset)
+    monkeypatch.setenv("RWKV_EVAL_STORE", "json")
+    monkeypatch.setattr(dataset_stats, "init_db", _fail_init_db)
 
+    dataset_stats.record_dataset_samples(dataset_path)
 
-def test_resolve_or_prepare_dataset_can_skip_probe_only_stats(tmp_path: Path, monkeypatch) -> None:
-    dataset = tmp_path / "tau3_bench_mock" / "base.jsonl"
-    dataset.parent.mkdir(parents=True)
-    dataset.write_text('{"task_id":"one"}\n', encoding="utf-8")
-    calls: list[Path] = []
-
-    monkeypatch.setattr(dataset_resolver, "record_dataset_samples", lambda path: calls.append(path))
-
-    resolved = dataset_resolver.resolve_or_prepare_dataset(str(dataset), record_stats=False)
-
-    assert resolved == dataset
-    assert calls == []
+    assert called is False

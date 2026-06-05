@@ -15,7 +15,6 @@ from src.eval.field_common import (
     resolve_configured_k_plan,
     set_task_env,
 )
-from src.eval.k_values import filter_metrics_by_k
 from src.eval.maths.common import (
     JudgeMode,
     build_llm_judge,
@@ -42,8 +41,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
-    parser.add_argument("--cot-max-tokens", type=int, help="Clamp CoT generation length")
-    parser.add_argument("--final-max-tokens", type=int, help="Clamp final answer generation length")
+    parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
+    parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
+    parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--db-write-queue", type=int, help="DB completion write queue max size")
     parser.add_argument(
         "--db-drain-every",
@@ -85,7 +85,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--judge-base-url",
         help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
     )
-    parser.add_argument("--judge-max-workers", type=int, default=32, help="Max concurrent workers for LLM judge")
+    parser.add_argument("--judge-max-workers", type=int, help="Max concurrent workers for LLM judge")
     parser.add_argument(
         "--judge-max-tokens",
         type=int,
@@ -125,10 +125,14 @@ def main(
     from src.eval.env_config import load_env_file
     from src.eval.evaluating import TaskRunController, TaskRunSignalGuard, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
-    from src.eval.maths.pipeline import FreeResponsePipeline
-    from src.eval.metrics.free_response import compute_avg_at_k, compute_pass_at_k, evaluate_free_response
+    from src.eval.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
+    from src.eval.metrics.free_response import (
+        attach_strategy_task_ids,
+        build_grouped_metrics_payload,
+        evaluate_free_response,
+    )
     from src.eval.results.payloads import make_score_payload
-    from src.eval.results.schema import normalize_sampling_config_by_stage
+    from src.eval.results.schema import sampling_config_to_dict
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
     from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -152,10 +156,10 @@ def main(
     backend = build_inference_backend_from_args(args)
     pipeline = FreeResponsePipeline(backend)
 
-    cot_sampling, final_sampling = resolve_sampling_pair(
+    generation_sampling, final_sampling = resolve_sampling_pair(
         slug,
         model_name,
-        cot_max_tokens=args.cot_max_tokens,
+        cot_max_tokens=args.max_tokens or args.cot_max_tokens,
         final_max_tokens=args.final_max_tokens,
     )
     batch_size = max(1, args.batch_size)
@@ -172,15 +176,15 @@ def main(
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    cot_prompt_template = (
+    prompt_template = (
         cot_config.cot_prompt_template
         if cot_config is not None and cot_config.cot_prompt_template
         else None
     )
-    final_prompt_template = (
+    final_answer_template = (
         final_config.final_prompt_template
         if final_config is not None and final_config.final_prompt_template
-        else None
+        else DEFAULT_FINAL_PROMPT
     )
     if judge is not None and root_config is not None and root_config.judge_prompt_template:
         judge.config.prompt_template = root_config.judge_prompt_template
@@ -198,7 +202,10 @@ def main(
         sampling_config=build_task_sampling_config(
             cot_mode=CoTMode.COT,
             avg_k=plan.avg_k,
-            sampling_config=normalize_sampling_config_by_stage([(1, cot_sampling), (2, final_sampling)]),
+            sampling_config={
+                "generation": sampling_config_to_dict(generation_sampling),
+                "final": sampling_config_to_dict(final_sampling),
+            },
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
             judger_model_name=(judge.config.model if judge is not None else None),
@@ -218,9 +225,9 @@ def main(
     if args.probe_only:
         pipeline.run(
             dataset_path=str(dataset_path),
-            **({"cot_prompt_template": cot_prompt_template} if cot_prompt_template else {}),
-            **({"final_answer_template": final_prompt_template} if final_prompt_template else {}),
-            cot_sampling=cot_sampling,
+            **({"prompt_template": prompt_template} if prompt_template else {}),
+            generation_sampling=generation_sampling,
+            final_answer_template=final_answer_template,
             final_sampling=final_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
@@ -253,9 +260,9 @@ def main(
         try:
             result = pipeline.run(
                 dataset_path=str(dataset_path),
-                **({"cot_prompt_template": cot_prompt_template} if cot_prompt_template else {}),
-                **({"final_answer_template": final_prompt_template} if final_prompt_template else {}),
-                cot_sampling=cot_sampling,
+                **({"prompt_template": prompt_template} if prompt_template else {}),
+                generation_sampling=generation_sampling,
+                final_answer_template=final_answer_template,
                 final_sampling=final_sampling,
                 batch_size=batch_size,
                 record_indices=plan.sample_indices,
@@ -277,47 +284,43 @@ def main(
             dataset_path=str(dataset_path),
             judge=judge,
         )
-        pass_metrics_all = compute_pass_at_k(evaluation.rows, k_plan.pass_k)
-        avg_metrics_all = compute_avg_at_k(evaluation.rows, k_plan.avg_k)
         if judge_mode is JudgeMode.LLM and evaluation.judge_accuracy is None:
             raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
-        if judge is not None and judge.last_run_stats is not None and judge.last_run_stats.error_count:
-            stats = judge.last_run_stats
-            print(
-                "⚠️ LLM judge 存在异常样本："
-                f"{stats.error_count}/{stats.total} "
-                f"(invalid_output={stats.invalid_output_count}, request_error={stats.request_error_count})"
-            )
+        if judge is not None:
+            for group, group_stats in evaluation.judge_stats_by_group.items():
+                if int(group_stats.get("error_count", 0) or 0):
+                    print(
+                        "⚠️ LLM judge 存在异常样本："
+                        f"{group} "
+                        f"{group_stats.get('error_count')}/{group_stats.get('total')} "
+                        f"(invalid_output={group_stats.get('invalid_output_count')}, "
+                        f"request_error={group_stats.get('request_error_count')})"
+                    )
 
-        primary_metric_name = "judge_accuracy" if judge_mode is JudgeMode.LLM else "exact_accuracy"
-        primary_metric_value = (
-            float(evaluation.judge_accuracy)
-            if judge_mode is JudgeMode.LLM
-            else float(evaluation.exact_accuracy)
+        strategy_task_ids = service.ingest_eval_payload_groups(
+            task_id=task_id,
+            completion_payloads=completions_payloads,
+            payloads_by_group=evaluation.payloads_by_group,
+            primary_group=evaluation.primary_group,
         )
-        metrics_payload = {primary_metric_name: primary_metric_value}
-        if judge_mode is JudgeMode.EXACT and evaluation.judge_accuracy is not None:
-            metrics_payload["judge_accuracy"] = evaluation.judge_accuracy
-        pass_payload = filter_metrics_by_k(pass_metrics_all, k_plan.report_pass_k, "pass@")
-        if k_plan.report_pass_k and not pass_payload:
-            pass_payload = pass_metrics_all or {}
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
-        if k_plan.report_avg_k and not avg_payload:
-            avg_payload = avg_metrics_all or {}
-        if avg_payload:
-            metrics_payload.update(avg_payload)
+        metrics_payload, metric_details = build_grouped_metrics_payload(
+            evaluation,
+            pass_k=k_plan.pass_k,
+            avg_k=k_plan.avg_k,
+            report_pass_k=k_plan.report_pass_k,
+            report_avg_k=k_plan.report_avg_k,
+        )
+        attach_strategy_task_ids(metrics_payload, strategy_task_ids)
 
         task_details: dict[str, object] = build_plan_task_details(plan, cot_mode=CoTMode.COT.value)
-        if judge is not None and judge.last_run_stats is not None:
-            task_details["judge_stats"] = judge.last_run_stats.as_dict()
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            task_details["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            task_details["avg_curve"] = avg_metrics_all
-
-        runtime.ingest_eval_payloads(evaluation.payloads)
+        task_details.update(metric_details)
+        runtime.state.task_results = {
+            (int(payload["sample_index"]), int(payload["repeat_index"]), int(payload.get("pass_index", 0))): bool(
+                payload.get("is_passed", False)
+            )
+            for payload in evaluation.payloads
+        }
+        runtime.state.eval_count = len(runtime.state.task_results)
         runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,

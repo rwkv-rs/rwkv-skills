@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import zipfile
 
 from src.eval.datasets.data_prepper.data_manager import available_function_calling_datasets, prepare_dataset
 from src.eval.datasets.runtime import read_jsonl_items
@@ -12,6 +14,11 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
 
     assert "browsecomp" in names
     assert "browsecomp_zh" in names
+    assert "complexfuncbench_official" in names
+    assert "longbench" in names
+    assert "longbench_qa" in names
+    assert "longbench_qa_balanced" in names
+    assert "longcodeqa" in names
     assert "mcp_bench" in names
     assert "apibank_level1" in names
     assert "apibank_level2" in names
@@ -138,6 +145,113 @@ def test_prepare_dataset_materializes_browsecomp_spec(tmp_path: Path, monkeypatc
             "source_path": str(source),
         }
     ]
+
+
+def test_prepare_dataset_materializes_longbench_qa_spec(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "longbench"
+    source.mkdir()
+    (source / "hotpotqa.jsonl").write_text(
+        '{"_id":"hp1","input":"Who wrote the book?","context":"Alice wrote the book.",'
+        '"answers":["Alice"],"length":24}\n',
+        encoding="utf-8",
+    )
+    (source / "passage_count.jsonl").write_text(
+        '{"_id":"pc1","input":"How many passages?","context":"passage one",'
+        '"answers":["1"],"length":11}\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.longbench.longbench_root",
+        lambda: source,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("longbench_qa", output_root, "test")
+
+    assert paths == [output_root / "longbench_qa" / "test.jsonl"]
+    assert read_jsonl_items(paths[0]) == [
+        {
+            "task_id": "hp1",
+            "dataset": "hotpotqa",
+            "input": "Who wrote the book?",
+            "context": "Alice wrote the book.",
+            "answers": ["Alice"],
+            "all_classes": [],
+            "language": "en",
+            "length": 24,
+            "category": "multi_doc_qa",
+            "source_path": str((source / "hotpotqa.jsonl").resolve()),
+        }
+    ]
+
+
+def test_prepare_dataset_materializes_longbench_qa_balanced_spec(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "longbench"
+    source.mkdir()
+    (source / "hotpotqa.jsonl").write_text(
+        "\n".join(
+            [
+                '{"_id":"hp1","input":"Question hp1","context":"Context hp1","answers":["A"],"length":11}',
+                '{"_id":"hp2","input":"Question hp2","context":"Context hp2","answers":["B"],"length":11}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (source / "qasper.jsonl").write_text(
+        "\n".join(
+            [
+                '{"_id":"qa1","input":"Question qa1","context":"Context qa1","answers":["C"],"length":11}',
+                '{"_id":"qa2","input":"Question qa2","context":"Context qa2","answers":["D"],"length":11}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.longbench.longbench_root",
+        lambda: source,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("longbench_qa_balanced", output_root, "test")
+
+    assert paths == [output_root / "longbench_qa_balanced" / "test.jsonl"]
+    rows = read_jsonl_items(paths[0])
+    assert [row["task_id"] for row in rows] == ["hp1", "qa1", "hp2", "qa2"]
+    assert [row["dataset"] for row in rows] == ["hotpotqa", "qasper", "hotpotqa", "qasper"]
+
+
+def test_prepare_dataset_materializes_longcodeqa_spec(tmp_path: Path, monkeypatch) -> None:
+    archive = tmp_path / "LongCodeQA.zip"
+    row = {
+        "prompt_goal": "Answer with a letter.",
+        "repo_text": "Repository:\n[start of a.py]\nVALUE = 1",
+        "question": "Question:\nWhat is VALUE?\nA) 0\nB) 1\n",
+        "prompt": "Answer with a letter.\nRepository: Repository:\n[start of a.py]\nVALUE = 1\nQuestion:\nWhat is VALUE?\nA) 0\nB) 1\n",
+        "correct_letter": "B",
+        "repo": "demo/repo",
+        "is_hard": "No",
+    }
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("LQA/32K.json", json.dumps([row]))
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.longcodebench.longcodebench_source",
+        lambda: archive,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("longcodeqa", output_root, "test")
+
+    assert paths == [output_root / "longcodeqa" / "test.jsonl"]
+    [parsed] = read_jsonl_items(paths[0])
+    assert parsed["task_id"] == "longcodeqa_32k_00000"
+    assert parsed["repo"] == "demo/repo"
+    assert parsed["context_bucket"] == "32K"
+    assert parsed["correct_letter"] == "B"
 
 
 def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch) -> None:

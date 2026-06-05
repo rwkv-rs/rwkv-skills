@@ -14,6 +14,7 @@ from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
 from src.eval.field_common import build_plan_task_details, build_task_sampling_config, resolve_configured_k_plan, set_task_env
 from src.eval.k_values import filter_metrics_by_k
+from src.eval.long_doc_evidence import LONG_DOC_MODE_CHOICES, LongDocEvidenceConfig
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
@@ -30,11 +31,13 @@ class CodingBenchmarkKind(str, Enum):
     HUMAN_EVAL = "human_eval"
     MBPP = "mbpp"
     LIVECODEBENCH = "livecodebench"
+    SWE_BENCH = "swe_bench"
 
 
 _HUMAN_EVAL_JOB_NAMES = frozenset({"code_human_eval"})
 _MBPP_JOB_NAMES = frozenset({"code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot"})
 _LIVECODEBENCH_JOB_NAMES = frozenset({"code_livecodebench"})
+_SWE_BENCH_JOB_NAMES = frozenset({"code_swe_bench"})
 _DEFAULT_PASS_K: tuple[int, ...] = ()
 _DEFAULT_AVG_K: tuple[float, ...] = ()
 
@@ -52,6 +55,52 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--eval-timeout", type=float, default=3.0, help="Seconds per test execution")
     parser.add_argument("--eval-workers", type=int, default=4, help="Parallel workers for evaluation")
     parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
+    parser.add_argument("--swebench-run-harness", action="store_true", help="Run the official SWE-bench Docker harness")
+    parser.add_argument("--swebench-dataset-name", help="Official SWE-bench dataset_name passed to the harness")
+    parser.add_argument("--swebench-run-id", help="Run id passed to the official SWE-bench harness")
+    parser.add_argument("--swebench-cache-level", help="SWE-bench harness cache_level")
+    parser.add_argument("--swebench-clean", action="store_true", help="Ask the SWE-bench harness to clean resources")
+    parser.add_argument("--swebench-predictions-path", help="Where to write official SWE-bench predictions JSONL")
+    parser.add_argument("--swebench-max-context-chars", type=int, help="Clamp retrieved context included in SWE-bench prompts")
+    parser.add_argument("--swebench-harness-timeout-s", type=float, help="Wall-clock timeout for official SWE-bench harness")
+    parser.add_argument(
+        "--long-doc-mode",
+        choices=LONG_DOC_MODE_CHOICES,
+        default="off",
+        help="SWE-bench retrieved-context chunk routing mode",
+    )
+    parser.add_argument("--long-doc-max-chars", type=int, default=1000, help="Long-document chunk max characters")
+    parser.add_argument("--long-doc-overlap-lines", type=int, default=3, help="Long-document chunk overlap lines")
+    parser.add_argument(
+        "--long-doc-min-chars",
+        type=int,
+        default=6000,
+        help="Minimum retrieved-context characters before chunk routing runs",
+    )
+    parser.add_argument(
+        "--long-doc-max-evidence-chunks",
+        type=int,
+        default=4,
+        help="Maximum selected chunks when compacting SWE-bench retrieved context",
+    )
+    parser.add_argument(
+        "--long-doc-max-evidence-chars",
+        type=int,
+        default=6000,
+        help="Maximum selected evidence characters for SWE-bench retrieved context",
+    )
+    parser.add_argument(
+        "--long-doc-model-max-tokens",
+        type=int,
+        default=96,
+        help="Generation token cap for model_parallel chunk routing",
+    )
+    parser.add_argument(
+        "--long-doc-model-parallel-batch-size",
+        type=int,
+        default=8,
+        help="Batch size for model_parallel chunk routing",
+    )
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -115,6 +164,8 @@ def _infer_benchmark_kind(dataset_slug: str) -> CodingBenchmarkKind:
         return CodingBenchmarkKind.MBPP
     if job_names & _LIVECODEBENCH_JOB_NAMES:
         return CodingBenchmarkKind.LIVECODEBENCH
+    if job_names & _SWE_BENCH_JOB_NAMES:
+        return CodingBenchmarkKind.SWE_BENCH
     raise ValueError(f"dataset {dataset_slug!r} 不是 coding benchmark，无法用 coding runner 运行。")
 
 
@@ -139,6 +190,10 @@ def _resolve_cot_mode(kind: CodingBenchmarkKind, requested_mode: str | None) -> 
         if requested_mode is not None and CoTMode(requested_mode) is not CoTMode.COT:
             raise ValueError("livecodebench only supports --cot-mode cot")
         return CoTMode.COT
+    if kind is CodingBenchmarkKind.SWE_BENCH:
+        if requested_mode is not None and CoTMode(requested_mode) is not CoTMode.COT:
+            raise ValueError("swe_bench only supports --cot-mode cot")
+        return CoTMode.COT
     if requested_mode is None:
         return CoTMode.NO_COT
     return CoTMode(requested_mode)
@@ -149,6 +204,8 @@ def _default_job_name(kind: CodingBenchmarkKind, cot_mode: CoTMode) -> str:
         return "code_human_eval"
     if kind is CodingBenchmarkKind.LIVECODEBENCH:
         return "code_livecodebench"
+    if kind is CodingBenchmarkKind.SWE_BENCH:
+        return "code_swe_bench"
     if cot_mode is CoTMode.NO_COT:
         return "code_mbpp"
     if cot_mode is CoTMode.FAKE_COT:
@@ -162,6 +219,9 @@ def _print_done_message(kind: CodingBenchmarkKind, cot_mode: CoTMode, sample_cou
         return
     if kind is CodingBenchmarkKind.LIVECODEBENCH:
         print(f"✅ LiveCodeBench done: {sample_count} samples")
+        return
+    if kind is CodingBenchmarkKind.SWE_BENCH:
+        print(f"✅ SWE-bench done: {sample_count} samples")
         return
     if cot_mode is CoTMode.NO_COT:
         print(f"✅ MBPP done: {sample_count} samples")
@@ -187,12 +247,46 @@ def _sampling_payload(
             "stage1": sampling_config_to_dict(cot_sampling),
             "stage2": sampling_config_to_dict(final_sampling),
         }
+    if kind is CodingBenchmarkKind.SWE_BENCH:
+        return {"stage1": sampling_config_to_dict(sampling)}
     if kind is CodingBenchmarkKind.MBPP and cot_mode is CoTMode.COT:
         return {
             "stage1": sampling_config_to_dict(sampling),
             "stage2": sampling_config_to_dict(sampling),
         }
     return {"stage1": sampling_config_to_dict(sampling)}
+
+
+def _coding_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    mode = str(getattr(args, "long_doc_mode", "off") or "off").strip().lower()
+    enabled = mode != "off"
+    if mode == "off":
+        mode = "lexical"
+    return LongDocEvidenceConfig(
+        enabled=enabled,
+        mode=mode,  # type: ignore[arg-type]
+        max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
+        overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
+        min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
+        max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
+        max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
+        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
+        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
+    )
+
+
+def _long_doc_config_payload(config: LongDocEvidenceConfig) -> dict[str, object]:
+    return {
+        "enabled": bool(config.enabled),
+        "mode": config.mode if config.enabled else "off",
+        "max_chunk_chars": int(config.max_chunk_chars),
+        "overlap_lines": int(config.overlap_lines),
+        "min_long_text_chars": int(config.min_long_text_chars),
+        "max_evidence_chunks": int(config.max_evidence_chunks),
+        "max_evidence_chars": int(config.max_evidence_chars),
+        "model_max_tokens": int(config.model_max_tokens),
+        "model_parallel_batch_size": int(config.model_parallel_batch_size),
+    }
 
 
 def main(
@@ -212,13 +306,13 @@ def main(
     from src.eval.metrics.code_generation.evaluate import evaluate_human_eval, evaluate_mbpp_dataset
     from src.eval.metrics.at_k import compute_avg_at_k
     from src.eval.metrics.code_generation.livecodebench import evaluate_livecodebench_dataset
+    from src.eval.coding.swe_bench import evaluate_swebench_predictions, infer_harness_dataset_name
     from src.eval.results.payloads import make_score_payload
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
     from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
     from src.db.async_writer import CompletionWriteWorker
-    from src.db.database import init_db
-    from src.db.eval_db_service import EvalDbService
+    from src.db.eval_service import create_eval_service, init_eval_store
 
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
@@ -257,6 +351,7 @@ def main(
             _require_sampling(slug, model_name, fallback_templates="code_default"),
             args,
         )
+    long_doc_config = _coding_long_doc_config(args) if benchmark_kind is CodingBenchmarkKind.SWE_BENCH else None
 
     backend = build_inference_backend_from_args(args)
     pipeline = CodingPipeline(backend)
@@ -281,7 +376,7 @@ def main(
                 probe_only=True,
                 samples_per_task=1,
             )
-        else:
+        elif benchmark_kind is CodingBenchmarkKind.LIVECODEBENCH:
             result = pipeline.run_livecodebench(
                 dataset_path=str(dataset_path),
                 cot_sampling=cot_sampling,
@@ -291,14 +386,25 @@ def main(
                 probe_only=True,
                 samples_per_task=1,
             )
+        else:
+            result = pipeline.run_swe_bench(
+                dataset_path=str(dataset_path),
+                sampling=sampling,
+                batch_size=batch_size,
+                sample_limit=sample_limit,
+                probe_only=True,
+                samples_per_task=1,
+                max_context_chars=args.swebench_max_context_chars,
+                long_doc_config=long_doc_config,
+            )
         print(
             "🧪 probe-only run completed: "
             f"{result.sample_count} sample(s) evaluated with batch {args.batch_size}."
         )
         return 0
 
-    init_db(DEFAULT_DB_CONFIG)
-    service = EvalDbService()
+    init_eval_store(DEFAULT_DB_CONFIG)
+    service = create_eval_service()
     job_name = run_context.job_name if run_context is not None else os.environ.get(
         "RWKV_SKILLS_JOB_NAME",
         _default_job_name(benchmark_kind, cot_mode),
@@ -370,7 +476,7 @@ def main(
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
             )
-        else:
+        elif benchmark_kind is CodingBenchmarkKind.LIVECODEBENCH:
             result = pipeline.run_livecodebench(
                 dataset_path=str(dataset_path),
                 cot_sampling=cot_sampling,
@@ -386,6 +492,22 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+            )
+        else:
+            result = pipeline.run_swe_bench(
+                dataset_path=str(dataset_path),
+                sampling=sampling,
+                batch_size=batch_size,
+                sample_limit=sample_limit,
+                record_indices=plan.sample_indices,
+                pass_k=k_plan.pass_k,
+                samples_per_task=plan.repeat_count,
+                probe_only=False,
+                attempt_keys=attempt_keys,
+                skip_keys=skip_keys,
+                on_record=writer.enqueue,
+                max_context_chars=args.swebench_max_context_chars,
+                long_doc_config=long_doc_config,
             )
     except BaseException:
         runtime.handle_attempt_stage_failure(writer)
@@ -409,13 +531,33 @@ def main(
                 n_workers=args.eval_workers,
                 timeout=args.eval_timeout,
             )
-        else:
+        elif benchmark_kind is CodingBenchmarkKind.LIVECODEBENCH:
             eval_metrics, eval_payloads = evaluate_livecodebench_dataset(
                 completions_payloads,
                 dataset_path=str(dataset_path),
                 pass_k=k_plan.pass_k,
                 n_workers=args.eval_workers,
                 timeout=args.eval_timeout,
+            )
+            predictions_path = None
+        else:
+            predictions_path = Path(args.swebench_predictions_path) if args.swebench_predictions_path else (
+                Path("results") / "swebench_predictions" / f"task_{task_id}" / "predictions.jsonl"
+            )
+            harness_dataset = args.swebench_dataset_name or infer_harness_dataset_name(dataset_path)
+            eval_metrics, eval_payloads, predictions_path = evaluate_swebench_predictions(
+                completions_payloads,
+                dataset_path=str(dataset_path),
+                model_name=model_name,
+                predictions_path=predictions_path,
+                run_harness=bool(args.swebench_run_harness),
+                dataset_name=harness_dataset,
+                split="test",
+                run_id=args.swebench_run_id or f"rwkv-skills-task-{task_id}",
+                max_workers=max(1, int(args.eval_workers or 1)),
+                cache_level=args.swebench_cache_level,
+                clean=bool(args.swebench_clean),
+                timeout_s=args.swebench_harness_timeout_s,
             )
 
         rows = [
@@ -424,16 +566,23 @@ def main(
         ]
         avg_metrics_all = compute_avg_at_k(rows, k_plan.avg_k)
         metrics_payload: dict[str, float] = {}
-        pass_payload = filter_metrics_by_k(eval_metrics, k_plan.report_pass_k, "pass@")
-        if k_plan.report_pass_k and not pass_payload:
-            pass_payload = eval_metrics or {}
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
-        if k_plan.report_avg_k and not avg_payload:
-            avg_payload = avg_metrics_all or {}
-        if avg_payload:
-            metrics_payload.update(avg_payload)
+        pass_payload: dict[str, float] = {}
+        avg_payload: dict[str, float] = {}
+        if benchmark_kind is CodingBenchmarkKind.SWE_BENCH:
+            metrics_payload.update(eval_metrics or {})
+            if avg_metrics_all:
+                metrics_payload.update(avg_metrics_all)
+        else:
+            pass_payload = filter_metrics_by_k(eval_metrics, k_plan.report_pass_k, "pass@")
+            if k_plan.report_pass_k and not pass_payload:
+                pass_payload = eval_metrics or {}
+            if pass_payload:
+                metrics_payload.update(pass_payload)
+            avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
+            if k_plan.report_avg_k and not avg_payload:
+                avg_payload = avg_metrics_all or {}
+            if avg_payload:
+                metrics_payload.update(avg_payload)
         task_details: dict[str, object] = build_plan_task_details(plan, cot_mode=cot_mode.value)
         if eval_metrics and pass_payload != eval_metrics:
             task_details["pass_curve"] = eval_metrics
@@ -441,7 +590,8 @@ def main(
             task_details["avg_curve"] = avg_metrics_all
 
         runtime.ingest_eval_payloads(eval_payloads)
-        runtime.run_checker(model_name=model_name)
+        if eval_payloads:
+            runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
             is_cot=cot_mode.is_cot,
@@ -451,7 +601,18 @@ def main(
             problems=result.problem_count,
             task=job_name,
             task_details=task_details,
-            extra={"cot_mode": cot_mode.value},
+            extra={
+                "cot_mode": cot_mode.value,
+                **(
+                    {
+                        "swebench_predictions_path": str(predictions_path),
+                        "swebench_harness_ran": bool(args.swebench_run_harness),
+                        "swebench_long_doc": _long_doc_config_payload(long_doc_config),
+                    }
+                    if benchmark_kind is CodingBenchmarkKind.SWE_BENCH
+                    else {}
+                ),
+            },
         )
         runtime.record_score(score_payload)
     except BaseException as exc:

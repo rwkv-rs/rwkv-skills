@@ -359,6 +359,9 @@ def _run_tau_official_attempt(
     max_steps: int,
     max_tool_errors: int,
     tool_routing_config: ToolRoutingConfig | None = None,
+    retail_repeated_read_guard: bool = False,
+    retail_tool_use_guard: bool = False,
+    retail_progressive_tool_disclosure: bool = False,
 ) -> dict[str, Any]:
     task = runtime_env.load_task(record.task)
     environment = runtime_env.create_environment(solo_mode=False)
@@ -371,6 +374,9 @@ def _run_tau_official_attempt(
         prompt_max_chars=prompt_max_chars,
         long_doc_config=long_doc_config,
         tool_routing_config=tool_routing_config or ToolRoutingConfig(),
+        retail_repeated_read_guard=retail_repeated_read_guard,
+        retail_tool_use_guard=retail_tool_use_guard,
+        retail_progressive_tool_disclosure=retail_progressive_tool_disclosure,
     )
     user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
     seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
@@ -513,6 +519,9 @@ def _run_tau(
     )
     long_doc_config = _tau_long_doc_config(args)
     tool_routing_config = tool_routing_config_from_args(args)
+    retail_repeated_read_guard = bool(getattr(args, "tau_retail_repeated_read_guard", False))
+    retail_tool_use_guard = bool(getattr(args, "tau_retail_tool_use_guard", False))
+    retail_progressive_tool_disclosure = bool(getattr(args, "tau_retail_progressive_tool_disclosure", False))
     sampling_payload = attach_function_calling_context_metadata(
         normalize_sampling_config_by_stage([(1, decision_sampling)]),
         long_doc_config=long_doc_config,
@@ -522,6 +531,9 @@ def _run_tau(
     sampling_payload["tau_adapter"] = {
         "semantic_fallbacks": False,
         "format_conversion": True,
+        "retail_repeated_read_guard": retail_repeated_read_guard,
+        "retail_tool_use_guard": retail_tool_use_guard,
+        "retail_progressive_tool_disclosure": retail_progressive_tool_disclosure,
         "state_prefix_cache": bool(str(getattr(args, "engine_mode", "") or "").strip() == "lightning"),
     }
     tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
@@ -560,6 +572,9 @@ def _run_tau(
                 prompt_max_chars=prompt_max_chars,
                 long_doc_config=long_doc_config,
                 tool_routing_config=tool_routing_config,
+                retail_repeated_read_guard=retail_repeated_read_guard,
+                retail_tool_use_guard=retail_tool_use_guard,
+                retail_progressive_tool_disclosure=retail_progressive_tool_disclosure,
             )
             decision_prompts.append(
                 agent._build_prompt(  # noqa: SLF001 - probe path intentionally inspects rendered first-turn prompt.
@@ -638,6 +653,9 @@ def _run_tau(
                             prompt_max_chars=prompt_max_chars,
                             long_doc_config=long_doc_config,
                             tool_routing_config=tool_routing_config,
+                            retail_repeated_read_guard=retail_repeated_read_guard,
+                            retail_tool_use_guard=retail_tool_use_guard,
+                            retail_progressive_tool_disclosure=retail_progressive_tool_disclosure,
                             max_steps=max_steps,
                             max_tool_errors=max_tool_errors,
                         ): key

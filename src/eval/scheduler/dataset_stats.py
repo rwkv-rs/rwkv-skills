@@ -7,6 +7,7 @@ from pathlib import Path
 
 from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
+from src.db.eval_service import use_json_eval_store
 
 from .config import DEFAULT_DB_CONFIG
 from .dataset_utils import canonical_slug, infer_dataset_slug_from_path
@@ -41,6 +42,8 @@ def load_dataset_manifest_count(path: Path) -> int | None:
 
 def record_dataset_samples(dataset_path: Path, *, dataset_slug: str | None = None) -> None:
     """Persist dataset sample count into benchmark table."""
+    if use_json_eval_store():
+        return
     slug = canonical_slug(dataset_slug or infer_dataset_slug_from_path(str(dataset_path)))
     if not slug:
         return

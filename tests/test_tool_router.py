@@ -180,6 +180,56 @@ def test_tool_router_prioritizes_tau_state_anchor_over_noisy_model_choice() -> N
     assert route.lexical_names[0] == "get_reservation_details"
 
 
+def test_tool_router_prioritizes_retail_read_tools_before_write_tools() -> None:
+    tools = [
+        _tool("calculate", "Calculate the result of a mathematical expression.", "expression"),
+        _tool("exchange_delivered_order_items", "Exchange items in a delivered order", "order_id"),
+        _tool("modify_pending_order_items", "Modify items in a pending order", "order_id"),
+        _tool("return_delivered_order_items", "Return items in a delivered order", "order_id"),
+        _tool("get_order_details", "Get the status and details of an order.", "order_id"),
+        _tool("list_all_product_types", "List the name and product id of all product types."),
+        _tool("get_product_details", "Get the inventory details of a product.", "product_id"),
+        _tool("get_item_details", "Get the inventory details of an item.", "item_id"),
+    ]
+
+    route = route_tools_for_prompt(
+        tools,
+        [{"role": "user", "content": "I received order #W2378156 and need to exchange a keyboard."}],
+        config=ToolRoutingConfig(mode="lexical", max_tools=8, trigger_tool_count=1, trigger_catalog_chars=1),
+    )
+
+    assert route.selected_names[:4] == (
+        "get_order_details",
+        "list_all_product_types",
+        "get_product_details",
+        "get_item_details",
+    )
+    assert "exchange_delivered_order_items" in route.selected_names
+    assert "calculate" not in route.selected_names
+
+
+def test_tool_router_keeps_complexfuncbench_attraction_location_tool() -> None:
+    tools = [
+        _tool("Search_Hotels", "Search hotels with destination id.", "dest_id"),
+        _tool("Search_Hotel_Destination", "Find hotel destination by city or place.", "query"),
+        _tool("Search_Attractions", "Search attractions by destination location.", "location_id"),
+        _tool("Search_Attraction_Location", "Find attraction location by place name.", "query"),
+        _tool("Get_Seat_Map", "Get aircraft seat map.", "flight_id"),
+        _tool("Get_Packages", "Get travel packages.", "package_id"),
+    ]
+
+    route = route_tools_for_prompt(
+        tools,
+        [{"role": "user", "content": "Find a hotel and nearby tourist attractions in Paris."}],
+        config=ToolRoutingConfig(mode="lexical", max_tools=4, trigger_tool_count=1, trigger_catalog_chars=1),
+    )
+
+    assert "Search_Hotel_Destination" in route.selected_names
+    assert "Search_Attraction_Location" in route.selected_names
+    assert "Search_Attractions" in route.selected_names
+    assert "Get_Seat_Map" not in route.selected_names
+
+
 def test_tool_router_triggers_on_large_catalog_even_with_few_tools() -> None:
     tools = [
         _tool("refund_order", "Refund an order " + ("details " * 80), "order_id"),

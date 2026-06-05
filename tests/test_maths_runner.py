@@ -12,8 +12,11 @@ def test_maths_runner_parser_accepts_judge_mode() -> None:
             "dataset.jsonl",
             "--judge-mode",
             "llm",
+            "--max-tokens",
+            "128",
             "--probe-only",
         ]
     )
     assert args.judge_mode == "llm"
+    assert args.max_tokens == 128
     assert args.probe_only is True

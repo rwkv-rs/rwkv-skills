@@ -121,6 +121,22 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
         is function_calling_runner.FunctionCallingBenchmarkKind.BROWSECOMP
     )
     assert (
+        function_calling_runner._infer_benchmark_kind("complexfuncbench_official_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("longbench_qa_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.LONGBENCH
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("longbench_qa_balanced_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.LONGBENCH
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("longcodeqa_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.LONGCODEBENCH
+    )
+    assert (
         function_calling_runner._infer_benchmark_kind("bfcl_v3_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.BFCL_V3
     )
@@ -147,6 +163,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     assert (
         function_calling_runner._infer_benchmark_kind("toolalpaca_eval_simulated_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.TOOLALPACA
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("complexfuncbench_official_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH
     )
     assert (
         function_calling_runner._infer_benchmark_kind("tau2_bench_airline_base.jsonl")
@@ -188,6 +208,58 @@ def test_function_calling_runner_main_dispatches_to_internal_implementation(monk
     assert called == ["browsecomp"]
 
 
+def test_function_calling_runner_main_dispatches_longbench(monkeypatch) -> None:
+    called: list[str] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.LONGBENCH,
+        dataset_path=Path("/tmp/longbench_qa_test.jsonl"),
+        dataset_slug="longbench_qa_test",
+        benchmark_name="longbench_qa",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_longbench",
+        lambda _args, _run, *, run_context=None: called.append("longbench") or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "longbench_qa_test.jsonl", "--model-path", "model.pth"])
+
+    assert rc == 0
+    assert called == ["longbench"]
+
+
+def test_function_calling_runner_main_dispatches_longcodebench(monkeypatch) -> None:
+    called: list[str] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.LONGCODEBENCH,
+        dataset_path=Path("/tmp/longcodeqa_test.jsonl"),
+        dataset_slug="longcodeqa_test",
+        benchmark_name="longcodeqa",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_longcodebench",
+        lambda _args, _run, *, run_context=None: called.append("longcodebench") or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "longcodeqa_test.jsonl", "--model-path", "model.pth"])
+
+    assert rc == 0
+    assert called == ["longcodebench"]
+
+
 def test_function_calling_runner_main_forwards_explicit_run_context(monkeypatch) -> None:
     captured: dict[str, object] = {}
     resolved = function_calling_runner.ResolvedFunctionCallingRun(
@@ -217,6 +289,32 @@ def test_function_calling_runner_main_forwards_explicit_run_context(monkeypatch)
 
     assert rc == 0
     assert captured["run_context"] is run_context
+
+
+def test_function_calling_runner_main_dispatches_complexfuncbench(monkeypatch) -> None:
+    called: list[str] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH,
+        dataset_path=Path("/tmp/complexfuncbench_official_test.jsonl"),
+        dataset_slug="complexfuncbench_official_test",
+        benchmark_name="complexfuncbench_official",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_complexfuncbench",
+        lambda _args, _run, *, run_context=None: called.append("complexfuncbench") or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "complexfuncbench_official_test.jsonl", "--model-path", "model.pth"])
+
+    assert rc == 0
+    assert called == ["complexfuncbench"]
 
 
 def test_function_calling_runner_main_dispatches_bfcl_v3(monkeypatch) -> None:

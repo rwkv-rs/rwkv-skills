@@ -30,6 +30,7 @@ from src.infer.sampling import SamplingConfig
 
 RESPOND_TOOL_NAME = "respond"
 DEFAULT_TAU_PROMPT_MAX_CHARS = 24576
+_TAU_REWARD_TYPE_PREFIX = "RewardType."
 
 
 @dataclass(slots=True)
@@ -37,6 +38,12 @@ class TauOfficialEvaluation:
     reward: float
     is_passed: bool
     details: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _TauRetailProgressiveToolDisclosure:
+    selected_tools: list[Any]
+    trace: dict[str, Any]
 
 
 class TauOfficialRuntime:
@@ -52,7 +59,7 @@ class TauOfficialRuntime:
     def load_task(self, payload: Mapping[str, Any]) -> Any:
         tasks_module = import_module_with_auto_install("tau2.data_model.tasks", context="tau2 Task model import")
         Task = getattr(tasks_module, "Task")
-        return Task.model_validate(dict(payload))
+        return Task.model_validate(normalize_tau_official_task_payload(payload))
 
     def create_environment(self, *, solo_mode: bool = False) -> Any:
         try:
@@ -77,6 +84,7 @@ class TauOfficialRuntime:
             llm=_tau_litellm_model_name(user_model),
             llm_args={
                 "temperature": float(temperature),
+                "stream": False,
                 "api_key": user_model.api_key,
                 "api_base": user_model.base_url,
                 **_tau_llm_timeout_args(),
@@ -149,6 +157,7 @@ def configure_tau_nl_assertions_judge(judge_model: Any) -> None:
         return
     llm_args: dict[str, Any] = {
         "temperature": 0.0,
+        "stream": False,
         "api_key": api_key,
         "response_format": {"type": "json_object"},
     }
@@ -159,6 +168,29 @@ def configure_tau_nl_assertions_judge(judge_model: Any) -> None:
         module = import_module_with_auto_install(module_name, context=f"tau2 NL assertion judge config: {module_name}")
         setattr(module, "DEFAULT_LLM_NL_ASSERTIONS", model_name)
         setattr(module, "DEFAULT_LLM_NL_ASSERTIONS_ARGS", dict(llm_args))
+
+
+def normalize_tau_official_task_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert known tau manifest wire formats to the vendored tau2 Task schema."""
+    normalized = dict(payload)
+    criteria = normalized.get("evaluation_criteria")
+    if not isinstance(criteria, Mapping):
+        return normalized
+
+    normalized_criteria = dict(criteria)
+    reward_basis = normalized_criteria.get("reward_basis")
+    if isinstance(reward_basis, Sequence) and not isinstance(reward_basis, (str, bytes)):
+        normalized_criteria["reward_basis"] = [
+            _normalize_tau_reward_type_value(value) for value in reward_basis
+        ]
+    normalized["evaluation_criteria"] = normalized_criteria
+    return normalized
+
+
+def _normalize_tau_reward_type_value(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith(_TAU_REWARD_TYPE_PREFIX):
+        return value.removeprefix(_TAU_REWARD_TYPE_PREFIX)
+    return value
 
 
 def _tau_litellm_model_name(model_config: Any) -> str:
@@ -213,6 +245,9 @@ class RWKVTauOfficialAgent:
         prompt_max_chars: int = DEFAULT_TAU_PROMPT_MAX_CHARS,
         long_doc_config: LongDocEvidenceConfig | None = None,
         tool_routing_config: ToolRoutingConfig | None = None,
+        retail_repeated_read_guard: bool = False,
+        retail_tool_use_guard: bool = False,
+        retail_progressive_tool_disclosure: bool = False,
     ) -> None:
         ensure_tau_v2_vendor_path()
         message_module = import_module_with_auto_install("tau2.data_model.message", context="tau2 message import")
@@ -232,6 +267,9 @@ class RWKVTauOfficialAgent:
         self._prompt_max_chars = max(1024, int(prompt_max_chars))
         self._long_doc_config = long_doc_config or long_doc_config_from_env("RWKV_TAU_LONG_DOC")
         self._tool_routing_config = tool_routing_config or ToolRoutingConfig()
+        self._retail_repeated_read_guard = bool(retail_repeated_read_guard)
+        self._retail_tool_use_guard = bool(retail_tool_use_guard)
+        self._retail_progressive_tool_disclosure = bool(retail_progressive_tool_disclosure)
         self._seed: int | None = None
         self._turn_index = 0
         self.stages: list[StageRecord] = []
@@ -317,7 +355,7 @@ class RWKVTauOfficialAgent:
             progress_desc="TauOfficial-LongDoc",
             prompt_seed=long_doc_seed,
         ).messages
-        facts_message = _build_tau_tool_facts_message(prompt_messages, max_chars=700)
+        facts_message = _build_tau_tool_facts_message(prompt_messages, max_chars=1100)
         facts_text = facts_message["content"] if facts_message is not None else None
         if facts_message is not None:
             compacted_messages = [*compacted_messages, facts_message]
@@ -342,6 +380,17 @@ class RWKVTauOfficialAgent:
             progress_desc="TauOfficial-ToolRouter",
             prompt_seed=None if self._seed is None else int(self._seed) + 10_000 + self._turn_index,
         )
+        selected_tools = list(tool_route.selected_tools)
+        progressive_trace: dict[str, Any] | None = None
+        if self._retail_progressive_tool_disclosure:
+            progressive_result = _apply_tau_retail_progressive_tool_disclosure(
+                self._tools,
+                selected_tools,
+                prompt_messages,
+                max_tools=max(1, int(self._tool_routing_config.max_tools)),
+            )
+            selected_tools = progressive_result.selected_tools
+            progressive_trace = progressive_result.trace
         (
             prompt,
             emitted_tools,
@@ -350,13 +399,15 @@ class RWKVTauOfficialAgent:
         ) = self._build_budgeted_agent_prompt(
             domain_policy=domain_policy,
             facts_text=facts_text,
-            selected_tools=tool_route.selected_tools,
+            selected_tools=selected_tools,
             messages=compacted_messages,
             history_budget=history_budget,
         )
         self._current_tool_names = {_tool_name(tool) for tool in emitted_tools if _tool_name(tool)}
         route_trace = {"turn_index": self._turn_index, **tool_route.trace_payload()}
-        if len(emitted_tools) != len(tool_route.selected_tools):
+        if progressive_trace is not None:
+            route_trace["retail_progressive_tool_disclosure"] = progressive_trace
+        if len(emitted_tools) != len(selected_tools):
             route_trace["emitted_names"] = [_tool_name(tool) for tool in emitted_tools if _tool_name(tool)]
             route_trace["system_budget_reduced"] = True
         if emitted_tool_schema_mode != "full":
@@ -461,6 +512,8 @@ class RWKVTauOfficialAgent:
             arguments,
             prompt_messages,
             available_tool_names=self._tool_names,
+            retail_repeated_read_guard=self._retail_repeated_read_guard,
+            retail_tool_use_guard=self._retail_tool_use_guard,
         )
         if normalized_name == RESPOND_TOOL_NAME:
             content = (
@@ -567,9 +620,9 @@ def build_tau_official_agent_system_prompt(
         "Valid names are exactly the listed tool names plus respond.",
         "Never invent wrapper or pseudo tools such as think, thought, search_flights, get_flights, search_bookings, get_user_bookings, or airline_agent_tool.",
         "Never copy a Function output object; do not return requestor/ok/output as your decision.",
-        "Do not invent ids/emails; lookup before changes.",
-        "Do not repeat successful read tools; use their outputs.",
-        "Use only argument keys declared by the selected tool schema.",
+        "Do not invent ids/emails; copy IDs exactly, including #.",
+        "Do not repeat successful reads; use outputs.",
+        "Use schema argument keys; detail tools need exact IDs, list/find names first.",
     ]
     if facts_text:
         sections.extend(
@@ -636,11 +689,23 @@ def _partial_tau_decision_payload(text: str, *, cause: Exception) -> dict[str, A
         raise ValueError(f"tau agent decision missing recoverable name: {normalized}") from cause
     try:
         arguments = _raw_decode_json_field(body, "arguments")
-    except ValueError as exc:
-        raise ValueError(f"tau agent decision missing recoverable arguments: {normalized}") from exc
+    except ValueError:
+        arguments = _partial_tau_arguments_payload(body)
     if arguments is None:
         arguments = {}
     return {"name": name, "arguments": arguments}
+
+
+def _partial_tau_arguments_payload(body: str) -> dict[str, Any]:
+    """Return an empty argument object when only the tool name is recoverable.
+
+    Some RWKV generations emit a valid name and then truncate inside the
+    arguments field. Keeping the recoverable tool name lets the downstream
+    context normalizers fill exact IDs from previous tool outputs when they
+    already have that information; otherwise the real environment still sees a
+    malformed/empty call instead of a parser-level stop.
+    """
+    return {}
 
 
 def _raw_decode_json_field(body: str, key: str) -> Any:
@@ -744,13 +809,55 @@ _TAU_READ_TOOL_NAMES = {
     "get_user_details",
 }
 _TAU_USER_ID_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z][a-z0-9]*_\d+\b", re.IGNORECASE)
+_TAU_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _TAU_GENERIC_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{3,}\b")
 _TAU_FLIGHT_NUMBER_RE = re.compile(r"\b[A-Z]{2,4}\d{2,4}\b")
+_TAU_HASH_ID_RE = re.compile(r"#[A-Za-z0-9][A-Za-z0-9_-]*")
+_TAU_RETAIL_ORDER_ID_RE = re.compile(r"#?[A-Z]\d{7,}\b", re.IGNORECASE)
+_TAU_NUMERIC_ID_RE = re.compile(r"\d{6,}")
 _TAU_EXISTING_RESERVATION_ACTION_RE = re.compile(
     r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation|refund|change|reschedule|move|upgrade|"
     r"baggage|bag|bags|suitcase|suitcases|luggage|passenger|date of birth|dob|existing reservation)\b",
     re.IGNORECASE,
 )
+_TAU_RETAIL_EXCHANGE_INTENT_RE = re.compile(
+    r"\b(?:exchange|replace|replacement|swap|change|different|wrong|size|color|colour|variant)\b",
+    re.IGNORECASE,
+)
+_TAU_RETAIL_RETURN_INTENT_RE = re.compile(r"\b(?:return|refund)\b", re.IGNORECASE)
+_TAU_RETAIL_CANCEL_INTENT_RE = re.compile(
+    r"\b(?:cancel|cancellation|ordered by mistake|no longer needed)\b",
+    re.IGNORECASE,
+)
+_TAU_RETAIL_ADDRESS_INTENT_RE = re.compile(
+    r"\b(?:address|shipping|ship to|delivery address|mailing address|street|zip)\b",
+    re.IGNORECASE,
+)
+_TAU_RETAIL_PAYMENT_INTENT_RE = re.compile(
+    r"\b(?:payment|pay|card|credit card|gift card|paypal)\b",
+    re.IGNORECASE,
+)
+_TAU_RETAIL_PRODUCT_INTENT_RE = re.compile(
+    r"\b(?:product|item|option|variant|inventory|available|availability|size|color|colour|shirt|t-shirt|headphone|watch)\b",
+    re.IGNORECASE,
+)
+_TAU_RETAIL_BOOTSTRAP_TOOLS = (
+    "find_user_id_by_email",
+    "find_user_id_by_name_zip",
+    "get_order_details",
+    "list_all_product_types",
+    "calculate",
+    "transfer_to_human_agents",
+)
+_TAU_RETAIL_ORDER_WRITE_TOOLS = (
+    "cancel_pending_order",
+    "exchange_delivered_order_items",
+    "return_delivered_order_items",
+    "modify_pending_order_address",
+    "modify_pending_order_items",
+    "modify_pending_order_payment",
+)
+_TAU_RETAIL_DETAIL_TOOLS = ("get_product_details", "get_item_details")
 _TAU_FACT_KEYS = {
     "account_status",
     "bill_ids",
@@ -781,9 +888,21 @@ def _normalize_tau_tool_decision_from_context(
     prompt_messages: Sequence[Mapping[str, object]],
     *,
     available_tool_names: set[str],
+    retail_repeated_read_guard: bool = False,
+    retail_tool_use_guard: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     normalized_name = str(name or "").strip()
     normalized_arguments = dict(arguments)
+    normalized_arguments = _preserve_hash_prefixed_ids_from_user_context(normalized_arguments, prompt_messages)
+    if retail_tool_use_guard:
+        retail_replacement = _tau_retail_tool_use_replacement(
+            normalized_name,
+            normalized_arguments,
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+        if retail_replacement is not None:
+            normalized_name, normalized_arguments = retail_replacement
     cancel_replacement = _tau_cancel_intent_replacement_from_context(
         normalized_name,
         prompt_messages,
@@ -814,6 +933,15 @@ def _normalize_tau_tool_decision_from_context(
             and _has_successful_tau_tool_name("get_user_details", prompt_messages)
         )
         if has_same_observation or has_prior_user_profile:
+            if retail_repeated_read_guard:
+                guard_response = _tau_repeated_retail_read_guard_response(
+                    normalized_name,
+                    normalized_arguments,
+                    prompt_messages,
+                    available_tool_names=available_tool_names,
+                )
+                if guard_response is not None:
+                    return guard_response
             context_response = _tau_readonly_reservation_response_from_context(prompt_messages)
             if context_response is not None:
                 return context_response
@@ -835,6 +963,316 @@ def _normalize_tau_tool_decision_from_context(
             if exhausted_response is not None:
                 return exhausted_response
     return normalized_name, normalized_arguments
+
+
+def _tau_retail_tool_use_replacement(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not _available_tau_retail_tools(available_tool_names):
+        return None
+    if name == "get_product_details" and "list_all_product_types" in available_tool_names:
+        product_id = str(arguments.get("product_id") or "").strip()
+        if not _TAU_NUMERIC_ID_RE.fullmatch(product_id):
+            catalog_product_id = _requested_tau_retail_product_id_from_catalog(prompt_messages)
+            if catalog_product_id and "get_product_details" in available_tool_names:
+                return "get_product_details", {"product_id": catalog_product_id}
+            return "list_all_product_types", {}
+    if name == "list_all_product_types" and "get_product_details" in available_tool_names:
+        if _has_successful_tau_tool_name("list_all_product_types", prompt_messages):
+            catalog_product_id = _requested_tau_retail_product_id_from_catalog(prompt_messages)
+            if catalog_product_id:
+                return "get_product_details", {"product_id": catalog_product_id}
+    if name == "get_order_details":
+        order_id = str(arguments.get("order_id") or "").strip()
+        if _TAU_RETAIL_ORDER_ID_RE.fullmatch(order_id):
+            return None
+        requested_order_id = _requested_tau_retail_order_id_from_user(prompt_messages)
+        if requested_order_id:
+            return "get_order_details", {"order_id": requested_order_id}
+    return None
+
+
+def _requested_tau_retail_product_id_from_catalog(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    user_text = _tau_user_request_text(prompt_messages).lower()
+    if not user_text:
+        return None
+    best: tuple[int, str] | None = None
+    for tool_name, _args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "list_all_product_types" or not ok or not isinstance(output, Mapping):
+            continue
+        for raw_name, raw_product_id in output.items():
+            product_name = str(raw_name or "").strip()
+            product_id = str(raw_product_id or "").strip()
+            if not product_name or not _TAU_NUMERIC_ID_RE.fullmatch(product_id):
+                continue
+            position = _tau_retail_product_name_position(product_name, user_text)
+            if position is not None and (best is None or position < best[0]):
+                best = (position, product_id)
+        if best is not None:
+            return best[1]
+    return None
+
+
+def _tau_retail_product_name_position(product_name: str, user_text_lower: str) -> int | None:
+    normalized_name = product_name.lower().strip()
+    candidates = {
+        normalized_name,
+        normalized_name.replace("-", " "),
+        normalized_name.replace(" ", "-"),
+    }
+    if normalized_name.endswith("s"):
+        singular = normalized_name[:-1]
+        candidates.update({singular, singular.replace("-", " "), singular.replace(" ", "-")})
+    positions = [user_text_lower.find(candidate) for candidate in candidates if candidate and candidate in user_text_lower]
+    return min(positions) if positions else None
+
+
+def _requested_tau_retail_order_id_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    matches = [match.group(0) for match in _TAU_RETAIL_ORDER_ID_RE.finditer(user_text) if match.group(0).startswith("#")]
+    deduped: list[str] = []
+    for value in matches:
+        normalized = value.upper()
+        if normalized not in {existing.upper() for existing in deduped}:
+            deduped.append(value)
+    if len(deduped) == 1:
+        return deduped[0]
+    return None
+
+
+def _tau_repeated_retail_read_guard_response(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not _available_tau_retail_tools(available_tool_names):
+        return None
+    if name not in {"get_order_details", "get_user_details"}:
+        return None
+    if not _has_successful_tau_tool_observation(name, arguments, prompt_messages):
+        return None
+    return (
+        RESPOND_TOOL_NAME,
+        {
+            "content": (
+                "I already have the successful tool output for that record and cannot safely continue "
+                "by repeating the same read. ###STOP###"
+            )
+        },
+    )
+
+
+def _available_tau_retail_tools(available_tool_names: set[str]) -> bool:
+    retail_markers = {
+        "get_order_details",
+        "exchange_delivered_order_items",
+        "return_delivered_order_items",
+        "list_all_product_types",
+    }
+    return bool(retail_markers.intersection(available_tool_names))
+
+
+def _apply_tau_retail_progressive_tool_disclosure(
+    tools: Sequence[Any],
+    selected_tools: Sequence[Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    max_tools: int,
+) -> _TauRetailProgressiveToolDisclosure:
+    tools_by_name = {_tool_name(tool): tool for tool in tools if _tool_name(tool)}
+    selected_names = [_tool_name(tool) for tool in selected_tools if _tool_name(tool)]
+    if not _available_tau_retail_tools(set(tools_by_name)):
+        return _TauRetailProgressiveToolDisclosure(
+            selected_tools=list(selected_tools),
+            trace={
+                "enabled": True,
+                "applied": False,
+                "reason": "non_retail_tools",
+                "selected_names_before": selected_names,
+                "selected_names_after": selected_names,
+            },
+        )
+
+    allowed_names, phase = _tau_retail_progressive_allowed_tool_names(
+        prompt_messages,
+        available_tool_names=set(tools_by_name),
+    )
+    allowed_set = set(allowed_names)
+    ranked_names = _dedupe_tau_tool_names(
+        [
+            *allowed_names,
+            *(name for name in selected_names if name in allowed_set),
+        ]
+    )
+    limit = max(1, int(max_tools))
+    selected = [tools_by_name[name] for name in ranked_names[:limit] if name in tools_by_name]
+    if not selected:
+        selected = list(selected_tools)
+    after_names = [_tool_name(tool) for tool in selected if _tool_name(tool)]
+    return _TauRetailProgressiveToolDisclosure(
+        selected_tools=selected,
+        trace={
+            "enabled": True,
+            "applied": True,
+            "phase": phase,
+            "allowed_names": [name for name in allowed_names if name in tools_by_name],
+            "selected_names_before": selected_names,
+            "selected_names_after": after_names,
+        },
+    )
+
+
+def _tau_retail_progressive_allowed_tool_names(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[list[str], str]:
+    user_text = _tau_user_request_text(prompt_messages)
+    requested_order_id = _requested_tau_retail_order_id_from_user(prompt_messages)
+    order = _latest_successful_tau_retail_order_observation(
+        prompt_messages,
+        order_id=requested_order_id,
+    )
+    has_order = order is not None
+    has_user = _has_successful_tau_tool_name("get_user_details", prompt_messages)
+    has_catalog = _has_successful_tau_tool_name("list_all_product_types", prompt_messages)
+    has_product = _has_successful_tau_tool_name("get_product_details", prompt_messages)
+    has_product_id = bool(_latest_tau_fact_value(prompt_messages, "product_id"))
+    has_item_id = bool(_latest_tau_fact_value(prompt_messages, "item_id"))
+    status = str((order.get("status") if isinstance(order, Mapping) else "") or "").strip().lower()
+    product_intent = bool(_TAU_RETAIL_PRODUCT_INTENT_RE.search(user_text))
+    exchange_intent = bool(_TAU_RETAIL_EXCHANGE_INTENT_RE.search(user_text))
+    return_intent = bool(_TAU_RETAIL_RETURN_INTENT_RE.search(user_text))
+    cancel_intent = bool(_TAU_RETAIL_CANCEL_INTENT_RE.search(user_text))
+    address_intent = bool(_TAU_RETAIL_ADDRESS_INTENT_RE.search(user_text))
+    payment_intent = bool(_TAU_RETAIL_PAYMENT_INTENT_RE.search(user_text))
+    lookup_tools = _tau_retail_explicit_user_lookup_tool_names(user_text)
+
+    allowed: list[str] = []
+    if requested_order_id and not has_order:
+        allowed.append("get_order_details")
+        phase = "order_lookup"
+    elif not has_order and not has_catalog and product_intent:
+        allowed.append("list_all_product_types")
+        allowed.extend(lookup_tools)
+        phase = "product_catalog_lookup"
+    elif not has_order and has_catalog and product_intent:
+        allowed.append("get_product_details")
+        allowed.extend(lookup_tools)
+        phase = "product_detail_lookup"
+    elif not has_order and not has_user:
+        allowed.extend(lookup_tools)
+        if product_intent:
+            allowed.append("list_all_product_types")
+        phase = "user_lookup"
+    elif has_order and not has_user:
+        allowed.append("get_user_details")
+        if product_intent or exchange_intent or has_product_id:
+            allowed.append("get_product_details" if has_catalog or has_product_id else "list_all_product_types")
+        phase = "order_known_user_lookup"
+    else:
+        phase = "action_or_detail"
+        if product_intent or exchange_intent or has_product_id or has_catalog:
+            if not has_catalog and not has_product_id:
+                allowed.append("list_all_product_types")
+            else:
+                allowed.append("get_product_details")
+        if has_product or has_item_id:
+            allowed.append("get_item_details")
+        if has_order:
+            if "pending" in status:
+                if cancel_intent:
+                    allowed.append("cancel_pending_order")
+                if address_intent:
+                    allowed.append("modify_pending_order_address")
+                if exchange_intent or product_intent:
+                    allowed.append("modify_pending_order_items")
+                if payment_intent:
+                    allowed.append("modify_pending_order_payment")
+            elif status == "delivered":
+                if return_intent:
+                    allowed.append("return_delivered_order_items")
+                if exchange_intent or product_intent:
+                    allowed.append("exchange_delivered_order_items")
+        if address_intent and has_user:
+            allowed.append("modify_user_address")
+        allowed.append("get_user_details")
+
+    allowed.extend(("calculate", "transfer_to_human_agents"))
+    if not allowed:
+        allowed.extend(_TAU_RETAIL_BOOTSTRAP_TOOLS)
+    return [name for name in _dedupe_tau_tool_names(allowed) if name in available_tool_names], phase
+
+
+def _latest_successful_tau_retail_order_observation(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    order_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    requested = str(order_id or "").strip().upper()
+    for tool_name, args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_order_details" or not ok or not isinstance(output, Mapping):
+            continue
+        observed_id = str(output.get("order_id") or args.get("order_id") or "").strip().upper()
+        if requested and observed_id != requested:
+            continue
+        return output
+    return None
+
+
+def _tau_retail_explicit_user_lookup_tool_names(user_text: str) -> list[str]:
+    text = str(user_text or "")
+    names: list[str] = []
+    if _TAU_EMAIL_RE.search(text):
+        names.append("find_user_id_by_email")
+    if re.search(r"\b\d{5}(?:-\d{4})?\b", text):
+        names.append("find_user_id_by_name_zip")
+    return names
+
+
+def _dedupe_tau_tool_names(values: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        name = str(value or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _preserve_hash_prefixed_ids_from_user_context(
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> dict[str, Any]:
+    """Restore a leading # only when the user supplied the exact same ID token."""
+    user_text = _tau_user_request_text(prompt_messages)
+    hash_ids = {match.group(0)[1:]: match.group(0) for match in _TAU_HASH_ID_RE.finditer(user_text)}
+    if not hash_ids:
+        return dict(arguments)
+
+    def preserve(value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped in hash_ids:
+                return hash_ids[stripped]
+            return value
+        if isinstance(value, list):
+            return [preserve(item) for item in value]
+        if isinstance(value, tuple):
+            return [preserve(item) for item in value]
+        if isinstance(value, Mapping):
+            return {str(key): preserve(child) for key, child in value.items()}
+        return value
+
+    return {str(key): preserve(value) for key, value in dict(arguments).items()}
 
 
 def _tau_cancel_intent_replacement_from_context(
@@ -1251,6 +1689,10 @@ def _iter_tau_fact_items(value: Any) -> list[tuple[str, Any]]:
         if depth > 2:
             return
         if isinstance(current, Mapping):
+            item_summary = _format_tau_item_fact(current)
+            if item_summary:
+                items.append(("item", item_summary))
+                return
             for raw_key, raw_value in current.items():
                 key = str(raw_key)
                 if key in _TAU_FACT_KEYS and _is_tau_fact_value(raw_value):
@@ -1264,6 +1706,29 @@ def _iter_tau_fact_items(value: Any) -> list[tuple[str, Any]]:
 
     visit(value, depth=0)
     return items
+
+
+def _format_tau_item_fact(value: Mapping[str, Any]) -> str | None:
+    name = str(value.get("name") or "").strip()
+    product_id = str(value.get("product_id") or "").strip()
+    item_id = str(value.get("item_id") or "").strip()
+    if not name or (not product_id and not item_id):
+        return None
+    parts = [name]
+    if product_id:
+        parts.append(f"product_id={product_id}")
+    if item_id:
+        parts.append(f"item_id={item_id}")
+    options = value.get("options")
+    if isinstance(options, Mapping):
+        option_parts = [
+            f"{str(key).strip()}={str(option_value).strip()}"
+            for key, option_value in options.items()
+            if str(key).strip() and str(option_value).strip()
+        ]
+        if option_parts:
+            parts.append("options: " + ", ".join(option_parts[:5]))
+    return truncate_text(" | ".join(parts), 180)
 
 
 def _is_tau_fact_value(value: Any) -> bool:

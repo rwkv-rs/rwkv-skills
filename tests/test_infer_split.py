@@ -746,6 +746,51 @@ def test_remote_backend_falls_back_to_text_completions_for_generate(monkeypatch)
     assert calls[1][1]["prompt"] == "prompt"
 
 
+def test_remote_backend_tqdm_cleanup_errors_do_not_fail_generation(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+        )
+    )
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        del payload
+        if url.endswith("/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        raise RemoteHTTPError(404, "missing")
+
+    class _BrokenTqdm:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            del args, kwargs
+
+        def update(self, amount: int) -> None:
+            del amount
+            raise AttributeError("'tqdm' object has no attribute 'sp'")
+
+        def close(self) -> None:
+            raise AttributeError("'tqdm' object has no attribute 'sp'")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+    monkeypatch.setattr("src.infer.backend.tqdm", _BrokenTqdm)
+
+    outputs = backend.generate(
+        ["prompt"],
+        sampling=SamplingConfig(max_generate_tokens=4, temperature=0.0, top_p=0.8),
+        batch_size=1,
+        show_progress=True,
+    )
+
+    assert outputs[0].text == "answer"
+
+
 def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(

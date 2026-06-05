@@ -168,6 +168,75 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert "--judge-base-url" in resolved.argv
 
 
+def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypatch, tmp_path: Path) -> None:
+    config = main_module.RunConfig.from_mapping(
+        {
+            "dataset": {"name": "swe_bench_lite_bm25_13k", "split": "test"},
+            "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
+            "runner": {
+                "benchmark_kind": "swe_bench",
+                "cot_mode": "cot",
+                "long_doc_mode": "model_parallel",
+                "long_doc_max_evidence_chars": 3000,
+                "long_doc_model_parallel_batch_size": 8,
+            },
+        }
+    )
+
+    dataset_path = tmp_path / "swe_bench_lite_bm25_13k" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text(
+        json.dumps({"task_id": "a__b-1", "prompt": "Fix it.", "instance_id": "a__b-1"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    resolved = main_module.resolve_run_config(config)
+
+    assert resolved.runner.name == "code_swe_bench"
+    assert resolved.module == "src.eval.coding.runner"
+    assert "--long-doc-mode" in resolved.argv
+    assert "model_parallel" in resolved.argv
+    assert "--long-doc-max-evidence-chars" in resolved.argv
+    assert "3000" in resolved.argv
+    assert "--long-doc-model-parallel-batch-size" in resolved.argv
+    assert "8" in resolved.argv
+
+
+def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypatch, tmp_path: Path) -> None:
+    config = main_module.RunConfig.from_mapping(
+        {
+            "dataset": {"name": "longcodeqa"},
+            "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
+            "runner": {
+                "result_store": "json",
+                "long_doc_mode": "off",
+                "answer_max_tokens": 64,
+                "avg_ks": [1.0],
+            },
+        }
+    )
+
+    dataset_path = tmp_path / "longcodeqa" / "test.jsonl"
+    dataset_path.parent.mkdir(parents=True)
+    dataset_path.write_text(
+        json.dumps({"task_id": "a", "prompt": "p", "repo_text": "r", "question": "q", "correct_letter": "A"})
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
+
+    resolved = main_module.resolve_run_config(config)
+
+    assert resolved.runner.name == "function_longcodebench"
+    assert resolved.module == "src.eval.function_calling.runner"
+    assert "--benchmark-kind" in resolved.argv
+    assert "longcodebench" in resolved.argv
+    assert "--answer-max-tokens" in resolved.argv
+    assert "64" in resolved.argv
+    assert resolved.env["RWKV_EVAL_STORE"] == "json"
+
+
 def test_resolve_run_config_can_select_json_result_store(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
@@ -424,7 +493,9 @@ def test_resolve_run_config_supports_param_search_mode(monkeypatch, tmp_path: Pa
     assert resolved.module == "src.bin.param_search_free_response_judge"
     assert "--db-write-queue" in resolved.argv
     assert "--cot-max-tokens" in resolved.argv
+    assert "256" in resolved.argv
     assert "--final-max-tokens" in resolved.argv
+    assert "64" in resolved.argv
 
 
 def test_param_search_requires_compatible_maths_benchmark(monkeypatch, tmp_path: Path) -> None:

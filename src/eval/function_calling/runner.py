@@ -39,6 +39,9 @@ from src.eval.function_calling.api_bank import _run_api_bank
 from src.eval.function_calling.bfcl_exec import _run_bfcl_exec
 from src.eval.function_calling.bfcl_v3_runner import _run_bfcl_v3
 from src.eval.function_calling.browsecomp import _run_browsecomp
+from src.eval.function_calling.complexfuncbench import _run_complexfuncbench
+from src.eval.function_calling.longbench import _run_longbench
+from src.eval.function_calling.longcodebench import _run_longcodebench
 from src.eval.function_calling.mcp_bench import _run_mcp_bench
 from src.eval.function_calling.runner_common import (
     FunctionCallingBenchmarkKind,
@@ -246,6 +249,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Abort one tau task after this many tool-call errors",
     )
     parser.add_argument(
+        "--complexfuncbench-disable-response-eval",
+        action="store_true",
+        help="Disable official ComplexFuncBench GPT response evaluation and score only sandbox/tool-call matching.",
+    )
+    parser.add_argument(
+        "--complexfuncbench-offline-compare",
+        action="store_true",
+        help="Disable official ComplexFuncBench RapidAPI/GPT equivalence checks and use offline rule/value matching.",
+    )
+    parser.add_argument(
+        "--tau-retail-repeated-read-guard",
+        action="store_true",
+        help="Stop retail tau tasks when the agent repeats an already-successful read call.",
+    )
+    parser.add_argument(
+        "--tau-retail-tool-use-guard",
+        action="store_true",
+        help="Route obvious retail ID/type mismatches to the safer read tool in tau ablations.",
+    )
+    parser.add_argument(
+        "--tau-retail-progressive-tool-disclosure",
+        action="store_true",
+        help="Expose retail tau tools in procedural stages instead of showing read/detail/write tools at once.",
+    )
+    parser.add_argument(
         "--agentbench-controller-url",
         help="AgentBench/AgentRL controller API URL, default AGENTBENCH_CONTROLLER_URL or http://127.0.0.1:5020/api",
     )
@@ -261,6 +289,10 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
     job_names = frozenset(metadata.scheduler_jobs)
     if "function_browsecomp" in job_names:
         return FunctionCallingBenchmarkKind.BROWSECOMP
+    if "function_longbench" in job_names:
+        return FunctionCallingBenchmarkKind.LONGBENCH
+    if "function_longcodebench" in job_names:
+        return FunctionCallingBenchmarkKind.LONGCODEBENCH
     if "function_mcp_bench" in job_names:
         return FunctionCallingBenchmarkKind.MCP_BENCH
     if "function_api_bank" in job_names:
@@ -275,6 +307,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         return FunctionCallingBenchmarkKind.BFCL_V3
     if "function_toolalpaca" in job_names:
         return FunctionCallingBenchmarkKind.TOOLALPACA
+    if "function_complexfuncbench" in job_names:
+        return FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH
     if "function_tau3_bench" in job_names:
         return FunctionCallingBenchmarkKind.TAU3_BENCH
     if "function_tau2_bench" in job_names:
@@ -324,6 +358,10 @@ def main(
     run = _resolve_run(args)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP:
         return _run_browsecomp(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.LONGBENCH:
+        return _run_longbench(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.LONGCODEBENCH:
+        return _run_longcodebench(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.MCP_BENCH:
         return _run_mcp_bench(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.API_BANK:
@@ -338,6 +376,8 @@ def main(
         return _run_bfcl_exec(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.TOOLALPACA:
         return _run_toolalpaca(args, run, run_context=run_context)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH:
+        return _run_complexfuncbench(args, run, run_context=run_context)
     return _run_tau(args, run, run_context=run_context)
 
 
