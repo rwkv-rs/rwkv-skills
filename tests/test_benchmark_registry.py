@@ -159,12 +159,25 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
 
 
 def test_instruction_following_benchmarks_are_no_cot_only() -> None:
-    metadata = resolve_benchmark_metadata("flores200_devtest")
+    metadata = resolve_benchmark_metadata("ifbench_test")
 
     assert metadata.field is BenchmarkField.INSTRUCTION_FOLLOWING
     assert metadata.cot_modes == (CoTMode.NO_COT,)
-    assert metadata.default_split == "devtest"
     assert metadata.scheduler_jobs == ("instruction_following",)
+
+
+def test_instruction_following_data_only_benchmarks_do_not_use_ifeval_scorer() -> None:
+    flores = resolve_benchmark_metadata("flores200_devtest")
+    arena = resolve_benchmark_metadata("arena_hard_test")
+    wmt = resolve_benchmark_metadata("wmt24pp_test")
+
+    assert flores.field is BenchmarkField.INSTRUCTION_FOLLOWING
+    assert flores.default_split == "devtest"
+    assert flores.scheduler_jobs == ()
+    assert arena.field is BenchmarkField.INSTRUCTION_FOLLOWING
+    assert arena.scheduler_jobs == ()
+    assert wmt.field is BenchmarkField.INSTRUCTION_FOLLOWING
+    assert wmt.scheduler_jobs == ()
 
 
 def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:

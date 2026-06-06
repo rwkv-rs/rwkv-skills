@@ -62,11 +62,12 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["instruction_following"].extra_args == ()
 
 
-def test_instruction_following_matrix_includes_all_supported_datasets() -> None:
+def test_instruction_following_matrix_includes_rule_scored_datasets_only() -> None:
     assert canonical_slug("ifeval_test") in INSTRUCTION_FOLLOWING_DATASET_SLUGS
-    assert canonical_slug("arena_hard_test") in INSTRUCTION_FOLLOWING_DATASET_SLUGS
-    assert canonical_slug("wmt24pp_test") in INSTRUCTION_FOLLOWING_DATASET_SLUGS
-    assert canonical_slug("flores200_devtest") in INSTRUCTION_FOLLOWING_DATASET_SLUGS
+    assert canonical_slug("ifbench_test") in INSTRUCTION_FOLLOWING_DATASET_SLUGS
+    assert canonical_slug("arena_hard_test") not in INSTRUCTION_FOLLOWING_DATASET_SLUGS
+    assert canonical_slug("wmt24pp_test") not in INSTRUCTION_FOLLOWING_DATASET_SLUGS
+    assert canonical_slug("flores200_devtest") not in INSTRUCTION_FOLLOWING_DATASET_SLUGS
 
 
 def test_scheduler_matrix_uses_metadata_default_splits() -> None:

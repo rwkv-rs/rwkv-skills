@@ -12,7 +12,7 @@ from dataclasses import replace
 
 from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.eval.benchmark_registry import CoTMode
+from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 DEFAULT_AVG_K: tuple[NumericK, ...] = ()
 IFEVAL_AVG_K: tuple[NumericK, ...] = (4,)
+_RULE_BASED_JOB_NAME = "instruction_following"
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -59,6 +60,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _ensure_rule_based_dataset(slug: str) -> None:
+    metadata = resolve_benchmark_metadata(slug)
+    if _RULE_BASED_JOB_NAME in metadata.scheduler_jobs:
+        return
+    raise ValueError(
+        f"dataset {slug!r} is registered as instruction-following data, "
+        "but it does not have a rule-based instruction-following scorer"
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -74,6 +85,7 @@ def main(
 
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
+    _ensure_rule_based_dataset(slug)
     model_name = resolve_backend_model_name(args)
     dataset_records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
     default_avg_k = IFEVAL_AVG_K if canonical_slug(str(slug)).startswith("ifeval") else DEFAULT_AVG_K

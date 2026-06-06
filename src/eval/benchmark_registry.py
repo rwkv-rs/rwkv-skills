@@ -181,6 +181,7 @@ def _instruction_following(
     *,
     default_split: str = "test",
     dataset_name: str | None = None,
+    scheduler_jobs: tuple[str, ...] = _INSTRUCTION_FOLLOWING_JOBS,
 ) -> BenchmarkMetadata:
     return _metadata(
         name,
@@ -188,7 +189,7 @@ def _instruction_following(
         cot_modes=_NO_COT_ONLY,
         default_split=default_split,
         dataset_name=dataset_name,
-        scheduler_jobs=_INSTRUCTION_FOLLOWING_JOBS,
+        scheduler_jobs=scheduler_jobs,
     )
 
 
@@ -264,9 +265,13 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     # Instruction following
     canonical_slug("ifeval"): _instruction_following("ifeval"),
     canonical_slug("ifbench"): _instruction_following("ifbench"),
-    canonical_slug("arena_hard_v2"): _instruction_following("arena_hard_v2", dataset_name="arena_hard"),
-    canonical_slug("wmt24pp"): _instruction_following("wmt24pp"),
-    canonical_slug("flores200"): _instruction_following("flores200", default_split="devtest"),
+    canonical_slug("arena_hard_v2"): _instruction_following(
+        "arena_hard_v2",
+        dataset_name="arena_hard",
+        scheduler_jobs=(),
+    ),
+    canonical_slug("wmt24pp"): _instruction_following("wmt24pp", scheduler_jobs=()),
+    canonical_slug("flores200"): _instruction_following("flores200", default_split="devtest", scheduler_jobs=()),
     # Function calling
     canonical_slug("browsecomp"): _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
@@ -401,7 +406,8 @@ _PREFIX_FALLBACKS: tuple[tuple[tuple[str, ...], BenchmarkMetadata], ...] = (
         ("livecodebench",),
         _coding_livecodebench("livecodebench"),
     ),
-    (("ifeval", "ifbench", "wmt24pp", "flores200"), _instruction_following("instruction_following")),
+    (("ifeval", "ifbench"), _instruction_following("instruction_following")),
+    (("wmt24pp", "flores200"), _instruction_following("instruction_following", scheduler_jobs=())),
     (
         ("browsecomp",),
         _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
