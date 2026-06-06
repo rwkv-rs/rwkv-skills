@@ -9,7 +9,9 @@ from lexical_chunk_router import (
     route_tools,
     summarize_tool,
 )
+from rwkv_agent_eval_plugin import agent_plugin_config_from_sources, route_agent_prompt_inputs
 from src.plugins import lexical_chunk_router as compat_lexical_chunk_router
+from src.plugins import rwkv_agent_eval_plugin as compat_agent_eval_plugin
 
 
 def _tool(name: str, description: str, *properties: str) -> dict[str, object]:
@@ -151,3 +153,60 @@ def test_plugin_summarize_tool_accepts_openai_function_shape() -> None:
 def test_src_plugins_import_path_remains_compatible() -> None:
     assert compat_lexical_chunk_router.LongDocConfig is LongDocConfig
     assert compat_lexical_chunk_router.route_tools is route_tools
+
+
+def test_rwkv_agent_eval_plugin_routes_policy_messages_and_tools() -> None:
+    policy = "\n".join(
+        [f"policy noise row {index:03d}" for index in range(30)]
+        + ["invoice INV-42 policy evidence: paid invoices should be returned with receipt details."]
+        + [f"policy archive row {index:03d}" for index in range(30)]
+    )
+    long_tool_output = "\n".join(
+        [f"ledger noise row {index:03d}" for index in range(30)]
+        + ["invoice INV-42 status paid evidence"]
+        + [f"ledger archive row {index:03d}" for index in range(30)]
+    )
+    tools = [
+        _tool("lookup_weather", "Read city weather forecast", "city"),
+        _tool("lookup_invoice", "Lookup invoice payment status", "invoice_id"),
+    ]
+
+    config = agent_plugin_config_from_sources(
+        {
+            "agent_plugin_enabled": True,
+            "tool_router_max_tools": 1,
+            "tool_router_trigger_tool_count": 1,
+            "tool_router_trigger_catalog_chars": 1,
+            "tool_router_enable_domain_hints": False,
+            "long_context_min_chars": 200,
+            "long_context_chunk_chars": 160,
+            "long_context_overlap_lines": 1,
+            "long_context_max_evidence_chunks": 1,
+            "long_context_max_evidence_chars": 260,
+            "long_context_query_chars": 500,
+            "prompt_max_chars": 3072,
+        }
+    )
+
+    route = route_agent_prompt_inputs(
+        domain_policy=policy,
+        tools=tools,
+        messages=[
+            {"role": "user", "content": "Need invoice INV-42 status."},
+            {"role": "assistant", "content": '{"name":"lookup_invoice","arguments":{"invoice_id":"INV-42"}}'},
+            {"role": "user", "content": long_tool_output},
+        ],
+        config=config,
+    )
+
+    assert route.tool_route is not None
+    assert route.tool_route.selected_names == ("lookup_invoice",)
+    assert "invoice INV-42 status paid evidence" in route.messages[-1]["content"]
+    assert "ledger noise row 000" not in route.messages[-1]["content"]
+    assert "invoice INV-42 policy evidence" in route.domain_policy
+    assert route.long_context_trace is not None
+    assert route.long_context_trace["compacted_message_count"] == 1
+    assert route.long_context_trace["policy_compacted"] is True
+    assert config.prompt_max_chars == 3072
+    assert config.long_context.max_chunk_chars == 160
+    assert compat_agent_eval_plugin.route_agent_prompt_inputs is route_agent_prompt_inputs

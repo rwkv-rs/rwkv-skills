@@ -1211,6 +1211,7 @@ class EvalDbService:
             "function_call_subtype",
             "function_call_env_type",
             "function_call_scorer_type",
+            "attempt_key",
         ):
             if key in payload:
                 context[key] = payload.get(key)

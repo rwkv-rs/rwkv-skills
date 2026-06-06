@@ -417,7 +417,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=TAU2_BENCH_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
-        batch_flag="--batch-size",
+        batch_flag="--tau-sample-workers",
     ),
     "function_tau3_bench": JobSpec(
         name="function_tau3_bench",
@@ -425,7 +425,7 @@ JOB_CATALOGUE: dict[str, JobSpec] = {
         dataset_slugs=TAU3_BENCH_DATASET_SLUGS,
         is_cot=False,
         domain="function_call",
-        batch_flag="--batch-size",
+        batch_flag="--tau-sample-workers",
     ),
     "function_agent_agentbench_db": JobSpec(
         name="function_agent_agentbench_db",

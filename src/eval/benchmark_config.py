@@ -72,6 +72,7 @@ class BenchmarkModelConfig:
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
+    agent_plugin_enabled: bool | None = None
     tool_router_mode: str | None = None
     tool_router_max_tools: int | None = None
     tool_router_trigger_tool_count: int | None = None
@@ -91,6 +92,9 @@ class BenchmarkModelConfig:
     max_tool_errors: int | None = None
     decision_max_tokens: int | None = None
     max_repeated_tool_calls: int | None = None
+    tau_sample_workers: int | None = None
+    tau_attempt_retries: int | None = None
+    tau_judge_concurrency: int | None = None
     user_model: str | None = None
     user_api_key: str | None = None
     user_base_url: str | None = None
@@ -350,6 +354,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
+    agent_plugin_enabled: bool | None = None
     tool_router_mode: str | None = None
     tool_router_max_tools: int | None = None
     tool_router_trigger_tool_count: int | None = None
@@ -369,6 +374,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     max_tool_errors: int | None = None
     decision_max_tokens: int | None = None
     max_repeated_tool_calls: int | None = None
+    tau_sample_workers: int | None = None
+    tau_attempt_retries: int | None = None
+    tau_judge_concurrency: int | None = None
     user_model: str | None = None
     user_api_key: str | None = None
     user_base_url: str | None = None
@@ -415,6 +423,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             continue
         elif key == "browsecomp_plus_judge":
             browsecomp_plus_judge = _coerce_str_mapping(raw)
+            continue
+        elif key == "agent_plugin_enabled":
+            agent_plugin_enabled = _coerce_bool(raw)
             continue
         elif key == "tool_router_mode":
             tool_router_mode = _coerce_str(raw)
@@ -473,6 +484,15 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "max_repeated_tool_calls":
             max_repeated_tool_calls = _coerce_int(raw)
             continue
+        elif key == "tau_sample_workers":
+            tau_sample_workers = _coerce_int(raw)
+            continue
+        elif key == "tau_attempt_retries":
+            tau_attempt_retries = _coerce_int(raw)
+            continue
+        elif key == "tau_judge_concurrency":
+            tau_judge_concurrency = _coerce_int(raw)
+            continue
         elif key == "user_model":
             user_model = _coerce_str(raw)
             continue
@@ -508,6 +528,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         final_prompt_template=final_prompt_template,
         judge_prompt_template=judge_prompt_template,
         browsecomp_plus_judge=browsecomp_plus_judge,
+        agent_plugin_enabled=agent_plugin_enabled,
         tool_router_mode=tool_router_mode,
         tool_router_max_tools=tool_router_max_tools,
         tool_router_trigger_tool_count=tool_router_trigger_tool_count,
@@ -527,6 +548,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         max_tool_errors=max_tool_errors,
         decision_max_tokens=decision_max_tokens,
         max_repeated_tool_calls=max_repeated_tool_calls,
+        tau_sample_workers=tau_sample_workers,
+        tau_attempt_retries=tau_attempt_retries,
+        tau_judge_concurrency=tau_judge_concurrency,
         user_model=user_model,
         user_api_key=user_api_key,
         user_base_url=user_base_url,
@@ -557,6 +581,18 @@ def _coerce_float(value: Any) -> float | None:
 def _coerce_str(value: Any) -> str | None:
     if isinstance(value, str):
         return value
+    return None
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
     return None
 
 

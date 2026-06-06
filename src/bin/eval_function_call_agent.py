@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+from rwkv_agent_eval_plugin import agent_plugin_config_from_sources
+
 from src.db.async_writer import CompletionWriteWorker
 from src.db.eval_db_service import EvalDbService
 from src.db.export_results import export_version_results
@@ -68,6 +70,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1, help="Reserved for scheduler compatibility")
     parser.add_argument("--max-samples", type=int, help="Limit number of tasks for quick runs")
     parser.add_argument("--db-write-queue", type=int, default=1024, help="DB completion write queue max size")
+    parser.add_argument(
+        "--agent-plugin-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable the RWKV multi-turn agent benchmark plugin defaults",
+    )
     parser.add_argument("--tool-router-mode", choices=("off", "lexical"), help="Tool window router mode")
     parser.add_argument("--tool-router-max-tools", type=int, help="Maximum tools exposed after routing")
     parser.add_argument("--tool-router-trigger-tool-count", type=int, help="Route when tool count reaches this value")
@@ -129,6 +137,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tool-errors", type=int, help="TAU official max tool/runtime errors before stopping")
     parser.add_argument("--decision-max-tokens", type=int, help="TAU official per-step generation token budget")
     parser.add_argument("--max-repeated-tool-calls", type=int, help="TAU official repeated tool-call guard threshold")
+    parser.add_argument(
+        "--tau-sample-workers",
+        type=int,
+        help="TAU attempt-level sample workers for one model task; not model generation batch size",
+    )
+    parser.add_argument("--tau-attempt-retries", type=int, help="TAU attempt retries before recording a failed attempt")
+    parser.add_argument("--tau-judge-concurrency", type=int, help="TAU external judge concurrency limit")
     parser.add_argument("--user-model", help="TAU official user simulator model name")
     parser.add_argument("--user-api-key", help="TAU official user simulator API key")
     parser.add_argument("--user-base-url", help="TAU official user simulator OpenAI-compatible base URL")
@@ -151,9 +166,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if job_name is None:
         raise ValueError(f"function_call agent 暂不支持数据集: {slug}")
     benchmark_config = resolve_benchmark_model_config(slug, model_name, stage="tool")
+    agent_plugin_config = agent_plugin_config_from_sources(args, benchmark_config)
+    tool_router_fallback_mode = agent_plugin_config.tool_router_mode if agent_plugin_config.enabled else "off"
     tool_routing_config = tool_routing_config_from_args(
         args,
-        base=tool_routing_config_from_benchmark_config(benchmark_config),
+        base=tool_routing_config_from_benchmark_config(
+            benchmark_config,
+            fallback_mode=tool_router_fallback_mode,
+        ),
     )
     sampling = resolve_sampling_config(
         slug,
@@ -168,7 +188,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
     tau_options = TauOfficialRunnerOptions.from_sources(args, benchmark_config) if is_tau_job else None
-    long_context_mode = tool_routing_config.mode if is_tau_job and tool_routing_config.enabled else "off"
+    if agent_plugin_config.enabled:
+        long_context_mode = agent_plugin_config.long_context_router_mode
+    else:
+        long_context_mode = tool_routing_config.mode if is_tau_job and tool_routing_config.enabled else "off"
     long_context_routing_config = long_context_routing_config_from_args(
         args,
         base=long_context_routing_config_from_benchmark_config(
@@ -223,6 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dataset_name=str(slug),
                 sample_limit=args.max_samples,
                 samples_per_task=1,
+                tau_sample_workers=args.tau_sample_workers,
                 skip_keys=ctx.completed_keys,
                 tool_routing_config=tool_routing_config,
                 long_context_routing_config=long_context_routing_config,
@@ -255,6 +279,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pass
         raise
     writer.close()
+
+    actual_count = service.count_completions(task_id=task_id, status="answer")
+    if actual_count != expected_count:
+        service.update_task_status(task_id=task_id, status="failed")
+        session_task_id = os.environ.get("RWKV_SESSION_TASK_ID")
+        if session_task_id:
+            try:
+                service.update_task_session_status(task_id=session_task_id, session_status="failed")
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"{job_name} produced {actual_count}/{expected_count} answer completions; refusing to record score"
+        )
 
     completions_payloads = service.list_completion_payloads(task_id=task_id, status="answer")
     try:

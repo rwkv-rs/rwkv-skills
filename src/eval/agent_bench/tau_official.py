@@ -11,6 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from rwkv_agent_eval_plugin import agent_plugin_config_from_sources, route_agent_prompt_inputs
+
 from src.eval.agent_bench.deps import import_module_with_auto_install
 from src.eval.agent_bench.tasks import ensure_tau_v2_vendor_path
 from src.eval.evaluators.common import StageRecord
@@ -26,7 +28,7 @@ from src.eval.function_calling.rwkv_prompt import (
     build_rwkv_json_call_prompt,
     extract_json_call_value_text,
 )
-from src.eval.function_calling.tool_router import ToolRoutingConfig, route_tools_for_prompt, tool_name
+from src.eval.function_calling.tool_router import ToolRoutingConfig, tool_name
 
 _TAU_REWARD_TYPE_PREFIX = "RewardType."
 RESPOND_TOOL_NAME = "respond"
@@ -240,6 +242,7 @@ class RWKVTauOfficialAgent:
         tool_routing_config: ToolRoutingConfig | None = None,
         long_context_routing_config: LongContextRoutingConfig | None = None,
         max_repeated_tool_calls: int = 2,
+        generate_lock: Any | None = None,
     ) -> None:
         ensure_tau_v2_vendor_path()
         message_module = import_module_with_auto_install("tau2.data_model.message", context="tau2 message import")
@@ -259,6 +262,7 @@ class RWKVTauOfficialAgent:
         self._tool_routing_config = tool_routing_config or ToolRoutingConfig()
         self._long_context_routing_config = long_context_routing_config or LongContextRoutingConfig()
         self._max_repeated_tool_calls = max(1, int(max_repeated_tool_calls))
+        self._generate_lock = generate_lock
         self._seed: int | None = None
         self._turn_index = 0
         self._tool_call_counts: dict[str, int] = {}
@@ -292,15 +296,20 @@ class RWKVTauOfficialAgent:
         )
         prompt = self._build_prompt(prompt_messages)
         prompt_seed = None if self._seed is None else int(self._seed) + self._turn_index
-        outputs = self._engine.generate(
-            [prompt],
-            sampling=self._sampling,
-            batch_size=1,
-            progress_desc="TauOfficial-Agent",
-            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-            prompt_seeds=[prompt_seed] if prompt_seed is not None else None,
-            preserve_prompt_whitespace=True,
-        )
+        generate_kwargs = {
+            "sampling": self._sampling,
+            "batch_size": 1,
+            "progress_desc": "TauOfficial-Agent",
+            "prompt_stop_suffixes": [list(JSON_CALL_STOP_SUFFIXES)],
+            "prompt_seeds": [prompt_seed] if prompt_seed is not None else None,
+            "preserve_prompt_whitespace": True,
+        }
+        generate_lock = self._generate_lock
+        if generate_lock is None:
+            outputs = self._engine.generate([prompt], **generate_kwargs)
+        else:
+            with generate_lock:
+                outputs = self._engine.generate([prompt], **generate_kwargs)
         output = outputs[0] if outputs else None
         raw_text = output.text if output is not None else ""
         finish_reason = output.finish_reason if output is not None else "missing_output"
@@ -324,24 +333,39 @@ class RWKVTauOfficialAgent:
         return assistant_message, history
 
     def _build_prompt(self, prompt_messages: Sequence[Mapping[str, object]]) -> str:
-        route = route_tools_for_prompt(
-            self._tools,
-            prompt_messages,
-            config=self._tool_routing_config,
+        routed_inputs = route_agent_prompt_inputs(
+            domain_policy=self._domain_policy,
+            tools=self._tools,
+            messages=prompt_messages,
+            config=agent_plugin_config_from_sources(
+                _agent_plugin_source_from_routing_configs(
+                    self._tool_routing_config,
+                    self._long_context_routing_config,
+                )
+            ),
             control_tool_names=(RESPOND_TOOL_NAME,),
         )
-        selected_tools = list(route.selected_tools)
         prompt, emitted_tools, emitted_policy_chars, schema_mode, long_context_trace = build_budgeted_tau_prompt(
-            domain_policy=self._domain_policy,
-            selected_tools=selected_tools,
-            messages=prompt_messages,
+            domain_policy=routed_inputs.domain_policy,
+            selected_tools=routed_inputs.selected_tools,
+            messages=routed_inputs.messages,
             history_max_chars=self._history_max_chars,
             prompt_max_chars=self._prompt_max_chars,
-            long_context_config=self._long_context_routing_config,
+            long_context_config=None,
         )
         self._current_tool_names = {tool_name(tool) for tool in emitted_tools if tool_name(tool)}
-        route_trace = {"turn_index": self._turn_index, **route.trace_payload()}
-        if len(emitted_tools) != len(selected_tools):
+        if routed_inputs.tool_route is not None:
+            route_trace = {"turn_index": self._turn_index, **routed_inputs.tool_route.trace_payload()}
+        else:
+            route_trace = {
+                "turn_index": self._turn_index,
+                "mode": self._tool_routing_config.mode,
+                "routed": False,
+                "reason": "disabled",
+                "selected_names": [tool_name(tool) for tool in routed_inputs.selected_tools if tool_name(tool)],
+                "total_tool_count": len(self._tools),
+            }
+        if len(emitted_tools) != len(routed_inputs.selected_tools):
             route_trace["emitted_names"] = [tool_name(tool) for tool in emitted_tools if tool_name(tool)]
             route_trace["system_budget_reduced"] = True
         if schema_mode != "full":
@@ -350,9 +374,10 @@ class RWKVTauOfficialAgent:
         if emitted_policy_chars < len(normalize_rwkv_text(self._domain_policy)):
             route_trace["emitted_policy_chars"] = int(emitted_policy_chars)
             route_trace["system_budget_reduced"] = True
-        if long_context_trace is not None:
-            route_trace["long_context"] = long_context_trace
-            if long_context_trace.get("compacted_message_count") or long_context_trace.get("policy_compacted"):
+        plugin_long_context_trace = routed_inputs.long_context_trace or long_context_trace
+        if plugin_long_context_trace is not None:
+            route_trace["long_context"] = plugin_long_context_trace
+            if plugin_long_context_trace.get("compacted_message_count") or plugin_long_context_trace.get("policy_compacted"):
                 route_trace["system_budget_reduced"] = True
         self.tool_routes.append(route_trace)
         return prompt
@@ -429,6 +454,30 @@ class StaticStopTauUser:
 
     def stop(self, message: Any | None = None, state: Any | None = None) -> None:
         del message, state
+
+
+def _agent_plugin_source_from_routing_configs(
+    tool_config: ToolRoutingConfig,
+    long_context_config: LongContextRoutingConfig,
+) -> dict[str, Any]:
+    return {
+        "agent_plugin_enabled": bool(tool_config.enabled or long_context_config.enabled),
+        "tool_router_mode": tool_config.mode,
+        "tool_router_max_tools": int(tool_config.max_tools),
+        "tool_router_trigger_tool_count": int(tool_config.trigger_tool_count),
+        "tool_router_trigger_catalog_chars": int(tool_config.trigger_catalog_chars),
+        "tool_router_context_chars": int(tool_config.context_chars),
+        "tool_router_description_chars": int(tool_config.description_chars),
+        "tool_router_fallback_to_all_on_empty": bool(tool_config.fallback_to_all_on_empty),
+        "long_context_router_mode": long_context_config.mode,
+        "long_context_min_chars": int(long_context_config.min_chars),
+        "long_context_chunk_chars": int(long_context_config.chunk_chars),
+        "long_context_overlap_lines": int(long_context_config.overlap_lines),
+        "long_context_max_evidence_chunks": int(long_context_config.max_evidence_chunks),
+        "long_context_max_evidence_chars": int(long_context_config.max_evidence_chars),
+        "long_context_query_chars": int(long_context_config.query_chars),
+        "long_context_fallback_to_original_on_empty": bool(long_context_config.fallback_to_original_on_empty),
+    }
 
 
 def build_budgeted_tau_prompt(

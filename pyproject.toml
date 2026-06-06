@@ -76,7 +76,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src", "lexical_chunk_router"]
+packages = ["src", "lexical_chunk_router", "rwkv_agent_eval_plugin"]
 include = [
     "src/space/styles/*.css",
     "src/space/assets/**/*",

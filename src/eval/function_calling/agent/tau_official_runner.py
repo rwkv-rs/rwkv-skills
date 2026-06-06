@@ -8,9 +8,19 @@ unbounded TAU prompts.
 """
 
 import os
-from dataclasses import dataclass
+import threading
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
+from src.eval.attempt_scheduler import (
+    AttemptKey,
+    AttemptResult,
+    AttemptStatus,
+    AttemptWorkItem,
+    ModelRuntimeLimiter,
+    TaskRunState,
+    run_attempt_scheduler,
+)
 from src.eval.agent_bench.tau_official import (
     DEFAULT_TAU_PROMPT_MAX_CHARS,
     RWKVTauOfficialAgent,
@@ -64,6 +74,9 @@ class TauOfficialRunnerOptions:
     judge_model: str | None = None
     judge_api_key: str | None = None
     judge_base_url: str | None = None
+    tau_sample_workers: int = 1
+    tau_attempt_retries: int = 0
+    tau_judge_concurrency: int = 1
 
     @classmethod
     def from_sources(cls, args: Any, config: Any | None) -> TauOfficialRunnerOptions:
@@ -74,6 +87,14 @@ class TauOfficialRunnerOptions:
             if raw is None:
                 raw = os.environ.get(env_name)
             return _positive_int(raw, default)
+
+        def nonnegative_int_value(name: str, env_name: str, default: int) -> int:
+            raw = getattr(args, name, None)
+            if raw is None and config is not None:
+                raw = getattr(config, name, None)
+            if raw is None:
+                raw = os.environ.get(env_name)
+            return _nonnegative_int(raw, default)
 
         def str_value(name: str, *env_names: str) -> str | None:
             raw = getattr(args, name, None)
@@ -125,6 +146,9 @@ class TauOfficialRunnerOptions:
             judge_base_url=_normalize_openai_base_url(
                 str_value("judge_base_url", "JUDGE_BASE_URL", "OPENAI_BASE_URL", "API_BASE", "BASE_URL")
             ),
+            tau_sample_workers=int_value("tau_sample_workers", "RWKV_TAU_SAMPLE_WORKERS", 1),
+            tau_attempt_retries=nonnegative_int_value("tau_attempt_retries", "RWKV_TAU_ATTEMPT_RETRIES", 0),
+            tau_judge_concurrency=int_value("tau_judge_concurrency", "RWKV_TAU_JUDGE_CONCURRENCY", 1),
         )
 
 
@@ -142,6 +166,7 @@ class TauOfficialAgentPipeline:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path
+        self._generate_lock = threading.Lock()
 
     def run(
         self,
@@ -152,6 +177,8 @@ class TauOfficialAgentPipeline:
         dataset_name: str | None = None,
         sample_limit: int | None = None,
         samples_per_task: int | None = None,
+        batch_size: int | None = None,
+        tau_sample_workers: int | None = None,
         skip_keys: set[tuple[int, int]] | None = None,
         tool_routing_config: ToolRoutingConfig | None = None,
         long_context_routing_config: LongContextRoutingConfig | None = None,
@@ -168,11 +195,23 @@ class TauOfficialAgentPipeline:
         )
         sampling = sampling.clamp(options.decision_max_tokens)
 
-        entries: list[tuple[int, FunctionCallTaskRecord, int]] = []
+        task_run_id = _task_run_id(dataset_name=dataset_name, model_path=str(getattr(self, "model_path", "unknown")))
+        entries: list[tuple[AttemptKey, FunctionCallTaskRecord]] = []
         for idx, record in enumerate(records):
             for sample_id in range(repeats):
                 if (idx, sample_id) not in skip_keys:
-                    entries.append((idx, record, sample_id))
+                    entries.append(
+                        (
+                            AttemptKey(
+                                task_run_id=task_run_id,
+                                sample_index=idx,
+                                avg_repeat_index=sample_id,
+                                pass_index=0,
+                                seed=sample_repeat_seed(idx, sample_id, stage=1),
+                            ),
+                            record,
+                        )
+                    )
         if not entries:
             return TauOfficialPipelineResult(dataset_name, 0, [])
 
@@ -182,6 +221,8 @@ class TauOfficialAgentPipeline:
             _apply_openai_env(user_model)
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         sampling_config["tau_official_runtime"] = _tau_runtime_model_metadata(user_model, judge_model)
+        requested_workers = tau_sample_workers or options.tau_sample_workers or batch_size
+        worker_count = _resolve_tau_sample_workers(requested_workers, len(entries))
         sampling_config["tau_limits"] = {
             "history_max_chars": int(options.history_max_chars),
             "prompt_max_chars": int(options.prompt_max_chars),
@@ -189,25 +230,42 @@ class TauOfficialAgentPipeline:
             "max_tool_errors": int(options.max_tool_errors),
             "decision_max_tokens": int(options.decision_max_tokens),
             "max_repeated_tool_calls": int(options.max_repeated_tool_calls),
+            "tau_sample_workers": int(worker_count),
+            "max_attempts_per_model": int(worker_count),
+            "attempt_retries": int(options.tau_attempt_retries),
+            "judge_concurrency": int(options.tau_judge_concurrency),
         }
         sampling_config["tool_routing"] = tool_routing_config_to_payload(routing)
         sampling_config["long_context_routing"] = long_context_routing_config_to_payload(long_context_routing)
 
-        runtime_cache: dict[str, TauOfficialRuntime] = {}
+        if worker_count > 1:
+            print(f"⚙️ TAU official sample workers: {worker_count}/{len(entries)}")
+
+        thread_state = threading.local()
+        judge_limiter = ModelRuntimeLimiter({"tau_judge": options.tau_judge_concurrency})
+        entry_by_key = {key: record for key, record in entries}
+        ordinal_by_key = {key: ordinal for ordinal, (key, _record) in enumerate(entries)}
+        ordered_payloads: list[dict[str, Any] | None] = [None] * len(entries)
 
         def runtime_for_domain(domain: str) -> TauOfficialRuntime:
+            runtime_cache = getattr(thread_state, "runtime_cache", None)
+            if runtime_cache is None:
+                runtime_cache = {}
+                thread_state.runtime_cache = runtime_cache
             cached = runtime_cache.get(domain)
             if cached is None:
                 cached = TauOfficialRuntime(domain=domain)
                 runtime_cache[domain] = cached
             return cached
 
-        payloads: list[dict[str, Any]] = []
-        for record_idx, record, sample_id in entries:
+        def run_entry(work: AttemptWorkItem) -> AttemptResult:
+            key = work.key
+            record = entry_by_key[key]
+            domain = _record_domain(record)
+            runtime = runtime_for_domain(domain)
             payload = self._run_one(
                 record=record,
-                sample_index=record_idx,
-                repeat_index=sample_id,
+                attempt_key=key,
                 sampling=sampling,
                 sampling_config=sampling_config,
                 benchmark_name=benchmark_name,
@@ -215,21 +273,66 @@ class TauOfficialAgentPipeline:
                 options=options,
                 tool_routing_config=routing,
                 long_context_routing_config=long_context_routing,
-                runtime=runtime_for_domain(_record_domain(record)),
+                runtime=runtime,
                 user_model=user_model,
                 judge_model=judge_model,
+                judge_limiter=judge_limiter,
             )
+            return AttemptResult(
+                key=key,
+                status=AttemptStatus.SUCCESS,
+                payload=payload,
+                passed=bool(payload.get("success")),
+                retry_count=work.retry_count,
+            )
+
+        def emit_result(_task: TaskRunState, result: AttemptResult) -> None:
+            payload = result.payload
+            if not isinstance(payload, dict):
+                payload = self._failed_attempt_payload(
+                    record=entry_by_key[result.key],
+                    attempt_key=result.key,
+                    sampling_config=sampling_config,
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    options=options,
+                    error_type=result.error_type,
+                    error_message=result.error_message,
+                    status=result.status,
+                    retry_count=result.retry_count,
+                )
+            ordinal = ordinal_by_key[result.key]
             if on_record is not None:
                 on_record(payload)
-            payloads.append(payload)
-        return TauOfficialPipelineResult(dataset_name, len(entries), payloads)
+            ordered_payloads[ordinal] = payload
+
+        task_state = TaskRunState.from_attempts(
+            task_run_id=task_run_id,
+            model_key=str(getattr(self, "model_path", "unknown")),
+            attempts=(key for key, _record in entries),
+            max_attempts_per_model=worker_count,
+            max_retries=options.tau_attempt_retries,
+        )
+        run_attempt_scheduler(
+            [task_state],
+            runner=run_entry,
+            on_result=emit_result,
+            max_workers=worker_count,
+        )
+        if not task_state.ready_to_finalize:
+            missing = sorted(task_state.missing_result_keys(task_state.expected_keys))
+            raise RuntimeError(f"TAU attempt scheduler finished with missing results: {missing[:5]}")
+        return TauOfficialPipelineResult(
+            dataset_name,
+            len(entries),
+            [payload for payload in ordered_payloads if payload is not None],
+        )
 
     def _run_one(
         self,
         *,
         record: FunctionCallTaskRecord,
-        sample_index: int,
-        repeat_index: int,
+        attempt_key: AttemptKey,
         sampling: SamplingConfig,
         sampling_config: dict[str, Any],
         benchmark_name: str,
@@ -240,7 +343,10 @@ class TauOfficialAgentPipeline:
         runtime: TauOfficialRuntime,
         user_model: TauLLMConfig | None,
         judge_model: TauLLMConfig | None,
+        judge_limiter: ModelRuntimeLimiter,
     ) -> dict[str, Any]:
+        sample_index = int(attempt_key.sample_index)
+        repeat_index = int(attempt_key.repeat_index)
         task_payload = _record_task_payload(record)
         env_kwargs = _tau_env_kwargs(record)
         task = runtime.load_task(task_payload)
@@ -255,6 +361,7 @@ class TauOfficialAgentPipeline:
             tool_routing_config=tool_routing_config,
             long_context_routing_config=long_context_routing_config,
             max_repeated_tool_calls=options.max_repeated_tool_calls,
+            generate_lock=getattr(self, "_generate_lock", None),
         )
         agent.set_seed(sample_repeat_seed(sample_index, repeat_index, stage=1))
         user = runtime.build_user(task=task, environment=environment, user_model=user_model)
@@ -269,13 +376,24 @@ class TauOfficialAgentPipeline:
         )
         try:
             simulation = orchestrator.run()
-            evaluation = runtime.evaluate(
-                simulation=simulation,
-                task=task,
-                judge_model=judge_model,
-                solo_mode=False,
-                env_kwargs=env_kwargs,
-            )
+            judge_semaphore = judge_limiter.semaphore("tau_judge", default=options.tau_judge_concurrency)
+            if judge_model is None:
+                evaluation = runtime.evaluate(
+                    simulation=simulation,
+                    task=task,
+                    judge_model=judge_model,
+                    solo_mode=False,
+                    env_kwargs=env_kwargs,
+                )
+            else:
+                with judge_semaphore:
+                    evaluation = runtime.evaluate(
+                        simulation=simulation,
+                        task=task,
+                        judge_model=judge_model,
+                        solo_mode=False,
+                        env_kwargs=env_kwargs,
+                    )
         except Exception as exc:
             error_text = f"tau official runtime error: {type(exc).__name__}: {exc}"
             agent.parse_errors.append(error_text)
@@ -289,6 +407,9 @@ class TauOfficialAgentPipeline:
                 "benchmark": "tau_official",
                 "domain": _record_domain(record),
                 "task_id": str(getattr(task, "id", "") or record.task_id),
+                "attempt_key": _attempt_key_payload(attempt_key),
+                "attempt_status": AttemptStatus.SUCCESS.value,
+                "retry_count": 0,
                 "benchmark_version": _record_benchmark_version(record),
                 "score": float(evaluation.reward),
                 "steps": len(agent.stages),
@@ -335,8 +456,63 @@ class TauOfficialAgentPipeline:
         payload["final_answer"] = final_answer
         payload["agent_trace"] = events
         payload["tau_official_result"] = details
+        payload["attempt_key"] = _attempt_key_payload(attempt_key)
         return payload
 
+    def _failed_attempt_payload(
+        self,
+        *,
+        record: FunctionCallTaskRecord,
+        attempt_key: AttemptKey,
+        sampling_config: dict[str, Any],
+        benchmark_name: str,
+        dataset_split: str,
+        options: TauOfficialRunnerOptions,
+        error_type: str,
+        error_message: str,
+        status: AttemptStatus,
+        retry_count: int,
+    ) -> dict[str, Any]:
+        details = {
+            "benchmark": "tau_official",
+            "domain": _record_domain(record),
+            "task_id": str(record.task_id),
+            "attempt_key": _attempt_key_payload(attempt_key),
+            "attempt_status": status.value,
+            "error_type": str(error_type or status.value),
+            "error_message": str(error_message or status.value),
+            "retry_count": int(retry_count),
+            "score": 0.0,
+            "steps": 0,
+            "parse_error_count": 0,
+            "invalid_action_count": 0,
+            "finish_reason": str(error_message or status.value),
+            "max_steps": int(options.max_steps),
+            "max_tool_errors": int(options.max_tool_errors),
+            "prompt_max_chars": int(options.prompt_max_chars),
+            "history_max_chars": int(options.history_max_chars),
+            "max_repeated_tool_calls": int(options.max_repeated_tool_calls),
+            "runtime": "official_tau_orchestrator",
+        }
+        payload = build_agent_completion_payload(
+            benchmark_name=benchmark_name,
+            dataset_split=dataset_split,
+            sample_index=int(attempt_key.sample_index),
+            repeat_index=int(attempt_key.repeat_index),
+            sampling_config=sampling_config,  # type: ignore[arg-type]
+            prompts=[],
+            completions=[],
+            events=[],
+            stats=FunctionCallRunStats(),
+            env_type="tau_official",
+            scorer_type="tau_official",
+            success=False,
+            official_score=0.0,
+            details=details,
+        )
+        payload["attempt_key"] = _attempt_key_payload(attempt_key)
+        payload["tau_official_result"] = details
+        return payload
 
 
 def _record_domain(record: FunctionCallTaskRecord) -> str:
@@ -451,6 +627,44 @@ def _first_positive_float_env(*names: str) -> float | None:
     return None
 
 
+def _first_positive_int_env(*names: str) -> int | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            parsed = int(str(value).strip())
+        except ValueError:
+            continue
+        if parsed > 0:
+            return parsed
+    return None
+
+
+def _resolve_tau_sample_workers(requested: int | None, entry_count: int) -> int:
+    if entry_count <= 1:
+        return 1
+    env_workers = _first_positive_int_env(
+        "RWKV_TAU_SAMPLE_WORKERS",
+        "RWKV_TAU_PARALLEL_SAMPLES",
+        "RWKV_TAU_MAX_WORKERS",
+    )
+    raw_workers = env_workers if env_workers is not None else _positive_int(requested, 1)
+    worker_cap = _first_positive_int_env("RWKV_TAU_SAMPLE_WORKER_CAP") or 4
+    return max(1, min(int(entry_count), int(raw_workers), int(worker_cap)))
+
+
+def _task_run_id(*, dataset_name: str, model_path: str) -> str:
+    task_id = os.environ.get("RWKV_SKILLS_TASK_ID") or os.environ.get("RWKV_SESSION_TASK_ID")
+    if task_id:
+        return str(task_id)
+    return f"{dataset_name}:{os.path.basename(model_path)}"
+
+
+def _attempt_key_payload(key: AttemptKey) -> dict[str, Any]:
+    return asdict(key)
+
+
 def _normalize_openai_base_url(value: str | None) -> str | None:
     if value is None:
         return None
@@ -522,6 +736,16 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return int(default)
     return max(1, parsed)
+
+
+def _nonnegative_int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or value is None:
+        return int(default)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(0, parsed)
 
 
 __all__ = [

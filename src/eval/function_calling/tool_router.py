@@ -101,10 +101,19 @@ def tool_routing_config_from_args(args: Any, *, base: ToolRoutingConfig | None =
     )
 
 
-def tool_routing_config_from_benchmark_config(config: Any | None) -> ToolRoutingConfig:
+def tool_routing_config_from_benchmark_config(
+    config: Any | None,
+    *,
+    fallback_mode: str = "off",
+) -> ToolRoutingConfig:
     if config is None:
-        return ToolRoutingConfig()
-    mode = str(getattr(config, "tool_router_mode", None) or "off").strip().lower()
+        mode = str(fallback_mode or "off").strip().lower()
+        if mode not in TOOL_ROUTER_MODE_CHOICES:
+            raise ValueError(
+                f"unsupported tool router mode {mode!r}; expected one of {', '.join(TOOL_ROUTER_MODE_CHOICES)}"
+            )
+        return ToolRoutingConfig(mode=mode)  # type: ignore[arg-type]
+    mode = str(getattr(config, "tool_router_mode", None) or fallback_mode or "off").strip().lower()
     if mode not in TOOL_ROUTER_MODE_CHOICES:
         raise ValueError(
             f"unsupported tool router mode {mode!r}; expected one of {', '.join(TOOL_ROUTER_MODE_CHOICES)}"

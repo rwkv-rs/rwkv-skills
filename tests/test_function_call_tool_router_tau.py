@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from src.eval.datasets.data_struct.function_call import FunctionCallTaskRecord
 from src.eval.function_calling.agent.env import AgentObservation
 from src.eval.function_calling.agent.pipeline import FunctionCallAgentPipeline
+from rwkv_agent_eval_plugin import agent_plugin_config_from_sources
 from src.eval.function_calling.long_context_router import (
     LongContextRoutingConfig,
     long_context_routing_config_from_benchmark_config,
@@ -95,6 +96,7 @@ def test_tool_router_config_can_be_read_from_benchmark_toml(monkeypatch, tmp_pat
         "\n".join(
             [
                 "[default]",
+                "agent_plugin_enabled = true",
                 'tool_router_mode = "lexical"',
                 "tool_router_max_tools = 5",
                 "tool_router_trigger_tool_count = 8",
@@ -122,8 +124,12 @@ def test_tool_router_config_can_be_read_from_benchmark_toml(monkeypatch, tmp_pat
     benchmark_config._CONFIG_CACHE.clear()
 
     config = benchmark_config.resolve_benchmark_model_config("tau2_bench_airline", "rwkv7-test", stage="tool")
+    agent_plugin_config = agent_plugin_config_from_sources(None, config)
     router_config = tool_routing_config_from_benchmark_config(config)
 
+    assert agent_plugin_config.enabled is True
+    assert agent_plugin_config.tool_router_mode == "lexical"
+    assert agent_plugin_config.long_context_router_mode == "lexical"
     assert router_config.mode == "lexical"
     assert router_config.max_tools == 5
     assert router_config.trigger_tool_count == 8
@@ -147,6 +153,53 @@ def test_tool_router_config_can_be_read_from_benchmark_toml(monkeypatch, tmp_pat
     assert config.max_tool_errors == 8
     assert config.decision_max_tokens == 384
     assert config.max_repeated_tool_calls == 2
+
+
+def test_agent_plugin_toml_gate_defaults_agent_routers_to_lexical(monkeypatch, tmp_path: Path) -> None:
+    import src.eval.benchmark_config as benchmark_config
+
+    root = tmp_path / "configs"
+    root.mkdir()
+    (root / "tau2_bench_airline.toml").write_text(
+        "\n".join(
+            [
+                "[default]",
+                "agent_plugin_enabled = true",
+                "tool_router_max_tools = 4",
+                "tool_router_trigger_tool_count = 9",
+                "long_context_min_chars = 3000",
+                "long_context_chunk_chars = 900",
+                "long_context_max_evidence_chunks = 3",
+                "long_context_max_evidence_chars = 3000",
+                "prompt_max_chars = 3072",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", str(root))
+    benchmark_config._CONFIG_CACHE.clear()
+
+    config = benchmark_config.resolve_benchmark_model_config("tau2_bench_airline", "rwkv7-test", stage="tool")
+    agent_plugin_config = agent_plugin_config_from_sources(None, config)
+    router_config = tool_routing_config_from_benchmark_config(
+        config,
+        fallback_mode=agent_plugin_config.tool_router_mode,
+    )
+    long_context_config = long_context_routing_config_from_benchmark_config(
+        config,
+        fallback_mode=agent_plugin_config.long_context_router_mode,
+    )
+
+    assert agent_plugin_config.enabled is True
+    assert router_config.mode == "lexical"
+    assert router_config.max_tools == 4
+    assert router_config.trigger_tool_count == 9
+    assert long_context_config.mode == "lexical"
+    assert long_context_config.chunk_chars == 900
+    assert long_context_config.max_evidence_chunks == 3
+    assert long_context_config.max_evidence_chars == 3000
+    assert config.prompt_max_chars == 3072
+    assert long_context_config.chunk_chars != config.prompt_max_chars
 
 
 def test_long_doc_config_aliases_map_to_long_context_fields(monkeypatch, tmp_path: Path) -> None:
@@ -417,6 +470,7 @@ def test_eval_function_call_agent_routes_tau_to_official_pipeline(monkeypatch, t
             return SimpleNamespace(dataset=kwargs["dataset_name"], sample_count=1, payloads=[payload])
 
     benchmark_config = SimpleNamespace(
+        agent_plugin_enabled=True,
         history_max_chars=2345,
         prompt_max_chars=3072,
         max_steps=12,
@@ -429,7 +483,7 @@ def test_eval_function_call_agent_routes_tau_to_official_pipeline(monkeypatch, t
         judge_model="judge-model",
         judge_api_key="judge-key",
         judge_base_url="https://judge.example/v1",
-        tool_router_mode="lexical",
+        tool_router_mode=None,
         tool_router_max_tools=5,
         tool_router_trigger_tool_count=6,
         tool_router_trigger_catalog_chars=700,
@@ -472,8 +526,6 @@ def test_eval_function_call_agent_routes_tau_to_official_pipeline(monkeypatch, t
             str(dataset),
             "--device",
             "cpu",
-            "--tool-router-mode",
-            "lexical",
         ]
     )
 
@@ -531,12 +583,13 @@ def test_tau_official_runner_records_tool_routing_payload_for_slots_config(monke
             self.domain = domain
 
     def fake_run_one(self, **kwargs):
+        attempt_key = kwargs["attempt_key"]
         captured["sampling_config"] = kwargs["sampling_config"]
         return {
             "benchmark_name": "tau2_bench_airline",
             "dataset_split": "",
-            "sample_index": 0,
-            "repeat_index": 0,
+            "sample_index": attempt_key.sample_index,
+            "repeat_index": attempt_key.repeat_index,
             "sampling_config": kwargs["sampling_config"],
             "prompt1": "prompt",
             "completion1": "{}",
@@ -586,6 +639,171 @@ def test_tau_official_runner_records_tool_routing_payload_for_slots_config(monke
     assert long_context_payload["chunk_chars"] == 1000
     assert long_context_payload["max_evidence_chars"] == 6000
     json.dumps(long_context_payload)
+
+
+def test_tau_official_runner_parallelizes_samples_when_workers_enabled(monkeypatch, tmp_path: Path) -> None:
+    import threading
+    import time
+
+    from src.eval.function_calling.agent import tau_official_runner
+    from src.eval.function_calling.agent.tau_official_runner import (
+        TauOfficialAgentPipeline,
+        TauOfficialRunnerOptions,
+    )
+    from src.infer.sampling import SamplingConfig
+
+    dataset = tmp_path / "tau2_bench_airline.jsonl"
+    rows = []
+    for index in range(4):
+        rows.append(
+            {
+                "task_id": f"mock_{index}",
+                "instruction": "Mock lightweight task.",
+                "env": {
+                    "type": "tau_official",
+                    "domain": "mock",
+                    "benchmark_version": "tau_v3_light",
+                },
+                "scorer": {"type": "tau_official"},
+                "metadata": {
+                    "domain": "mock",
+                    "task": {"id": f"mock_{index}", "ticket": "mock"},
+                    "benchmark_version": "tau_v3_light",
+                },
+                "tools": [_tool("lookup_mock", "Lookup mock state", "id")],
+            }
+        )
+    dataset.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    class FakeTauOfficialRuntime:
+        def __init__(self, *, domain: str) -> None:
+            self.domain = domain
+
+    def fake_run_one(self, **kwargs):
+        nonlocal active, max_active
+        attempt_key = kwargs["attempt_key"]
+        sample_index = int(attempt_key.sample_index)
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05 if sample_index % 2 == 0 else 0.01)
+        with lock:
+            active -= 1
+        return {
+            "benchmark_name": "tau2_bench_airline",
+            "dataset_split": "",
+            "sample_index": sample_index,
+            "repeat_index": 0,
+            "sampling_config": kwargs["sampling_config"],
+            "prompt1": "prompt",
+            "completion1": "{}",
+            "stop_reason1": "done",
+            "final_answer": "done",
+            "events": [],
+            "stats": {"steps": 1},
+            "success": True,
+            "official_score": 1.0,
+            "agent_details": {},
+        }
+
+    monkeypatch.setenv("RWKV_TAU_SAMPLE_WORKERS", "2")
+    monkeypatch.setenv("RWKV_TAU_SAMPLE_WORKER_CAP", "2")
+    monkeypatch.setattr(tau_official_runner, "TauOfficialRuntime", FakeTauOfficialRuntime)
+    monkeypatch.setattr(TauOfficialAgentPipeline, "_run_one", fake_run_one)
+
+    pipeline = object.__new__(TauOfficialAgentPipeline)
+    recorded: list[int] = []
+    result = pipeline.run(
+        str(dataset),
+        sampling=SamplingConfig(max_generate_tokens=512),
+        options=TauOfficialRunnerOptions(),
+        dataset_name="tau2_bench_airline",
+        tau_sample_workers=2,
+        on_record=lambda payload: recorded.append(int(payload["sample_index"])),
+    )
+
+    assert max_active == 2
+    assert result.sample_count == 4
+    assert [payload["sample_index"] for payload in result.payloads] == [0, 1, 2, 3]
+    assert sorted(recorded) == [0, 1, 2, 3]
+    assert result.payloads[0]["sampling_config"]["tau_limits"]["tau_sample_workers"] == 2
+    assert result.payloads[0]["sampling_config"]["tau_limits"]["max_attempts_per_model"] == 2
+
+
+def test_tau_official_agent_serializes_shared_engine_generate() -> None:
+    import threading
+    import time
+
+    from src.eval.agent_bench.tau_official import RWKVTauOfficialAgent
+
+    class FakeAssistantMessage:
+        def __init__(self, *, role: str, content: str | None = None, **_kwargs) -> None:
+            self.role = role
+            self.content = content
+
+    class FakeToolMessage:
+        pass
+
+    class FakeUserMessage:
+        pass
+
+    class FakeMultiToolMessage:
+        pass
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def generate(self, *_args, **_kwargs):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.03)
+            with self.lock:
+                self.active -= 1
+            return [SimpleNamespace(text='{"name":"respond","arguments":{"content":"done ###STOP###"}}', finish_reason="stop")]
+
+    engine = FakeEngine()
+    agent = object.__new__(RWKVTauOfficialAgent)
+    agent._AssistantMessage = FakeAssistantMessage
+    agent._ToolCall = object
+    agent._MultiToolMessage = FakeMultiToolMessage
+    agent._ToolMessage = FakeToolMessage
+    agent._UserMessage = FakeUserMessage
+    agent._engine = engine
+    agent._sampling = object()
+    agent._tools = []
+    agent._tool_names = set()
+    agent._current_tool_names = set()
+    agent._domain_policy = ""
+    agent._history_max_chars = 100
+    agent._prompt_max_chars = 100
+    agent._max_repeated_tool_calls = 2
+    agent._tool_call_counts = {}
+    agent._seed = None
+    agent._turn_index = 0
+    agent.stages = []
+    agent.parse_errors = []
+    agent.tool_routes = []
+    agent._generate_lock = threading.Lock()
+    agent._build_prompt = lambda _messages: "prompt"
+
+    threads = [
+        threading.Thread(target=agent.generate_next_message, args=(FakeUserMessage(), []))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert engine.max_active == 1
 
 
 def test_tau_official_runner_defaults_match_dedicated_tau_path() -> None:
