@@ -18,6 +18,7 @@ from src.eval.function_calling.complexfuncbench import (
     build_complexfuncbench_format_bridge,
     build_complexfuncbench_prompt,
     load_complexfuncbench_manifest_records,
+    parse_complexfuncbench_tool_calls,
     summarize_complexfuncbench_official_payloads,
 )
 from src.eval.function_calling import complexfuncbench as complexfuncbench_module
@@ -129,7 +130,20 @@ def test_complexfuncbench_prompt_uses_routed_tool_window(tmp_path: Path, monkeyp
     assert "Tool router trace" in prompt
     assert "final_answer" in prompt
     assert "JSON array" in prompt
+    assert prompt.endswith("Assistant: ```json\n{")
     assert route.trace_payload()["routed"] is True
+
+
+def test_complexfuncbench_parser_accepts_prefill_and_agentic_formats() -> None:
+    prefilled = parse_complexfuncbench_tool_calls('"name":"SearchHotel","arguments":{"city":"Paris","adults":2}}')
+    agentic = parse_complexfuncbench_tool_calls('**Tool Call:** SearchHotel(city="Paris", adults=2)')
+
+    assert [(call.name, call.arguments) for call in prefilled] == [
+        ("SearchHotel", {"city": "Paris", "adults": 2})
+    ]
+    assert [(call.name, call.arguments) for call in agentic] == [
+        ("SearchHotel", {"city": "Paris", "adults": 2})
+    ]
 
 
 def test_complexfuncbench_official_env_accepts_parallel_calls_and_final_answer() -> None:

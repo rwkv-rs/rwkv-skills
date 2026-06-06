@@ -167,7 +167,7 @@ def _build_completion_context(payload: Mapping[str, Any]) -> dict[str, Any]:
         "stages": stages,
         "sampling_config": payload.get("sampling_config", {}),
     }
-    for key in ("agent_result", "agent_info", "agent_trace", "task_id", "domain", "instruction"):
+    for key in ("agent_result", "agent_info", "agent_trace", "perf", "task_id", "domain", "instruction"):
         value = payload.get(key)
         if value is not None:
             context[key] = value

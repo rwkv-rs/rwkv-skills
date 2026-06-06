@@ -33,6 +33,22 @@ def test_parse_text_tool_calls_accepts_tool_calls_envelope() -> None:
     assert json.loads(tool_calls[0]["function"]["arguments"]) == {"id": "A1"}
 
 
+def test_parse_text_tool_calls_accepts_prefilled_object_continuation() -> None:
+    tool_calls = parse_text_tool_calls('"name":"lookup","arguments":{"id":"A1"}}')
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "lookup"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"id": "A1"}
+
+
+def test_parse_text_tool_calls_accepts_rwkv_agentic_tool_call_label() -> None:
+    tool_calls = parse_text_tool_calls('**Tool Call:** lookup(id="A1")')
+
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "lookup"
+    assert json.loads(tool_calls[0]["function"]["arguments"]) == {"id": "A1"}
+
+
 def test_parse_text_tool_calls_leaves_plain_text_alone() -> None:
     assert parse_text_tool_calls("The task is complete.") == []
 

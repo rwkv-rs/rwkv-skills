@@ -338,7 +338,10 @@ def _run_bfcl_official_json_generation_step(
         sampling=tool_sampling,
         progress_desc=f"BFCLV3-Decision {progress_suffix}",
         stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
-        constraint=build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(routed_tools)),
+        constraint=build_bfcl_tool_call_constraint(
+            _bfcl_tools_with_control_functions(routed_tools),
+            prefilled_object=True,
+        ),
         constraint_mode="strict",
     )
     decision_text = normalize_bfcl_decision_output(output.text)
@@ -704,7 +707,10 @@ def _run_bfcl_v3(
             None
             if isinstance(run.engine, RemoteInferenceBackend)
             else [
-                build_bfcl_tool_call_constraint(_bfcl_tools_with_control_functions(routed_tools))
+                build_bfcl_tool_call_constraint(
+                    _bfcl_tools_with_control_functions(routed_tools),
+                    prefilled_object=True,
+                )
                 for _route, routed_tools in probe_routes
             ]
         )

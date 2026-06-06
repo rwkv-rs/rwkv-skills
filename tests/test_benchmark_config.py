@@ -24,9 +24,9 @@ def test_resolve_math_500_cot_config_merges_default_and_template() -> None:
     assert config.report_pass_k == ()
     assert config.report_avg_k == (8,)
     assert config.sampling_overrides["max_generate_tokens"] == 4096
-    assert config.sampling_overrides["top_k"] == 500
-    assert config.sampling_overrides["temperature"] == 0.3
-    assert config.sampling_overrides["stop_tokens"] == (0, 261, 24281)
+    assert config.sampling_overrides["top_k"] == 40
+    assert config.sampling_overrides["temperature"] == 0.25
+    assert config.sampling_overrides["stop_tokens"] == (0,)
 
 
 def test_resolve_livecodebench_final_sampling_config_uses_code_template() -> None:

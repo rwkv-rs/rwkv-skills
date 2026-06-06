@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import json
 from typing import Literal
 
+from src.eval.function_calling.rwkv_prompt import assistant_json_prefix, extract_json_call_value_text
+
 from .api import (
     ChatCompletionChoice,
     ChatCompletionChunkChoice,
@@ -694,6 +696,9 @@ def _build_chat_prompt(
     prompt_preamble: str | None,
     response_mode: StructuredResponseMode,
 ) -> str:
+    if response_mode == "tool_call":
+        return _build_tool_call_chat_prompt(messages, prompt_preamble=prompt_preamble)
+
     parts: list[str] = []
     if prompt_preamble:
         parts.append(f"System: {prompt_preamble}")
@@ -704,12 +709,102 @@ def _build_chat_prompt(
     if last_role == "assistant":
         return "\n\n".join(parts)
     if response_mode == "tool_call":
-        parts.append("Assistant: <think>\n</think>\n```json\n")
+        parts.append(assistant_json_prefix())
     elif response_mode == "plain_text":
         parts.append("Assistant: <think>")
     else:
         parts.append("Assistant:")
     return "\n\n".join(parts)
+
+
+def _build_tool_call_chat_prompt(
+    messages: list[ChatCompletionMessage],
+    *,
+    prompt_preamble: str | None,
+) -> str:
+    system_parts: list[str] = []
+    if prompt_preamble:
+        system_parts.append(prompt_preamble)
+    dialog_messages: list[ChatCompletionMessage] = []
+    for message in messages:
+        role = _normalize_chat_role(message.role)
+        if role == "system":
+            system_parts.append(message.text_content())
+        else:
+            dialog_messages.append(message)
+
+    parts: list[str] = []
+    if system_parts:
+        parts.append("System: " + _normalize_prompt_text("\n".join(system_parts)))
+    user_body = _render_tool_call_dialog_user_body(dialog_messages)
+    if user_body:
+        parts.append("User: " + user_body)
+
+    last_role = _normalize_chat_role(messages[-1].role)
+    if last_role != "assistant":
+        parts.append(assistant_json_prefix())
+    return "\n\n".join(parts)
+
+
+def _render_tool_call_dialog_user_body(messages: list[ChatCompletionMessage]) -> str:
+    if not messages:
+        return ""
+    if len(messages) == 1 and _normalize_chat_role(messages[0].role) == "user":
+        return _sanitize_prompt_role_headers(messages[0].text_content())
+
+    transcript: list[dict[str, object]] = []
+    for message in messages:
+        role = _normalize_chat_role(message.role)
+        has_tool_calls = bool(message.tool_calls)
+        if has_tool_calls and role != "assistant":
+            raise ValueError("tool_calls are only valid on assistant messages")
+        if message.tool_call_id and role != "tool":
+            raise ValueError("tool_call_id is only valid on tool messages")
+        if role == "assistant" and message.tool_calls:
+            if message.text_content().strip():
+                raise ValueError("assistant tool_calls messages cannot include content")
+            transcript.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": json.loads(_render_tool_call_history_json(message.tool_calls))["tool_calls"],
+                }
+            )
+            continue
+        if role == "tool":
+            transcript.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id or "",
+                    "content": message.text_content(),
+                }
+            )
+            continue
+        transcript.append({"role": role, "content": message.text_content()})
+    return "Conversation transcript JSON:\n" + json.dumps(transcript, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_prompt_text(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    return "\n".join(line for line in normalized.strip().split("\n") if line.strip())
+
+
+def _sanitize_prompt_role_headers(text: str) -> str:
+    replacements = {
+        "User:": "User message:",
+        "Assistant:": "Assistant message:",
+        "System:": "System message:",
+    }
+    rendered: list[str] = []
+    for line in _normalize_prompt_text(text).split("\n"):
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        for header, replacement in replacements.items():
+            if stripped.startswith(header):
+                stripped = replacement + stripped[len(header) :]
+                break
+        rendered.append(indent + stripped)
+    return "\n".join(rendered)
 
 
 def _render_prompt_message(message: ChatCompletionMessage) -> str:
@@ -724,7 +819,7 @@ def _render_prompt_message(message: ChatCompletionMessage) -> str:
         if message.text_content().strip():
             raise ValueError("assistant tool_calls messages cannot include content")
         tool_history = _render_tool_call_history_json(message.tool_calls or [])
-        return f"Assistant: <think>\n</think>\n```json\n{tool_history}\n```"
+        return f"{assistant_json_prefix(prefill_object=False)}{tool_history}\n```"
 
     content = message.text_content()
     if role == "tool":
@@ -767,10 +862,9 @@ def _render_tool_call_history_json(tool_calls: list[ChatCompletionToolCall]) -> 
 
 
 def _parse_tool_model_output(text: str) -> dict[str, object]:
-    text = _strip_tool_model_output_wrappers(text)
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
+        parsed = json.loads(extract_json_call_value_text(_strip_tool_model_output_wrappers(text)))
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("tool output must be valid JSON") from exc
 
     if isinstance(parsed, dict):

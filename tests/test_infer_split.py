@@ -16,6 +16,8 @@ from src.infer.api import (
     ChatResponseFormat,
     ChatTool,
     ChatToolFunction,
+    ChatCompletionToolCall,
+    ChatCompletionToolCallFunction,
     CompletionChoice,
     CompletionLogprobs,
     CompletionRequest,
@@ -436,7 +438,7 @@ def test_chat_completion_request_supports_openai_tool_prompting_and_parsing() ->
     assert prepared.response_mode == "tool_call"
     assert "OpenAI tool-calling interface" in prepared.completion_request.prompt
     assert "get_weather" in prepared.completion_request.prompt
-    assert prepared.completion_request.prompt.endswith("\n\nAssistant: <think>\n</think>\n```json\n")
+    assert prepared.completion_request.prompt.endswith("\n\nAssistant: ```json\n{")
 
     response = build_chat_completion_response(
         request,
@@ -471,6 +473,47 @@ def test_chat_completion_request_supports_openai_tool_prompting_and_parsing() ->
     assert tool_calls[0].function.name == "get_weather"
     assert json.loads(tool_calls[0].function.arguments) == {"city": "Hangzhou"}
     assert response.choices[0].finish_reason == "tool_calls"
+
+
+def test_chat_completion_tool_prompt_collapses_history_to_single_turn() -> None:
+    request = ChatCompletionRequest(
+        model="demo-model",
+        messages=[
+            ChatCompletionMessage(role="user", content="Lookup weather for Hangzhou"),
+            ChatCompletionMessage(
+                role="assistant",
+                tool_calls=[
+                    ChatCompletionToolCall(
+                        id="call_0",
+                        function=ChatCompletionToolCallFunction(
+                            name="get_weather",
+                            arguments='{"city":"Hangzhou"}',
+                        ),
+                    )
+                ],
+            ),
+            ChatCompletionMessage(role="tool", tool_call_id="call_0", content='{"temp_c": 20}'),
+            ChatCompletionMessage(role="user", content="Summarize it."),
+        ],
+        tools=[
+            ChatTool(
+                function=ChatToolFunction(
+                    name="get_weather",
+                    description="Get current weather",
+                    parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+                )
+            )
+        ],
+        tool_choice="required",
+    )
+
+    prepared = prepare_chat_completion_request(request)
+    prompt = prepared.completion_request.prompt
+
+    assert sum(1 for line in prompt.splitlines() if line.startswith("User:")) == 1
+    assert sum(1 for line in prompt.splitlines() if line.startswith("Assistant:")) == 1
+    assert "Conversation transcript JSON:" in prompt
+    assert prompt.endswith("Assistant: ```json\n{")
 
 
 def test_chat_completion_request_rejects_invalid_tool_configuration() -> None:

@@ -294,7 +294,7 @@ def build_bfcl_system_block(system_prompt: str) -> str:
 
 
 def build_bfcl_assistant_json_prefix() -> str:
-    return assistant_json_prefix()
+    return assistant_json_prefix(enable_think=False, prefill_object=True)
 
 
 def build_bfcl_assistant_json_block(json_text: str) -> str:

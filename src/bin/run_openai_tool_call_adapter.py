@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 import uvicorn
 
+from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
 from src.infer.backend import normalize_api_base
 
 
@@ -134,14 +135,9 @@ def parse_text_tool_calls(content: object) -> list[dict[str, Any]]:
         return []
     text = _strip_model_output_wrappers(content)
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            payload, offset = json.JSONDecoder().raw_decode(text)
-        except json.JSONDecodeError:
-            return []
-        if _strip_known_trailing(text[offset:]):
-            return []
+        payload = json.loads(extract_json_call_value_text(text))
+    except (json.JSONDecodeError, ValueError):
+        return []
     return _coerce_tool_calls(payload)
 
 
@@ -220,25 +216,6 @@ def _strip_model_output_wrappers(text: str) -> str:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         stripped = "\n".join(lines).strip()
-    return stripped
-
-
-def _strip_known_trailing(text: str) -> str:
-    stripped = text.strip()
-    while stripped.startswith("```"):
-        stripped = stripped[3:].strip()
-        lowered = stripped.lower()
-        for marker in ("json", "js", "javascript"):
-            if lowered == marker:
-                stripped = ""
-                break
-            if lowered.startswith(marker + "\n") or lowered.startswith(marker + " "):
-                stripped = stripped[len(marker) :].strip()
-                break
-        else:
-            continue
-    while stripped.endswith("```"):
-        stripped = stripped[:-3].strip()
     return stripped
 
 

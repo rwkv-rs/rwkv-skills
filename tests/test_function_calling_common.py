@@ -16,7 +16,7 @@ from src.eval.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.function_calling.context_budget import normalize_rwkv_text
-from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
+from src.eval.function_calling.rwkv_prompt import build_rwkv_json_call_prompt, extract_json_call_value_text
 from src.eval.function_calling.mcp_bench import (
     McpBenchItem,
     McpBenchTaskSpec,
@@ -97,7 +97,8 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert "return a JSON array containing every required call" in prompt
     assert "Do not copy tool schemas" in prompt
     assert "Available tools:" not in prompt
-    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: <think>\n</think>\n```json\n' in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n{' in prompt
+    assert "<think>" not in prompt
 
 
 def test_api_bank_prompt_documents_missing_year_convention() -> None:
@@ -137,6 +138,37 @@ def test_extract_json_call_value_accepts_sft_safe_wrappers() -> None:
     )
 
 
+def test_extract_json_call_value_accepts_prefilled_object_continuation() -> None:
+    assert (
+        extract_json_call_value_text('"name":"lookup","arguments":{"id":"A1"}}')
+        == '{"name":"lookup","arguments":{"id":"A1"}}'
+    )
+
+
+def test_extract_json_call_value_accepts_rwkv_agentic_tool_call_format() -> None:
+    assert (
+        extract_json_call_value_text('**Tool Call:** lookup(id="A1")')
+        == '{"name":"lookup","arguments":{"id":"A1"}}'
+    )
+
+
+def test_rwkv_json_call_prompt_collapses_history_to_single_user_and_assistant_turn() -> None:
+    prompt = build_rwkv_json_call_prompt(
+        "Use exactly one tool call.",
+        [
+            {"role": "user", "content": "Find A1"},
+            {"role": "assistant", "content": '{"name":"lookup","arguments":{"id":"A1"}}'},
+            {"role": "user", "content": "Function output:\n{\"ok\":true}"},
+        ],
+        history_max_chars=4000,
+    )
+
+    assert sum(1 for line in prompt.splitlines() if line.startswith("User:")) == 1
+    assert sum(1 for line in prompt.splitlines() if line.startswith("Assistant:")) == 1
+    assert "Conversation transcript JSON:" in prompt
+    assert prompt.endswith('Assistant: ```json\n{')
+
+
 def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
     item = McpBenchItem(
         task_file="tasks.json",
@@ -174,7 +206,7 @@ def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
     assert '"name": "calendar:search"' in planning
     assert "Output JSON schema:" in planning
     assert "\nUser: Task:\nBook the meeting" in planning
-    assert planning.endswith("Assistant: <think>\n</think>\n```json\n")
+    assert planning.endswith("Assistant: ```json\n{")
     assert final.endswith("Assistant:")
 
 

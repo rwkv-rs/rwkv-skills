@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from src.eval.agent_bench.envs.tau_v2 import TauV2Env
 from src.eval.agent_bench.tau_official import (
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
 DEFAULT_MAX_STEPS = 200
 DEFAULT_MAX_TOOL_ERRORS = 10
 DEFAULT_TAU_HISTORY_MAX_CHARS = 16000
+DEFAULT_TAU_DECISION_MAX_TOKENS = 384
 
 @dataclass(slots=True)
 class _ActiveEpisode:
@@ -204,6 +206,60 @@ def _sum_message_costs(trajectory: Sequence[Any]) -> float:
     return total
 
 
+def _sum_float(items: Sequence[dict[str, Any]], key: str) -> float:
+    total = 0.0
+    for item in items:
+        try:
+            total += float(item.get(key) or 0.0)
+        except Exception:
+            pass
+    return total
+
+
+def _tau_agent_perf_summary(
+    *,
+    agent: RWKVTauOfficialAgent,
+    simulation: Any,
+    timing: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    steps = [dict(item) for item in list(getattr(agent, "step_timings", []) or [])]
+    simulation_duration_s = float(getattr(simulation, "duration", 0.0) or 0.0)
+    agent_generation_s = _sum_float(steps, "generation_s")
+    agent_prompt_build_s = _sum_float(steps, "prompt_build_s")
+    agent_parse_s = _sum_float(steps, "parse_s")
+    agent_total_s = _sum_float(steps, "total_s")
+    prompt_chars = [int(item.get("prompt_chars") or 0) for item in steps]
+    completion_chars = [int(item.get("completion_chars") or 0) for item in steps]
+    payload: dict[str, Any] = {
+        "simulation_duration_s": simulation_duration_s,
+        "agent_turns": len(steps),
+        "agent_total_s": agent_total_s,
+        "agent_generation_s": agent_generation_s,
+        "agent_prompt_build_s": agent_prompt_build_s,
+        "agent_parse_s": agent_parse_s,
+        "non_agent_simulation_s": max(0.0, simulation_duration_s - agent_total_s),
+        "avg_agent_generation_s": agent_generation_s / len(steps) if steps else 0.0,
+        "max_prompt_chars": max(prompt_chars, default=0),
+        "avg_prompt_chars": (sum(prompt_chars) / len(prompt_chars)) if prompt_chars else 0.0,
+        "max_completion_chars": max(completion_chars, default=0),
+        "avg_completion_chars": (sum(completion_chars) / len(completion_chars)) if completion_chars else 0.0,
+        "steps": steps,
+    }
+    if timing:
+        payload.update(dict(timing))
+        if "total_attempt_s" in timing:
+            try:
+                payload["attempt_overhead_s"] = max(
+                    0.0,
+                    float(timing["total_attempt_s"])
+                    - float(timing.get("orchestrator_run_s") or 0.0)
+                    - float(timing.get("evaluation_s") or 0.0),
+                )
+            except Exception:
+                pass
+    return payload
+
+
 def _ref_answer(state: _ActiveEpisode) -> str:
     task_id = str(getattr(state.task, "id", "") or state.record.task_id)
     return f"domain={state.record.domain}\ntask_id={task_id}\nbenchmark_version={state.record.benchmark_version}"
@@ -295,6 +351,7 @@ def _tau_official_completion_payload(
     benchmark_name: str,
     dataset_split: str,
     sampling_payload: dict[str, Any],
+    timing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     task_id = str(getattr(simulation, "task_id", "") or record.task_id)
     official_reward = float(getattr(evaluation, "reward", 0.0))
@@ -308,6 +365,8 @@ def _tau_official_completion_payload(
     details["official_reward"] = official_reward
     details["official_is_passed"] = official_is_passed
     details["tool_routes"] = list(getattr(agent, "tool_routes", []) or [])
+    perf = _tau_agent_perf_summary(agent=agent, simulation=simulation, timing=timing)
+    details["perf"] = perf
     details["ref_answer"] = (
         f"domain={record.domain}\n"
         f"task_id={task_id}\n"
@@ -337,6 +396,7 @@ def _tau_official_completion_payload(
     }
     payload["agent_info"] = details
     payload["agent_trace"] = _trajectory_dump(list(getattr(simulation, "messages", []) or []))
+    payload["perf"] = perf
     return payload
 
 
@@ -363,6 +423,7 @@ def _run_tau_official_attempt(
     retail_tool_use_guard: bool = False,
     retail_progressive_tool_disclosure: bool = False,
 ) -> dict[str, Any]:
+    attempt_started = time.perf_counter()
     task = runtime_env.load_task(record.task)
     environment = runtime_env.create_environment(solo_mode=False)
     agent = RWKVTauOfficialAgent(
@@ -390,9 +451,14 @@ def _run_tau_official_attempt(
         seed=seed,
         validate_communication=True,
     )
+    timing: dict[str, Any] = {}
     try:
+        run_started = time.perf_counter()
         simulation = orchestrator.run()
+        timing["orchestrator_run_s"] = time.perf_counter() - run_started
+        evaluation_started = time.perf_counter()
         evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
+        timing["evaluation_s"] = time.perf_counter() - evaluation_started
     except Exception as exc:
         error_text = f"tau official runtime error: {type(exc).__name__}: {exc}"
         agent.parse_errors.append(error_text)
@@ -409,6 +475,7 @@ def _run_tau_official_attempt(
             is_passed=False,
             details={"termination_reason": error_text, "runtime_error": error_text},
         )
+    timing["total_attempt_s"] = time.perf_counter() - attempt_started
     return _tau_official_completion_payload(
         record=record,
         sample_index=sample_index,
@@ -420,6 +487,7 @@ def _run_tau_official_attempt(
         benchmark_name=run.benchmark_name,
         dataset_split=run.dataset_split,
         sampling_payload=sampling_payload,
+        timing=timing,
     )
 
 
@@ -507,7 +575,10 @@ def _run_tau(
     if decision_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     normalize_function_prompt_style(getattr(args, "prompt_style", None))
-    decision_sampling = clamp_function_calling_sampling(decision_sampling, args.decision_max_tokens or 1024)
+    decision_sampling = clamp_function_calling_sampling(
+        decision_sampling,
+        args.decision_max_tokens or DEFAULT_TAU_DECISION_MAX_TOKENS,
+    )
 
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
     batch_size = max(1, int(args.batch_size or 16))
@@ -529,7 +600,8 @@ def _run_tau(
         prompt_max_chars=prompt_max_chars,
     )
     sampling_payload["tau_adapter"] = {
-        "semantic_fallbacks": False,
+        "semantic_fallbacks": True,
+        "text_decision_recovery": True,
         "format_conversion": True,
         "retail_repeated_read_guard": retail_repeated_read_guard,
         "retail_tool_use_guard": retail_tool_use_guard,

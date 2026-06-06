@@ -41,6 +41,7 @@ from src.eval.function_calling.runner_common import (
 )
 from src.eval.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
+    assistant_json_prefix,
     coerce_json_function_call_payloads,
     extract_json_call_value_text,
 )
@@ -813,7 +814,7 @@ def build_complexfuncbench_prompt(
         f"Trajectory:\n{trajectory}\n\n"
         f"Current observation:\n{current}\n\n"
         f"Step: {step}\n\n"
-        "Assistant: <think>\n</think>\n```json\n"
+        + assistant_json_prefix()
     )
 
 

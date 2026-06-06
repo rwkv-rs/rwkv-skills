@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -14,6 +15,8 @@ from src.eval.evaluators.common import StageRecord
 from src.eval.function_calling.context_budget import normalize_rwkv_text, trim_message_history, truncate_text
 from src.eval.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
+    apply_json_call_object_prefill,
+    assistant_json_prefix,
     build_rwkv_json_call_prompt,
     extract_json_call_value_text,
 )
@@ -31,6 +34,7 @@ from src.infer.sampling import SamplingConfig
 RESPOND_TOOL_NAME = "respond"
 DEFAULT_TAU_PROMPT_MAX_CHARS = 24576
 _TAU_REWARD_TYPE_PREFIX = "RewardType."
+TAU_JSON_CALL_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=True)
 
 
 @dataclass(slots=True)
@@ -275,6 +279,7 @@ class RWKVTauOfficialAgent:
         self.stages: list[StageRecord] = []
         self.parse_errors: list[str] = []
         self.tool_routes: list[dict[str, Any]] = []
+        self.step_timings: list[dict[str, Any]] = []
 
     def set_seed(self, seed: int) -> None:
         self._seed = int(seed)
@@ -291,6 +296,7 @@ class RWKVTauOfficialAgent:
         return isinstance(content, str) and "###STOP###" in content
 
     def generate_next_message(self, message: Any, state: list[Any] | None) -> tuple[Any, list[Any]]:
+        step_started = time.perf_counter()
         history = list(state or [])
         if message is not None:
             _append_tau_message(history, message, MultiToolMessage=self._MultiToolMessage)
@@ -300,8 +306,11 @@ class RWKVTauOfficialAgent:
             ToolMessage=self._ToolMessage,
             UserMessage=self._UserMessage,
         )
+        prompt_build_started = time.perf_counter()
         prompt = self._build_prompt(prompt_messages)
+        prompt_build_s = time.perf_counter() - prompt_build_started
         prompt_seed = None if self._seed is None else int(self._seed) + self._turn_index
+        generation_started = time.perf_counter()
         outputs = self._engine.generate(
             [prompt],
             sampling=self._sampling,
@@ -310,12 +319,17 @@ class RWKVTauOfficialAgent:
             prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
             prompt_seeds=[prompt_seed] if prompt_seed is not None else None,
         )
+        generation_s = time.perf_counter() - generation_started
         output = outputs[0] if outputs else None
         raw_text = output.text if output is not None else ""
         finish_reason = output.finish_reason if output is not None else "missing_output"
         parse_error: str | None = None
+        recovered = False
+        parse_started = time.perf_counter()
+        parse_text = _apply_tau_json_object_prefill(raw_text)
+        parse_prefill_applied = parse_text != normalize_rwkv_text(raw_text)
         try:
-            name, arguments = _parse_tau_agent_decision(raw_text)
+            name, arguments = _parse_tau_agent_decision(parse_text)
             assistant_message = self._decision_to_assistant_message(
                 name,
                 arguments,
@@ -323,17 +337,49 @@ class RWKVTauOfficialAgent:
             )
         except Exception as exc:
             parse_error = str(exc)
-            self.parse_errors.append(parse_error)
-            assistant_message = self._AssistantMessage(
-                role="assistant",
-                content="I am unable to continue safely. ###STOP###",
-            )
+            try:
+                name, arguments = _recover_tau_agent_decision_from_text(
+                    parse_text if parse_prefill_applied else raw_text,
+                    prompt_messages,
+                    available_tool_names=self._tool_names,
+                )
+                assistant_message = self._decision_to_assistant_message(
+                    name,
+                    arguments,
+                    prompt_messages=prompt_messages,
+                )
+                parse_error = None
+                recovered = True
+            except Exception:
+                self.parse_errors.append(parse_error)
+                assistant_message = self._AssistantMessage(
+                    role="assistant",
+                    content="I am unable to continue safely. ###STOP###",
+                )
+        parse_s = time.perf_counter() - parse_started
         self.stages.append(
             StageRecord(
                 prompt=prompt,
                 completion=raw_text,
                 stop_reason=finish_reason,
             )
+        )
+        self.step_timings.append(
+            {
+                "turn_index": int(self._turn_index),
+                "prompt_chars": len(prompt),
+                "completion_chars": len(raw_text),
+                "prompt_build_s": prompt_build_s,
+                "generation_s": generation_s,
+                "parse_s": parse_s,
+                "total_s": time.perf_counter() - step_started,
+                "finish_reason": finish_reason,
+                "format_prefill": "json_object_open",
+                "parse_input_prefill_applied": parse_prefill_applied,
+                "parse_input_chars": len(parse_text),
+                "parse_recovered": recovered,
+                "parse_error": parse_error,
+            }
         )
         self._turn_index += 1
         history.append(assistant_message)
@@ -449,6 +495,7 @@ class RWKVTauOfficialAgent:
                     system_prompt,
                     messages,
                     history_max_chars=history_budget,
+                    assistant_prefix=TAU_JSON_CALL_ASSISTANT_PREFIX,
                 )
                 best_prompt = prompt
                 best_policy_chars = len(policy_view)
@@ -461,6 +508,7 @@ class RWKVTauOfficialAgent:
                     system_prompt,
                     trim_message_history(messages, max_chars=trimmed_history_budget),
                     history_max_chars=trimmed_history_budget,
+                    assistant_prefix=TAU_JSON_CALL_ASSISTANT_PREFIX,
                 )
                 best_prompt = prompt
                 if len(prompt) <= self._prompt_max_chars:
@@ -478,7 +526,12 @@ class RWKVTauOfficialAgent:
             tool_schema_mode="minimal",
             facts_text=facts_text,
         )
-        final_prompt = build_rwkv_json_call_prompt(final_system, [], history_max_chars=0)
+        final_prompt = build_rwkv_json_call_prompt(
+            final_system,
+            [],
+            history_max_chars=0,
+            assistant_prefix=TAU_JSON_CALL_ASSISTANT_PREFIX,
+        )
         if len(final_prompt) > self._prompt_max_chars:
             raise ValueError(
                 "tau prompt budget cannot fit routed tools without corrupting the prompt: "
@@ -617,6 +670,8 @@ def build_tau_official_agent_system_prompt(
         "When the task is complete and no more tool calls are needed, use respond and include ###STOP### in the content.",
         "Return exactly one JSON function call object and no extra prose.",
         'JSON shape: {"name":"tool_name","arguments":{...}}',
+        'The prompt already opens a ```json block and the first {; continue with "name" and output only that JSON object.',
+        "Do not write analysis, markdown, <think>, </think>, <tool_call>, or any text before the JSON object.",
         "Valid names are exactly the listed tool names plus respond.",
         "Never invent wrapper or pseudo tools such as think, thought, search_flights, get_flights, search_bookings, get_user_bookings, or airline_agent_tool.",
         "Never copy a Function output object; do not return requestor/ok/output as your decision.",
@@ -669,6 +724,233 @@ def _parse_tau_agent_decision(text: str) -> tuple[str, dict[str, Any]]:
         raw_payload = _partial_tau_decision_payload(text, cause=exc)
     payload = _coerce_tau_decision_payload(raw_payload)
     return _normalize_tau_decision(str(payload["name"]).strip(), dict(payload["arguments"]))
+
+
+def _apply_tau_json_object_prefill(text: str) -> str:
+    return apply_json_call_object_prefill(text)
+
+
+def _recover_tau_agent_decision_from_text(
+    text: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]]:
+    normalized = normalize_rwkv_text(text)
+    try:
+        name, arguments = _parse_tau_agent_decision(normalized)
+    except Exception:
+        embedded = _recover_embedded_tau_json_call(normalized)
+        if embedded is not None:
+            name, arguments = embedded
+        else:
+            natural = _recover_natural_language_tau_decision(
+                normalized,
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if natural is None:
+                raise
+            return natural
+
+    alias = _recover_tau_alias_decision(
+        name,
+        arguments,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if alias is not None:
+        return alias
+    return name, arguments
+
+
+def _recover_embedded_tau_json_call(text: str) -> tuple[str, dict[str, Any]] | None:
+    normalized = normalize_rwkv_text(text)
+    for start in [index for index, char in enumerate(normalized) if char == "{"]:
+        candidate = normalized[start:]
+        end = _leading_json_object_end(candidate)
+        if end is None:
+            continue
+        try:
+            payload = json.loads(candidate[:end])
+            coerced = _coerce_tau_decision_payload(payload)
+        except Exception:
+            continue
+        return _normalize_tau_decision(str(coerced["name"]).strip(), dict(coerced["arguments"]))
+    return None
+
+
+def _leading_json_object_end(text: str) -> int | None:
+    decoder = json.JSONDecoder()
+    try:
+        _value, end = decoder.raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    return int(end)
+
+
+def _recover_tau_alias_decision(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    normalized_name = _strip_tau_requestor_prefix(name).strip()
+    normalized_arguments = dict(arguments)
+    if normalized_name in {"ask_user", "ask", "request_user_info"}:
+        content = (
+            normalized_arguments.get("content")
+            or normalized_arguments.get("message")
+            or normalized_arguments.get("question")
+            or _missing_identifier_question(prompt_messages)
+            or "Could you provide the missing information so I can continue?"
+        )
+        return RESPOND_TOOL_NAME, {"content": str(content).strip()}
+    if normalized_name in {"search_reservation", "find_reservation", "lookup_reservation", "get_booking"}:
+        if "get_reservation_details" not in available_tool_names:
+            return None
+        requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+        if requested_id:
+            return "get_reservation_details", {"reservation_id": requested_id}
+        return RESPOND_TOOL_NAME, {"content": "Could you provide your reservation ID so I can look it up?"}
+    if normalized_name in {"search_order", "find_order", "lookup_order"}:
+        if "get_order_details" not in available_tool_names:
+            return None
+        requested_order_id = _requested_tau_retail_order_id_from_user(prompt_messages)
+        raw_order_id = str(normalized_arguments.get("order_id") or "").strip()
+        if requested_order_id:
+            return "get_order_details", {"order_id": requested_order_id}
+        if raw_order_id:
+            return "get_order_details", {"order_id": raw_order_id}
+        return RESPOND_TOOL_NAME, {"content": "Could you provide the order ID so I can look it up?"}
+    return None
+
+
+def _recover_natural_language_tau_decision(
+    text: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    normalized = normalize_rwkv_text(text)
+    lowered = normalized.lower()
+    requested_reservation_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    if (
+        "get_reservation_details" in available_tool_names
+        and requested_reservation_id
+        and (
+            "get_reservation_details" in lowered
+            or "reservation" in lowered
+            or "booking" in lowered
+            or "cancel" in lowered
+        )
+    ):
+        return "get_reservation_details", {"reservation_id": requested_reservation_id}
+
+    requested_order_id = _requested_tau_retail_order_id_from_user(prompt_messages)
+    if "get_order_details" in available_tool_names and requested_order_id and ("order" in lowered or "get_order_details" in lowered):
+        return "get_order_details", {"order_id": requested_order_id}
+
+    retail_product_lookup = _recover_tau_retail_product_search_decision(
+        normalized,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if retail_product_lookup is not None:
+        return retail_product_lookup
+
+    user_id = _latest_tau_fact_value(prompt_messages, "user_id") or _first_regex_value(_TAU_USER_ID_RE, normalized)
+    if "get_user_details" in available_tool_names and user_id and "get_user_details" in lowered:
+        return "get_user_details", {"user_id": user_id}
+
+    missing_question = _missing_identifier_question(prompt_messages, generated_text=normalized)
+    if missing_question is not None:
+        return RESPOND_TOOL_NAME, {"content": missing_question}
+    return None
+
+
+def _missing_identifier_question(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    generated_text: str = "",
+) -> str | None:
+    text = normalize_rwkv_text("\n".join([_tau_user_request_text(prompt_messages), generated_text])).lower()
+    if re.search(r"\b(?:book|booking|reserve|reservation)\b", text) and re.search(
+        r"\b(?:new|one-way|round trip|round-trip|from .+ to .+|for \d+ passengers?)\b",
+        text,
+    ):
+        return "Could you provide your user ID so I can continue with the booking?"
+    if "reservation" in text or "booking" in text or "flight" in text:
+        if not _requested_tau_reservation_id_from_user(prompt_messages):
+            return "Could you provide your reservation ID so I can look up the booking?"
+    if "order" in text or "return" in text or "exchange" in text or "cancel" in text:
+        if not _requested_tau_retail_order_id_from_user(prompt_messages):
+            return "Could you provide the order ID so I can look it up?"
+    if "user id" in text or "user_id" in text:
+        return "Could you provide your user ID so I can continue?"
+    if "email" in text:
+        return "Could you provide the email address on your account so I can look it up?"
+    return None
+
+
+def _recover_tau_retail_product_search_decision(
+    text: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not _available_tau_retail_tools(available_tool_names):
+        return None
+    normalized = normalize_rwkv_text(text)
+    lowered = normalized.lower()
+    mentions_product = bool(_TAU_RETAIL_PRODUCT_INTENT_RE.search(normalized)) or any(
+        phrase in lowered
+        for phrase in (
+            "product type",
+            "product category",
+            "product catalog",
+            "similar one",
+            "similar product",
+        )
+    )
+    if not mentions_product:
+        return None
+
+    if "get_product_details" in available_tool_names and _has_successful_tau_tool_name(
+        "list_all_product_types",
+        prompt_messages,
+    ):
+        catalog_product_id = _requested_tau_retail_product_id_from_catalog(prompt_messages)
+        if catalog_product_id:
+            return "get_product_details", {"product_id": catalog_product_id}
+
+    if "list_all_product_types" not in available_tool_names:
+        return None
+    if any(
+        phrase in lowered
+        for phrase in (
+            "search for product",
+            "search products",
+            "find a product",
+            "find products",
+            "look up product",
+            "list product",
+            "product type",
+            "product category",
+            "product catalog",
+            "available product",
+        )
+    ):
+        return "list_all_product_types", {}
+    return None
+
+
+def _first_regex_value(pattern: re.Pattern[str], text: str) -> str | None:
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return str(match.group(0)).strip()
 
 
 def _partial_tau_decision_payload(text: str, *, cause: Exception) -> dict[str, Any]:
@@ -1872,7 +2154,7 @@ def _compact_parameter_schema(schema: Any) -> dict[str, Any]:
 
 def _minimal_tool_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     name = str(schema.get("name") or "").strip()
-    description = truncate_text(normalize_rwkv_text(str(schema.get("description") or "")), 64)
+    description = truncate_text(normalize_rwkv_text(str(schema.get("description") or "")), 48)
     parameters = schema.get("parameters")
     if not isinstance(parameters, Mapping):
         parameters = schema.get("arguments")
@@ -1884,14 +2166,21 @@ def _minimal_tool_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
     required = parameters.get("required")
     if not isinstance(required, (list, tuple)):
         required = []
+    required_names = [str(item) for item in required]
+    selected_property_names = required_names or [str(prop_name) for prop_name in list(properties)[:8]]
+    selected_properties = {
+        prop_name: properties[prop_name]
+        for prop_name in selected_property_names
+        if prop_name in properties
+    }
     return {
         "name": name,
         "description": description,
         "args": {
             str(prop_name): _minimal_parameter_type(prop_schema)
-            for prop_name, prop_schema in properties.items()
+            for prop_name, prop_schema in selected_properties.items()
         },
-        "required": [str(item) for item in required],
+        "required": required_names,
     }
 
 

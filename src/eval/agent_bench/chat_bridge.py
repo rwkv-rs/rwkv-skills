@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Sequence
 
+from src.eval.function_calling.rwkv_prompt import assistant_json_prefix, extract_json_call_value_text
 from src.infer.backend import InferenceBackend
 from src.infer.sampling import SamplingConfig
 
@@ -160,8 +161,9 @@ class RWKVChatBridge:
             lines.append("")
 
         # Tool calling guidance (minimal, since RWKV needs format hints)
-        lines.append("When you need to call a tool, output JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}")
-        lines.append("When you want to respond to the user, just write your response directly.")
+        lines.append('Return exactly one JSON object: {"name":"<tool_name>","arguments":{...}}')
+        lines.append('When responding to the user, return {"type":"message","content":"..."}')
+        lines.append('The prompt already opens a ```json block and the first {; continue with "name" or "type".')
         if tool_choice == "required":
             lines.append("A tool call is required for this turn.")
         elif tool_choice == "none":
@@ -180,14 +182,14 @@ class RWKVChatBridge:
             lines.append(self._extra_system_instruction)
 
         # Conversation (skip system message)
-        lines.append("")
-        for message in messages:
-            if message.get("role") == "system":
-                continue
-            lines.append(_format_message_tau_v1(message))
+        dialog = [message for message in messages if message.get("role") != "system"]
+        user_body = _render_dialog_user_body(dialog)
+        if user_body:
+            lines.append("")
+            lines.append(f"User: {user_body}")
 
         lines.append("")
-        lines.append("Assistant:")
+        lines.append(assistant_json_prefix())
         return "\n".join(lines)
 
     def _render_tau_v2(
@@ -207,9 +209,10 @@ class RWKVChatBridge:
         instruction_text = (
             "You are a customer service agent that helps the user according to the <policy> provided below.\n"
             "In each turn you can either:\n"
-            "- Send a message to the user.\n"
-            "- Make a tool call as JSON: {\"name\": \"<tool_name>\", \"arguments\": {...}}\n"
-            "You cannot do both at the same time."
+            "- Send a message to the user as JSON: {\"type\":\"message\",\"content\":\"...\"}.\n"
+            "- Make a tool call as JSON: {\"name\":\"<tool_name>\",\"arguments\":{...}}.\n"
+            "You cannot do both at the same time.\n"
+            "The prompt already opens a ```json block and the first {; continue with \"name\" or \"type\"."
         )
         if tool_choice == "required":
             instruction_text += "\nA tool call is required for this turn."
@@ -239,16 +242,14 @@ class RWKVChatBridge:
             lines.append(self._extra_system_instruction)
 
         # Conversation (skip system message)
-        lines.append("")
-        lines.append("<conversation>")
-        for message in messages:
-            if message.get("role") == "system":
-                continue
-            lines.append(_format_message_tau_v2(message))
-        lines.append("</conversation>")
+        dialog = [message for message in messages if message.get("role") != "system"]
+        user_body = _render_dialog_user_body(dialog)
+        if user_body:
+            lines.append("")
+            lines.append(f"User: {user_body}")
 
         lines.append("")
-        lines.append("Assistant:")
+        lines.append(assistant_json_prefix())
         return "\n".join(lines)
 
     def _render_legacy(
@@ -285,7 +286,9 @@ class RWKVChatBridge:
             lines.append(f"[{idx}] {_serialize_message(message)}")
 
         lines.append("")
-        lines.append("Now output one JSON object only.")
+        lines.append('Now output one JSON object only. The prompt already opened the first {; continue with "type".')
+        lines.append("")
+        lines.append(assistant_json_prefix())
         return "\n".join(lines)
 
 
@@ -333,6 +336,48 @@ def _format_message_tau_v2(message: dict[str, Any]) -> str:
         tool_name = message.get("name", "unknown")
         return f"<tool name=\"{tool_name}\">{content or ''}</tool>"
     return f"<{role}>{content or ''}</{role}>"
+
+
+def _render_dialog_user_body(messages: Sequence[dict[str, Any]]) -> str:
+    if not messages:
+        return ""
+    if len(messages) == 1 and str(messages[0].get("role") or "").strip().lower() == "user":
+        return _sanitize_role_headers(str(messages[0].get("content") or ""))
+    transcript: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "assistant").strip().lower() or "assistant"
+        if role == "assistant" and message.get("tool_calls"):
+            transcript.append({"role": "assistant", "tool_calls": message.get("tool_calls")})
+            continue
+        if role == "tool":
+            transcript.append(
+                {
+                    "role": "tool",
+                    "name": message.get("name") or "",
+                    "tool_call_id": message.get("tool_call_id") or "",
+                    "content": message.get("content") or "",
+                }
+            )
+            continue
+        transcript.append({"role": role, "content": message.get("content") or ""})
+    return "Conversation transcript JSON:\n" + json.dumps(transcript, ensure_ascii=False, separators=(",", ":"))
+
+
+def _sanitize_role_headers(text: str) -> str:
+    rendered: list[str] = []
+    for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip().split("\n"):
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        for header, replacement in (
+            ("User:", "User message:"),
+            ("Assistant:", "Assistant message:"),
+            ("System:", "System message:"),
+        ):
+            if stripped.startswith(header):
+                stripped = replacement + stripped[len(header) :]
+                break
+        rendered.append(indent + stripped.rstrip())
+    return "\n".join(rendered).strip()
 
 
 def _serialize_message(message: dict[str, Any]) -> str:
@@ -384,6 +429,15 @@ def _parse_generation(raw_text: str, *, tool_names: set[str]) -> tuple[list[Pars
     text = raw_text.strip()
     if not text:
         return [], "", "empty_output"
+
+    try:
+        parsed = json.loads(extract_json_call_value_text(text))
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if parsed is not None:
+        tool_calls, content = _interpret_parsed_json(parsed, tool_names=tool_names)
+        if tool_calls or content:
+            return tool_calls, content, None
 
     for candidate in _iter_json_candidates(text):
         parsed = _loads_json(candidate)

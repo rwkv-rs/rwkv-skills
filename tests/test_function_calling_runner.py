@@ -675,7 +675,8 @@ def test_run_bfcl_generation_step_uses_official_json_prompt_style() -> None:
     assert call["prompt_stop_suffixes"] == [list(bfcl_v3_runner.BFCL_DECISION_STOP_SUFFIXES)]
     prompt = str(call["prompts"][0])
     assert prompt.startswith("System: Tools:")
-    assert "\n\nUser: Find A1\n\nAssistant: <think>\n</think>\n```json\n" in prompt
+    assert "\n\nUser: Find A1\n\nAssistant: ```json\n{" in prompt
+    assert "<think>" not in prompt
 
 
 def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:

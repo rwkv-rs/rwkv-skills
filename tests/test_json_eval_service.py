@@ -47,6 +47,7 @@ def test_json_eval_store_persists_structured_completion_and_resume(monkeypatch, 
             "stop_reason1": "stop_token",
             "agent_trace": [{"role": "user", "content": "hello"}],
             "agent_result": {"is_passed": False, "num_turns": 1, "error": "demo"},
+            "perf": {"total_attempt_s": 1.25, "agent_generation_s": 0.75},
         },
     )
 
@@ -54,6 +55,7 @@ def test_json_eval_store_persists_structured_completion_and_resume(monkeypatch, 
     rows = [json.loads(line) for line in completion_path.read_text(encoding="utf-8").splitlines()]
     assert rows[0]["context"]["agent_trace"] == [{"role": "user", "content": "hello"}]
     assert rows[0]["context"]["stages"][0]["prompt"] == "User: hello\nAssistant:"
+    assert rows[0]["context"]["perf"] == {"agent_generation_s": 0.75, "total_attempt_s": 1.25}
 
     resumed = prepare_task_execution(
         service=create_eval_service(),

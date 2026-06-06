@@ -121,7 +121,11 @@ def build_single_function_call_constraint(spec: SingleFunctionCallConstraintSpec
     return SingleFunctionCallConstraint(spec)
 
 
-def build_bfcl_tool_call_constraint(tools: Sequence[Mapping[str, Any]]) -> SingleFunctionCallConstraint:
+def build_bfcl_tool_call_constraint(
+    tools: Sequence[Mapping[str, Any]],
+    *,
+    prefilled_object: bool = False,
+) -> SingleFunctionCallConstraint:
     tool_names = tuple(str(tool.get("name") or "").strip() for tool in tools if str(tool.get("name") or "").strip())
     tool_schemas = {
         str(tool.get("name") or "").strip(): dict(tool.get("parameters") or {})
@@ -132,6 +136,7 @@ def build_bfcl_tool_call_constraint(tools: Sequence[Mapping[str, Any]]) -> Singl
         SingleFunctionCallConstraintSpec(
             tool_names=tool_names,
             tool_schemas=tool_schemas,
+            prefix_literal='"name":"' if prefilled_object else '{"name":"',
         )
     )
 

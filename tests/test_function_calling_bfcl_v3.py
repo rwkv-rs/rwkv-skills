@@ -684,9 +684,9 @@ def test_build_bfcl_router_and_branch_prompts_use_hidden_summary_and_tool_prefix
     assert '"name": "lookup"' in router_prompt
     assert "```json" not in router_prompt
     assert "<tool_call>" not in tool_prompt
-    assert tool_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
-    assert ask_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
-    assert handoff_prompt.endswith("Assistant: <think>\n</think>\n```json\n")
+    assert tool_prompt.endswith("Assistant: ```json\n{")
+    assert ask_prompt.endswith("Assistant: ```json\n{")
+    assert handoff_prompt.endswith("Assistant: ```json\n{")
 
 
 def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
@@ -743,19 +743,22 @@ def test_parse_bfcl_router_output_accepts_only_known_labels() -> None:
         raise AssertionError("expected router validation failure")
 
 
-def test_parse_bfcl_assistant_output_rejects_non_rwkv_tool_protocols() -> None:
-    bad_outputs = [
-        '<tool_call>{"name":"lookup","arguments":{}}</tool_call>',
-        'text before {"name":"lookup","arguments":{}}',
-    ]
+def test_parse_bfcl_assistant_output_accepts_rwkv_agentic_tool_protocols() -> None:
+    decision = parse_bfcl_assistant_output('**Tool Call:** lookup(id="A1")')
 
-    for text in bad_outputs:
-        try:
-            parse_bfcl_assistant_output(text)
-        except ValueError as exc:
-            assert any(token in str(exc) for token in ("forbidden", "JSON function call object"))
-        else:  # pragma: no cover - defensive
-            raise AssertionError(f"expected ValueError for {text!r}")
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+    assert decision.tool_call.arguments == {"id": "A1"}
+
+
+def test_parse_bfcl_assistant_output_rejects_unlabeled_leading_prose() -> None:
+    try:
+        parse_bfcl_assistant_output('text before {"name":"lookup","arguments":{}}')
+    except ValueError as exc:
+        assert "JSON function call object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected ValueError")
 
 
 def test_parse_bfcl_assistant_output_accepts_openai_tool_calls_shape() -> None:
@@ -900,6 +903,10 @@ def test_bfcl_tool_call_constraint_enforces_root_argument_schema() -> None:
     assert valid.feed_text('{"name":"lookup","arguments":{"id":"A1"}}')
     assert valid.is_complete() is True
 
+    continuation = build_bfcl_tool_call_constraint(tools, prefilled_object=True)
+    assert continuation.feed_text('"name":"lookup","arguments":{"id":"A1"}}')
+    assert continuation.is_complete() is True
+
     invalid = build_bfcl_tool_call_constraint(tools)
     assert invalid.feed_text('{"name":"lookup","arguments":{"bad"') is False
 
@@ -986,6 +993,8 @@ def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
 
     assert context.startswith("System: Tools:")
     assert '"name": "lookup"' in context
-    assert "\nUser: Find A1\n" in context
-    assert '\nAssistant: <think>\n</think>\n```json\n{"name":"lookup","arguments":{"id":"A1"}}\n```' in context
-    assert context.endswith("Assistant: <think>\n</think>\n```json\n")
+    assert sum(1 for line in context.splitlines() if line.startswith("User:")) == 1
+    assert sum(1 for line in context.splitlines() if line.startswith("Assistant:")) == 1
+    assert "Conversation transcript JSON:" in context
+    assert '{"role":"assistant","content":"{\\"name\\":\\"lookup\\",\\"arguments\\":{\\"id\\":\\"A1\\"}}"}' in context
+    assert context.endswith("Assistant: ```json\n{")

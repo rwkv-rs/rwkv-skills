@@ -11,14 +11,17 @@ from src.eval.function_calling import (
     parse_tool_call_or_final_answer,
     render_tau_user_prompt,
 )
+from src.eval.function_calling.rwkv_prompt import assistant_json_prefix, render_assistant_json_block
 from src.eval.agent_bench.tau_official import (
     RWKVTauOfficialAgent,
+    _apply_tau_json_object_prefill,
     _apply_tau_retail_progressive_tool_disclosure,
     _build_tau_tool_facts_message,
     build_tau_official_agent_system_prompt,
     configure_tau_nl_assertions_judge,
     normalize_tau_official_task_payload,
     _parse_tau_agent_decision,
+    _recover_tau_agent_decision_from_text,
     _tau_litellm_model_name,
     _tau_llm_timeout_args,
 )
@@ -183,6 +186,30 @@ def test_tau_official_parser_accepts_top_level_content_as_arguments() -> None:
     assert arguments == {"content": "Done ###STOP###"}
 
 
+def test_tau_official_parser_accepts_json_object_prefill_continuation() -> None:
+    name, arguments = _parse_tau_agent_decision(
+        _apply_tau_json_object_prefill(
+            '"name":"get_reservation_details","arguments":{"reservation_id":"EHGLP3"}}'
+        )
+    )
+
+    assert name == "get_reservation_details"
+    assert arguments == {"reservation_id": "EHGLP3"}
+
+
+def test_tau_official_recovery_accepts_prefilled_json_with_trailing_text() -> None:
+    name, arguments = _recover_tau_agent_decision_from_text(
+        _apply_tau_json_object_prefill(
+            '"name":"get_reservation_details","arguments":{"reservation_id":"EHGLP3"}}\nI will now look it up.'
+        ),
+        [{"role": "user", "content": "Cancel reservation EHGLP3."}],
+        available_tool_names={"get_reservation_details", "respond"},
+    )
+
+    assert name == "get_reservation_details"
+    assert arguments == {"reservation_id": "EHGLP3"}
+
+
 def test_tau_official_parser_keeps_semantic_tool_alias_unmodified() -> None:
     name, arguments = _parse_tau_agent_decision(
         '{"name":"search_flights","arguments":{"origin":"JFK","destination":"LAX","departure_date":"2024-05-01","return_date":null,"cabin":"economy"}}'
@@ -206,6 +233,51 @@ def test_tau_official_parser_keeps_wrapper_tool_unmodified() -> None:
     assert name == "airline_agent_tool"
     assert arguments["action_details"] == {"action": "cancel", "reservation_id": "IFOYYZ"}
     assert arguments["user_id"] == "aarav_ahmed_6699"
+
+
+def test_tau_official_recovers_natural_language_reservation_lookup() -> None:
+    name, arguments = _recover_tau_agent_decision_from_text(
+        "The user wants to cancel reservation EHGLP3. I'll call get_reservation_details to inspect it.</think>",
+        [{"role": "user", "content": "Please cancel reservation EHGLP3."}],
+        available_tool_names={"get_reservation_details", "cancel_reservation", "respond"},
+    )
+
+    assert name == "get_reservation_details"
+    assert arguments == {"reservation_id": "EHGLP3"}
+
+
+def test_tau_official_recovers_search_reservation_alias_without_hallucinated_id() -> None:
+    name, arguments = _recover_tau_agent_decision_from_text(
+        '<tool_call>{"name":"search_reservation","arguments":{"reservation_id":"ZFA04Y"}}</tool_call>',
+        [{"role": "user", "content": "I need to cancel my trip from Philadelphia to LaGuardia."}],
+        available_tool_names={"get_reservation_details", "respond"},
+    )
+
+    assert name == "respond"
+    assert "reservation ID" in arguments["content"]
+
+
+def test_tau_official_recovers_ask_user_alias() -> None:
+    name, arguments = _recover_tau_agent_decision_from_text(
+        '{"name":"ask_user","arguments":{"question":"What is your user ID?"}}',
+        [{"role": "user", "content": "I want to book a flight from San Francisco to New York."}],
+        available_tool_names={"respond"},
+    )
+
+    assert name == "respond"
+    assert arguments == {"content": "What is your user ID?"}
+
+
+def test_tau_official_recovers_retail_product_search_language() -> None:
+    name, arguments = _recover_tau_agent_decision_from_text(
+        "The user wants to exchange the mechanical keyboard for a similar one with clicky switches. "
+        "I need to find a product that is similar, so I should search products in the keyboard category.</think>",
+        [{"role": "user", "content": "I want to exchange my mechanical keyboard for one with clicky switches."}],
+        available_tool_names={"list_all_product_types", "get_product_details", "respond"},
+    )
+
+    assert name == "list_all_product_types"
+    assert arguments == {}
 
 
 def test_parse_tau_rejects_plain_text_final_answer() -> None:
@@ -260,6 +332,41 @@ def test_build_tau_official_agent_system_prompt_uses_respond_and_real_tools() ->
     assert "detail tools need exact IDs" in prompt
     assert "include ###STOP###" in prompt
     assert "Follow the refund policy." in prompt
+
+
+def test_tau_official_agent_prompt_uses_plain_json_prefill_without_think() -> None:
+    tool = {
+        "name": "get_reservation_details",
+        "description": "Get reservation details",
+        "parameters": {
+            "type": "object",
+            "properties": {"reservation_id": {"type": "string"}},
+            "required": ["reservation_id"],
+        },
+    }
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=[tool],
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+
+    prompt = agent._build_prompt([{"role": "user", "content": "Cancel reservation EHGLP3."}])  # noqa: SLF001
+
+    assert prompt.endswith("Assistant: ```json\n{")
+    assert "\n\nAssistant: <think>\n</think>\n```json\n" not in prompt
+
+
+def test_assistant_json_object_prefill_does_not_double_render_history_object() -> None:
+    rendered = render_assistant_json_block(
+        '{"name":"get_reservation_details","arguments":{"reservation_id":"EHGLP3"}}',
+        assistant_prefix=assistant_json_prefix(enable_think=False, prefill_object=True),
+    )
+
+    assert rendered.startswith('Assistant: ```json\n{"name"')
+    assert "{{" not in rendered
 
 
 def test_tau_official_agent_preserves_hash_prefixed_user_ids() -> None:

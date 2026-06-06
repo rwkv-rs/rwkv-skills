@@ -438,7 +438,8 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert "return a JSON array containing every required call" in prompt
     assert "Do not copy tool schemas" in prompt
     assert "Available tools:" not in prompt
-    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: <think>\n</think>\n```json\n' in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n{' in prompt
+    assert "<think>" not in prompt
 
 
 def test_simple_tool_call_decoder_accepts_arithmetic_literals() -> None:
