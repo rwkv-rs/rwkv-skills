@@ -84,6 +84,32 @@ def bfcl_small_source_paths(dataset_name: str) -> tuple[Path, Path]:
     return (root.joinpath(*question_parts).resolve(), root.joinpath(*answer_parts).resolve())
 
 
+def bfcl_official_root_from_source_root(source_root: Path | None = None) -> Path | None:
+    root = (source_root or bfcl_small_source_root()).expanduser().resolve()
+    if root.name == "data" and root.parent.name == "bfcl_eval":
+        candidate = root.parent.parent
+        if (candidate / "bfcl_eval").is_dir():
+            return candidate.resolve()
+    for parent in (root, *root.parents):
+        if (parent / "bfcl_eval" / "eval_checker").is_dir():
+            return parent.resolve()
+    return None
+
+
+def _with_bfcl_official_metadata(rows: list[dict[str, Any]], *, source_root: Path) -> list[dict[str, Any]]:
+    official_root = bfcl_official_root_from_source_root(source_root)
+    if official_root is None:
+        return rows
+    for row in rows:
+        metadata = row.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            row["metadata"] = metadata
+        metadata.setdefault("official_root", str(official_root))
+        metadata.setdefault("official_source", "gorilla/berkeley-function-call-leaderboard")
+    return rows
+
+
 def _prepare_bfcl_small_spec(dataset_name: str, output_root: Path, split: str) -> LocalRowsDatasetSpec:
     if split != "test":
         raise ValueError(f"{dataset_name} 仅提供 test split")
@@ -94,7 +120,10 @@ def _prepare_bfcl_small_spec(dataset_name: str, output_root: Path, split: str) -
 
     def _load() -> list[dict[str, Any]]:
         question_path, answer_path = _paths()
-        return load_bfcl_ast_rows_from_sources(question_path, answer_path, category=category)
+        return _with_bfcl_official_metadata(
+            load_bfcl_ast_rows_from_sources(question_path, answer_path, category=category),
+            source_root=bfcl_small_source_root(),
+        )
 
     return LocalRowsDatasetSpec(
         dataset_name,
@@ -117,7 +146,10 @@ def _prepare_bfcl_exec_spec(dataset_name: str, output_root: Path, split: str) ->
 
     def _load() -> list[dict[str, Any]]:
         question_path, answer_path = _paths()
-        return load_bfcl_exec_rows_from_sources(question_path, answer_path, category=category)
+        return _with_bfcl_official_metadata(
+            load_bfcl_exec_rows_from_sources(question_path, answer_path, category=category),
+            source_root=bfcl_small_source_root(),
+        )
 
     return LocalRowsDatasetSpec(
         dataset_name,
@@ -173,6 +205,7 @@ def prepare_bfcl_exec_parallel_multiple_spec(output_root: Path, split: str = "te
 __all__ = [
     "bfcl_small_source_paths",
     "bfcl_small_source_root",
+    "bfcl_official_root_from_source_root",
     "prepare_bfcl_exec_multiple_spec",
     "prepare_bfcl_exec_multiple_ast_spec",
     "prepare_bfcl_exec_parallel_multiple_spec",

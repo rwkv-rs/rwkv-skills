@@ -9,6 +9,12 @@ from src.eval.function_calling import McpBenchItem, load_mcp_bench_task_items
 from .common import LocalRowsDatasetSpec, rwkv_rs_datasets_root
 
 _REQUIRED_FIELDS = ("task_id", "instruction", "task")
+_MCP_BENCH_DATASET_FILES: dict[str, tuple[str, ...] | None] = {
+    "mcp_bench": None,
+    "mcp_bench_single": ("mcpbench_tasks_single_runner_format.json",),
+    "mcp_bench_multi_2server": ("mcpbench_tasks_multi_2server_runner_format.json",),
+    "mcp_bench_multi_3server": ("mcpbench_tasks_multi_3server_runner_format.json",),
+}
 
 
 def _resolve_mcp_bench_roots() -> tuple[Path, Path]:
@@ -50,18 +56,26 @@ def _rows_from_items(
     ]
 
 
-@FUNCTION_CALLING_REGISTRY.register_spec("mcp_bench")
-def prepare_mcp_bench_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+def _prepare_mcp_bench_spec(dataset_name: str, output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
     if split != "test":
-        raise ValueError("mcp_bench 仅提供 test split")
+        raise ValueError(f"{dataset_name} 仅提供 test split")
 
     tasks_root, runtime_root = _resolve_mcp_bench_roots()
+    file_names = _MCP_BENCH_DATASET_FILES[dataset_name]
 
     def _load() -> list[dict[str, Any]]:
-        return _rows_from_items(load_mcp_bench_task_items(tasks_root, runtime_root), tasks_root=tasks_root, runtime_root=runtime_root)
+        if file_names is None:
+            items = load_mcp_bench_task_items(tasks_root, runtime_root)
+        else:
+            items = load_mcp_bench_task_items(tasks_root, runtime_root, file_names=file_names)
+        return _rows_from_items(
+            items,
+            tasks_root=tasks_root,
+            runtime_root=runtime_root,
+        )
 
     return LocalRowsDatasetSpec(
-        "mcp_bench",
+        dataset_name,
         output_root,
         split,
         required_fields=_REQUIRED_FIELDS,
@@ -71,4 +85,29 @@ def prepare_mcp_bench_spec(output_root: Path, split: str = "test") -> LocalRowsD
     )
 
 
-__all__ = ["prepare_mcp_bench_spec"]
+@FUNCTION_CALLING_REGISTRY.register_spec("mcp_bench")
+def prepare_mcp_bench_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_mcp_bench_spec("mcp_bench", output_root, split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("mcp_bench_single")
+def prepare_mcp_bench_single_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_mcp_bench_spec("mcp_bench_single", output_root, split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("mcp_bench_multi_2server")
+def prepare_mcp_bench_multi_2server_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_mcp_bench_spec("mcp_bench_multi_2server", output_root, split)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("mcp_bench_multi_3server")
+def prepare_mcp_bench_multi_3server_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_mcp_bench_spec("mcp_bench_multi_3server", output_root, split)
+
+
+__all__ = [
+    "prepare_mcp_bench_multi_2server_spec",
+    "prepare_mcp_bench_multi_3server_spec",
+    "prepare_mcp_bench_single_spec",
+    "prepare_mcp_bench_spec",
+]

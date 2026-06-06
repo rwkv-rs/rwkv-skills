@@ -1,0 +1,11 @@
+[default]
+template = "instruction_following_default"
+avg_k = [1]
+report_avg_k = [1]
+
+[tool]
+template = "instruction_following_default"
+max_generate_tokens = 1024
+temperature = 0.2
+top_k = 20
+top_p = 0.2

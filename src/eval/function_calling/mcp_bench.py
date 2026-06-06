@@ -60,6 +60,11 @@ MCP_BENCH_MAX_TOOL_SCHEMA_CHARS = DEFAULT_TOOL_SCHEMA_MAX_CHARS
 MCP_BENCH_MAX_RESULT_CHARS = DEFAULT_TOOL_RESULT_MAX_CHARS
 MCP_BENCH_MAX_ERROR_CHARS = DEFAULT_TOOL_ERROR_MAX_CHARS
 MCP_BENCH_MAX_HISTORY_CHARS = DEFAULT_HISTORY_MAX_CHARS
+MCP_BENCH_TASK_FILES: tuple[str, ...] = (
+    "mcpbench_tasks_single_runner_format.json",
+    "mcpbench_tasks_multi_2server_runner_format.json",
+    "mcpbench_tasks_multi_3server_runner_format.json",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,16 +271,17 @@ class McpBenchWorkerClient:
         return message
 
 
-def load_mcp_bench_task_items(tasks_root: str | Path, runtime_root: str | Path) -> list[McpBenchItem]:
+def load_mcp_bench_task_items(
+    tasks_root: str | Path,
+    runtime_root: str | Path,
+    *,
+    file_names: Sequence[str] | None = None,
+) -> list[McpBenchItem]:
     root = Path(tasks_root)
     runtime = Path(runtime_root)
-    file_names = (
-        "mcpbench_tasks_single_runner_format.json",
-        "mcpbench_tasks_multi_2server_runner_format.json",
-        "mcpbench_tasks_multi_3server_runner_format.json",
-    )
+    selected_file_names = tuple(file_names or MCP_BENCH_TASK_FILES)
     items: list[McpBenchItem] = []
-    for file_name in file_names:
+    for file_name in selected_file_names:
         payload = json.loads((root / file_name).read_text(encoding="utf-8"))
         for group in payload.get("server_tasks", []):
             if not isinstance(group, dict):

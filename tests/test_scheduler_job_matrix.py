@@ -87,6 +87,7 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     tau2_spec = DATASET_PREP_SPECS[canonical_slug("tau2_bench_airline_base")]
     tau3_spec = DATASET_PREP_SPECS[canonical_slug("tau3_bench_banking_knowledge_base")]
     complex_spec = DATASET_PREP_SPECS[canonical_slug("complexfuncbench_official_test")]
+    complex_subset_spec = DATASET_PREP_SPECS[canonical_slug("complexfuncbench_subset_test")]
 
     assert gpqa_spec.dataset == "gpqa"
     assert gpqa_spec.split == "diamond"
@@ -100,9 +101,12 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     assert tau3_spec.split == "base"
     assert complex_spec.dataset == "complexfuncbench_official"
     assert complex_spec.split == "test"
+    assert complex_subset_spec.dataset == "complexfuncbench_subset"
+    assert complex_subset_spec.split == "test"
     assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
     assert canonical_slug("tau3_bench_banking_knowledge_base") in CODE_DATASET_SLUGS
     assert canonical_slug("complexfuncbench_official_test") in CODE_DATASET_SLUGS
+    assert canonical_slug("complexfuncbench_subset_test") in CODE_DATASET_SLUGS
 
 
 def test_locate_dataset_prefers_existing_registered_artifact_without_source_prepare(
@@ -248,6 +252,11 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("longbench_qa_balanced_test") in longbench_slugs
     assert canonical_slug("longcodeqa_test") in longcodebench_slugs
     assert canonical_slug("mcp_bench_test") in mcp_slugs
+    assert canonical_slug("mcp_bench_single_test") in mcp_slugs
+    assert canonical_slug("mcp_bench_multi_2server_test") in mcp_slugs
+    assert canonical_slug("mcp_bench_multi_3server_test") in mcp_slugs
+    assert canonical_slug("apibank_l1_test") in api_bank_slugs
+    assert canonical_slug("apibank_l2_test") in api_bank_slugs
     assert canonical_slug("apibank_level1_test") in api_bank_slugs
     assert canonical_slug("apibank_level2_test") in api_bank_slugs
     assert canonical_slug("agentbench_db_test") in agentbench_slugs
@@ -267,6 +276,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("tau_bench_airline_test") in tau_slugs
     assert canonical_slug("tau_bench_telecom_test") in tau_slugs
     assert canonical_slug("complexfuncbench_official_test") in complex_slugs
+    assert canonical_slug("complexfuncbench_subset_test") in complex_slugs
     assert canonical_slug("tau2_bench_retail_base") in tau2_slugs
     assert canonical_slug("tau2_bench_airline_base") in tau2_slugs
     assert canonical_slug("tau2_bench_telecom_base") in tau2_slugs
@@ -282,6 +292,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("longbench_qa_balanced_test"), is_cot=True) == "function_longbench"
     assert detect_job_from_dataset(canonical_slug("longcodeqa_test"), is_cot=True) == "function_longcodebench"
     assert detect_job_from_dataset(canonical_slug("mcp_bench_test"), is_cot=True) == "function_mcp_bench"
+    assert detect_job_from_dataset(canonical_slug("mcp_bench_multi_3server_test"), is_cot=True) == "function_mcp_bench"
+    assert detect_job_from_dataset(canonical_slug("apibank_l2_test"), is_cot=True) == "function_api_bank"
     assert detect_job_from_dataset(canonical_slug("apibank_level1_test"), is_cot=True) == "function_api_bank"
     assert detect_job_from_dataset(canonical_slug("agentbench_db_test"), is_cot=True) == "function_agentbench"
     assert detect_job_from_dataset(canonical_slug("bfcl_v3_test"), is_cot=True) == "function_bfcl_v3"
@@ -293,6 +305,10 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert detect_job_from_dataset(canonical_slug("tau2_bench_telecom_base"), is_cot=True) == "function_tau2_bench"
     assert (
         detect_job_from_dataset(canonical_slug("complexfuncbench_official_test"), is_cot=True)
+        == "function_complexfuncbench"
+    )
+    assert (
+        detect_job_from_dataset(canonical_slug("complexfuncbench_subset_test"), is_cot=True)
         == "function_complexfuncbench"
     )
     assert (

@@ -159,6 +159,7 @@ from .complexfuncbench import (
 )
 from .mcp_bench import (
     MCP_BENCH_PASS_THRESHOLD,
+    MCP_BENCH_TASK_FILES,
     McpBenchEvaluation,
     McpBenchExecutionResult,
     McpBenchItem,
@@ -258,6 +259,7 @@ __all__ = [
     "DEFAULT_COMPLEXFUNC_MAX_ROWS",
     "DEFAULT_HISTORY_MAX_CHARS",
     "MCP_BENCH_PASS_THRESHOLD",
+    "MCP_BENCH_TASK_FILES",
     "McpBenchEvaluation",
     "McpBenchExecutionResult",
     "McpBenchItem",

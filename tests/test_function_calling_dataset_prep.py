@@ -20,6 +20,11 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "longbench_qa_balanced" in names
     assert "longcodeqa" in names
     assert "mcp_bench" in names
+    assert "mcp_bench_single" in names
+    assert "mcp_bench_multi_2server" in names
+    assert "mcp_bench_multi_3server" in names
+    assert "apibank_l1" in names
+    assert "apibank_l2" in names
     assert "apibank_level1" in names
     assert "apibank_level2" in names
     assert "agentbench_db" in names
@@ -71,6 +76,35 @@ def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monke
             "argument_options": {"formula": ["2+2"]},
         }
     ]
+    assert row["metadata"]["source_format"] == "official_api_bank"
+
+
+def test_prepare_dataset_materializes_api_bank_legacy_aliases(tmp_path: Path, monkeypatch) -> None:
+    source_dir = tmp_path / "api-bank" / "lv1-lv2-samples" / "level-1-given-desc"
+    source_dir.mkdir(parents=True)
+    (source_dir / "Demo-level-2-1.jsonl").write_text(
+        "\n".join(
+            [
+                '{"role":"User","text":"Turn on the lamp."}',
+                '{"role":"API","api_name":"TimedSwitch","param_dict":{"name":"lamp","time":"08:00"},'
+                '"result":{"api_name":"TimedSwitch","input":{"name":"lamp","time":"08:00"},'
+                '"output":"ok","exception":null}}',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.api_bank.api_bank_lv1_lv2_dir",
+        lambda: source_dir,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("apibank_l2", output_root, "test")
+
+    assert paths == [output_root / "apibank_l2" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "apibank_l2__Demo-level-2-1_001"
+    assert row["metadata"]["level"] == 2
     assert row["metadata"]["source_format"] == "official_api_bank"
 
 
@@ -313,6 +347,47 @@ def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch
     ]
 
 
+def test_prepare_dataset_materializes_mcp_bench_split_specs(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "rwkv_rs"
+    tasks_root = source_root / "mcp_bench" / "tasks"
+    runtime_root = source_root / "mcp_bench" / "runtime"
+    tasks_root.mkdir(parents=True)
+    runtime_root.mkdir(parents=True)
+    seen_file_names: list[tuple[str, ...] | None] = []
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.mcp_bench.rwkv_rs_datasets_root",
+        lambda: source_root,
+    )
+
+    def _load_items(_tasks_root, _runtime_root, *, file_names=None):
+        seen_file_names.append(tuple(file_names) if file_names is not None else None)
+        return [
+            McpBenchItem(
+                task_file=(file_names or ("all.json",))[0],
+                server_name="calendar",
+                combination_name="calendar_only",
+                combination_type="single",
+                servers=("calendar",),
+                task=McpBenchTaskSpec(task_id="task-1", task_description="Schedule the meeting"),
+                runtime_root=str(runtime_root),
+            )
+        ]
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.mcp_bench.load_mcp_bench_task_items",
+        _load_items,
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("mcp_bench_single", output_root, "test")
+
+    assert paths == [output_root / "mcp_bench_single" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_file"] == "mcpbench_tasks_single_runner_format.json"
+    assert seen_file_names == [("mcpbench_tasks_single_runner_format.json",)]
+
+
 def test_prepare_dataset_materializes_mcp_bench_runtime_tasks_layout(tmp_path: Path, monkeypatch) -> None:
     source_root = tmp_path / "rwkv_rs"
     runtime_root = source_root / "mcp_bench" / "runtime"
@@ -529,6 +604,41 @@ def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkey
             },
         }
     ]
+
+
+def test_bfcl_small_rows_keep_official_root_metadata(tmp_path: Path, monkeypatch) -> None:
+    official_root = tmp_path / "berkeley-function-call-leaderboard"
+    source_root = official_root / "bfcl_eval" / "data"
+    source_root.mkdir(parents=True)
+    question_path = source_root / "BFCL_v4_simple_python.json"
+    answer_path = source_root / "possible_answer" / "BFCL_v4_simple_python.json"
+    answer_path.parent.mkdir()
+    question_path.write_text('{"id":"simple_python_0"}\n', encoding="utf-8")
+    answer_path.write_text('{"id":"simple_python_0"}\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.bfcl_small.bfcl_small_source_root",
+        lambda: source_root,
+    )
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.bfcl_small.load_bfcl_ast_rows_from_sources",
+        lambda _question, _answer, *, category: [
+            {
+                "task_id": "simple_python_0",
+                "instruction": "User: Find the area.",
+                "tools": [],
+                "expected_tool_calls": [],
+                "metadata": {"category": category},
+            }
+        ],
+    )
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("bfcl_simple_python", output_root, "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["metadata"]["official_root"] == str(official_root.resolve())
+    assert row["metadata"]["official_source"] == "gorilla/berkeley-function-call-leaderboard"
 
 
 def test_prepare_dataset_materializes_toolalpaca_spec(tmp_path: Path, monkeypatch) -> None:

@@ -17,9 +17,16 @@ def api_bank_source_root() -> Path:
     override = os.environ.get("API_BANK_SOURCE_ROOT") or os.environ.get("RWKV_API_BANK_SOURCE_ROOT")
     if override:
         return Path(override).expanduser().resolve()
-    reference_root = REPO_ROOT / "references" / "API-Bank"
-    if reference_root.exists():
-        return reference_root.resolve()
+    for candidate in (
+        REPO_ROOT / "references" / "API-Bank",
+        REPO_ROOT / "references" / "api-bank",
+        REPO_ROOT.parent / "API-Bank",
+        REPO_ROOT.parent / "api-bank",
+        Path("/tmp/rwkv-official-refs/DAMO-ConvAI/api-bank"),
+        Path("/tmp/ref-DAMO-ConvAI/api-bank"),
+    ):
+        if candidate.exists():
+            return candidate.resolve()
     return (REPO_ROOT.parent / "API-Bank").resolve()
 
 
@@ -58,9 +65,21 @@ def prepare_apibank_level2_spec(output_root: Path, split: str = "test") -> Local
     return _prepare_api_bank_spec("apibank_level2", output_root, split, level=2)
 
 
+@FUNCTION_CALLING_REGISTRY.register_spec("apibank_l1")
+def prepare_apibank_l1_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_api_bank_spec("apibank_l1", output_root, split, level=1)
+
+
+@FUNCTION_CALLING_REGISTRY.register_spec("apibank_l2")
+def prepare_apibank_l2_spec(output_root: Path, split: str = "test") -> LocalRowsDatasetSpec:
+    return _prepare_api_bank_spec("apibank_l2", output_root, split, level=2)
+
+
 __all__ = [
     "api_bank_lv1_lv2_dir",
     "api_bank_source_root",
+    "prepare_apibank_l1_spec",
+    "prepare_apibank_l2_spec",
     "prepare_apibank_level1_spec",
     "prepare_apibank_level2_spec",
 ]

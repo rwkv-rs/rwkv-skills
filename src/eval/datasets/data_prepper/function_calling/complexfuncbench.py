@@ -75,11 +75,13 @@ def complexfuncbench_source_path(output_root: Path, dataset_name: str) -> Path:
     )
 
 
-@FUNCTION_CALLING_REGISTRY.register("complexfuncbench_official")
-def prepare_complexfuncbench_official(output_root: Path, split: str = "test") -> list[Path]:
+def _prepare_complexfuncbench_official_dataset(
+    dataset_name: str,
+    output_root: Path,
+    split: str = "test",
+) -> list[Path]:
     if split != "test":
-        raise ValueError("complexfuncbench_official only provides test split")
-    dataset_name = "complexfuncbench_official"
+        raise ValueError(f"{dataset_name} only provides test split")
     source_path = complexfuncbench_source_path(output_root, dataset_name)
     official_root = complexfuncbench_official_root()
     max_rows = int(os.environ.get("RWKV_COMPLEXFUNCBENCH_MAX_ROWS", str(DEFAULT_COMPLEXFUNC_MAX_ROWS)))
@@ -98,9 +100,20 @@ def prepare_complexfuncbench_official(output_root: Path, split: str = "test") ->
     return [target]
 
 
+@FUNCTION_CALLING_REGISTRY.register("complexfuncbench_official")
+def prepare_complexfuncbench_official(output_root: Path, split: str = "test") -> list[Path]:
+    return _prepare_complexfuncbench_official_dataset("complexfuncbench_official", output_root, split)
+
+
+@FUNCTION_CALLING_REGISTRY.register("complexfuncbench_subset")
+def prepare_complexfuncbench_subset(output_root: Path, split: str = "test") -> list[Path]:
+    return _prepare_complexfuncbench_official_dataset("complexfuncbench_subset", output_root, split)
+
+
 __all__ = [
     "complexfuncbench_official_root",
     "complexfuncbench_source_root",
     "complexfuncbench_source_path",
     "prepare_complexfuncbench_official",
+    "prepare_complexfuncbench_subset",
 ]

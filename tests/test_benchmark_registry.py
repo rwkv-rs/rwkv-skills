@@ -95,10 +95,14 @@ def test_swe_bench_family_is_coding_cot_only() -> None:
 def test_function_calling_benchmarks_are_cot_only() -> None:
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     complexfuncbench = resolve_benchmark_metadata("complexfuncbench_official_test")
+    complexfuncbench_subset = resolve_benchmark_metadata("complexfuncbench_subset_test")
     longbench = resolve_benchmark_metadata("longbench_qa_test")
     longbench_balanced = resolve_benchmark_metadata("longbench_qa_balanced_test")
     longcodeqa = resolve_benchmark_metadata("longcodeqa_test")
     mcp_bench = resolve_benchmark_metadata("mcp_bench_test")
+    mcp_single = resolve_benchmark_metadata("mcp_bench_single_test")
+    mcp_multi = resolve_benchmark_metadata("mcp_bench_multi_2server_test")
+    apibank_alias = resolve_benchmark_metadata("apibank_l1_test")
     apibank = resolve_benchmark_metadata("apibank_level1_test")
     agentbench = resolve_benchmark_metadata("agentbench_db_test")
     bfcl_ast = resolve_benchmark_metadata("bfcl_simple_python_test")
@@ -118,6 +122,8 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert complexfuncbench.field is BenchmarkField.FUNCTION_CALLING
     assert complexfuncbench.cot_modes == (CoTMode.COT,)
     assert complexfuncbench.scheduler_jobs == ("function_complexfuncbench",)
+    assert complexfuncbench_subset.field is BenchmarkField.FUNCTION_CALLING
+    assert complexfuncbench_subset.scheduler_jobs == ("function_complexfuncbench",)
     assert longbench.field is BenchmarkField.FUNCTION_CALLING
     assert longbench.cot_modes == (CoTMode.COT,)
     assert longbench.scheduler_jobs == ("function_longbench",)
@@ -129,6 +135,12 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert longcodeqa.scheduler_jobs == ("function_longcodebench",)
     assert mcp_bench.field is BenchmarkField.FUNCTION_CALLING
     assert mcp_bench.scheduler_jobs == ("function_mcp_bench",)
+    assert mcp_single.field is BenchmarkField.FUNCTION_CALLING
+    assert mcp_single.scheduler_jobs == ("function_mcp_bench",)
+    assert mcp_multi.field is BenchmarkField.FUNCTION_CALLING
+    assert mcp_multi.scheduler_jobs == ("function_mcp_bench",)
+    assert apibank_alias.field is BenchmarkField.FUNCTION_CALLING
+    assert apibank_alias.scheduler_jobs == ("function_api_bank",)
     assert apibank.field is BenchmarkField.FUNCTION_CALLING
     assert apibank.scheduler_jobs == ("function_api_bank",)
     assert agentbench.field is BenchmarkField.FUNCTION_CALLING
@@ -199,6 +211,12 @@ def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
         "tau3_bench_banking_knowledge",
         "tau3_bench_mock",
         "tau3_bench_mock_long_context",
+    )
+    assert expand_benchmark_alias("apibank") == (
+        "apibank_l1",
+        "apibank_l2",
+        "apibank_level1",
+        "apibank_level2",
     )
 
 

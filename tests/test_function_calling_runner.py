@@ -125,6 +125,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
         is function_calling_runner.FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH
     )
     assert (
+        function_calling_runner._infer_benchmark_kind("complexfuncbench_subset_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.COMPLEXFUNCBENCH
+    )
+    assert (
         function_calling_runner._infer_benchmark_kind("longbench_qa_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.LONGBENCH
     )
@@ -142,6 +146,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     )
     assert (
         function_calling_runner._infer_benchmark_kind("apibank_level1_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.API_BANK
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("apibank_l2_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.API_BANK
     )
     assert (
@@ -163,6 +171,10 @@ def test_function_calling_runner_can_infer_benchmark_kind_from_dataset_slug() ->
     assert (
         function_calling_runner._infer_benchmark_kind("toolalpaca_eval_simulated_test.jsonl")
         is function_calling_runner.FunctionCallingBenchmarkKind.TOOLALPACA
+    )
+    assert (
+        function_calling_runner._infer_benchmark_kind("mcp_bench_multi_2server_test.jsonl")
+        is function_calling_runner.FunctionCallingBenchmarkKind.MCP_BENCH
     )
     assert (
         function_calling_runner._infer_benchmark_kind("complexfuncbench_official_test.jsonl")

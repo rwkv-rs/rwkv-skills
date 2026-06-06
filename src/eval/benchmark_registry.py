@@ -279,6 +279,10 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
         "complexfuncbench_official",
         scheduler_jobs=_COMPLEXFUNCBENCH_JOBS,
     ),
+    canonical_slug("complexfuncbench_subset"): _function_calling(
+        "complexfuncbench_subset",
+        scheduler_jobs=_COMPLEXFUNCBENCH_JOBS,
+    ),
     canonical_slug("longbench"): _function_calling("longbench", scheduler_jobs=_LONGBENCH_JOBS),
     canonical_slug("longbench_qa"): _function_calling("longbench_qa", scheduler_jobs=_LONGBENCH_JOBS),
     canonical_slug("longbench_qa_balanced"): _function_calling(
@@ -287,6 +291,17 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     ),
     canonical_slug("longcodeqa"): _function_calling("longcodeqa", scheduler_jobs=_LONGCODEBENCH_JOBS),
     canonical_slug("mcp_bench"): _function_calling("mcp_bench", scheduler_jobs=_MCP_BENCH_JOBS),
+    canonical_slug("mcp_bench_single"): _function_calling("mcp_bench_single", scheduler_jobs=_MCP_BENCH_JOBS),
+    canonical_slug("mcp_bench_multi_2server"): _function_calling(
+        "mcp_bench_multi_2server",
+        scheduler_jobs=_MCP_BENCH_JOBS,
+    ),
+    canonical_slug("mcp_bench_multi_3server"): _function_calling(
+        "mcp_bench_multi_3server",
+        scheduler_jobs=_MCP_BENCH_JOBS,
+    ),
+    canonical_slug("apibank_l1"): _function_calling("apibank_l1", scheduler_jobs=_API_BANK_JOBS),
+    canonical_slug("apibank_l2"): _function_calling("apibank_l2", scheduler_jobs=_API_BANK_JOBS),
     canonical_slug("apibank_level1"): _function_calling("apibank_level1", scheduler_jobs=_API_BANK_JOBS),
     canonical_slug("apibank_level2"): _function_calling("apibank_level2", scheduler_jobs=_API_BANK_JOBS),
     canonical_slug("agentbench_db"): _function_calling("agentbench_db", scheduler_jobs=_AGENTBENCH_JOBS),
@@ -369,6 +384,12 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     canonical_slug("arena_hard"): (canonical_slug("arena_hard_v2"),),
     canonical_slug("longcodebench"): (canonical_slug("longcodeqa"),),
+    canonical_slug("apibank"): (
+        canonical_slug("apibank_l1"),
+        canonical_slug("apibank_l2"),
+        canonical_slug("apibank_level1"),
+        canonical_slug("apibank_level2"),
+    ),
     canonical_slug("tau_bench"): (
         canonical_slug("tau_bench_retail"),
         canonical_slug("tau_bench_airline"),
