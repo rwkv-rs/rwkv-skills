@@ -1,15 +1,16 @@
 [math_cot_default]
-cot_prompt_template = """User: <Q>
+cot_prompt_template = """User: Solve the problem using one clean solution path. Keep each step concise. Put the complete final answer inside \\(\\boxed{...}\\), preserving every required component such as ordered pairs, fractions, degree symbols, units,names, or expressions. Do not return only the first component. Do not use a choice letter unless the problem asks for a letter. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)
+<Q>
 
 Assistant: <think"""
 max_generate_tokens = 4096
-temperature = 0.55
-top_k = 66
-top_p = 0.79
-alpha_presence = 0.14
-alpha_frequency = 0.01
-alpha_decay = 0.997
-stop_tokens = [0, 261, 24281]
+temperature = 0.25
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
+alpha_decay = 0.99
+stop_tokens = [0]
 pad_zero = true
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
@@ -54,26 +55,29 @@ ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
 [free_response_cot_default]
-cot_prompt_template = """User: <Q>
+cot_prompt_template = """User: Solve the problem using one clean solution path. Keep each step concise. Put the complete final answer inside \\(\\boxed{...}\\), preserving every required component such as ordered pairs, fractions, degree symbols, units,names, or expressions. Do not return only the first component. Do not use a choice letter unless the problem asks for a letter. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)
+<Q>
 
 Assistant: <think"""
 max_generate_tokens = 4096
-temperature = 0.3
-top_k = 500
-top_p = 0.4
-alpha_presence = 0.5
-alpha_frequency = 0.1
+temperature = 0.25
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
 alpha_decay = 0.99
-stop_tokens = [0, 261, 24281]
+stop_tokens = [0]
 pad_zero = true
 ban_tokens = []
 no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 
 [free_response_final_default]
-max_generate_tokens = 64
+final_prompt_template = """<Q><COT>
+Therefore, the answer is \\(\\boxed{"""
+max_generate_tokens = 128
 temperature = 1.0
-top_k = 1
-top_p = 0.3
+top_k = 8
+top_p = 0.30
 alpha_presence = 0.0
 alpha_frequency = 0.0
 alpha_decay = 0.99

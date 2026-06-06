@@ -8,7 +8,7 @@ report_avg_k = [64]
 template = "free_response_cot_default"
 alpha_frequency = 0.35
 alpha_decay = 0.996
-cot_prompt_template = "User: Solve the problem using one clean solution path. Keep each step concise. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)\n<Q>\nAssistant: <think>"
+cot_prompt_template = "User: Solve the problem using one clean solution path. Keep each step concise. Put the complete final answer inside \\(\\boxed{...}\\), preserving every required component such as ordered pairs, fractions, degree symbols, units,names, or expressions. Do not return only the first component. Do not use a choice letter unless the problem asks for a letter. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)\n<Q>\nAssistant: <think>"
 
 [final]
 template = "free_response_final_default"

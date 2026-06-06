@@ -6,9 +6,6 @@ report_avg_k = [8]
 
 [cot]
 template = "free_response_cot_default"
-temperature = 0.3
-top_k = 500
-top_p = 0.4
 
 [final]
 template = "free_response_final_default"

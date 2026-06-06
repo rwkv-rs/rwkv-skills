@@ -5,33 +5,9 @@ report_pass_k = []
 report_avg_k = [2]
 
 [cot]
-cot_prompt_template = """User: Solve the problem. Preserve the exact requested answer form. Use compact mathematical notation and avoid extra spaces inside expressions. If the answer is an equation, keep the equation sign. Think briefly and do not give multiple equivalent final forms. (think a bit)
-<Q>
-Assistant: <think>"""
-max_generate_tokens = 2048
-temperature = 0.45
-top_k = 80
-top_p = 0.65
-alpha_presence = 0.25
-alpha_frequency = 0.25
-alpha_decay = 0.996
-stop_tokens = [0, 261, 24281]
-pad_zero = true
-ban_tokens = []
-no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+template = "free_response_cot_default"
 
 [final]
+template = "free_response_final_default"
 final_prompt_template = """<Q><COT>
-</think>
-Therefore, the final answer is \\(\\boxed{"""
-max_generate_tokens = 96
-temperature = 1.0
-top_k = 1
-top_p = 0.3
-alpha_presence = 0.0
-alpha_frequency = 0.0
-alpha_decay = 0.99
-stop_tokens = [0, 2402, 4910]
-pad_zero = true
-ban_tokens = []
-no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+Therefore, the answer is \\(\\boxed{"""
