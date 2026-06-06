@@ -142,7 +142,7 @@ def test_strategy_c_repairs_truncated_answer_region(monkeypatch, tmp_path) -> No
     assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
 
 
-def test_two_stage_payload_scores_final_answer_context(monkeypatch, tmp_path) -> None:
+def test_two_stage_payload_uses_legacy_completion1_scoring(monkeypatch, tmp_path) -> None:
     _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"
     dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
@@ -166,9 +166,9 @@ def test_two_stage_payload_scores_final_answer_context(monkeypatch, tmp_path) ->
         judge=None,
     )
 
-    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 1.0
-    assert evaluation.rows_by_group["strategy_a"] == [(0, 0, True)]
-    assert evaluation.payloads[0]["answer"].endswith("7")
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.rows_by_group["strategy_a"] == [(0, 0, False)]
+    assert evaluation.payloads[0]["answer"].endswith("8")
 
 
 def test_math_verify_pass_skips_judge_per_strategy_group(monkeypatch, tmp_path) -> None:

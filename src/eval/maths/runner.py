@@ -22,7 +22,7 @@ from src.eval.maths.common import (
     default_db_drain_every,
     default_db_write_queue,
     default_job_name,
-    resolve_sampling_pair,
+    resolve_generation_sampling,
 )
 
 if TYPE_CHECKING:
@@ -125,7 +125,7 @@ def main(
     from src.eval.env_config import load_env_file
     from src.eval.evaluating import TaskRunController, TaskRunSignalGuard, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
-    from src.eval.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
+    from src.eval.maths.pipeline import FreeResponsePipeline
     from src.eval.metrics.free_response import (
         attach_strategy_task_ids,
         build_grouped_metrics_payload,
@@ -156,11 +156,10 @@ def main(
     backend = build_inference_backend_from_args(args)
     pipeline = FreeResponsePipeline(backend)
 
-    generation_sampling, final_sampling = resolve_sampling_pair(
+    generation_sampling = resolve_generation_sampling(
         slug,
         model_name,
-        cot_max_tokens=args.max_tokens or args.cot_max_tokens,
-        final_max_tokens=args.final_max_tokens,
+        max_tokens=args.max_tokens or args.cot_max_tokens,
     )
     batch_size = max(1, args.batch_size)
     judge = None
@@ -174,17 +173,11 @@ def main(
             required=True,
         )
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
-    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
     prompt_template = (
         cot_config.cot_prompt_template
         if cot_config is not None and cot_config.cot_prompt_template
         else None
-    )
-    final_answer_template = (
-        final_config.final_prompt_template
-        if final_config is not None and final_config.final_prompt_template
-        else DEFAULT_FINAL_PROMPT
     )
     if judge is not None and root_config is not None and root_config.judge_prompt_template:
         judge.config.prompt_template = root_config.judge_prompt_template
@@ -204,7 +197,6 @@ def main(
             avg_k=plan.avg_k,
             sampling_config={
                 "generation": sampling_config_to_dict(generation_sampling),
-                "final": sampling_config_to_dict(final_sampling),
             },
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
@@ -227,8 +219,6 @@ def main(
             dataset_path=str(dataset_path),
             **({"prompt_template": prompt_template} if prompt_template else {}),
             generation_sampling=generation_sampling,
-            final_answer_template=final_answer_template,
-            final_sampling=final_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
             pad_to_batch=True,
@@ -262,8 +252,6 @@ def main(
                 dataset_path=str(dataset_path),
                 **({"prompt_template": prompt_template} if prompt_template else {}),
                 generation_sampling=generation_sampling,
-                final_answer_template=final_answer_template,
-                final_sampling=final_sampling,
                 batch_size=batch_size,
                 record_indices=plan.sample_indices,
                 pad_to_batch=False,

@@ -19,7 +19,7 @@ from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.k_values import NumericK, filter_metrics_by_k
 from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
 from src.eval.results.io import iter_jsonl
-from src.eval.results.schema import build_context_from_completions, iter_stage_indices, make_eval_payload, strict_nonneg_int
+from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 USER_SENTINEL = "\nUser:"
 REPAIR_FINAL_CUE = "Therefore, the final answer is "
@@ -337,51 +337,21 @@ def _parsed_answer_text(parsed: Any) -> str:
     return str(item)
 
 
-def _close_trailing_boxed_expression(text: str) -> str:
-    boxed_start = text.rfind("\\boxed{")
-    if boxed_start < 0:
-        return text
-    depth = 1
-    for char in text[boxed_start + len("\\boxed{") :]:
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return text
-    if depth > 0:
-        text = text + ("}" * depth)
-    if text.rfind("\\(") > text.rfind("\\)"):
-        text = text + "\\)"
-    return text
-
-
 def _completion_text(payload: dict[str, Any]) -> str:
-    if payload.get("completion2") is not None:
-        return _close_trailing_boxed_expression(
-            build_context_from_completions(payload).split(USER_SENTINEL, 1)[0]
-        )
     text = str(payload.get("completion1") or "")
     return text.split(USER_SENTINEL, 1)[0]
 
 
 def _completion_prompt(payload: dict[str, Any]) -> str:
-    if payload.get("completion2") is not None:
-        return ""
     return str(payload.get("prompt1") or "")
 
 
 def _completion_stop_reason(payload: dict[str, Any]) -> str:
-    indices = iter_stage_indices(payload)
-    for idx in reversed(indices):
-        value = payload.get(f"stop_reason{idx}")
-        if value:
-            return str(value)
-    return ""
+    return str(payload.get("stop_reason1") or "")
 
 
 def _is_truncated(payload: dict[str, Any]) -> bool:
-    if _completion_stop_reason(payload) in {"max_tokens", "max_length"}:
+    if _completion_stop_reason(payload) == "max_tokens":
         return True
     stats = payload.get("stats")
     return isinstance(stats, dict) and bool(stats.get("truncated"))
@@ -396,8 +366,6 @@ def _think_state(prompt: str, text: str) -> tuple[bool, bool]:
 
 def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
     text = _completion_text(payload)
-    if payload.get("completion2") is not None:
-        return text
     prompt = _completion_prompt(payload)
     has_think, has_close = _think_state(prompt, text)
     unclosed_think = has_think and not has_close
