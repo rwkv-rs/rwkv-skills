@@ -166,7 +166,7 @@ class TauOfficialAgentPipeline:
         self.model, self.tokenizer = load_rwkv_model(model_config)
         self.engine = InferenceEngine(self.model, self.tokenizer)
         self.model_path = model_config.weights_path
-        self._generate_lock = threading.Lock()
+        self._target_model_limiter = ModelRuntimeLimiter({str(self.model_path): 1})
 
     def run(
         self,
@@ -361,7 +361,7 @@ class TauOfficialAgentPipeline:
             tool_routing_config=tool_routing_config,
             long_context_routing_config=long_context_routing_config,
             max_repeated_tool_calls=options.max_repeated_tool_calls,
-            generate_lock=getattr(self, "_generate_lock", None),
+            generate_lock=_target_model_generate_guard(self),
         )
         agent.set_seed(sample_repeat_seed(sample_index, repeat_index, stage=1))
         user = runtime.build_user(task=task, environment=environment, user_model=user_model)
@@ -652,6 +652,13 @@ def _resolve_tau_sample_workers(requested: int | None, entry_count: int) -> int:
     raw_workers = env_workers if env_workers is not None else _positive_int(requested, 1)
     worker_cap = _first_positive_int_env("RWKV_TAU_SAMPLE_WORKER_CAP") or 4
     return max(1, min(int(entry_count), int(raw_workers), int(worker_cap)))
+
+
+def _target_model_generate_guard(pipeline: TauOfficialAgentPipeline) -> Any | None:
+    limiter = getattr(pipeline, "_target_model_limiter", None)
+    if isinstance(limiter, ModelRuntimeLimiter):
+        return limiter.semaphore(str(getattr(pipeline, "model_path", "target_model")), default=1)
+    return None
 
 
 def _task_run_id(*, dataset_name: str, model_path: str) -> str:
