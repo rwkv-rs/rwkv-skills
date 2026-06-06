@@ -20,8 +20,6 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.CODING]] == [
         "code_human_eval",
         "code_mbpp",
-        "code_mbpp_fake_cot",
-        "code_mbpp_cot",
         "code_livecodebench",
         "code_swe_bench",
     ]

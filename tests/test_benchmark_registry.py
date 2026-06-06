@@ -71,6 +71,17 @@ def test_human_eval_family_is_no_cot_only() -> None:
     assert not supports_cot_mode("human_eval_plus_test", CoTMode.COT)
 
 
+def test_mbpp_family_is_legacy_no_cot_only() -> None:
+    metadata = resolve_benchmark_metadata("mbpp_plus_test")
+
+    assert metadata.field is BenchmarkField.CODING
+    assert metadata.cot_modes == (CoTMode.NO_COT,)
+    assert metadata.scheduler_jobs == ("code_mbpp",)
+    assert supports_cot_mode("mbpp_plus_test", CoTMode.NO_COT)
+    assert not supports_cot_mode("mbpp_plus_test", CoTMode.FAKE_COT)
+    assert not supports_cot_mode("mbpp_plus_test", CoTMode.COT)
+
+
 def test_swe_bench_family_is_coding_cot_only() -> None:
     metadata = resolve_benchmark_metadata("swe_bench_lite_test")
 

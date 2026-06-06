@@ -35,7 +35,7 @@ class CodingBenchmarkKind(str, Enum):
 
 
 _HUMAN_EVAL_JOB_NAMES = frozenset({"code_human_eval"})
-_MBPP_JOB_NAMES = frozenset({"code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot"})
+_MBPP_JOB_NAMES = frozenset({"code_mbpp"})
 _LIVECODEBENCH_JOB_NAMES = frozenset({"code_livecodebench"})
 _SWE_BENCH_JOB_NAMES = frozenset({"code_swe_bench"})
 _DEFAULT_PASS_K: tuple[int, ...] = ()
@@ -194,6 +194,10 @@ def _resolve_cot_mode(kind: CodingBenchmarkKind, requested_mode: str | None) -> 
         if requested_mode is not None and CoTMode(requested_mode) is not CoTMode.COT:
             raise ValueError("swe_bench only supports --cot-mode cot")
         return CoTMode.COT
+    if kind is CodingBenchmarkKind.MBPP:
+        if requested_mode is not None and CoTMode(requested_mode) is not CoTMode.NO_COT:
+            raise ValueError("mbpp legacy-aligned runner only supports --cot-mode no_cot")
+        return CoTMode.NO_COT
     if requested_mode is None:
         return CoTMode.NO_COT
     return CoTMode(requested_mode)
@@ -206,11 +210,7 @@ def _default_job_name(kind: CodingBenchmarkKind, cot_mode: CoTMode) -> str:
         return "code_livecodebench"
     if kind is CodingBenchmarkKind.SWE_BENCH:
         return "code_swe_bench"
-    if cot_mode is CoTMode.NO_COT:
-        return "code_mbpp"
-    if cot_mode is CoTMode.FAKE_COT:
-        return "code_mbpp_fake_cot"
-    return "code_mbpp_cot"
+    return "code_mbpp"
 
 
 def _print_done_message(kind: CodingBenchmarkKind, cot_mode: CoTMode, sample_count: int) -> None:

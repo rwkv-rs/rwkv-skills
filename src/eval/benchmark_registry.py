@@ -51,7 +51,6 @@ class BenchmarkMetadata:
 
 
 _THREE_MODE_KNOWLEDGE = (CoTMode.NO_COT, CoTMode.FAKE_COT, CoTMode.COT)
-_THREE_MODE_CODE = (CoTMode.NO_COT, CoTMode.FAKE_COT, CoTMode.COT)
 _COT_ONLY = (CoTMode.COT,)
 _NO_COT_ONLY = (CoTMode.NO_COT,)
 
@@ -59,7 +58,7 @@ _MULTI_CHOICE_JOBS = ("multi_choice_plain", "multi_choice_fake_cot", "multi_choi
 _FREE_RESPONSE_JOBS = ("free_response",)
 _FREE_RESPONSE_JUDGE_JOBS = ("free_response_judge",)
 _HUMAN_EVAL_JOBS = ("code_human_eval",)
-_MBPP_JOBS = ("code_mbpp", "code_mbpp_fake_cot", "code_mbpp_cot")
+_MBPP_JOBS = ("code_mbpp",)
 _LIVECODEBENCH_JOBS = ("code_livecodebench",)
 _SWE_BENCH_JOBS = ("code_swe_bench",)
 _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following",)
@@ -151,7 +150,7 @@ def _coding_mbpp(name: str, *, dataset_name: str | None = None) -> BenchmarkMeta
     return _metadata(
         name,
         field=BenchmarkField.CODING,
-        cot_modes=_THREE_MODE_CODE,
+        cot_modes=_NO_COT_ONLY,
         dataset_name=dataset_name,
         scheduler_jobs=_MBPP_JOBS,
     )

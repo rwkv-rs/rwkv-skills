@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from src.eval.benchmark_registry import CoTMode
 from src.eval.coding import runner as coding_runner
 
 
@@ -20,6 +23,11 @@ def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:
     assert args.benchmark_kind == "mbpp"
     assert args.cot_mode == "fake_cot"
     assert args.probe_only is True
+
+
+def test_coding_runner_rejects_non_legacy_mbpp_cot_modes() -> None:
+    with pytest.raises(ValueError, match="mbpp legacy-aligned runner"):
+        coding_runner._resolve_cot_mode(coding_runner.CodingBenchmarkKind.MBPP, CoTMode.FAKE_COT.value)
 
 
 def test_coding_runner_parser_accepts_swebench_options() -> None:

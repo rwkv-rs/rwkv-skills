@@ -19,10 +19,10 @@ from src.eval.scheduler.jobs import (
 )
 
 
-def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
+def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert "multi_choice_fake_cot" in JOB_CATALOGUE
-    assert "code_mbpp_fake_cot" in JOB_CATALOGUE
-    assert "code_mbpp_cot" in JOB_CATALOGUE
+    assert "code_mbpp_fake_cot" not in JOB_CATALOGUE
+    assert "code_mbpp_cot" not in JOB_CATALOGUE
     assert "code_swe_bench" in JOB_CATALOGUE
 
     assert JOB_CATALOGUE["multi_choice_plain"].runner_group is RunnerGroup.KNOWLEDGE
@@ -37,8 +37,6 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["free_response_judge"].module == "src.eval.maths.runner"
     assert JOB_CATALOGUE["code_human_eval"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_mbpp_fake_cot"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_mbpp_cot"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["instruction_following"].module == "src.eval.instruction_following.runner"
@@ -59,8 +57,6 @@ def test_job_catalogue_exposes_fake_cot_and_mbpp_variants() -> None:
     assert JOB_CATALOGUE["free_response"].extra_args == ("--judge-mode", "exact")
     assert JOB_CATALOGUE["free_response_judge"].extra_args == ("--judge-mode", "llm")
     assert JOB_CATALOGUE["code_mbpp"].extra_args == ("--cot-mode", "no_cot")
-    assert JOB_CATALOGUE["code_mbpp_fake_cot"].extra_args == ("--cot-mode", "fake_cot")
-    assert JOB_CATALOGUE["code_mbpp_cot"].extra_args == ("--cot-mode", "cot")
     assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
     assert detect_job_from_dataset(canonical_slug("swe_bench_lite_test"), is_cot=True) == "code_swe_bench"
     assert JOB_CATALOGUE["instruction_following"].extra_args == ()

@@ -343,7 +343,7 @@ def _canonical_legacy_job_name(dataset_slug: str, *, is_cot: bool) -> str | None
         return None
 
     if is_cot:
-        for preferred in ("multi_choice_cot", "free_response_judge", "free_response", "code_mbpp_cot"):
+        for preferred in ("multi_choice_cot", "free_response_judge", "free_response"):
             if preferred in scheduler_jobs:
                 return preferred
         for job_name in scheduler_jobs:

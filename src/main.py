@@ -552,11 +552,9 @@ def _default_job_name(config: RunConfig, benchmark: BenchmarkMetadata) -> str:
         return "free_response_judge" if judge_mode == "llm" else "free_response"
     if benchmark.field is BenchmarkField.CODING:
         cot_mode = _resolve_cot_mode(config.runner.cot_mode, benchmark=benchmark, default=CoTMode.NO_COT)
-        return {
-            CoTMode.NO_COT: "code_mbpp",
-            CoTMode.FAKE_COT: "code_mbpp_fake_cot",
-            CoTMode.COT: "code_mbpp_cot",
-        }[cot_mode]
+        if cot_mode is not CoTMode.NO_COT:
+            raise ValueError("legacy-aligned coding benchmarks only support cot_mode='no_cot' by default")
+        return "code_mbpp"
     raise ValueError(f"benchmark {benchmark.name!r} requires an explicit run.job")
 
 
