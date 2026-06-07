@@ -73,6 +73,7 @@ _BFCL_AST_JOBS = ("function_bfcl_ast",)
 _BFCL_EXEC_JOBS = ("function_bfcl_exec",)
 _BFCL_V3_JOBS = ("function_bfcl_v3",)
 _TOOLALPACA_JOBS = ("function_toolalpaca",)
+_BROWSECOMP_PLUS_JOBS = ("function_browsecomp_plus",)
 _TAU_BENCH_JOBS = ("function_tau_bench",)
 _TAU2_BENCH_JOBS = ("function_tau2_bench",)
 _TAU3_BENCH_JOBS = ("function_tau3_bench",)
@@ -228,7 +229,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("aime25"): _math("aime25"),
     canonical_slug("algebra222"): _math("algebra222"),
     canonical_slug("amc23"): _math("amc23", scheduler_jobs=_FREE_RESPONSE_JUDGE_JOBS),
-    canonical_slug("answer_judge"): _math("answer_judge", scheduler_jobs=_FREE_RESPONSE_JUDGE_JOBS),
+    canonical_slug("answer_judge"): _math("answer_judge"),
     canonical_slug("asdiv"): _math("asdiv"),
     canonical_slug("beyond_aime"): _math("beyond_aime"),
     canonical_slug("brumo25"): _math("brumo25"),
@@ -244,7 +245,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("math_odyssey"): _math("math_odyssey"),
     canonical_slug("mawps"): _math("mawps"),
     canonical_slug("minerva_math"): _math("minerva_math", scheduler_jobs=_FREE_RESPONSE_JUDGE_JOBS),
-    canonical_slug("olympiadbench"): _math("olympiadbench"),
+    canonical_slug("olympiadbench"): _math("olympiadbench", scheduler_jobs=_FREE_RESPONSE_JUDGE_JOBS),
     canonical_slug("omni_math"): _math("omni_math"),
     canonical_slug("polymath"): _math("polymath", default_split="all"),
     canonical_slug("simpleqa"): _math("simpleqa", default_split="verified"),
@@ -275,6 +276,10 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     # Function calling
     canonical_slug("browsecomp"): _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
+    canonical_slug("browsecomp_plus"): _function_calling(
+        "browsecomp_plus",
+        scheduler_jobs=_BROWSECOMP_PLUS_JOBS,
+    ),
     canonical_slug("complexfuncbench_official"): _function_calling(
         "complexfuncbench_official",
         scheduler_jobs=_COMPLEXFUNCBENCH_JOBS,

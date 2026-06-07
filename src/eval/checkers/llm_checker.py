@@ -16,7 +16,7 @@ import jsonschema
 from json import JSONDecodeError
 from openai import OpenAI, OpenAIError
 
-from src.eval.env_config import load_env_file
+from src.eval.env_config import load_env_file, resolve_judge_max_workers, resolve_judge_model_config
 from src.eval.results.layout import check_details_path
 from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import strict_nonneg_int
@@ -188,38 +188,24 @@ class LLMCheckerConfig:
 
     @classmethod
     def from_env(cls) -> LLMCheckerConfig | None:
-        api_key = (
-            os.environ.get("CHECKER_API_KEY")
-            or os.environ.get("LLM_CHECKER_API_KEY")
-            or os.environ.get("JUDGE_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("API_KEY")
-        )
-        model = (
-            os.environ.get("CHECKER_MODEL")
-            or os.environ.get("LLM_CHECKER_MODEL")
-            or os.environ.get("JUDGE_MODEL")
-        )
-        base_url = (
-            os.environ.get("CHECKER_BASE_URL")
-            or os.environ.get("LLM_CHECKER_BASE_URL")
-            or os.environ.get("JUDGE_BASE_URL")
-            or os.environ.get("LLM_JUDGE_BASE_URL")
-            or os.environ.get("API_BASE")
-        )
-        max_workers_raw = os.environ.get("CHECKER_MAX_WORKERS") or os.environ.get("LLM_CHECKER_MAX_WORKERS")
+        if _env_flag("RWKV_SKILLS_DISABLE_CHECKER") or _env_flag("DISABLE_CHECKER"):
+            return None
+        try:
+            judge_config = resolve_judge_model_config()
+        except ValueError:
+            return None
+        if judge_config is None:
+            return None
         max_prompt_chars_raw = os.environ.get("CHECKER_MAX_PROMPT_CHARS") or os.environ.get(
             "LLM_CHECKER_MAX_PROMPT_CHARS"
         )
         max_retries_raw = os.environ.get("CHECKER_MAX_RETRIES") or os.environ.get("LLM_CHECKER_MAX_RETRIES")
-        if not api_key or not model:
-            return None
-        kwargs: dict[str, Any] = {}
-        if max_workers_raw:
-            try:
-                kwargs["max_workers"] = max(1, int(max_workers_raw))
-            except ValueError:
-                pass
+        kwargs: dict[str, Any] = {
+            "api_key": judge_config.api_key,
+            "model": judge_config.model_name,
+            "base_url": judge_config.base_url,
+            "max_workers": resolve_judge_max_workers(default=16),
+        }
         if max_prompt_chars_raw:
             try:
                 kwargs["max_prompt_chars"] = max(1000, int(max_prompt_chars_raw))
@@ -230,8 +216,7 @@ class LLMCheckerConfig:
                 kwargs["max_retries"] = int(max_retries_raw)
             except ValueError:
                 pass
-        return cls(api_key=api_key, model=model, base_url=base_url, **kwargs)
-
+        return cls(**kwargs)
 
 def _build_prompt(context: str, answer: str, ref_answer: str) -> str:
     fields = [
@@ -325,7 +310,7 @@ def run_llm_checker_rows(
         return []
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
-        print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env)")
+        print("⚠️  LLM checker skipped: missing JUDGE_API_KEY/JUDGE_MODEL (see .env)")
         return []
     if not rows:
         return []
@@ -545,7 +530,7 @@ def run_llm_checker(
         return None
     cfg = config or LLMCheckerConfig.from_env()
     if cfg is None:
-        print("⚠️  LLM checker skipped: missing API_KEY/JUDGE_MODEL (see .env)")
+        print("⚠️  LLM checker skipped: missing JUDGE_API_KEY/JUDGE_MODEL (see .env)")
         return None
 
     eval_path = Path(eval_results_path).expanduser().resolve()

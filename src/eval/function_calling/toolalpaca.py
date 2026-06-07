@@ -18,6 +18,7 @@ from src.eval.function_calling.simple_tool_call import (
     SimpleToolCallEvaluation,
     SimpleToolCallRecord,
     ToolCallExpectation,
+    load_simple_tool_call_manifest_records,
     _run_simple_tool_call,
 )
 from src.eval.function_calling.toolalpaca_source import (
@@ -61,12 +62,26 @@ class ToolAlpacaActionResult:
     status_code: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ToolAlpacaPreflightReport:
+    ok: bool
+    checked_backends: tuple[str, ...]
+    simulator_url: str
+    errors: tuple[str, ...] = ()
+
+
 def _run_toolalpaca(
     args: argparse.Namespace,
     run: ResolvedFunctionCallingRun,
     *,
     run_context: "RunContext | None" = None,
 ) -> int:
+    if not bool(getattr(args, "skip_runtime_preflight", False)):
+        records = load_simple_tool_call_manifest_records(run.dataset_path)
+        sample_limit = args.max_samples if getattr(args, "max_samples", None) else None
+        if sample_limit is not None and int(sample_limit) > 0:
+            records = records[: int(sample_limit)]
+        preflight_toolalpaca_environment(records)
     return _run_simple_tool_call(
         args,
         run,
@@ -205,6 +220,45 @@ def evaluate_toolalpaca_actions(
         fail_reason="; ".join(failure_bits),
         details=details,
     )
+
+
+def preflight_toolalpaca_environment(
+    records: Sequence[SimpleToolCallRecord],
+    *,
+    timeout_s: float = 3.0,
+    raise_on_error: bool = True,
+) -> ToolAlpacaPreflightReport:
+    backends = sorted({_toolalpaca_backend_for_record(record) for record in records})
+    errors: list[str] = []
+    simulator_url = _toolalpaca_simulator_url()
+    if "toolalpaca_simulator" in backends:
+        try:
+            response = requests.get(simulator_url, timeout=max(0.5, float(timeout_s)))
+            if int(response.status_code) >= 500:
+                errors.append(f"toolalpaca_simulator_unhealthy:{simulator_url}:http_{response.status_code}")
+        except requests.RequestException as exc:
+            errors.append(f"toolalpaca_simulator_unreachable:{simulator_url}:{exc}")
+    if "toolalpaca_real_http" in backends:
+        for record in records:
+            if _toolalpaca_backend_for_record(record) != "toolalpaca_real_http":
+                continue
+            api_name = str(record.metadata.get("api_name") or "").strip()
+            if _toolalpaca_record_server_url(record) == "":
+                errors.append(f"toolalpaca_real_missing_server_url:{record.task_id}")
+            for param_name, env_names in _TOOLALPACA_AUTH_ENV_BY_API.get(api_name.lower(), {}).items():
+                if not any(os.environ.get(name) for name in env_names):
+                    errors.append(
+                        f"toolalpaca_real_missing_auth:{api_name}:{param_name}:set_one_of={','.join(env_names)}"
+                    )
+    report = ToolAlpacaPreflightReport(
+        ok=not errors,
+        checked_backends=tuple(backends),
+        simulator_url=simulator_url,
+        errors=tuple(errors),
+    )
+    if errors and raise_on_error:
+        raise RuntimeError("ToolAlpaca runtime preflight failed: " + "; ".join(errors))
+    return report
 
 
 class ToolAlpacaSandbox:
@@ -934,16 +988,31 @@ def _normalize_toolalpaca_call(
 
 
 def _default_toolalpaca_sandbox(record: SimpleToolCallRecord) -> ToolAlpacaSandbox:
-    backend = str(record.metadata.get("execution_backend") or "").strip().lower()
-    if not backend and record.task_id.startswith("toolalpaca_eval_simulated__"):
-        backend = "toolalpaca_simulator"
-    elif not backend and record.task_id.startswith("toolalpaca_eval_real__"):
-        backend = "toolalpaca_real_http"
+    backend = _toolalpaca_backend_for_record(record)
     if backend == "toolalpaca_simulator":
         return ToolAlpacaHttpSandbox(simulator_url=_toolalpaca_simulator_url())
     if backend == "toolalpaca_real_http":
         return ToolAlpacaHttpSandbox(real_http=True)
     return ToolAlpacaSandbox()
+
+
+def _toolalpaca_backend_for_record(record: SimpleToolCallRecord) -> str:
+    backend = str(record.metadata.get("execution_backend") or "").strip().lower()
+    if not backend and record.task_id.startswith("toolalpaca_eval_simulated__"):
+        backend = "toolalpaca_simulator"
+    elif not backend and record.task_id.startswith("toolalpaca_eval_real__"):
+        backend = "toolalpaca_real_http"
+    return backend or "toolalpaca_synthetic"
+
+
+def _toolalpaca_record_server_url(record: SimpleToolCallRecord) -> str:
+    if str(record.metadata.get("api_server_url") or "").strip():
+        return str(record.metadata.get("api_server_url") or "").strip()
+    for tool in record.tools:
+        metadata = tool.get("metadata") if isinstance(tool.get("metadata"), Mapping) else {}
+        if isinstance(metadata, Mapping) and str(metadata.get("server_url") or "").strip():
+            return str(metadata.get("server_url") or "").strip()
+    return ""
 
 
 def _inject_toolalpaca_auth_placeholders(
@@ -1114,7 +1183,9 @@ def _slug(value: str) -> str:
 __all__ = [
     "ToolAlpacaActionResult",
     "ToolAlpacaHttpSandbox",
+    "ToolAlpacaPreflightReport",
     "ToolAlpacaSandbox",
     "evaluate_toolalpaca_actions",
+    "preflight_toolalpaca_environment",
     "_run_toolalpaca",
 ]

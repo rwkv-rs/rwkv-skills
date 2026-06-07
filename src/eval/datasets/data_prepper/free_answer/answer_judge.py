@@ -49,10 +49,22 @@ def _map_answer_judge_row(row: Mapping[str, Any]) -> dict[str, Any]:
             f"answer-judge: judges-verdict 缺少 annotations/score: item_name={payload.get('item_name')!r}"
         )
     expected_judgement = mean_score > 0.5
+    problem = str(payload.get("question", "") or "")
+    expected_answer = str(payload.get("gt_answer", "") or "")
+    predicted_answer = str(payload.get("gen_answer", "") or "")
     return {
-        "problem": str(payload.get("question", "") or ""),
-        "expected_answer": str(payload.get("gt_answer", "") or ""),
-        "predicted_answer": str(payload.get("gen_answer", "") or ""),
+        "problem": (
+            "Problem:\n"
+            f"{problem}\n\n"
+            "Expected answer:\n"
+            f"{expected_answer}\n\n"
+            "Predicted answer:\n"
+            f"{predicted_answer}\n\n"
+            "Decide whether the predicted answer matches the expected answer. "
+            "Return exactly `Judgement: Yes` or `Judgement: No`."
+        ),
+        "expected_answer": expected_answer,
+        "predicted_answer": predicted_answer,
         "expected_judgement": _judgement_text(expected_judgement),
         "comment": f"judges-verdict mean_score={mean_score:.3f}",
         "source": payload.get("dataset_name") or "judges-verdict",

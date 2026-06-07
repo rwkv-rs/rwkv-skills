@@ -453,7 +453,7 @@ def _run_browsecomp(
 
     judge_cfg = resolve_judge_model_config()
     if judge_cfg is None:
-        raise ValueError("BrowseComp requires JUDGE_MODEL / judge_model_name and judge API key")
+        raise ValueError("BrowseComp requires JUDGE_MODEL + JUDGE_API_KEY")
     judge = BrowseCompJudgeConfig(
         api_key=judge_cfg.api_key,
         model=judge_cfg.model_name,

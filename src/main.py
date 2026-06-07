@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Unified config-driven entrypoint for single-run evaluation flows."""
+
+from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
@@ -154,6 +154,8 @@ class ModelSection:
     infer_api_key: str = ""
     infer_timeout_s: float | None = None
     infer_max_workers: int | None = None
+    infer_protocol: str | None = None
+    infer_seed_policy: str | None = None
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ModelSection":
@@ -167,6 +169,8 @@ class ModelSection:
             infer_api_key=_maybe_str(payload.get("infer_api_key")) or "",
             infer_timeout_s=_maybe_float(payload.get("infer_timeout_s"), field_name="model.infer_timeout_s"),
             infer_max_workers=_maybe_int(payload.get("infer_max_workers"), field_name="model.infer_max_workers"),
+            infer_protocol=_maybe_str(payload.get("infer_protocol")),
+            infer_seed_policy=_maybe_str(payload.get("infer_seed_policy")),
         )
 
 
@@ -593,6 +597,10 @@ def _append_backend_args(argv: list[str], model: ModelSection) -> None:
         argv.extend(["--infer-timeout-s", str(model.infer_timeout_s)])
     if model.infer_max_workers is not None:
         argv.extend(["--infer-max-workers", str(model.infer_max_workers)])
+    if model.infer_protocol:
+        argv.extend(["--infer-protocol", model.infer_protocol])
+    if model.infer_seed_policy:
+        argv.extend(["--infer-seed-policy", model.infer_seed_policy])
 
 
 def _resolve_model_name(model: ModelSection) -> str:
@@ -664,6 +672,7 @@ def _build_runner_argv(
     elif group is RunnerGroup.MATHS:
         math_max_tokens = runner_cfg.max_tokens if runner_cfg.max_tokens is not None else runner_cfg.cot_max_tokens
         _append_flag(argv, "--max-tokens", math_max_tokens)
+        _append_flag(argv, "--final-max-tokens", runner_cfg.final_max_tokens)
         _append_flag(argv, "--db-write-queue", runner_cfg.db_write_queue)
         _append_flag(argv, "--db-drain-every", runner_cfg.db_drain_every)
         _append_flag(argv, "--db-close-timeout-s", runner_cfg.db_close_timeout_s)

@@ -36,9 +36,11 @@ from src.eval.function_calling.tool_router import (
 )
 from src.eval.function_calling.agentbench import _run_agentbench
 from src.eval.function_calling.api_bank import _run_api_bank
+from src.eval.function_calling.bfcl_ast import _run_bfcl_ast
 from src.eval.function_calling.bfcl_exec import _run_bfcl_exec
 from src.eval.function_calling.bfcl_v3_runner import _run_bfcl_v3
 from src.eval.function_calling.browsecomp import _run_browsecomp
+from src.eval.function_calling.browsecomp_plus import _run_browsecomp_plus
 from src.eval.function_calling.complexfuncbench import _run_complexfuncbench
 from src.eval.function_calling.longbench import _run_longbench
 from src.eval.function_calling.longcodebench import _run_longcodebench
@@ -47,7 +49,6 @@ from src.eval.function_calling.runner_common import (
     FunctionCallingBenchmarkKind,
     ResolvedFunctionCallingRun,
 )
-from src.eval.function_calling.simple_tool_call import _run_simple_tool_call
 from src.eval.function_calling.tau_runner import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOOL_ERRORS,
@@ -243,6 +244,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=20, help="Maximum MCP planning rounds per task")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Maximum tau turns per task")
     parser.add_argument(
+        "--skip-runtime-preflight",
+        action="store_true",
+        help="Skip benchmark-specific sandbox/runtime preflight checks.",
+    )
+    parser.add_argument(
         "--max-tool-errors",
         type=int,
         default=DEFAULT_MAX_TOOL_ERRORS,
@@ -287,6 +293,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         raise ValueError(f"dataset {dataset_slug!r} 不是 function-calling benchmark，无法用 function_calling runner 运行。")
 
     job_names = frozenset(metadata.scheduler_jobs)
+    if "function_browsecomp_plus" in job_names:
+        return FunctionCallingBenchmarkKind.BROWSECOMP_PLUS
     if "function_browsecomp" in job_names:
         return FunctionCallingBenchmarkKind.BROWSECOMP
     if "function_longbench" in job_names:
@@ -356,6 +364,8 @@ def main(
     _apply_runner_env_overrides(args)
     validate_inference_backend_args(args)
     run = _resolve_run(args)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP_PLUS:
+        return _run_browsecomp_plus(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP:
         return _run_browsecomp(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.LONGBENCH:
@@ -371,7 +381,7 @@ def main(
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_V3:
         return _run_bfcl_v3(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_AST:
-        return _run_simple_tool_call(args, run, default_job_name="function_bfcl_ast", run_context=run_context)
+        return _run_bfcl_ast(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BFCL_EXEC:
         return _run_bfcl_exec(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.TOOLALPACA:

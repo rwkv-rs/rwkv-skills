@@ -4,13 +4,14 @@ import os
 from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
 from src.eval.function_calling.complexfuncbench import (
     DEFAULT_COMPLEXFUNC_MAX_ROWS,
     load_complexfuncbench_rows_from_source,
 )
 from src.eval.scheduler.config import REPO_ROOT
 
-from ..data_utils import download_file, write_jsonl
+from ..data_utils import download_file
 
 _COMPLEXFUNC_HF_URL = (
     "https://huggingface.co/datasets/zai-org/ComplexFuncBench/resolve/main/ComplexFuncBench.jsonl"
@@ -75,14 +76,14 @@ def complexfuncbench_source_path(output_root: Path, dataset_name: str) -> Path:
     )
 
 
-def _prepare_complexfuncbench_official_dataset(
+def _load_complexfuncbench_official_rows(
     dataset_name: str,
-    output_root: Path,
-    split: str = "test",
-) -> list[Path]:
+    split: str,
+    context: DatasetPrepareContext,
+) -> list[dict[str, object]]:
     if split != "test":
         raise ValueError(f"{dataset_name} only provides test split")
-    source_path = complexfuncbench_source_path(output_root, dataset_name)
+    source_path = complexfuncbench_source_path(context.data_root, dataset_name)
     official_root = complexfuncbench_official_root()
     max_rows = int(os.environ.get("RWKV_COMPLEXFUNCBENCH_MAX_ROWS", str(DEFAULT_COMPLEXFUNC_MAX_ROWS)))
     response_eval = str(os.environ.get("RWKV_COMPLEXFUNCBENCH_RESPONSE_EVAL", "1")).strip().lower()
@@ -95,19 +96,37 @@ def _prepare_complexfuncbench_official_dataset(
     )
     if not rows:
         raise ValueError(f"{source_path} did not yield any ComplexFuncBench official rows")
-    target = output_root / dataset_name / "test.jsonl"
-    write_jsonl(target, rows)
-    return [target]
+    return rows
 
 
-@FUNCTION_CALLING_REGISTRY.register("complexfuncbench_official")
-def prepare_complexfuncbench_official(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_complexfuncbench_official_dataset("complexfuncbench_official", output_root, split)
+@FUNCTION_CALLING_REGISTRY.register_spec("complexfuncbench_official")
+def prepare_complexfuncbench_official(output_root: Path, split: str = "test") -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec(
+        "complexfuncbench_official",
+        output_root,
+        split,
+        load_rows=lambda requested_split, context: _load_complexfuncbench_official_rows(
+            "complexfuncbench_official",
+            requested_split,
+            context,
+        ),
+        source_kind="complexfuncbench_official",
+    )
 
 
-@FUNCTION_CALLING_REGISTRY.register("complexfuncbench_subset")
-def prepare_complexfuncbench_subset(output_root: Path, split: str = "test") -> list[Path]:
-    return _prepare_complexfuncbench_official_dataset("complexfuncbench_subset", output_root, split)
+@FUNCTION_CALLING_REGISTRY.register_spec("complexfuncbench_subset")
+def prepare_complexfuncbench_subset(output_root: Path, split: str = "test") -> CallableRowsDatasetSpec:
+    return CallableRowsDatasetSpec(
+        "complexfuncbench_subset",
+        output_root,
+        split,
+        load_rows=lambda requested_split, context: _load_complexfuncbench_official_rows(
+            "complexfuncbench_subset",
+            requested_split,
+            context,
+        ),
+        source_kind="complexfuncbench_official",
+    )
 
 
 __all__ = [

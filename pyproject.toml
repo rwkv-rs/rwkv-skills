@@ -104,6 +104,12 @@ vllm-cu128 = [
     "torchvision==0.25.0",
     "vllm==0.19.0",
 ]
+function-calling-official = [
+    "tree_sitter==0.21.3",
+    "tree-sitter-java==0.21.0",
+    "tree-sitter-javascript==0.21.4",
+    "pyserini>=1.2.0",
+]
 dev = ["openai>=1.0.0", "requests>=2.32.5", "tqdm>=4.67.1"]
 
 [tool.uv]
@@ -168,6 +174,10 @@ rwkv-skills-infer-router = "src.bin.run_infer_router:main"
 rwkv-benchmark-service-perf = "src.bin.run_perf_benchmark:main"
 rwkv-download-weights = "src.bin.download_weights:main"
 rwkv-skills-space = "src.space.app:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["references", "results", "out", "data", ".venv"]
 
 [tool.black]
 line-length = 120

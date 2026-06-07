@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 import math
 from dataclasses import dataclass
@@ -42,6 +43,13 @@ from src.eval.results.schema import make_eval_payload, normalize_sampling_config
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
+OFFICIAL_BFCL_EXEC_SOURCE = "ShishirPatil/gorilla@28a0f42"
+BFCL_OFFICIAL_AST_DEPENDENCIES: tuple[str, ...] = (
+    "tree_sitter",
+    "tree_sitter_java",
+    "tree_sitter_javascript",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class BfclExecRecord:
@@ -67,6 +75,14 @@ class BfclExecEvaluation:
     is_passed: bool
     fail_reason: str
     details: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class BfclOfficialAstStatus:
+    available: bool
+    official_root: str
+    missing_dependencies: tuple[str, ...]
+    import_error: str = ""
 
 
 def load_bfcl_exec_rows_from_sources(
@@ -421,9 +437,32 @@ class BfclExecSandbox:
             if "genre" in name:
                 return info["genre"]
             return info["director"]
-        if name in {"retrieve_holiday_by_year", "find_term_on_urban_dictionary", "convert_currency"}:
-            return {"function": name, "arguments": _json_safe(dict(kwargs) if kwargs else list(args))}
-        return {"function": name, "arguments": _json_safe(dict(kwargs) if kwargs else list(args))}
+        if name == "retrieve_holiday_by_year":
+            country = kwargs.get("country") or (args[0] if args else "")
+            year = int(kwargs.get("year") or (args[1] if len(args) > 1 else 2023))
+            return [
+                {
+                    "countryCode": str(country),
+                    "date": f"{year:04d}-01-01",
+                    "localName": "New Year",
+                    "name": "New Year's Day",
+                }
+            ]
+        if name == "find_term_on_urban_dictionary":
+            term = str(kwargs.get("term") or (args[0] if args else ""))
+            return {"term": term, "definition": f"Definition for {term}"}
+        if name == "convert_currency":
+            amount = float(kwargs.get("amount") or (args[0] if args else 0.0))
+            from_currency = str(kwargs.get("from_currency") or (args[1] if len(args) > 1 else "")).upper()
+            to_currency = str(kwargs.get("to_currency") or (args[2] if len(args) > 2 else "")).upper()
+            rates = {
+                ("USD", "EUR"): 0.92,
+                ("EUR", "USD"): 1.08,
+                ("USD", "GBP"): 0.79,
+                ("GBP", "USD"): 1.27,
+            }
+            return amount * rates.get((from_currency, to_currency), 1.0)
+        raise ValueError(f"unsupported official BFCL executable function: {name}")
 
     @staticmethod
     def _stock_price(stock: str) -> float:
@@ -875,6 +914,44 @@ def _both_plain_ints(actual: Any, expected: Any) -> bool:
     )
 
 
+def bfcl_official_ast_checker_status(official_root: str | Path | None = None) -> BfclOfficialAstStatus:
+    root = Path(official_root or _default_bfcl_official_root()).expanduser().resolve()
+    missing = tuple(name for name in BFCL_OFFICIAL_AST_DEPENDENCIES if importlib.util.find_spec(name) is None)
+    if missing:
+        return BfclOfficialAstStatus(False, str(root), missing, "")
+    if not (root / "bfcl_eval" / "eval_checker" / "ast_eval" / "ast_checker.py").exists():
+        return BfclOfficialAstStatus(False, str(root), (), f"missing official BFCL checker under {root}")
+    try:
+        import sys
+
+        added = False
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+            added = True
+        try:
+            __import__("bfcl_eval.eval_checker.ast_eval.ast_checker")
+        finally:
+            if added:
+                try:
+                    sys.path.remove(str(root))
+                except ValueError:
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        return BfclOfficialAstStatus(False, str(root), (), str(exc))
+    return BfclOfficialAstStatus(True, str(root), (), "")
+
+
+def _default_bfcl_official_root() -> Path:
+    for candidate in (
+        Path(__file__).resolve().parents[3] / "references" / "gorilla" / "berkeley-function-call-leaderboard",
+        Path("/tmp/gorilla-official/berkeley-function-call-leaderboard"),
+        Path("/tmp/rwkv-official-refs/gorilla/berkeley-function-call-leaderboard"),
+    ):
+        if (candidate / "bfcl_eval" / "eval_checker").is_dir():
+            return candidate
+    return Path(__file__).resolve().parents[3] / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+
+
 def _truthy_exec_flag(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "none", "null"}
@@ -1070,6 +1147,8 @@ __all__ = [
     "BfclExecEvaluation",
     "BfclExecRecord",
     "BfclExecSandbox",
+    "BfclOfficialAstStatus",
+    "bfcl_official_ast_checker_status",
     "build_bfcl_exec_prompt",
     "evaluate_bfcl_exec_calls",
     "load_bfcl_exec_manifest_records",

@@ -141,6 +141,9 @@ def load_bfcl_ast_rows_from_sources(
                     "source_path": str(Path(question_path)),
                     "possible_answer_path": str(Path(possible_answer_path)),
                     "execution_result_type": _coerce_list(answer.get("execution_result_type")),
+                    "bfcl_official_function": _coerce_list(item.get("function")),
+                    "bfcl_official_ground_truth": _coerce_list(answer.get("ground_truth")),
+                    "bfcl_official_language": _infer_bfcl_language(category, item),
                 },
             }
         )
@@ -577,6 +580,18 @@ def _normalize_bfcl_ground_truth_calls(raw: Any) -> list[dict[str, Any]]:
                 }
             )
     return calls
+
+
+def _infer_bfcl_language(category: str, item: Mapping[str, Any]) -> str:
+    raw = str(item.get("language") or item.get("programming_language") or "").strip().lower()
+    if raw:
+        return raw
+    category_text = str(category or "").lower()
+    if "javascript" in category_text or category_text.endswith("_js"):
+        return "javascript"
+    if "java" in category_text:
+        return "java"
+    return "python"
 
 
 def _canonical_option_value(options: Sequence[Any]) -> Any:

@@ -65,6 +65,9 @@ class SchedulerStartRequest:
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
+    infer_protocol: str = "openai"
+    infer_seed_policy: str = "preserve"
+    remote_batch_size: int | None = None
     distributed_claims: bool = False
     scheduler_node_id: str = ""
     lease_duration_s: int = 900
@@ -121,6 +124,12 @@ class SchedulerStartRequest:
     def to_dispatch_options(self) -> DispatchOptions:
         if self.model_select not in MODEL_SELECT_CHOICES:
             raise ValueError(f"unknown model_select={self.model_select!r}")
+        infer_protocol = str(self.infer_protocol or "openai")
+        if infer_protocol not in {"openai", "nano-vllm-contents"}:
+            raise ValueError(f"unknown infer_protocol={infer_protocol!r}")
+        infer_seed_policy = str(self.infer_seed_policy or "preserve")
+        if infer_seed_policy not in {"preserve", "omit-for-contents"}:
+            raise ValueError(f"unknown infer_seed_policy={infer_seed_policy!r}")
 
         job_list = _resolve_job_list(self.only_jobs, self.skip_jobs, self.domains)
         if not job_list:
@@ -178,6 +187,13 @@ class SchedulerStartRequest:
             infer_api_key=str(self.infer_api_key or ""),
             infer_timeout_s=float(self.infer_timeout_s),
             infer_max_workers=int(self.infer_max_workers),
+            infer_protocol=infer_protocol,
+            infer_seed_policy=infer_seed_policy,
+            remote_batch_size=(
+                int(self.remote_batch_size)
+                if self.remote_batch_size is not None
+                else None
+            ),
             distributed_claims=bool(self.distributed_claims),
             scheduler_node_id=(str(self.scheduler_node_id or "").strip() or None),
             lease_duration_s=int(self.lease_duration_s),

@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Free-response evaluation using full completions and math_verify."""
+
+from __future__ import annotations
 
 import re
 import time
@@ -35,6 +35,7 @@ STRATEGY_LABELS = {
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _PREFERRED_ANSWER_KEYS = (
+    "expected_judgement",
     "expected_answer",
     "reference_answer",
     "target",
@@ -43,8 +44,10 @@ _PREFERRED_ANSWER_KEYS = (
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
     "You are a rigorous AI judge. Your task is to evaluate whether a student's "
-    "answer is semantically completely equivalent to the reference answer, based on "
-    "the provided question and reference answer.\\n\\nInput:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
+    "answer is mathematically equivalent to the reference answer, based on "
+    "the provided question and reference answer. Accept different wording or formatting "
+    "only when the mathematical value is unchanged and all required components are present.\\n\\n"
+    "Input:\\nQuestion: <Q>\\nReference Answer: <REF>\\n"
     "Student's Answer: <A>\\n\\nOutput Format:\\nStrictly adhere to the output format: Only output 'True' or 'False'."
 )
 
@@ -56,6 +59,10 @@ def _normalize_text(value: str) -> str:
     normalized = normalized.replace("\\ ", " ").replace("\u00a0", " ")
     normalized = _WHITESPACE_RE.sub(" ", normalized.strip())
     return normalized
+
+
+def _is_exact_match(prediction: str, reference: str) -> bool:
+    return bool(reference) and _normalize_text(prediction) == _normalize_text(reference)
 
 
 def _short_text(value: str, *, limit: int = 1200) -> str:
@@ -287,6 +294,12 @@ def _reference_expr(reference: str) -> str:
 def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
     api = _load_math_verify()
     display_answer = _short_text(scoring_text)
+    if _is_exact_match(scoring_text, reference):
+        return _MathVerifyResult(
+            passed=True,
+            answer=display_answer,
+            fail_reason="",
+        )
     if api is None:
         return _MathVerifyResult(
             passed=False,
@@ -337,21 +350,53 @@ def _parsed_answer_text(parsed: Any) -> str:
     return str(item)
 
 
-def _completion_text(payload: dict[str, Any]) -> str:
-    text = str(payload.get("completion1") or "")
+def _stage_text(payload: dict[str, Any], stage: int) -> str:
+    text = str(payload.get(f"completion{stage}") or "")
     return text.split(USER_SENTINEL, 1)[0]
 
 
+def _stage_prompt(payload: dict[str, Any], stage: int) -> str:
+    return str(payload.get(f"prompt{stage}") or "")
+
+
+def _stage_stop_reason(payload: dict[str, Any], stage: int) -> str:
+    return str(payload.get(f"stop_reason{stage}") or "")
+
+
+def _has_stage(payload: dict[str, Any], stage: int) -> bool:
+    return f"completion{stage}" in payload or f"prompt{stage}" in payload
+
+
+def _completion_text(payload: dict[str, Any]) -> str:
+    return _stage_text(payload, 1)
+
+
 def _completion_prompt(payload: dict[str, Any]) -> str:
-    return str(payload.get("prompt1") or "")
+    return _stage_prompt(payload, 1)
 
 
 def _completion_stop_reason(payload: dict[str, Any]) -> str:
-    return str(payload.get("stop_reason1") or "")
+    return _stage_stop_reason(payload, 1)
+
+
+def _stage_is_truncated(payload: dict[str, Any], stage: int) -> bool:
+    if _stage_stop_reason(payload, stage) in {"max_tokens", "max_length"}:
+        return True
+    stats = payload.get("stats")
+    if isinstance(stats, dict):
+        stage_stats = stats.get(f"stage{stage}")
+        if isinstance(stage_stats, dict):
+            return bool(stage_stats.get("truncated"))
+    return False
 
 
 def _is_truncated(payload: dict[str, Any]) -> bool:
-    if _completion_stop_reason(payload) == "max_tokens":
+    if _has_stage(payload, 2):
+        if _stage_is_truncated(payload, 2):
+            return True
+        stats = payload.get("stats")
+        return isinstance(stats, dict) and bool(stats.get("truncated"))
+    if _stage_is_truncated(payload, 1):
         return True
     stats = payload.get("stats")
     return isinstance(stats, dict) and bool(stats.get("truncated"))
@@ -364,7 +409,47 @@ def _think_state(prompt: str, text: str) -> tuple[bool, bool]:
     return has_think, has_close
 
 
+def _two_stage_scoring_text(payload: dict[str, Any]) -> str:
+    prompt = _stage_prompt(payload, 2)
+    text = _stage_text(payload, 2)
+    return f"{prompt}{text}" if prompt else text
+
+
+def _has_unclosed_boxed(text: str) -> bool:
+    last_box = text.rfind("\\boxed{")
+    if last_box < 0:
+        return False
+    tail = text[last_box + len("\\boxed{") :]
+    depth = 1
+    for char in tail:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return False
+    return depth > 0
+
+
+def _repair_two_stage_scoring_text(payload: dict[str, Any], text: str) -> str:
+    repaired = text.rstrip()
+    if _has_unclosed_boxed(repaired):
+        repaired = f"{repaired}}}"
+    if _stage_is_truncated(payload, 2) and "\\boxed" not in repaired:
+        repaired = f"{repaired}\n{REPAIR_FINAL_CUE}"
+    return repaired
+
+
 def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
+    if group == STRATEGY_A:
+        return _completion_text(payload)
+    if _has_stage(payload, 2):
+        two_stage_text = _two_stage_scoring_text(payload)
+        if group == STRATEGY_B:
+            return two_stage_text
+        if group == STRATEGY_C:
+            return _repair_two_stage_scoring_text(payload, two_stage_text)
+
     text = _completion_text(payload)
     prompt = _completion_prompt(payload)
     has_think, has_close = _think_state(prompt, text)
@@ -400,6 +485,7 @@ def evaluate_free_response(
     dataset = list(JsonlFreeAnswerLoader(str(dataset_path)))
     completion_payloads = list(_iter_completions(completions))
     grouped: dict[str, list[_ScoredCompletion]] = {group: [] for group in STRATEGY_GROUPS}
+    primary_group = STRATEGY_C if any(_has_stage(payload, 2) for payload in completion_payloads) else STRATEGY_A
 
     for payload in completion_payloads:
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
@@ -495,7 +581,7 @@ def evaluate_free_response(
                 )
             )
         eval_payloads_by_group[group] = group_payloads
-        if group == STRATEGY_A:
+        if group == primary_group:
             eval_payloads.extend(group_payloads)
 
     return FreeResponseEvaluation(
@@ -505,6 +591,7 @@ def evaluate_free_response(
         payloads=eval_payloads,
         payloads_by_group=eval_payloads_by_group,
         judge_stats_by_group=judge_stats_by_group,
+        primary_group=primary_group,
     )
 
 

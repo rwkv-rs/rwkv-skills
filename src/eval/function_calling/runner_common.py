@@ -26,6 +26,7 @@ _TEMPLATE_LEAK_MARKERS = (
 class FunctionCallingBenchmarkKind(str, Enum):
     AUTO = "auto"
     BROWSECOMP = "browsecomp"
+    BROWSECOMP_PLUS = "browsecomp_plus"
     COMPLEXFUNCBENCH = "complexfuncbench"
     LONGBENCH = "longbench"
     LONGCODEBENCH = "longcodebench"

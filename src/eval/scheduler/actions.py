@@ -66,6 +66,8 @@ class QueueOptions:
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
+    infer_protocol: str = "openai"
+    infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
     function_prompt_style: str | None = None
     function_tool_catalog_format: str | None = None
@@ -430,6 +432,8 @@ def _launch_queue_items(
             env["RWKV_SKILLS_INFER_MODEL"] = str(item.infer_model or item.model_name or "")
             if opts.infer_api_key:
                 env["RWKV_SKILLS_INFER_API_KEY"] = opts.infer_api_key
+            env["RWKV_SKILLS_INFER_PROTOCOL"] = str(opts.infer_protocol or "openai")
+            env["RWKV_SKILLS_INFER_SEED_POLICY"] = str(opts.infer_seed_policy or "preserve")
         if opts.disable_checker:
             env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
@@ -464,12 +468,16 @@ def _launch_queue_items(
             infer_api_key=opts.infer_api_key,
             infer_timeout_s=opts.infer_timeout_s,
             infer_max_workers=opts.infer_max_workers,
+            infer_protocol=opts.infer_protocol,
+            infer_seed_policy=opts.infer_seed_policy,
         )
         _backup_run_config(
             model_name=item.model_name or item.model_slug,
             model_path=item.model_path,
             infer_base_url=item.infer_base_url,
             infer_model=item.infer_model,
+            infer_protocol=opts.infer_protocol,
+            infer_seed_policy=opts.infer_seed_policy,
             dataset_slug=dataset_slug,
             dataset_path=dataset_path,
             job_name=item.job_name,
@@ -812,6 +820,8 @@ def build_command(
     infer_api_key: str = "",
     infer_timeout_s: float = 600.0,
     infer_max_workers: int = 32,
+    infer_protocol: str = "openai",
+    infer_seed_policy: str = "preserve",
 ) -> list[str]:
     base = [DEFAULT_PYTHON, "-m", job.module]
     args = ["--dataset", str(dataset_path)]
@@ -828,6 +838,8 @@ def build_command(
             args.extend(["--infer-api-key", infer_api_key])
         args.extend(["--infer-timeout-s", str(float(infer_timeout_s))])
         args.extend(["--infer-max-workers", str(int(infer_max_workers))])
+        args.extend(["--infer-protocol", str(infer_protocol or "openai")])
+        args.extend(["--infer-seed-policy", str(infer_seed_policy or "preserve")])
     else:
         if item.model_path is None:
             raise ValueError("local scheduler launch requires model_path")
@@ -1026,6 +1038,8 @@ def _backup_run_config(
     model_path: Path | None,
     infer_base_url: str | None,
     infer_model: str | None,
+    infer_protocol: str | None,
+    infer_seed_policy: str | None,
     dataset_slug: str,
     dataset_path: Path,
     job_name: str,
@@ -1053,6 +1067,8 @@ def _backup_run_config(
         model_path=model_path,
         infer_base_url=infer_base_url,
         infer_model=infer_model,
+        infer_protocol=infer_protocol,
+        infer_seed_policy=infer_seed_policy,
         config_path=config_path,
         job_name=job_name,
         job_id=job_id,
@@ -1074,6 +1090,8 @@ def _render_run_block(
     model_path: Path | None,
     infer_base_url: str | None,
     infer_model: str | None,
+    infer_protocol: str | None,
+    infer_seed_policy: str | None,
     config_path: Path,
     job_name: str,
     job_id: str,
@@ -1101,6 +1119,10 @@ def _render_run_block(
         lines.append(f"infer_base_url = {_toml_quote(str(infer_base_url))}")
     if infer_model:
         lines.append(f"infer_model = {_toml_quote(str(infer_model))}")
+    if infer_protocol:
+        lines.append(f"infer_protocol = {_toml_quote(str(infer_protocol))}")
+    if infer_seed_policy:
+        lines.append(f"infer_seed_policy = {_toml_quote(str(infer_seed_policy))}")
     if gpu:
         lines.append(f"gpu = {_toml_quote(gpu)}")
     if batch_size is not None:

@@ -431,6 +431,7 @@ def _run_tau_official_attempt(
         sampling=sampling,
         tools=environment.get_tools(),
         domain_policy=str(environment.get_policy()),
+        domain=record.domain,
         history_max_chars=history_max_chars,
         prompt_max_chars=prompt_max_chars,
         long_doc_config=long_doc_config,
@@ -615,7 +616,11 @@ def _run_tau(
     if _requires_tau_user_model(records):
         _apply_tau_model_overrides(args)
         user_model = resolve_required_user_model_config()
-        judge_model = resolve_judge_model_config(default_model=user_model.model_name) or user_model
+        judge_model = resolve_judge_model_config(
+            default_model=user_model.model_name,
+            default_api_key=user_model.api_key,
+            default_base_url=user_model.base_url,
+        ) or user_model
         apply_openai_env(user_model)
     sampling_payload["tau_official_runtime"] = _tau_runtime_model_metadata(user_model, judge_model)
 
@@ -640,6 +645,7 @@ def _run_tau(
                 sampling=decision_sampling,
                 tools=environment.get_tools(),
                 domain_policy=str(environment.get_policy()),
+                domain=record.domain,
                 history_max_chars=history_max_chars,
                 prompt_max_chars=prompt_max_chars,
                 long_doc_config=long_doc_config,

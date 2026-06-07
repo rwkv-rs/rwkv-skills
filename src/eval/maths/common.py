@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 """Maths-domain shared helpers aligned with rwkv-rs maths modules."""
-
-import os
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
+from src.eval.env_config import resolve_judge_max_tokens, resolve_judge_max_workers, resolve_judge_model_config
 from src.eval.k_values import NumericK, filter_metrics_by_k
 
 
@@ -112,49 +111,33 @@ def build_llm_judge(
 ):
     from src.eval.metrics.free_response import LLMJudge, LLMJudgeConfig
 
-    resolved_model = (
-        judge_model
-        or os.environ.get("judge_model_name")
-        or os.environ.get("JUDGE_MODEL")
-        or os.environ.get("LLM_JUDGE_MODEL")
-    )
-    resolved_api_key = (
-        judge_api_key
-        or os.environ.get("JUDGE_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("API_KEY")
-    )
-    resolved_base_url = (
-        judge_base_url
-        or os.environ.get("JUDGE_BASE_URL")
-        or os.environ.get("LLM_JUDGE_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("API_BASE")
-    )
-    resolved_max_workers = (
-        judge_max_workers
-        or int(
-            os.environ.get("JUDGE_MAX_WORKERS")
-            or os.environ.get("LLM_JUDGE_MAX_WORKERS")
-            or "16"
+    try:
+        config = resolve_judge_model_config(
+            model_name=judge_model,
+            api_key=judge_api_key,
+            base_url=judge_base_url,
         )
-    )
-
-    if not resolved_model or not resolved_api_key:
+    except ValueError:
+        if required:
+            raise
+        return None
+    if config is None:
         if required:
             raise ValueError(
                 "free_response_judge 需要有效的 judge 配置："
                 "请提供 --judge-model/--judge-api-key，或设置 JUDGE_MODEL + JUDGE_API_KEY。"
             )
         return None
+    resolved_max_workers = resolve_judge_max_workers(judge_max_workers, default=16)
+    resolved_max_tokens = resolve_judge_max_tokens(judge_max_tokens)
 
     return LLMJudge(
         LLMJudgeConfig(
-            api_key=resolved_api_key,
-            model=resolved_model,
-            base_url=resolved_base_url,
+            api_key=config.api_key,
+            model=config.model_name,
+            base_url=config.base_url,
             max_workers=resolved_max_workers,
-            max_completion_tokens=judge_max_tokens,
+            max_completion_tokens=resolved_max_tokens,
         )
     )
 

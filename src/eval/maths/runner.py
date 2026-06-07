@@ -1,11 +1,13 @@
-from __future__ import annotations
-
 """Field-oriented maths runner aligned with rwkv-rs maths datasets."""
+
+from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
@@ -22,7 +24,7 @@ from src.eval.maths.common import (
     default_db_drain_every,
     default_db_write_queue,
     default_job_name,
-    resolve_generation_sampling,
+    resolve_sampling_pair,
 )
 
 if TYPE_CHECKING:
@@ -33,6 +35,14 @@ from src.infer.backend import (
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class MathStageConfig:
+    cot_prompt_template: str
+    final_answer_template: str
+    cot_sampling: Any
+    final_sampling: Any
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -79,11 +89,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=JudgeMode.EXACT.value,
         help="Maths verdict mode",
     )
-    parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
-    parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
+    parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL)")
+    parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY)")
     parser.add_argument(
         "--judge-base-url",
-        help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
+        help="Optional base URL for judge model (env: JUDGE_BASE_URL)",
     )
     parser.add_argument("--judge-max-workers", type=int, help="Max concurrent workers for LLM judge")
     parser.add_argument(
@@ -156,10 +166,11 @@ def main(
     backend = build_inference_backend_from_args(args)
     pipeline = FreeResponsePipeline(backend)
 
-    generation_sampling = resolve_generation_sampling(
+    stage_config = _resolve_math_stage_config(
         slug,
         model_name,
-        max_tokens=args.max_tokens or args.cot_max_tokens,
+        cot_max_tokens=args.max_tokens or args.cot_max_tokens,
+        final_max_tokens=args.final_max_tokens,
     )
     batch_size = max(1, args.batch_size)
     judge = None
@@ -172,13 +183,7 @@ def main(
             judge_max_tokens=args.judge_max_tokens,
             required=True,
         )
-    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    prompt_template = (
-        cot_config.cot_prompt_template
-        if cot_config is not None and cot_config.cot_prompt_template
-        else None
-    )
     if judge is not None and root_config is not None and root_config.judge_prompt_template:
         judge.config.prompt_template = root_config.judge_prompt_template
 
@@ -196,7 +201,8 @@ def main(
             cot_mode=CoTMode.COT,
             avg_k=plan.avg_k,
             sampling_config={
-                "generation": sampling_config_to_dict(generation_sampling),
+                "stage1": sampling_config_to_dict(stage_config.cot_sampling),
+                "stage2": sampling_config_to_dict(stage_config.final_sampling),
             },
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
@@ -217,8 +223,10 @@ def main(
     if args.probe_only:
         pipeline.run(
             dataset_path=str(dataset_path),
-            **({"prompt_template": prompt_template} if prompt_template else {}),
-            generation_sampling=generation_sampling,
+            cot_prompt_template=stage_config.cot_prompt_template,
+            cot_sampling=stage_config.cot_sampling,
+            final_answer_template=stage_config.final_answer_template,
+            final_sampling=stage_config.final_sampling,
             batch_size=batch_size,
             sample_limit=batch_size,
             pad_to_batch=True,
@@ -250,8 +258,10 @@ def main(
         try:
             result = pipeline.run(
                 dataset_path=str(dataset_path),
-                **({"prompt_template": prompt_template} if prompt_template else {}),
-                generation_sampling=generation_sampling,
+                cot_prompt_template=stage_config.cot_prompt_template,
+                cot_sampling=stage_config.cot_sampling,
+                final_answer_template=stage_config.final_answer_template,
+                final_sampling=stage_config.final_sampling,
                 batch_size=batch_size,
                 record_indices=plan.sample_indices,
                 pad_to_batch=False,
@@ -330,6 +340,57 @@ def main(
     else:
         print(f"✅ CoT free-form done: {result.sample_count} samples")
     return 0
+
+
+def _require_math_prompt_template(
+    slug: str,
+    model_name: str,
+    *,
+    stage: str,
+    template: str | None,
+) -> str:
+    if template:
+        return template
+    expected_key = "cot_prompt_template" if stage == "cot" else "final_prompt_template"
+    raise ValueError(
+        f"math benchmark {slug!r} ({model_name}) requires configs/<benchmark>.toml "
+        f"[{stage}] {expected_key}; formal math runs are two-stage"
+    )
+
+
+def _resolve_math_stage_config(
+    slug: str,
+    model_name: str,
+    *,
+    cot_max_tokens: int | None = None,
+    final_max_tokens: int | None = None,
+) -> MathStageConfig:
+    from src.eval.benchmark_config import resolve_benchmark_model_config
+
+    cot_sampling, final_sampling = resolve_sampling_pair(
+        slug,
+        model_name,
+        cot_max_tokens=cot_max_tokens,
+        final_max_tokens=final_max_tokens,
+    )
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    return MathStageConfig(
+        cot_prompt_template=_require_math_prompt_template(
+            slug,
+            model_name,
+            stage="cot",
+            template=getattr(cot_config, "cot_prompt_template", None),
+        ),
+        final_answer_template=_require_math_prompt_template(
+            slug,
+            model_name,
+            stage="final",
+            template=getattr(final_config, "final_prompt_template", None),
+        ),
+        cot_sampling=cot_sampling,
+        final_sampling=final_sampling,
+    )
 
 
 __all__ = ["main", "parse_args"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 """Argparse-based CLI that exposes the scheduler actions."""
 
 import argparse
+import json
 import re
 from pathlib import Path
 from typing import Sequence
@@ -18,6 +19,7 @@ from src.eval.function_calling.rwkv_prompt import (
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
 )
 from src.eval.function_calling.tool_router import TOOL_ROUTER_MODE_CHOICES
+from src.eval.performance.workload import parse_int_csv
 
 from .actions import (
     DispatchOptions,
@@ -44,6 +46,7 @@ from .config import (
 from .dataset_utils import canonical_slug, canonicalize_benchmark_list
 from .jobs import JOB_CATALOGUE, JOB_ORDER
 from .models import MODEL_SELECT_CHOICES
+from .remote_profiler import DEFAULT_REMOTE_PROBE_PROMPT, probe_remote_inference, write_remote_probe_result
 
 
 _KNOWN_DATASET_SLUGS: tuple[str, ...] = tuple(
@@ -91,6 +94,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ADMIN_API_KEY,
         help="Bearer token；为空时不鉴权",
     )
+
+    probe_parser = sub.add_parser("probe-infer", help="探测远端推理服务最大健康并发")
+    probe_parser.add_argument("--infer-base-url", required=True, help="远端推理服务地址")
+    probe_parser.add_argument("--infer-model", required=True, help="远端推理服务上的模型名")
+    probe_parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
+    probe_parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
+    probe_parser.add_argument(
+        "--infer-protocol",
+        choices=("openai", "nano-vllm-contents"),
+        default="openai",
+        help="远端推理协议",
+    )
+    probe_parser.add_argument(
+        "--candidates",
+        default="1,2,4,8,16,32,64",
+        help="逗号分隔并发候选值，按升序探测到首次失败为止",
+    )
+    probe_parser.add_argument("--prompt", default=DEFAULT_REMOTE_PROBE_PROMPT, help="探测 prompt")
+    probe_parser.add_argument("--max-tokens", type=int, default=16, help="每个请求生成 token 数")
+    probe_parser.add_argument("--temperature", type=float, default=0.0, help="探测 temperature")
+    probe_parser.add_argument("--top-p", type=float, default=0.8, help="探测 top-p")
+    probe_parser.add_argument("--top-k", type=int, default=50, help="探测 top-k")
+    probe_parser.add_argument("--stop-suffix", help="可选文本停止后缀，nano contents 会映射为 stop_tokens")
+    probe_parser.add_argument("--gpu-index", type=int, help="可选本机 GPU index；传入后采样利用率/显存")
+    probe_parser.add_argument("--target-gpu-utilization", type=float, default=90.0, help="认为 GPU 已吃满的峰值利用率阈值")
+    probe_parser.add_argument("--output-json", help="写出探测结果 JSON")
 
     return parser
 
@@ -181,6 +210,18 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
     parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument(
+        "--infer-protocol",
+        choices=("openai", "nano-vllm-contents"),
+        default="openai",
+        help="远端推理协议：标准 OpenAI 单 prompt 请求，或 nano-vLLM contents 批量请求",
+    )
+    parser.add_argument(
+        "--infer-seed-policy",
+        choices=("preserve", "omit-for-contents"),
+        default="preserve",
+        help="远端 seed 策略：默认保留 seed；omit-for-contents 在 nano contents 批量时丢弃 seed",
+    )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
     parser.add_argument(
         "--function-prompt-style",
@@ -316,6 +357,8 @@ def _dispatch_options_from_args(
         infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
         infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
         infer_max_workers=int(getattr(args, "infer_max_workers", 32)),
+        infer_protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),
+        infer_seed_policy=str(getattr(args, "infer_seed_policy", "preserve") or "preserve"),
         remote_batch_size=(
             int(getattr(args, "remote_batch_size"))
             if getattr(args, "remote_batch_size", None) is not None
@@ -473,12 +516,41 @@ def _resolve_scheduler_inference_args(
     return model_globs, None, tuple()
 
 
+def _run_probe_infer(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    try:
+        candidates = parse_int_csv(str(args.candidates))
+    except ValueError as exc:
+        parser.error(str(exc))
+    result = probe_remote_inference(
+        base_url=str(args.infer_base_url),
+        model=str(args.infer_model),
+        api_key=str(getattr(args, "infer_api_key", "") or ""),
+        timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
+        protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),  # type: ignore[arg-type]
+        candidates=candidates,
+        prompt=str(getattr(args, "prompt", DEFAULT_REMOTE_PROBE_PROMPT)),
+        max_tokens=int(getattr(args, "max_tokens", 16)),
+        temperature=float(getattr(args, "temperature", 0.0)),
+        top_p=float(getattr(args, "top_p", 0.8)),
+        top_k=int(getattr(args, "top_k", 50)),
+        stop_suffix=getattr(args, "stop_suffix", None),
+        gpu_index=getattr(args, "gpu_index", None),
+        target_gpu_utilization=float(getattr(args, "target_gpu_utilization", 90.0)),
+    )
+    if getattr(args, "output_json", None):
+        write_remote_probe_result(Path(args.output_json), result)
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
 __all__ = ["build_parser", "main"]
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command
+    if command == "probe-infer":
+        return _run_probe_infer(parser, args)
 
     job_list = _resolve_job_list(
         getattr(args, "only_jobs", None),

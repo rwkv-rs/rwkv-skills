@@ -18,6 +18,13 @@ class OpenAIModelConfig:
     base_url: str | None = None
 
 
+JUDGE_API_KEY_ENV = "JUDGE_API_KEY"
+JUDGE_MODEL_ENV = "JUDGE_MODEL"
+JUDGE_BASE_URL_ENV = "JUDGE_BASE_URL"
+JUDGE_MAX_WORKERS_ENV = "JUDGE_MAX_WORKERS"
+JUDGE_MAX_TOKENS_ENV = "JUDGE_MAX_TOKENS"
+
+
 def load_env_file(path: Path | str = ".env") -> None:
     target = Path(path).expanduser()
     if not target.exists():
@@ -46,15 +53,51 @@ def resolve_required_user_model_config() -> OpenAIModelConfig:
     )
 
 
-def resolve_judge_model_config(default_model: str | None = None) -> OpenAIModelConfig | None:
-    model_name = _first_env("judge_model_name", "JUDGE_MODEL", "LLM_JUDGE_MODEL") or default_model
-    if not model_name:
+def resolve_judge_model_config(
+    default_model: str | None = None,
+    *,
+    model_name: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    default_api_key: str | None = None,
+    default_base_url: str | None = None,
+) -> OpenAIModelConfig | None:
+    explicit_model_name = _first_value(model_name, _first_env(JUDGE_MODEL_ENV))
+    resolved_model_name = _first_value(explicit_model_name, default_model)
+    if not resolved_model_name:
         return None
-    api_key = _first_env("JUDGE_API_KEY", "API_KEY", "OPENAI_API_KEY")
+    using_default_model = explicit_model_name is None
+    api_key = _first_value(
+        api_key,
+        _first_env(JUDGE_API_KEY_ENV),
+        default_api_key if using_default_model else None,
+    )
     if not api_key:
-        raise ValueError("Missing judge API key: set JUDGE_API_KEY or API_KEY / OPENAI_API_KEY in .env")
-    base_url = _first_env("JUDGE_BASE_URL", "OPENAI_BASE_URL", "API_BASE")
-    return OpenAIModelConfig(api_key=api_key, model_name=model_name, base_url=normalize_openai_base_url(base_url))
+        raise ValueError("Missing judge API key: set JUDGE_API_KEY in .env or pass --judge-api-key")
+    base_url = _first_value(
+        base_url,
+        _first_env(JUDGE_BASE_URL_ENV),
+        default_base_url if using_default_model else None,
+    )
+    return OpenAIModelConfig(
+        api_key=api_key,
+        model_name=resolved_model_name,
+        base_url=normalize_openai_base_url(base_url),
+    )
+
+
+def resolve_judge_max_workers(value: int | None = None, *, default: int = 16) -> int:
+    return _positive_int_value(value, field_name="judge max workers") or _positive_int_env(
+        JUDGE_MAX_WORKERS_ENV,
+        default=default,
+    )
+
+
+def resolve_judge_max_tokens(value: int | None = None) -> int | None:
+    return _positive_int_value(value, field_name="judge max tokens") or _positive_int_env(
+        JUDGE_MAX_TOKENS_ENV,
+        default=None,
+    )
 
 
 def apply_openai_env(config: OpenAIModelConfig) -> None:
@@ -89,11 +132,50 @@ def _first_env(*names: str) -> str | None:
     return None
 
 
+def _first_value(*values: str | None) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
+def _positive_int_env(name: str, *, default: int | None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = _positive_int_value(raw, field_name=name)
+    if value is None:
+        return default
+    return value
+
+
+def _positive_int_value(value: int | str | None, *, field_name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive integer: {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer: {value!r}")
+    return parsed
+
+
 __all__ = [
     "OpenAIModelConfig",
+    "JUDGE_API_KEY_ENV",
+    "JUDGE_BASE_URL_ENV",
+    "JUDGE_MAX_TOKENS_ENV",
+    "JUDGE_MAX_WORKERS_ENV",
+    "JUDGE_MODEL_ENV",
     "load_env_file",
     "resolve_required_user_model_config",
     "resolve_judge_model_config",
+    "resolve_judge_max_tokens",
+    "resolve_judge_max_workers",
     "apply_openai_env",
     "normalize_openai_base_url",
 ]

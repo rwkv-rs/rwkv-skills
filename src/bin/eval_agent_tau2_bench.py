@@ -138,7 +138,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     bridge = RWKVChatBridge(engine=backend, default_sampling=sampling)
 
     judge: NLAssertionJudge | None = None
-    judge_cfg: OpenAIModelConfig | None = resolve_judge_model_config(default_model=args.judge_model)
+    judge_cfg: OpenAIModelConfig | None = resolve_judge_model_config(
+        model_name=args.judge_model,
+    )
     if judge_cfg is not None:
         judge = NLAssertionJudge(
             model_name=judge_cfg.model_name,

@@ -135,6 +135,15 @@ class McpBenchEvaluation:
     planning_json_compliance: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class McpBenchPreflightReport:
+    ok: bool
+    runtime_root: str
+    worker_script: str
+    checked_servers: tuple[str, ...]
+    errors: tuple[str, ...] = ()
+
+
 class McpBenchWorkerClient:
     def __init__(self, *, runtime_root: str | Path, worker_script: str | Path) -> None:
         self.runtime_root = Path(runtime_root).expanduser().resolve()
@@ -343,6 +352,79 @@ def load_mcp_bench_manifest_records(path: str | Path) -> list[McpBenchItem]:
                 )
             )
     return items
+
+
+def preflight_mcp_bench_runtime(
+    items: Sequence[McpBenchItem],
+    *,
+    runtime_root: str | Path,
+    worker_script: str | Path,
+    open_first_task: bool = True,
+    raise_on_error: bool = True,
+) -> McpBenchPreflightReport:
+    runtime = Path(runtime_root).expanduser().resolve()
+    worker = Path(worker_script).expanduser().resolve()
+    errors: list[str] = []
+    if not items:
+        errors.append("mcp_bench_no_items")
+    python_bin = runtime / ".venv" / "bin" / "python"
+    commands_path = runtime / "mcp_servers" / "commands.json"
+    if not python_bin.is_file():
+        errors.append(f"missing_runtime_python:{python_bin}")
+    if not worker.is_file():
+        errors.append(f"missing_worker_script:{worker}")
+    commands: Mapping[str, Any] = {}
+    if not commands_path.is_file():
+        errors.append(f"missing_commands_json:{commands_path}")
+    else:
+        try:
+            payload = json.loads(commands_path.read_text(encoding="utf-8"))
+            commands = payload if isinstance(payload, Mapping) else {}
+            if not commands:
+                errors.append(f"invalid_commands_json:{commands_path}")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"invalid_commands_json:{commands_path}:{exc}")
+
+    checked_servers = tuple(sorted({server for item in items for server in item.servers if server}))
+    for server_name in checked_servers:
+        raw = commands.get(server_name) if isinstance(commands, Mapping) else None
+        if not isinstance(raw, Mapping):
+            errors.append(f"missing_server_config:{server_name}")
+            continue
+        if not str(raw.get("cmd") or "").strip():
+            errors.append(f"missing_server_command:{server_name}")
+        cwd = _resolve_mcp_server_cwd(runtime, str(raw.get("cwd") or ""))
+        if not cwd.exists():
+            errors.append(f"missing_server_cwd:{server_name}:{cwd}")
+
+    if not errors and open_first_task and items:
+        client = McpBenchWorkerClient(runtime_root=runtime, worker_script=worker)
+        try:
+            client.open_task(items[0])
+            client.close_task()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"worker_open_task_failed:{exc}")
+        finally:
+            client.close()
+
+    report = McpBenchPreflightReport(
+        ok=not errors,
+        runtime_root=str(runtime),
+        worker_script=str(worker),
+        checked_servers=checked_servers,
+        errors=tuple(errors),
+    )
+    if errors and raise_on_error:
+        raise RuntimeError("MCP-Bench runtime preflight failed: " + "; ".join(errors))
+    return report
+
+
+def _resolve_mcp_server_cwd(runtime_root: Path, raw_cwd: str) -> Path:
+    if not raw_cwd:
+        return runtime_root
+    if raw_cwd.startswith("../"):
+        return (runtime_root / "mcp_servers" / raw_cwd[3:]).resolve()
+    return (runtime_root / raw_cwd).resolve()
 
 
 def presented_task(item: McpBenchItem) -> str:
@@ -680,6 +762,13 @@ def _run_mcp_bench(
 
     runtime_root = Path(items[0].runtime_root or "").expanduser().resolve()
     worker_script = REPO_ROOT / "src" / "eval" / "function_calling" / "mcp_bench_worker.py"
+    if not bool(getattr(args, "skip_runtime_preflight", False)):
+        preflight_mcp_bench_runtime(
+            items,
+            runtime_root=runtime_root,
+            worker_script=worker_script,
+            open_first_task=True,
+        )
     if args.probe_only:
         worker = McpBenchWorkerClient(runtime_root=runtime_root, worker_script=worker_script)
         try:
@@ -705,7 +794,7 @@ def _run_mcp_bench(
 
     judge_cfg = resolve_judge_model_config()
     if judge_cfg is None:
-        raise ValueError("MCP-Bench requires JUDGE_MODEL / judge_model_name and judge API key")
+        raise ValueError("MCP-Bench requires JUDGE_MODEL + JUDGE_API_KEY")
 
     job_name = _resolve_job_name("function_mcp_bench", run_context=run_context)
     sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling), (2, final_sampling)])

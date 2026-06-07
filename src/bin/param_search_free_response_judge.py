@@ -97,16 +97,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         help="avg@k values to compute from generated samples (default: none)",
     )
-    parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL / LLM_JUDGE_MODEL)")
-    parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY / OPENAI_API_KEY / API_KEY)")
+    parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL)")
+    parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY)")
     parser.add_argument(
         "--judge-base-url",
-        help="Optional base URL for judge model (env: JUDGE_BASE_URL / LLM_JUDGE_BASE_URL / API_BASE)",
+        help="Optional base URL for judge model (env: JUDGE_BASE_URL)",
     )
     parser.add_argument(
         "--judge-max-workers",
         type=int,
-        help="Max concurrent workers for LLM judge (env: JUDGE_MAX_WORKERS / LLM_JUDGE_MAX_WORKERS)",
+        help="Max concurrent workers for LLM judge (env: JUDGE_MAX_WORKERS)",
     )
     parser.add_argument(
         "--judge-max-tokens",
