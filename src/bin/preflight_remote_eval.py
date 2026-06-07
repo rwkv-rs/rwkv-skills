@@ -59,7 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--infer-model", "--model", required=True, help="Remote model name")
     parser.add_argument("--infer-api-key", "--api-key", default="", help="Remote inference bearer token")
     parser.add_argument("--infer-timeout-s", "--timeout-s", type=float, default=600.0, help="Inference timeout")
-    parser.add_argument("--protocols", default="openai,nano-vllm-contents", help="Protocols for generation smoke")
+    parser.add_argument("--protocols", default="vllm", help="Protocols for generation smoke")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -90,7 +90,7 @@ def run_preflight(
     infer_model: str,
     infer_api_key: str = "",
     infer_timeout_s: float = 600.0,
-    protocols: Sequence[str] = ("openai", "nano-vllm-contents"),
+    protocols: Sequence[str] = ("vllm",),
     batch_size: int = DEFAULT_PROTOCOL_SMOKE_BATCH_SIZE,
     max_tokens: int = 8,
     check_db: bool = True,

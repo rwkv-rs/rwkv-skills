@@ -20,6 +20,7 @@ from src.eval.function_calling.rwkv_prompt import (
 )
 from src.eval.function_calling.tool_router import TOOL_ROUTER_MODE_CHOICES
 from src.eval.performance.workload import parse_int_csv
+from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
 from .actions import (
     DispatchOptions,
@@ -102,8 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
     probe_parser.add_argument(
         "--infer-protocol",
-        choices=("openai", "nano-vllm-contents"),
-        default="openai",
+        choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
+        default="vllm",
         help="远端推理协议",
     )
     probe_parser.add_argument(
@@ -119,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser.add_argument("--stop-suffix", help="可选文本停止后缀，nano contents 会映射为 stop_tokens")
     probe_parser.add_argument("--gpu-index", type=int, help="可选本机 GPU index；传入后采样利用率/显存")
     probe_parser.add_argument("--target-gpu-utilization", type=float, default=90.0, help="认为 GPU 已吃满的峰值利用率阈值")
+    probe_parser.add_argument("--warmup-requests", type=int, default=1, help="正式并发曲线前的预热请求数")
+    probe_parser.add_argument("--max-p95-latency-s", type=float, help="候选并发 p95 延迟上限")
+    probe_parser.add_argument("--min-throughput-gain", type=float, default=0.03, help="选择吞吐拐点的最小相对增益")
     probe_parser.add_argument("--output-json", help="写出探测结果 JSON")
 
     return parser
@@ -212,9 +216,9 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
     parser.add_argument(
         "--infer-protocol",
-        choices=("openai", "nano-vllm-contents"),
+        choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
         default="openai",
-        help="远端推理协议：标准 OpenAI 单 prompt 请求，或 nano-vLLM contents 批量请求",
+        help="远端推理协议：标准 OpenAI 兼容，或按 vLLM continuous batching 调度",
     )
     parser.add_argument(
         "--infer-seed-policy",
@@ -536,6 +540,9 @@ def _run_probe_infer(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         stop_suffix=getattr(args, "stop_suffix", None),
         gpu_index=getattr(args, "gpu_index", None),
         target_gpu_utilization=float(getattr(args, "target_gpu_utilization", 90.0)),
+        warmup_requests=int(getattr(args, "warmup_requests", 1)),
+        max_p95_latency_s=getattr(args, "max_p95_latency_s", None),
+        min_throughput_gain=float(getattr(args, "min_throughput_gain", 0.03)),
     )
     if getattr(args, "output_json", None):
         write_remote_probe_result(Path(args.output_json), result)

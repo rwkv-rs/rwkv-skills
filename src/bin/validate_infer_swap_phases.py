@@ -281,7 +281,7 @@ def validate_readiness_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
         )
     if payload.get("probe_model") != run_infer_swap_eval.DEFAULT_INFER_MODEL:
         errors.append(f"readiness probe model mismatch: {payload.get('probe_model')}")
-    if payload.get("probe_protocol") != "nano-vllm-contents":
+    if payload.get("probe_protocol") != run_infer_swap_eval.DEFAULT_INFER_PROTOCOL:
         errors.append(f"readiness probe protocol mismatch: {payload.get('probe_protocol')}")
     if payload.get("protocol_smoke_ok") is not True:
         errors.append(f"readiness protocol_smoke_ok is not true: {payload.get('protocol_smoke_ok')}")

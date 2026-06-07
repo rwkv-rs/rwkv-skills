@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.bin import run_infer_swap_eval
+
 
 DEFAULT_SUMMARY_JSON = "/tmp/rwkv-skills-infer-swap-eval-summary.json"
 DEFAULT_PROBE_JSON = "/tmp/rwkv-skills-infer-swap-probe-19082-gpu0-lightweight-full-20260607.json"
@@ -170,8 +172,8 @@ def validate_readiness_evidence(
         return False, "readiness probe_model does not match summary"
     if readiness.get("probe_model") != probe.get("model"):
         return False, "readiness probe_model does not match probe"
-    if readiness.get("probe_protocol") != "nano-vllm-contents":
-        return False, "readiness probe_protocol is not nano-vllm-contents"
+    if readiness.get("probe_protocol") != run_infer_swap_eval.DEFAULT_INFER_PROTOCOL:
+        return False, f"readiness probe_protocol is not {run_infer_swap_eval.DEFAULT_INFER_PROTOCOL}"
 
     expected_workers = _as_int(readiness.get("expected_infer_max_workers"))
     expected_batch = _as_int(readiness.get("expected_remote_batch_size"))
@@ -205,7 +207,7 @@ def validate_protocol_smoke(protocols: Any) -> tuple[bool, str]:
     if not isinstance(protocols, list):
         return False, "readiness protocol_smoke_protocols missing"
     by_protocol = {str(item.get("protocol")): item for item in protocols if isinstance(item, Mapping)}
-    for protocol in ("openai", "nano-vllm-contents"):
+    for protocol in (run_infer_swap_eval.DEFAULT_INFER_PROTOCOL,):
         item = by_protocol.get(protocol)
         if item is None:
             return False, f"readiness protocol smoke missing: {protocol}"
@@ -396,7 +398,7 @@ def build_speedup_design_doc(
             "",
             "### Proposed Optimization Tracks",
             "",
-            "1. Keep `nano-vllm-contents` as the scheduler remote protocol for this model family.",
+            "1. Keep `vllm` as the scheduler remote protocol for standard vLLM OpenAI-compatible serving.",
             "2. Use the full-load profile for maximum GPU occupancy and the throughput-peak profile for a controlled score/speed comparison.",
             "3. Compare completed benchmark scores before changing prompt, routing, or evaluator semantics.",
             "4. If scores are stable, tune only scheduler-side concurrency first: `infer_max_workers`, `remote_batch_size`, and `max_concurrent_jobs`.",

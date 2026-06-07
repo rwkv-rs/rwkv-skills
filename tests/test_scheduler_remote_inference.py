@@ -62,6 +62,7 @@ def test_build_command_uses_remote_backend_arguments(tmp_path: Path) -> None:
         infer_api_key="secret",
         infer_timeout_s=12.5,
         infer_max_workers=9,
+        infer_protocol="vllm",
     )
 
     assert "--infer-base-url" in command
@@ -69,6 +70,8 @@ def test_build_command_uses_remote_backend_arguments(tmp_path: Path) -> None:
     assert "--infer-api-key" in command
     assert "--infer-timeout-s" in command
     assert "--infer-max-workers" in command
+    assert "--infer-protocol" in command
+    assert "vllm" in command
     assert "--model-path" not in command
     assert "--device" not in command
     assert "remote-demo" in command
@@ -101,6 +104,7 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
         infer_api_key="secret",
         infer_timeout_s=42.0,
         infer_max_workers=7,
+        infer_protocol="vllm",
         max_concurrent_jobs=5,
     )
 
@@ -112,6 +116,7 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
     assert opts.infer_api_key == "secret"
     assert opts.infer_timeout_s == 42.0
     assert opts.infer_max_workers == 7
+    assert opts.infer_protocol == "vllm"
     assert opts.max_concurrent_jobs == 5
 
 
@@ -126,6 +131,8 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "remote-demo",
             "--remote-batch-size",
             "64",
+            "--infer-protocol",
+            "vllm",
             "--max-concurrent-jobs",
             "4",
         ]
@@ -134,6 +141,7 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_base_url == "http://127.0.0.1:8081"
     assert args.infer_models == ["remote-demo"]
     assert args.remote_batch_size == 64
+    assert args.infer_protocol == "vllm"
     assert args.max_concurrent_jobs == 4
 
 

@@ -11,9 +11,13 @@ import sys
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
+from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES, REMOTE_INFERENCE_SEED_POLICY_CHOICES
+
 
 DEFAULT_INFER_BASE_URL = "http://127.0.0.1:29082"
 DEFAULT_INFER_MODEL = "rwkv7-g1g-2.9b-20260526-ctx8192"
+DEFAULT_INFER_PROTOCOL = "vllm"
+DEFAULT_INFER_SEED_POLICY = "preserve"
 DEFAULT_DB_HOST = "127.0.0.1"
 DEFAULT_DB_PORT = 5432
 DEFAULT_DB_USER = "postgres"
@@ -80,6 +84,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--infer-base-url", default=DEFAULT_INFER_BASE_URL)
     parser.add_argument("--infer-model", default=DEFAULT_INFER_MODEL)
     parser.add_argument("--infer-timeout-s", type=float, default=600.0)
+    parser.add_argument("--infer-protocol", choices=REMOTE_INFERENCE_PROTOCOL_CHOICES, default=DEFAULT_INFER_PROTOCOL)
+    parser.add_argument(
+        "--infer-seed-policy",
+        choices=REMOTE_INFERENCE_SEED_POLICY_CHOICES,
+        default=DEFAULT_INFER_SEED_POLICY,
+    )
     parser.add_argument("--infer-max-workers", type=int, help="Override profile infer workers")
     parser.add_argument("--remote-batch-size", type=int, help="Override profile remote batch size")
     parser.add_argument("--max-concurrent-jobs", type=int, default=1)
@@ -172,9 +182,9 @@ def build_scheduler_args(args: argparse.Namespace) -> list[str]:
         "--infer-models",
         str(args.infer_model),
         "--infer-protocol",
-        "nano-vllm-contents",
+        str(args.infer_protocol),
         "--infer-seed-policy",
-        "omit-for-contents",
+        str(args.infer_seed_policy),
         "--infer-timeout-s",
         str(float(args.infer_timeout_s)),
         "--infer-max-workers",
@@ -285,6 +295,8 @@ def _validate_launch_parameters_against_args(
         ("base url", params.get("infer_base_url"), str(dispatch_args.infer_base_url)),
         ("model", params.get("infer_model"), str(dispatch_args.infer_model)),
         ("timeout", _optional_float(params.get("infer_timeout_s")), float(dispatch_args.infer_timeout_s)),
+        ("protocol", params.get("infer_protocol"), str(dispatch_args.infer_protocol)),
+        ("seed policy", params.get("infer_seed_policy"), str(dispatch_args.infer_seed_policy)),
         ("workers", _optional_int(params.get("infer_max_workers")), expected_workers),
         ("remote batch", _optional_int(params.get("remote_batch_size")), expected_batch),
         ("max concurrent jobs", _optional_int(params.get("max_concurrent_jobs")), int(dispatch_args.max_concurrent_jobs)),
@@ -395,7 +407,12 @@ def validate_phase_gate_payload(
             if not isinstance(protocol_smoke_protocols, list):
                 errors.append("phase gate readiness protocol_smoke_protocols missing")
             else:
-                errors.extend(_validate_phase_gate_protocol_smoke(protocol_smoke_protocols))
+                errors.extend(
+                    _validate_phase_gate_protocol_smoke(
+                        protocol_smoke_protocols,
+                        expected_protocols=(str(dispatch_args.infer_protocol),),
+                    )
+                )
             expected_count = len(tuple(dispatch_args.only_datasets))
             if _optional_int(readiness.get("expected_queue_count")) != expected_count:
                 errors.append(
@@ -428,8 +445,11 @@ def validate_phase_gate_payload(
                     "phase gate probe largest_successful_concurrency insufficient: "
                     f"{probe.get('largest_successful_concurrency')} < {required_concurrency}"
                 )
-        if probe.get("protocol") != "nano-vllm-contents":
-            errors.append(f"phase gate probe protocol mismatch: {probe.get('protocol')}")
+        if dispatch_args is not None and probe.get("protocol") != str(dispatch_args.infer_protocol):
+            errors.append(
+                "phase gate probe protocol mismatch: "
+                f"{probe.get('protocol')} != {dispatch_args.infer_protocol}"
+            )
     elif dispatch_args is not None:
         errors.append("phase gate probe details missing")
     summary = _phase_details(by_name.get("summary_json"))
@@ -480,7 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             infer_base_url=str(args.infer_base_url),
             infer_model=str(args.infer_model),
             infer_timeout_s=float(args.infer_timeout_s),
-            protocols=("openai", "nano-vllm-contents"),
+            protocols=(str(args.infer_protocol),),
             batch_size=DEFAULT_PROTOCOL_SMOKE_BATCH_SIZE,
             max_tokens=16,
             check_db=True,
@@ -523,10 +543,14 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
-def _validate_phase_gate_protocol_smoke(protocols: Sequence[Mapping[str, Any]]) -> list[str]:
+def _validate_phase_gate_protocol_smoke(
+    protocols: Sequence[Mapping[str, Any]],
+    *,
+    expected_protocols: Sequence[str] = (DEFAULT_INFER_PROTOCOL,),
+) -> list[str]:
     by_protocol = {str(item.get("protocol")): item for item in protocols if item.get("protocol") is not None}
     errors: list[str] = []
-    for protocol in ("openai", "nano-vllm-contents"):
+    for protocol in tuple(str(item) for item in expected_protocols):
         item = by_protocol.get(protocol)
         if item is None:
             errors.append(f"phase gate readiness protocol smoke missing: {protocol}")

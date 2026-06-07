@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Smoke-compare remote OpenAI and nano contents inference protocols."""
+"""Smoke-check remote OpenAI-compatible inference protocols."""
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -9,12 +9,18 @@ import time
 from pathlib import Path
 from typing import Sequence
 
-from src.infer.backend import RemoteInferenceBackend, RemoteInferenceConfig, RemoteInferenceProtocol
+from src.infer.backend import (
+    REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES,
+    REMOTE_INFERENCE_PROTOCOL_CHOICES,
+    RemoteInferenceBackend,
+    RemoteInferenceConfig,
+    RemoteInferenceProtocol,
+)
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 
 DEFAULT_VERIFY_PROMPT = "User: Reply with exactly one short sentence about remote inference.\n\nAssistant:"
-DEFAULT_PROTOCOLS: tuple[RemoteInferenceProtocol, ...] = ("openai", "nano-vllm-contents")
+DEFAULT_PROTOCOLS: tuple[RemoteInferenceProtocol, ...] = ("vllm",)
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,7 +78,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--protocols",
         default=",".join(DEFAULT_PROTOCOLS),
-        help="Comma-separated protocols to verify: openai,nano-vllm-contents",
+        help="Comma-separated protocols to verify: openai,vllm",
     )
     parser.add_argument("--prompt", default=DEFAULT_VERIFY_PROMPT, help="Prompt used for both protocols")
     parser.add_argument("--max-tokens", type=int, default=16, help="Max generated tokens per request")
@@ -210,8 +216,8 @@ def _normalize_protocols(protocols: Sequence[str]) -> tuple[RemoteInferenceProto
             protocol = item.strip()
             if not protocol:
                 continue
-            if protocol not in DEFAULT_PROTOCOLS:
-                choices = ", ".join(DEFAULT_PROTOCOLS)
+            if protocol not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:
+                choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)
                 raise ValueError(f"protocol must be one of: {choices}")
             normalized.append(protocol)  # type: ignore[arg-type]
     if not normalized:

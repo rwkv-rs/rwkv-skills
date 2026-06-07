@@ -41,9 +41,14 @@ _REMOTE_TRANSIENT_ERRORS = (
     socket.timeout,
 )
 
-RemoteInferenceProtocol = Literal["openai", "nano-vllm-contents"]
+RemoteInferenceProtocol = Literal["openai", "vllm", "nano-vllm-contents"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
-REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "nano-vllm-contents")
+REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "vllm")
+REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("nano-vllm-contents",)
+REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
+    *REMOTE_INFERENCE_PROTOCOL_CHOICES,
+    *REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES,
+)
 REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
     "preserve",
     "omit-for-contents",
@@ -109,7 +114,7 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         "--infer-protocol",
         choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
         default="openai",
-        help="Remote request protocol: OpenAI-compatible one-prompt requests or nano-vLLM contents batching",
+        help="Remote request protocol: generic OpenAI compatibility, or vLLM-tuned OpenAI chat requests",
     )
     parser.add_argument(
         "--infer-seed-policy",
@@ -292,6 +297,11 @@ class RemoteInferenceConfig:
     prefer_chat_completions: bool = True
     protocol: RemoteInferenceProtocol = "openai"
     seed_policy: RemoteInferenceSeedPolicy = "preserve"
+    request_latency_callback: Callable[[str, float, bool], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def completions_url(self) -> str:
         return f"{normalize_api_base(self.base_url)}/completions"
@@ -494,6 +504,9 @@ class RemoteInferenceBackend:
     ) -> tuple[dict[str, float], str]:
         if not choice_token_texts:
             raise ValueError("choice_token_texts cannot be empty")
+        if self.config.protocol == "vllm":
+            self._legacy_choice_scoring_supported = False
+            raise NotImplementedError("vllm remote protocol does not support candidate choice scoring")
         if self._legacy_choice_scoring_supported is False:
             raise NotImplementedError("remote infer service does not support candidate choice scoring")
         payload = {
@@ -540,34 +553,27 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
-        _ = prefill_chunk_size
-        payload: dict[str, object] = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "max_tokens": int(sampling.max_generate_tokens),
-            "temperature": float(sampling.temperature),
-            "top_k": int(sampling.top_k),
-            "top_p": float(sampling.top_p),
-            "presence_penalty": float(sampling.alpha_presence),
-            "frequency_penalty": float(sampling.alpha_frequency),
-            "repetition_penalty": float(sampling.alpha_frequency),
-            "penalty_decay": float(sampling.alpha_decay),
-            "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
-            "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
-            "pad_zero": bool(sampling.pad_zero),
-            "no_penalty_token_ids": [int(token_id) for token_id in sampling.no_penalty_token_ids],
-            "prefill_chunk_size": int(prefill_chunk_size),
-        }
-        if seed is not None:
-            payload["seed"] = int(seed)
-        if stop_suffixes:
-            payload["stop"] = list(stop_suffixes)
-        if self.config.prefer_chat_completions:
+        include_private_fields = self.config.protocol == "nano-vllm-contents"
+        payload = _completion_payload_from_sampling(
+            model=self.model_name,
+            prompt=prompt,
+            sampling=sampling,
+            seed=seed,
+            stop_suffixes=stop_suffixes,
+            prefill_chunk_size=prefill_chunk_size,
+            include_private_fields=include_private_fields,
+        )
+        chat_payload = _chat_payload_from_completion_payload(
+            payload,
+            prompt,
+            include_private_fields=include_private_fields,
+        )
+        if self.config.protocol == "vllm":
+            response = self._post_json(self.config.chat_completions_url(), chat_payload)
+            is_chat_response = True
+        elif self.config.prefer_chat_completions:
             try:
-                response = self._post_json(
-                    self.config.chat_completions_url(),
-                    _chat_payload_from_completion_payload(payload, prompt),
-                )
+                response = self._post_json(self.config.chat_completions_url(), chat_payload)
                 is_chat_response = True
             except RemoteHTTPError as exc:
                 if exc.status_code not in {404, 405}:
@@ -581,10 +587,7 @@ class RemoteInferenceBackend:
             except RemoteHTTPError as exc:
                 if exc.status_code not in {404, 405}:
                     raise
-                response = self._post_json(
-                    self.config.chat_completions_url(),
-                    _chat_payload_from_completion_payload(payload, prompt),
-                )
+                response = self._post_json(self.config.chat_completions_url(), chat_payload)
                 is_chat_response = True
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -602,6 +605,8 @@ class RemoteInferenceBackend:
         )
 
     def _post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:
+        started = time.perf_counter()
+        ok = False
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib_request.Request(
             url,
@@ -613,11 +618,17 @@ class RemoteInferenceBackend:
                 "Authorization": f"Bearer {self.config.api_key or 'rwkv-skills'}",
             },
         )
-        raw = self._urlopen_with_retries(req)
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise RuntimeError("remote infer response must be a JSON object")
-        return data
+        try:
+            raw = self._urlopen_with_retries(req)
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise RuntimeError("remote infer response must be a JSON object")
+            ok = True
+            return data
+        finally:
+            callback = self.config.request_latency_callback
+            if callback is not None:
+                callback(str(url), max(0.0, time.perf_counter() - started), ok)
 
     def _urlopen_with_retries(self, req: urllib_request.Request) -> str:
         attempts = max(1, int(self.config.max_retries) + 1)
@@ -644,37 +655,84 @@ class RemoteInferenceBackend:
         raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc}") from last_exc
 
 
-def _chat_payload_from_completion_payload(payload: dict[str, object], prompt: str) -> dict[str, object]:
+def _completion_payload_from_sampling(
+    *,
+    model: str,
+    prompt: str,
+    sampling: SamplingConfig,
+    seed: int | None,
+    stop_suffixes: Sequence[str] | None,
+    prefill_chunk_size: int,
+    include_private_fields: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": int(sampling.max_generate_tokens),
+        "temperature": float(sampling.temperature),
+        "top_p": float(sampling.top_p),
+        "presence_penalty": float(sampling.alpha_presence),
+        "frequency_penalty": float(sampling.alpha_frequency),
+    }
+    if seed is not None:
+        payload["seed"] = int(seed)
+    if stop_suffixes:
+        payload["stop"] = list(stop_suffixes)
+    if include_private_fields:
+        payload.update(
+            {
+                "top_k": int(sampling.top_k),
+                "repetition_penalty": float(sampling.alpha_frequency),
+                "penalty_decay": float(sampling.alpha_decay),
+                "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
+                "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
+                "pad_zero": bool(sampling.pad_zero),
+                "no_penalty_token_ids": [int(token_id) for token_id in sampling.no_penalty_token_ids],
+                "prefill_chunk_size": int(prefill_chunk_size),
+            }
+        )
+    return payload
+
+
+def _chat_payload_from_completion_payload(
+    payload: dict[str, object],
+    prompt: str,
+    *,
+    include_private_fields: bool = True,
+) -> dict[str, object]:
     chat_payload: dict[str, object] = {
         "model": payload["model"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": payload["max_tokens"],
-        "temperature": max(float(payload.get("temperature", 0.001) or 0.001), 0.001),
+        "temperature": float(payload.get("temperature", 0.0) or 0.0),
+        "stream": False,
     }
     if "top_p" in payload:
         chat_payload["top_p"] = payload["top_p"]
-    if "top_k" in payload:
-        chat_payload["top_k"] = payload["top_k"]
-    for key in (
-        "presence_penalty",
-        "frequency_penalty",
-        "repetition_penalty",
-        "penalty_decay",
-        "ban_tokens",
-        "pad_zero",
-        "no_penalty_token_ids",
-        "prefill_chunk_size",
-    ):
+    for key in ("presence_penalty", "frequency_penalty"):
         if key in payload:
             chat_payload[key] = payload[key]
-    if "stop_tokens" in payload:
-        # The current RWKV chat serving schema accepts token ids as strings,
-        # while the local/legacy completion path keeps them as ints.
-        chat_payload["stop_tokens"] = [str(token_id) for token_id in payload["stop_tokens"]]  # type: ignore[index]
     if "seed" in payload:
         chat_payload["seed"] = payload["seed"]
     if "stop" in payload:
         chat_payload["stop"] = payload["stop"]
+    if include_private_fields:
+        if "top_k" in payload:
+            chat_payload["top_k"] = payload["top_k"]
+        for key in (
+            "repetition_penalty",
+            "penalty_decay",
+            "ban_tokens",
+            "pad_zero",
+            "no_penalty_token_ids",
+            "prefill_chunk_size",
+        ):
+            if key in payload:
+                chat_payload[key] = payload[key]
+        if "stop_tokens" in payload:
+            # The current RWKV chat serving schema accepts token ids as strings,
+            # while the local/legacy completion path keeps them as ints.
+            chat_payload["stop_tokens"] = [str(token_id) for token_id in payload["stop_tokens"]]  # type: ignore[index]
     return chat_payload
 
 
@@ -767,9 +825,11 @@ def _normalize_constraint_mode(mode: str | None) -> Literal["off", "soft", "stri
 
 def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
     value = str(protocol or "openai").strip().lower().replace("_", "-")
+    if value in {"vllm-openai", "vllm-chat", "vllm-compatible"}:
+        value = "vllm"
     if value in {"nano-vllm", "nanovllm", "contents", "lightning"}:
         value = "nano-vllm-contents"
-    if value not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
+    if value not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:
         choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)
         raise ValueError(f"infer_protocol must be one of: {choices}")
     return value  # type: ignore[return-value]
@@ -842,6 +902,8 @@ __all__ = [
     "InferenceBackend",
     "LocalInferenceBackend",
     "REMOTE_INFERENCE_PROTOCOL_CHOICES",
+    "REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES",
+    "REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES",
     "REMOTE_INFERENCE_SEED_POLICY_CHOICES",
     "RemoteInferenceProtocol",
     "RemoteInferenceSeedPolicy",

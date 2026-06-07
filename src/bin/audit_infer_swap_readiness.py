@@ -71,6 +71,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--infer-base-url", default=run_infer_swap_eval.DEFAULT_INFER_BASE_URL)
     parser.add_argument("--infer-model", default=run_infer_swap_eval.DEFAULT_INFER_MODEL)
     parser.add_argument("--infer-timeout-s", type=float, default=600.0)
+    parser.add_argument(
+        "--infer-protocol",
+        choices=run_infer_swap_eval.REMOTE_INFERENCE_PROTOCOL_CHOICES,
+        default=run_infer_swap_eval.DEFAULT_INFER_PROTOCOL,
+    )
+    parser.add_argument(
+        "--infer-seed-policy",
+        choices=run_infer_swap_eval.REMOTE_INFERENCE_SEED_POLICY_CHOICES,
+        default=run_infer_swap_eval.DEFAULT_INFER_SEED_POLICY,
+    )
     parser.add_argument("--infer-max-workers", type=int)
     parser.add_argument("--remote-batch-size", type=int)
     parser.add_argument("--max-concurrent-jobs", type=int, default=1)
@@ -119,7 +129,7 @@ def run_audit(args: argparse.Namespace) -> InferenceSwapReadinessAudit:
             infer_base_url=str(args.infer_base_url),
             infer_model=str(args.infer_model),
             infer_timeout_s=float(args.infer_timeout_s),
-            protocols=("openai", "nano-vllm-contents"),
+            protocols=(str(args.infer_protocol),),
             batch_size=run_infer_swap_eval.DEFAULT_PROTOCOL_SMOKE_BATCH_SIZE,
             max_tokens=16,
             check_db=True,
@@ -132,7 +142,7 @@ def run_audit(args: argparse.Namespace) -> InferenceSwapReadinessAudit:
             preflight_module.write_preflight_result(Path(args.preflight_output_json).expanduser(), preflight_result)
         if not preflight_ok:
             errors.append("preflight failed")
-        errors.extend(validate_protocol_smoke(protocol_smoke_protocols))
+        errors.extend(validate_protocol_smoke(protocol_smoke_protocols, expected_protocols=(str(args.infer_protocol),)))
 
     queue = QueuePreviewResult(rc=0, argv=(), stdout="")
     if not bool(args.skip_queue):
@@ -263,10 +273,14 @@ def extract_protocol_smoke(preflight_result: Any) -> tuple[bool | None, tuple[di
     return None, ()
 
 
-def validate_protocol_smoke(protocols: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+def validate_protocol_smoke(
+    protocols: Sequence[Mapping[str, Any]],
+    *,
+    expected_protocols: Sequence[str] = (run_infer_swap_eval.DEFAULT_INFER_PROTOCOL,),
+) -> tuple[str, ...]:
     by_protocol = {str(item.get("protocol")): item for item in protocols if item.get("protocol") is not None}
     errors: list[str] = []
-    for protocol in ("openai", "nano-vllm-contents"):
+    for protocol in tuple(str(item) for item in expected_protocols):
         item = by_protocol.get(protocol)
         if item is None:
             errors.append(f"protocol smoke missing: {protocol}")
@@ -412,8 +426,9 @@ def validate_probe_payload(
     if probe_model != str(args.infer_model):
         errors.append(f"probe model mismatch: expected {args.infer_model}, got {probe_model}")
     probe_protocol = _optional_str_from_mapping(payload, "protocol")
-    if probe_protocol != "nano-vllm-contents":
-        errors.append(f"probe protocol mismatch: expected nano-vllm-contents, got {probe_protocol}")
+    expected_protocol = str(getattr(args, "infer_protocol", run_infer_swap_eval.DEFAULT_INFER_PROTOCOL))
+    if probe_protocol != expected_protocol:
+        errors.append(f"probe protocol mismatch: expected {expected_protocol}, got {probe_protocol}")
     required_concurrency = max(int(expected_workers), int(expected_batch_size))
     largest_successful = _optional_int_from_mapping(payload, "largest_successful_concurrency")
     if largest_successful is None or largest_successful < required_concurrency:

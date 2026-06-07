@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from src.eval.scheduler.remote_profiler import DEFAULT_REMOTE_PROBE_PROMPT, probe_remote_inference, write_remote_probe_result
+from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -19,8 +20,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--infer-protocol",
         "--protocol",
-        choices=("openai", "nano-vllm-contents"),
-        default="openai",
+        choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
+        default="vllm",
         help="Remote inference protocol",
     )
     parser.add_argument("--candidates", default="1,2,4,8,16,32,64", help="Comma-separated concurrency candidates")
@@ -32,6 +33,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--stop-suffix", help="Optional text stop suffix for every prompt")
     parser.add_argument("--gpu-index", type=int, help="Optional local GPU index to sample with NVML")
     parser.add_argument("--target-gpu-utilization", type=float, default=90.0, help="GPU utilization target")
+    parser.add_argument("--warmup-requests", type=int, default=1, help="Warmup requests excluded from the curve")
+    parser.add_argument("--max-p95-latency-s", type=float, help="Reject candidate points above this p95 latency")
+    parser.add_argument(
+        "--min-throughput-gain",
+        type=float,
+        default=0.03,
+        help="Smallest relative throughput gain worth keeping when selecting the concurrency knee",
+    )
     parser.add_argument("--output-json", help="Optional JSON summary path")
     return parser.parse_args(argv)
 
@@ -72,6 +81,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_suffix=args.stop_suffix,
         gpu_index=args.gpu_index,
         target_gpu_utilization=float(args.target_gpu_utilization),
+        warmup_requests=int(args.warmup_requests),
+        max_p95_latency_s=args.max_p95_latency_s,
+        min_throughput_gain=float(args.min_throughput_gain),
     )
     payload = result.to_dict()
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)

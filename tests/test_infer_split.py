@@ -728,13 +728,21 @@ def test_remote_backend_uses_chat_completions_for_generate_and_caches_choice_sco
     assert calls[0][0].endswith("/chat/completions")
     assert calls[0][1]["messages"] == [{"role": "user", "content": "prompt"}]
     assert "prompt" not in calls[0][1]
-    assert calls[0][1]["top_k"] == 42
-    assert calls[0][1]["penalty_decay"] == 0.95
-    assert calls[0][1]["stop_tokens"] == ["0"]
-    assert calls[0][1]["ban_tokens"] == [123]
-    assert calls[0][1]["pad_zero"] is False
-    assert calls[0][1]["no_penalty_token_ids"] == [33, 10]
-    assert calls[0][1]["prefill_chunk_size"] == 64
+    assert calls[0][1]["temperature"] == 0.3
+    assert calls[0][1]["top_p"] == 0.8
+    assert calls[0][1]["presence_penalty"] == 0.1
+    assert calls[0][1]["frequency_penalty"] == 0.2
+    assert calls[0][1]["stream"] is False
+    for private_key in (
+        "top_k",
+        "penalty_decay",
+        "stop_tokens",
+        "ban_tokens",
+        "pad_zero",
+        "no_penalty_token_ids",
+        "prefill_chunk_size",
+    ):
+        assert private_key not in calls[0][1]
 
     with pytest.raises(NotImplementedError):
         backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
@@ -783,10 +791,153 @@ def test_remote_backend_falls_back_to_text_completions_for_generate(monkeypatch)
     assert outputs[0].text == "legacy answer"
     assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/chat/completions"
     assert calls[0][1]["messages"] == [{"role": "user", "content": "prompt"}]
-    assert calls[0][1]["temperature"] == 0.001
+    assert calls[0][1]["temperature"] == 0.0
     assert calls[0][1]["top_p"] == 0.8
     assert calls[1][0] == "http://127.0.0.1:19081/openai/v1/completions"
     assert calls[1][1]["prompt"] == "prompt"
+
+
+def test_remote_backend_vllm_protocol_uses_standard_chat_without_completion_fallback(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            prefer_chat_completions=False,
+            protocol="vllm",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "vllm answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["prompt"],
+        sampling=SamplingConfig(
+            max_generate_tokens=4,
+            temperature=0.0,
+            top_k=42,
+            top_p=0.8,
+            alpha_presence=0.1,
+            alpha_frequency=0.2,
+            alpha_decay=0.95,
+            stop_tokens=(0,),
+            ban_tokens=(123,),
+            pad_zero=False,
+            no_penalty_token_ids=(33, 10),
+        ),
+        batch_size=1,
+        prompt_stop_suffixes=[(" END",)],
+        prompt_seeds=[123],
+        prefill_chunk_size=64,
+        show_progress=False,
+    )
+
+    assert outputs[0].text == "vllm answer"
+    assert len(calls) == 1
+    assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/chat/completions"
+    payload = calls[0][1]
+    assert payload == {
+        "model": "remote-demo",
+        "messages": [{"role": "user", "content": "prompt"}],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "stream": False,
+        "top_p": 0.8,
+        "presence_penalty": 0.1,
+        "frequency_penalty": 0.2,
+        "seed": 123,
+        "stop": [" END"],
+    }
+
+
+def test_remote_backend_vllm_protocol_rejects_private_choice_scoring(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            protocol="vllm",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        RemoteInferenceBackend,
+        "_post_json",
+        lambda self, url, payload: calls.append((url, payload)) or {},
+    )
+
+    with pytest.raises(NotImplementedError, match="candidate choice scoring"):
+        backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
+
+    assert calls == []
+
+
+def test_remote_backend_legacy_nano_single_requests_keep_private_fields(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+            protocol="nano-vllm-contents",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["prompt"],
+        sampling=SamplingConfig(
+            max_generate_tokens=4,
+            temperature=0.3,
+            top_k=42,
+            top_p=0.8,
+            alpha_presence=0.1,
+            alpha_frequency=0.2,
+            alpha_decay=0.95,
+            stop_tokens=(0,),
+            ban_tokens=(123,),
+            pad_zero=False,
+            no_penalty_token_ids=(33, 10),
+        ),
+        batch_size=1,
+        prompt_seeds=[123],
+        prefill_chunk_size=64,
+        show_progress=False,
+    )
+
+    assert outputs[0].text == "answer"
+    payload = calls[0][1]
+    assert payload["top_k"] == 42
+    assert payload["penalty_decay"] == 0.95
+    assert payload["stop_tokens"] == ["0"]
+    assert payload["ban_tokens"] == [123]
+    assert payload["pad_zero"] is False
+    assert payload["no_penalty_token_ids"] == [33, 10]
+    assert payload["prefill_chunk_size"] == 64
 
 
 def test_remote_backend_tqdm_cleanup_errors_do_not_fail_generation(monkeypatch) -> None:

@@ -64,6 +64,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--infer-base-url", default=run_infer_swap_eval.DEFAULT_INFER_BASE_URL)
     parser.add_argument("--infer-model", default=run_infer_swap_eval.DEFAULT_INFER_MODEL)
     parser.add_argument("--infer-timeout-s", type=float, default=600.0)
+    parser.add_argument(
+        "--infer-protocol",
+        choices=run_infer_swap_eval.REMOTE_INFERENCE_PROTOCOL_CHOICES,
+        default=run_infer_swap_eval.DEFAULT_INFER_PROTOCOL,
+    )
+    parser.add_argument(
+        "--infer-seed-policy",
+        choices=run_infer_swap_eval.REMOTE_INFERENCE_SEED_POLICY_CHOICES,
+        default=run_infer_swap_eval.DEFAULT_INFER_SEED_POLICY,
+    )
     parser.add_argument("--infer-max-workers", type=int)
     parser.add_argument("--remote-batch-size", type=int)
     parser.add_argument("--max-concurrent-jobs", type=int, default=1)
@@ -140,6 +150,10 @@ def run_launch_bundle(args: argparse.Namespace) -> InferSwapLaunchBundle:
             str(args.infer_model),
             "--infer-timeout-s",
             str(float(args.infer_timeout_s)),
+            "--infer-protocol",
+            str(args.infer_protocol),
+            "--infer-seed-policy",
+            str(args.infer_seed_policy),
             "--max-concurrent-jobs",
             str(int(args.max_concurrent_jobs)),
             "--run-mode",
@@ -289,6 +303,8 @@ def build_launch_parameters(args: argparse.Namespace) -> dict[str, Any]:
         "infer_base_url": str(args.infer_base_url),
         "infer_model": str(args.infer_model),
         "infer_timeout_s": float(args.infer_timeout_s),
+        "infer_protocol": str(args.infer_protocol),
+        "infer_seed_policy": str(args.infer_seed_policy),
         "infer_max_workers": workers,
         "remote_batch_size": batch_size,
         "max_concurrent_jobs": int(args.max_concurrent_jobs),
@@ -354,6 +370,10 @@ def build_run_infer_swap_eval_argv(args: argparse.Namespace, *, action: str) -> 
         str(args.infer_model),
         "--infer-timeout-s",
         str(float(args.infer_timeout_s)),
+        "--infer-protocol",
+        str(args.infer_protocol),
+        "--infer-seed-policy",
+        str(args.infer_seed_policy),
         "--max-concurrent-jobs",
         str(int(args.max_concurrent_jobs)),
         "--run-mode",

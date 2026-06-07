@@ -37,6 +37,7 @@ from .control import (
 from .dataset_utils import canonical_slug, canonicalize_benchmark_list
 from .jobs import JOB_CATALOGUE, JOB_ORDER
 from .models import MODEL_SELECT_CHOICES
+from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
 
 _KNOWN_DATASET_SLUGS: tuple[str, ...] = tuple(
@@ -125,7 +126,7 @@ class SchedulerStartRequest:
         if self.model_select not in MODEL_SELECT_CHOICES:
             raise ValueError(f"unknown model_select={self.model_select!r}")
         infer_protocol = str(self.infer_protocol or "openai")
-        if infer_protocol not in {"openai", "nano-vllm-contents"}:
+        if infer_protocol not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
             raise ValueError(f"unknown infer_protocol={infer_protocol!r}")
         infer_seed_policy = str(self.infer_seed_policy or "preserve")
         if infer_seed_policy not in {"preserve", "omit-for-contents"}:
