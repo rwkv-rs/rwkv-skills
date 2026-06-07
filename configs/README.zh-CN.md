@@ -21,7 +21,11 @@
   数据量 > 5000 时做确定性随机抽样；数据量 <= 5000 时重复整套题，直到达到 5000 个有效样本。
 - 当前 benchmark job 不再统计 pass@k；现有 pass_k / report_pass_k 字段只保留给旧脚本和兼容路径。
 - benchmark job 的 zeroshot / cot_mode 由具体 evaluator 入口控制，不再通过 TOML 切换。
-- llm_judge 仍由评测脚本或 CLI 控制，不从 TOML 读取。
+- LLM judge 模型配置统一从 `.env` 的 `JUDGE_MODEL`、`JUDGE_API_KEY`、
+  `JUDGE_BASE_URL`、`JUDGE_MAX_WORKERS`、`JUDGE_MAX_TOKENS` 读取；CLI 参数仍可覆盖。
+- 正式 math 的 LLM judge 路由只包含 math_500、gsm8k、gaokao2023en、amc23、
+  olympiadbench、comp_math_24_25、minerva_math。其它 free-response benchmark job 走 exact 路径。
+- 正式 math judge 判定的是 reference answer 与模型答案之间的数学等价，不是按数据集举例做匹配。
 - free_response 的采样配置只用于 CoT 生成阶段。
 - livecodebench 的采样配置同时作用于 CoT 和 final 阶段。
 - 缺少 configs/livecodebench.toml 时，livecodebench 默认使用 full_code_* 模板。
@@ -29,6 +33,12 @@
 - 可用 template = "name" 或 templates = ["base", "override"] 先合并模板再覆盖。
 - 同时存在 [default] 与 [cot]/[final] 时，按 default -> stage -> model 的顺序合并。
 - 如果缺少 benchmark 文件，调用方可通过 fallback_templates 使用 configs/_templates.toml 里的模板。
+- 正式 math 测评必须显式提供 `configs/<benchmark>.toml`，并同时包含 `[cot]` 与 `[final]`。
+  math runner 在缺少任一阶段 prompt 时会直接失败；fallback 模板只用于开发/探测辅助路径，
+  不用于正式 math 计分。
+- math 分组策略使用不同阶段语义：`strategy_a` 评分 legacy one-stage 的 `completion1`，
+  `strategy_b` 评分严格 two-stage 的 final prompt/completion，`strategy_c` 评分修复后的
+  two-stage final answer。two-stage math 运行以 `strategy_c` 作为主分数，同时保留 A/B 分组指标。
 
 `python -m src.main` 使用的统一运行配置放在 `configs/run/`：
 

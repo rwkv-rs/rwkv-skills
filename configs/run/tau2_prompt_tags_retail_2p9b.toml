@@ -1,0 +1,48 @@
+[run]
+id = "tau2_prompt_tags_retail_2p9b_20260606"
+run_mode = "rerun"
+max_samples = 10
+batch_size = 4
+
+[dataset]
+name = "tau2_bench_retail"
+split = "base"
+
+[model]
+infer_base_url = "http://127.0.0.1:19081/openai"
+infer_model = "rwkv7-g1g-2.9b-20260526-ctx8192"
+infer_timeout_s = 900
+infer_max_workers = 4
+
+[runner]
+result_store = "json"
+benchmark_kind = "tau2_bench"
+prompt_style = "rwkv_official_json"
+tool_catalog_format = "json"
+avg_ks = [1]
+history_max_chars = 16000
+prompt_max_chars = 24576
+tool_router_mode = "lexical"
+tool_router_max_tools = 12
+tool_router_trigger_tool_count = 1
+tool_router_trigger_catalog_chars = 1
+tool_router_description_chars = 180
+long_doc_mode = "lexical"
+long_doc_min_chars = 6000
+long_doc_max_evidence_chars = 6000
+max_steps = 16
+max_tool_errors = 10
+decision_max_tokens = 1024
+user_model = "rwkv7-g1g-7.2b-20260523-ctx8192"
+user_base_url = "http://127.0.0.1:19081/openai/v1"
+user_api_key = "rwkv-skills"
+judge_model = "rwkv7-g1g-7.2b-20260523-ctx8192"
+judge_base_url = "http://127.0.0.1:19081/openai/v1"
+judge_api_key = "rwkv-skills"
+extra_args = [
+  "--task-desc", "tau2 prompt-tags/id-guard experiment retail 2.9b 20260606",
+  "--disable-checker",
+  "--tau-retail-repeated-read-guard",
+  "--tau-retail-tool-use-guard",
+  "--tau-retail-progressive-tool-disclosure",
+]

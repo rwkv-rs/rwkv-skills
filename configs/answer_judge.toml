@@ -1,0 +1,37 @@
+[default]
+pass_k = []
+avg_k = [8]
+report_pass_k = []
+report_avg_k = [8]
+
+[cot]
+cot_prompt_template = """User: Decide whether the predicted answer matches the expected answer for this judgement task. Keep reasoning concise. The final judgement must be exactly `Judgement: Yes` or `Judgement: No`.
+<Q>
+
+Assistant: <think"""
+max_generate_tokens = 4096
+temperature = 0.25
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
+alpha_decay = 0.99
+stop_tokens = [0]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[final]
+final_prompt_template = """<Q><COT>
+Return exactly one final label: """
+max_generate_tokens = 16
+temperature = 0.0
+top_k = 1
+top_p = 0.0
+alpha_presence = 0.0
+alpha_frequency = 0.0
+alpha_decay = 0.99
+stop_tokens = [0, 2402, 4910]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

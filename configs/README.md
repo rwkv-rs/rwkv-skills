@@ -23,7 +23,14 @@ Notes:
 - Current benchmark jobs do not report pass@k; existing pass_k/report_pass_k TOML fields are retained only for
   legacy scripts and compatibility.
 - For benchmark jobs, zeroshot / cot_mode selection is controlled by the evaluator entrypoint rather than TOML.
-- llm_judge stays in evaluator code or CLI flags; it is not read from TOML.
+- LLM judge model configuration is read from `.env` with one canonical prefix:
+  `JUDGE_MODEL`, `JUDGE_API_KEY`, `JUDGE_BASE_URL`, `JUDGE_MAX_WORKERS`, and
+  `JUDGE_MAX_TOKENS`; CLI flags may still override these values.
+- Formal maths LLM-judge routing is limited to math_500, gsm8k, gaokao2023en,
+  amc23, olympiadbench, comp_math_24_25, and minerva_math. Other free-response
+  benchmark jobs use the exact path.
+- The formal maths judge checks mathematical equivalence between the reference
+  answer and the model answer; it is not a dataset-specific example matcher.
 - free_response applies sampling overrides to CoT generation.
 - livecodebench applies sampling overrides to both CoT and final stages.
 - livecodebench defaults to full_code_* templates when configs/livecodebench.toml is missing.
@@ -31,6 +38,13 @@ Notes:
 - Use template = "name" or templates = ["base", "override"] to merge templates before overrides.
 - When both [default] and [cot]/[final] exist, values are merged in order: default -> stage -> model.
 - When benchmark config is missing, callers may supply fallback_templates to use templates from configs/_templates.toml.
+- Formal maths runs require an explicit `configs/<benchmark>.toml` with both `[cot]` and `[final]`.
+  The maths runner fails fast when either stage prompt is missing; fallback templates are only for
+  dev/probe helper paths, not formal maths scoring.
+- Maths grouped strategies use different stage semantics: `strategy_a` scores legacy one-stage
+  `completion1`, `strategy_b` scores the exact two-stage final prompt/completion, and `strategy_c`
+  scores the repaired two-stage final answer. Two-stage maths runs use `strategy_c` as the primary
+  score while retaining A/B in grouped metrics.
 
 Unified run configs for `python -m src.main` live under `configs/run/`:
 
