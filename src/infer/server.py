@@ -5,15 +5,22 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from queue import Empty
+from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from .api import (
+    ChatCompletionChoice,
+    ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    ContentsChatCompletionRequest,
+    completion_finish_reason_to_chat,
+    completion_logprobs_to_chat_logprobs,
 )
 from .openai_service import (
     build_chat_completion_response,
@@ -79,6 +86,47 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
                 "X-Accel-Buffering": "no",
             },
         )
+
+    async def _run_contents_chat_completions(
+        request: ContentsChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        if request.stream:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="streaming is not supported for contents batch requests",
+            )
+        if request.n not in (None, 1):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="only n=1 is supported")
+        if request.model != service.model_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"unknown model {request.model!r}; available model is {service.model_name!r}",
+            )
+        futures = [service.submit_completion(item) for item in request.to_completion_requests()]
+        try:
+            responses = await asyncio.gather(*(asyncio.wrap_future(future) for future in futures))
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - exercised through integration
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+        choices: list[ChatCompletionChoice] = []
+        for index, response in enumerate(responses):
+            if not response.choices:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="contents batch response missing choice",
+                )
+            choice = response.choices[0]
+            choices.append(
+                ChatCompletionChoice(
+                    index=index,
+                    message=ChatCompletionMessage(role="assistant", content=choice.text),
+                    finish_reason=completion_finish_reason_to_chat(choice.finish_reason),
+                    logprobs=completion_logprobs_to_chat_logprobs(choice.logprobs),
+                )
+            )
+        return ChatCompletionResponse(model=service.model_name, choices=choices)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -155,7 +203,13 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
         dependencies=[Depends(_authorize)],
         response_model=ChatCompletionResponse,
     )
-    async def chat_completions(request: ChatCompletionRequest) -> ChatCompletionResponse | StreamingResponse:
+    async def chat_completions(payload: dict[str, Any] = Body(...)) -> ChatCompletionResponse | StreamingResponse:
+        try:
+            if "contents" in payload:
+                return await _run_contents_chat_completions(ContentsChatCompletionRequest.model_validate(payload))
+            request = ChatCompletionRequest.model_validate(payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.errors()) from exc
         try:
             prepared = prepare_chat_completion_request(request)
         except ValueError as exc:

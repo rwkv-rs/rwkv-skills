@@ -41,6 +41,14 @@ _REMOTE_TRANSIENT_ERRORS = (
     socket.timeout,
 )
 
+RemoteInferenceProtocol = Literal["openai", "nano-vllm-contents"]
+RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
+REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "nano-vllm-contents")
+REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
+    "preserve",
+    "omit-for-contents",
+)
+
 
 def normalize_api_base(base_url: str) -> str:
     base = str(base_url or "").strip()
@@ -97,6 +105,21 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         default=32,
         help="Max concurrent HTTP workers used by the eval-side remote client",
     )
+    parser.add_argument(
+        "--infer-protocol",
+        choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
+        default="openai",
+        help="Remote request protocol: OpenAI-compatible one-prompt requests or nano-vLLM contents batching",
+    )
+    parser.add_argument(
+        "--infer-seed-policy",
+        choices=REMOTE_INFERENCE_SEED_POLICY_CHOICES,
+        default="preserve",
+        help=(
+            "Remote seed handling. preserve keeps per-prompt seeds, falling back to OpenAI requests when needed; "
+            "omit-for-contents drops seeds only for nano-vLLM contents batching."
+        ),
+    )
 
 
 def validate_inference_backend_args(args: argparse.Namespace) -> None:
@@ -140,7 +163,7 @@ class InferenceBackend(Protocol):
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
-        prompt_seeds: Sequence[int] | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
@@ -203,7 +226,7 @@ class LocalInferenceBackend:
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
-        prompt_seeds: Sequence[int] | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
@@ -267,6 +290,8 @@ class RemoteInferenceConfig:
     retry_initial_delay_s: float = 1.0
     retry_max_delay_s: float = 10.0
     prefer_chat_completions: bool = True
+    protocol: RemoteInferenceProtocol = "openai"
+    seed_policy: RemoteInferenceSeedPolicy = "preserve"
 
     def completions_url(self) -> str:
         return f"{normalize_api_base(self.base_url)}/completions"
@@ -297,7 +322,7 @@ class RemoteInferenceBackend:
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
-        prompt_seeds: Sequence[int] | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
         top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
@@ -315,6 +340,28 @@ class RemoteInferenceBackend:
         if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
             raise ValueError("prompt_stop_suffixes length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
+        force_openai_single_requests = False
+        use_contents_protocol = self.config.protocol == "nano-vllm-contents"
+        if prompt_seeds is not None:
+            has_prompt_seeds = any(seed is not None for seed in prompt_seeds)
+            if use_contents_protocol and has_prompt_seeds and self.config.seed_policy == "omit-for-contents":
+                prompt_seeds = None
+            elif has_prompt_seeds:
+                force_openai_single_requests = True
+            else:
+                prompt_seeds = None
+        if use_contents_protocol and not force_openai_single_requests:
+            return self._generate_contents_batches(
+                prompts,
+                sampling=effective_sampling,
+                batch_size=batch_size,
+                progress_desc=progress_desc,
+                probe_only=probe_only,
+                on_complete=on_complete,
+                on_token=on_token,
+                prompt_stop_suffixes=prompt_stop_suffixes,
+                show_progress=show_progress,
+            )
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
@@ -343,6 +390,101 @@ class RemoteInferenceBackend:
         finally:
             _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
+
+    def _generate_contents_batches(
+        self,
+        prompts: Sequence[str],
+        *,
+        sampling: SamplingConfig,
+        batch_size: int,
+        progress_desc: str,
+        probe_only: bool,
+        on_complete: Callable[[GenerationOutput], None] | None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+        show_progress: bool,
+    ) -> list[GenerationOutput]:
+        outputs: list[GenerationOutput | None] = [None] * len(prompts)
+        max_batch = max(1, min(int(batch_size), len(prompts)))
+        progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
+        try:
+            for indices, stop_suffixes in _iter_contents_batches(
+                prompt_count=len(prompts),
+                max_batch=max_batch,
+                prompt_stop_suffixes=prompt_stop_suffixes,
+            ):
+                batch_outputs = self._generate_contents_batch(
+                    indices=indices,
+                    prompts=[prompts[index] for index in indices],
+                    sampling=sampling,
+                    stop_suffixes=stop_suffixes,
+                )
+                for output in batch_outputs:
+                    outputs[output.prompt_index] = output
+                    if on_token is not None and output.text:
+                        on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
+                    if on_complete is not None and not probe_only:
+                        on_complete(output)
+                _safe_tqdm_update(progress, len(indices))
+        finally:
+            _safe_tqdm_close(progress)
+        return [output for output in outputs if output is not None]
+
+    def _generate_contents_batch(
+        self,
+        *,
+        indices: Sequence[int],
+        prompts: Sequence[str],
+        sampling: SamplingConfig,
+        stop_suffixes: tuple[str, ...],
+    ) -> list[GenerationOutput]:
+        payload: dict[str, object] = {
+            "model": self.model_name,
+            "contents": list(prompts),
+            "max_tokens": int(sampling.max_generate_tokens),
+            "temperature": float(sampling.temperature),
+            "top_k": int(sampling.top_k),
+            "top_p": float(sampling.top_p),
+            "alpha_presence": float(sampling.alpha_presence),
+            "alpha_frequency": float(sampling.alpha_frequency),
+            "alpha_decay": float(sampling.alpha_decay),
+            "pad_zero": bool(sampling.pad_zero),
+            "stream": False,
+            "stop_tokens": list(stop_suffixes),
+        }
+        response = self._post_json(self.config.chat_completions_url(), payload)
+        choices = response.get("choices")
+        if not isinstance(choices, list):
+            raise RuntimeError("remote infer response missing choices")
+        by_index: dict[int, dict[str, object]] = {}
+        for choice in choices:
+            if not isinstance(choice, dict):
+                raise RuntimeError("remote infer response choice format is invalid")
+            raw_index = choice.get("index", len(by_index))
+            try:
+                choice_index = int(raw_index)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("remote infer response choice index is invalid") from exc
+            by_index[choice_index] = choice
+        if len(by_index) != len(indices):
+            raise RuntimeError("remote infer response choice count does not match contents batch")
+
+        outputs: list[GenerationOutput] = []
+        for local_index, prompt_index in enumerate(indices):
+            choice = by_index.get(local_index)
+            if choice is None:
+                raise RuntimeError("remote infer response missing contents batch choice")
+            text = _extract_chat_choice_text(choice)
+            outputs.append(
+                GenerationOutput(
+                    prompt_index=int(prompt_index),
+                    prompt=prompts[local_index],
+                    token_ids=[],
+                    text=text,
+                    finish_reason=_normalize_remote_finish_reason(choice.get("finish_reason")),
+                )
+            )
+        return outputs
 
     def score_choice_tokens(
         self,
@@ -581,6 +723,8 @@ def build_inference_backend_from_args(args: argparse.Namespace) -> InferenceBack
                 api_key=str(getattr(args, "infer_api_key", "") or ""),
                 timeout_s=float(getattr(args, "infer_timeout_s", 600.0) or 600.0),
                 max_workers=max(1, int(getattr(args, "infer_max_workers", 32) or 32)),
+                protocol=_normalize_remote_protocol(getattr(args, "infer_protocol", "openai")),
+                seed_policy=_normalize_remote_seed_policy(getattr(args, "infer_seed_policy", "preserve")),
             )
         )
     model_path = str(getattr(args, "model_path", "") or "").strip()
@@ -621,6 +765,68 @@ def _normalize_constraint_mode(mode: str | None) -> Literal["off", "soft", "stri
     return normalized  # type: ignore[return-value]
 
 
+def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
+    value = str(protocol or "openai").strip().lower().replace("_", "-")
+    if value in {"nano-vllm", "nanovllm", "contents", "lightning"}:
+        value = "nano-vllm-contents"
+    if value not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
+        choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)
+        raise ValueError(f"infer_protocol must be one of: {choices}")
+    return value  # type: ignore[return-value]
+
+
+def _normalize_remote_seed_policy(seed_policy: object) -> RemoteInferenceSeedPolicy:
+    value = str(seed_policy or "preserve").strip().lower().replace("_", "-")
+    aliases = {
+        "keep": "preserve",
+        "keep-seeds": "preserve",
+        "preserve-seeds": "preserve",
+        "omit": "omit-for-contents",
+        "drop": "omit-for-contents",
+        "drop-for-contents": "omit-for-contents",
+        "omit-seeds": "omit-for-contents",
+    }
+    value = aliases.get(value, value)
+    if value not in REMOTE_INFERENCE_SEED_POLICY_CHOICES:
+        choices = ", ".join(REMOTE_INFERENCE_SEED_POLICY_CHOICES)
+        raise ValueError(f"infer_seed_policy must be one of: {choices}")
+    return value  # type: ignore[return-value]
+
+
+def _contents_stop_key(
+    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+    index: int,
+) -> tuple[str, ...]:
+    if prompt_stop_suffixes is None:
+        return ()
+    raw = prompt_stop_suffixes[index]
+    if raw is None:
+        return ()
+    return tuple(str(item) for item in raw if str(item))
+
+
+def _iter_contents_batches(
+    *,
+    prompt_count: int,
+    max_batch: int,
+    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+) -> list[tuple[tuple[int, ...], tuple[str, ...]]]:
+    batches: list[tuple[tuple[int, ...], tuple[str, ...]]] = []
+    start = 0
+    while start < prompt_count:
+        stop_key = _contents_stop_key(prompt_stop_suffixes, start)
+        indices = [start]
+        next_index = start + 1
+        while next_index < prompt_count and len(indices) < max_batch:
+            if _contents_stop_key(prompt_stop_suffixes, next_index) != stop_key:
+                break
+            indices.append(next_index)
+            next_index += 1
+        batches.append((tuple(indices), stop_key))
+        start = next_index
+    return batches
+
+
 def _resolve_effective_constraints(
     *,
     constraints: Sequence[DecodeConstraint | None] | None,
@@ -635,6 +841,10 @@ def _resolve_effective_constraints(
 __all__ = [
     "InferenceBackend",
     "LocalInferenceBackend",
+    "REMOTE_INFERENCE_PROTOCOL_CHOICES",
+    "REMOTE_INFERENCE_SEED_POLICY_CHOICES",
+    "RemoteInferenceProtocol",
+    "RemoteInferenceSeedPolicy",
     "RemoteInferenceBackend",
     "RemoteInferenceConfig",
     "add_inference_backend_arguments",

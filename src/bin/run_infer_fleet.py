@@ -25,6 +25,9 @@ class InferServiceSpec:
     max_batch_size: int
     log_path: Path
     state_db_path: Path | None = None
+    model_index: int = 0
+    replica_index: int = 0
+    replica_count: int = 1
 
     @property
     def base_url(self) -> str:
@@ -38,6 +41,30 @@ class InferServiceSpec:
 @dataclass(frozen=True, slots=True)
 class RunningInferService:
     spec: InferServiceSpec
+    pid: int
+
+
+@dataclass(frozen=True, slots=True)
+class InferRouterSpec:
+    host: str
+    port: int
+    routes: tuple[str, ...]
+    timeout_s: float
+    log_level: str
+    log_path: Path
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def health_url(self) -> str:
+        return f"{self.base_url}/healthz"
+
+
+@dataclass(frozen=True, slots=True)
+class RunningInferRouter:
+    spec: InferRouterSpec
     pid: int
 
 
@@ -67,6 +94,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Per-model infer batch sizes; length must match --models. Overrides --max-batch-size.",
     )
     parser.add_argument("--batch-collect-ms", type=int, default=10, help="Batch collection window")
+    parser.add_argument(
+        "--replicas-per-model",
+        type=int,
+        default=1,
+        help="Number of infer service replicas to launch for each model on its assigned GPU",
+    )
     parser.add_argument("--log-level", default="info", help="uvicorn log level")
     parser.add_argument("--log-dir", default="logs/infer", help="Directory for child service logs")
     parser.add_argument("--manifest-path", default="logs/infer/fleet.json", help="JSON manifest output path")
@@ -88,6 +121,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Start child services in new sessions and exit after writing the manifest",
     )
+    parser.add_argument(
+        "--router-port",
+        type=int,
+        help="When provided, launch run_infer_router on this port after all infer services start",
+    )
+    parser.add_argument("--router-host", help="Router bind host; defaults to --host")
+    parser.add_argument("--router-timeout-s", type=float, default=600.0, help="Router backend request timeout")
+    parser.add_argument("--router-log-level", help="Router uvicorn log level; defaults to --log-level")
+    parser.add_argument("--router-log-path", help="Router child process log path; defaults under --log-dir")
     return parser.parse_args(argv)
 
 
@@ -126,28 +168,35 @@ def plan_deployments(
     log_dir: Path,
     state_db_dir: Path | None,
     launched_count: int,
+    replicas_per_model: int = 1,
 ) -> list[InferServiceSpec]:
     available_gpus = [gpu for gpu in idle_gpus if gpu not in assigned_gpus]
     specs: list[InferServiceSpec] = []
-    for offset, (model_path, model_name, max_batch_size, gpu) in enumerate(
+    replica_count = max(1, int(replicas_per_model))
+    for model_index, (model_path, model_name, max_batch_size, gpu) in enumerate(
         zip(model_paths, model_names, max_batch_sizes, available_gpus, strict=False)
     ):
-        port = int(base_port) + int(launched_count) + offset
         safe_name = _safe_name(model_name)
-        state_db_path = None
-        if state_db_dir is not None:
-            state_db_path = state_db_dir / f"{safe_name}.sqlite3"
-        specs.append(
-            InferServiceSpec(
-                model_path=model_path,
-                model_name=model_name,
-                gpu=str(gpu),
-                port=port,
-                max_batch_size=max(1, int(max_batch_size)),
-                log_path=log_dir / f"{safe_name}.port{port}.log",
-                state_db_path=state_db_path,
+        for replica_index in range(replica_count):
+            port = int(base_port) + int(launched_count) + len(specs)
+            replica_suffix = "" if replica_count == 1 else f".r{replica_index + 1}"
+            state_db_path = None
+            if state_db_dir is not None:
+                state_db_path = state_db_dir / f"{safe_name}{replica_suffix}.sqlite3"
+            specs.append(
+                InferServiceSpec(
+                    model_path=model_path,
+                    model_name=model_name,
+                    gpu=str(gpu),
+                    port=port,
+                    max_batch_size=max(1, int(max_batch_size)),
+                    log_path=log_dir / f"{safe_name}{replica_suffix}.port{port}.log",
+                    state_db_path=state_db_path,
+                    model_index=model_index,
+                    replica_index=replica_index,
+                    replica_count=replica_count,
+                )
             )
-        )
     return specs
 
 
@@ -190,6 +239,27 @@ def build_command(
     return command
 
 
+def build_router_command(spec: InferRouterSpec) -> list[str]:
+    if not spec.routes:
+        raise ValueError("router requires at least one route")
+    command = [
+        sys.executable,
+        "-m",
+        "src.bin.run_infer_router",
+        "--host",
+        spec.host,
+        "--port",
+        str(int(spec.port)),
+        "--timeout-s",
+        str(float(spec.timeout_s)),
+        "--log-level",
+        spec.log_level,
+    ]
+    for route in spec.routes:
+        command.extend(["--route", route])
+    return command
+
+
 def launch_service(
     spec: InferServiceSpec,
     *,
@@ -224,17 +294,64 @@ def launch_service(
         )
 
 
+def launch_router(spec: InferRouterSpec, *, detach: bool) -> subprocess.Popen[bytes]:
+    command = build_router_command(spec)
+    spec.log_path.parent.mkdir(parents=True, exist_ok=True)
+    with spec.log_path.open("ab", buffering=0) as stream:
+        stream.write(f"\n$ {' '.join(command)}\n".encode("utf-8"))
+        return subprocess.Popen(
+            command,
+            stdout=stream,
+            stderr=stream,
+            start_new_session=detach,
+        )
+
+
+def build_routes_by_model(services: Sequence[RunningInferService]) -> dict[str, list[str]]:
+    routes_by_model: dict[str, list[str]] = {}
+    for service in services:
+        routes_by_model.setdefault(service.spec.model_name, []).append(service.spec.base_url)
+    return routes_by_model
+
+
+def build_router_routes(services: Sequence[RunningInferService]) -> list[str]:
+    routes_by_model = build_routes_by_model(services)
+    return [
+        f"{model_name}={base_url}"
+        for model_name, base_urls in routes_by_model.items()
+        for base_url in base_urls
+    ]
+
+
 def write_manifest(
     manifest_path: Path,
     *,
     services: Sequence[RunningInferService],
     host: str,
     api_key_set: bool,
+    router: RunningInferRouter | None = None,
 ) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    routes_by_model = build_routes_by_model(services)
+    router_routes = build_router_routes(services)
     payload = {
         "host": host,
         "api_key_set": bool(api_key_set),
+        "routes_by_model": routes_by_model,
+        "router_routes": router_routes,
+        "router": None
+        if router is None
+        else {
+            "host": router.spec.host,
+            "port": router.spec.port,
+            "base_url": router.spec.base_url,
+            "health_url": router.spec.health_url,
+            "routes": list(router.spec.routes),
+            "timeout_s": router.spec.timeout_s,
+            "log_level": router.spec.log_level,
+            "log_path": str(router.spec.log_path),
+            "pid": router.pid,
+        },
         "services": [
             {
                 "model_path": str(service.spec.model_path),
@@ -242,6 +359,8 @@ def write_manifest(
                 "gpu": service.spec.gpu,
                 "port": service.spec.port,
                 "max_batch_size": service.spec.max_batch_size,
+                "replica_index": service.spec.replica_index,
+                "replica_count": service.spec.replica_count,
                 "log_path": str(service.spec.log_path),
                 "state_db_path": None if service.spec.state_db_path is None else str(service.spec.state_db_path),
                 "base_url": service.spec.base_url,
@@ -254,25 +373,36 @@ def write_manifest(
     manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def terminate_services(services: Sequence[RunningInferService]) -> None:
-    for service in services:
+def _terminate_pids(pids: Sequence[int]) -> None:
+    for pid in pids:
         try:
-            os.kill(service.pid, signal.SIGTERM)
+            os.kill(int(pid), signal.SIGTERM)
         except ProcessLookupError:
             continue
     deadline = time.time() + 20
-    for service in services:
+    for pid in pids:
         while time.time() < deadline:
             try:
-                os.kill(service.pid, 0)
+                os.kill(int(pid), 0)
             except ProcessLookupError:
                 break
             time.sleep(0.2)
         else:
             try:
-                os.kill(service.pid, signal.SIGKILL)
+                os.kill(int(pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def terminate_services(services: Sequence[RunningInferService]) -> None:
+    _terminate_pids([service.pid for service in services])
+
+
+def terminate_running(services: Sequence[RunningInferService], router: RunningInferRouter | None = None) -> None:
+    pids = [service.pid for service in services]
+    if router is not None:
+        pids.append(router.pid)
+    _terminate_pids(pids)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -298,6 +428,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     assigned_gpus: set[str] = set()
     services: list[RunningInferService] = []
     processes: dict[int, subprocess.Popen[bytes]] = {}
+    router: RunningInferRouter | None = None
 
     try:
         while pending_paths:
@@ -312,6 +443,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log_dir=log_dir,
                 state_db_dir=state_db_dir,
                 launched_count=len(services),
+                replicas_per_model=int(args.replicas_per_model),
             )
             if not specs:
                 if not wait_for_gpus:
@@ -342,13 +474,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                 assigned_gpus.add(spec.gpu)
                 services.append(RunningInferService(spec=spec, pid=int(process.pid)))
                 processes[int(process.pid)] = process
-                pending_paths.pop(0)
-                pending_names.pop(0)
-                pending_batch_sizes.pop(0)
-                write_manifest(manifest_path, services=services, host=str(args.host), api_key_set=bool(args.api_key))
+                write_manifest(
+                    manifest_path,
+                    services=services,
+                    host=str(args.host),
+                    api_key_set=bool(args.api_key),
+                    router=router,
+                )
                 time.sleep(max(float(args.startup_stagger_s), 0.0))
+            consumed_models = 1 + max(spec.model_index for spec in specs)
+            del pending_paths[:consumed_models]
+            del pending_names[:consumed_models]
+            del pending_batch_sizes[:consumed_models]
 
-        write_manifest(manifest_path, services=services, host=str(args.host), api_key_set=bool(args.api_key))
+        if args.router_port is not None:
+            router_log_path = (
+                Path(args.router_log_path).expanduser()
+                if args.router_log_path
+                else log_dir / f"router.port{int(args.router_port)}.log"
+            )
+            router_spec = InferRouterSpec(
+                host=str(args.router_host or args.host),
+                port=int(args.router_port),
+                routes=tuple(build_router_routes(services)),
+                timeout_s=float(args.router_timeout_s),
+                log_level=str(args.router_log_level or args.log_level),
+                log_path=router_log_path,
+            )
+            print(
+                f"launch router port={router_spec.port} routes={len(router_spec.routes)} log={router_spec.log_path}",
+                flush=True,
+            )
+            router_process = launch_router(router_spec, detach=bool(args.detach))
+            router = RunningInferRouter(spec=router_spec, pid=int(router_process.pid))
+            processes[int(router_process.pid)] = router_process
+
+        write_manifest(
+            manifest_path,
+            services=services,
+            host=str(args.host),
+            api_key_set=bool(args.api_key),
+            router=router,
+        )
         print(f"manifest written: {manifest_path}", flush=True)
         if args.detach:
             return 0
@@ -358,16 +525,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rc = process.poll()
                 if rc is None:
                     continue
+                if router is not None and pid == router.pid:
+                    print(f"infer router exited: pid={pid} returncode={rc}", flush=True)
+                    processes.pop(pid)
+                    if rc != 0:
+                        terminate_services(services)
+                        return int(rc)
+                    continue
                 service = next(item for item in services if item.pid == pid)
                 print(f"infer service exited: model={service.spec.model_name} pid={pid} returncode={rc}", flush=True)
                 processes.pop(pid)
                 if rc != 0:
-                    terminate_services([item for item in services if item.pid != pid])
+                    remaining_services = [item for item in services if item.pid != pid]
+                    terminate_running(remaining_services, router)
                     return int(rc)
             time.sleep(2)
         return 0
     except KeyboardInterrupt:
-        terminate_services(services)
+        terminate_running(services, router)
         return 130
 
 
@@ -376,15 +551,22 @@ def _safe_name(value: str) -> str:
 
 
 __all__ = [
+    "InferRouterSpec",
     "InferServiceSpec",
+    "RunningInferRouter",
     "RunningInferService",
     "build_command",
+    "build_router_command",
+    "build_router_routes",
+    "build_routes_by_model",
     "launch_service",
+    "launch_router",
     "main",
     "parse_args",
     "plan_deployments",
     "resolve_max_batch_sizes",
     "resolve_model_names",
+    "terminate_running",
     "write_manifest",
 ]
 

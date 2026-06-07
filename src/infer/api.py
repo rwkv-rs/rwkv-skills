@@ -10,8 +10,10 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .engine import DEFAULT_PREFILL_CHUNK_SIZE
 from .sampling import SamplingConfig
+
+
+DEFAULT_PREFILL_CHUNK_SIZE = 16
 
 
 def current_unix_seconds() -> int:
@@ -378,6 +380,98 @@ class ChatCompletionRequest(BaseModel):
     prefill_chunk_size: int | None = Field(default=None, ge=1)
 
 
+class ContentsChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    contents: list[str] = Field(min_length=1)
+    max_tokens: int | None = Field(default=None, ge=0)
+    max_completion_tokens: int | None = Field(default=None, ge=0)
+    temperature: float | None = None
+    top_k: int | None = None
+    top_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
+    penalty_decay: float | None = None
+    alpha_presence: float | None = None
+    alpha_frequency: float | None = None
+    alpha_decay: float | None = None
+    stop: str | list[str] | None = None
+    stop_tokens: list[str | int] | None = None
+    stream: bool | None = None
+    seed: int | None = None
+    n: int | None = None
+    ban_tokens: list[int] | None = None
+    pad_zero: bool | None = None
+    no_penalty_token_ids: list[int] | None = None
+    prefill_chunk_size: int | None = Field(default=None, ge=1)
+
+    def to_completion_requests(self) -> list[CompletionRequest]:
+        max_tokens = self.max_completion_tokens
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        text_stops, token_stops = self._split_stop_values()
+        return [
+            CompletionRequest(
+                model=self.model,
+                prompt=content,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                presence_penalty=(
+                    self.alpha_presence
+                    if self.alpha_presence is not None
+                    else self.presence_penalty
+                ),
+                repetition_penalty=(
+                    self.alpha_frequency
+                    if self.alpha_frequency is not None
+                    else self.repetition_penalty
+                ),
+                frequency_penalty=self.frequency_penalty,
+                penalty_decay=(
+                    self.alpha_decay
+                    if self.alpha_decay is not None
+                    else self.penalty_decay
+                ),
+                stop=text_stops,
+                stream=False,
+                seed=self.seed,
+                stop_tokens=token_stops,
+                ban_tokens=self.ban_tokens,
+                pad_zero=self.pad_zero,
+                no_penalty_token_ids=self.no_penalty_token_ids,
+                prefill_chunk_size=self.prefill_chunk_size,
+            )
+            for content in self.contents
+        ]
+
+    def _split_stop_values(self) -> tuple[str | list[str] | None, list[int] | None]:
+        text_stops: list[str] = []
+        token_stops: list[int] = []
+        if isinstance(self.stop, str):
+            text_stops.append(self.stop)
+        elif self.stop is not None:
+            text_stops.extend(str(item) for item in self.stop if str(item))
+        for value in self.stop_tokens or []:
+            if isinstance(value, int):
+                token_stops.append(int(value))
+            else:
+                text = str(value)
+                if text:
+                    text_stops.append(text)
+        stop_payload: str | list[str] | None
+        if not text_stops:
+            stop_payload = None
+        elif len(text_stops) == 1:
+            stop_payload = text_stops[0]
+        else:
+            stop_payload = text_stops
+        return stop_payload, token_stops or None
+
+
 def chat_message_content_to_text(content: str | list[ChatMessageTextPart] | None) -> str:
     if content is None:
         return ""
@@ -492,6 +586,7 @@ __all__ = [
     "CompletionLogprobs",
     "CompletionRequest",
     "CompletionResponse",
+    "ContentsChatCompletionRequest",
     "chat_message_content_to_text",
     "completion_logprobs_to_chat_logprobs",
     "completion_finish_reason_to_chat",
