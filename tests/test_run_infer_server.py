@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.bin import run_infer_server
+from src.infer.auto_config import GpuProfile
 from src.infer.nano_vllm_backend import NanoVLLMBackendConfig
 
 
@@ -89,6 +90,88 @@ def test_build_backend_uses_nano_vllm_config(monkeypatch, tmp_path: Path) -> Non
     assert config.gpu_memory_utilization == 0.75
     assert config.tensor_parallel_size == 2
     assert config.enforce_eager is True
+
+
+def test_parse_args_applies_throughput_auto_config_for_large_visible_gpu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_infer_server,
+        "detect_visible_gpu_profile",
+        lambda: GpuProfile(name="generic-cuda-device", total_memory_mb=97887),
+    )
+
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            "/models/rwkv7-g1g-7.2b-20260523-ctx8192.pth",
+            "--model-name",
+            "rwkv7-g1g-7.2b-20260523-ctx8192",
+        ]
+    )
+
+    assert args.infer_auto_config == "throughput"
+    assert args.infer_auto_config_applied is True
+    assert "gpu_memory_mb=97887" in args.infer_auto_config_reason
+    assert "model_params_b=7.2" in args.infer_auto_config_reason
+    assert "generic-cuda-device" not in args.infer_auto_config_reason
+    assert args.max_batch_size == 1024
+    assert args.batch_collect_ms == 50
+    assert args.max_num_seqs == -1
+    assert args.max_num_batched_tokens == 32768
+    assert args.rwkv_prefill_token_budget == 8192
+    assert args.rwkv_prefill_max_batch_size == 1024
+    assert args.max_state_slots == -1
+    assert args.gpu_memory_utilization == 0.98
+
+
+def test_parse_args_keeps_explicit_values_when_auto_config_is_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        run_infer_server,
+        "detect_visible_gpu_profile",
+        lambda: GpuProfile(name="large-gpu", total_memory_mb=97887),
+    )
+
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            "/models/rwkv7-g1f-2.9b-20260420-ctx8192.pth",
+            "--max-batch-size",
+            "77",
+            "--gpu-memory-utilization",
+            "0.91",
+        ]
+    )
+
+    assert args.max_batch_size == 77
+    assert args.gpu_memory_utilization == 0.91
+    assert args.batch_collect_ms == 50
+    assert args.max_num_batched_tokens == 32768
+    assert args.rwkv_prefill_max_batch_size == 1024
+
+
+def test_parse_args_auto_config_off_uses_legacy_defaults(monkeypatch) -> None:
+    def _fail_gpu_probe() -> None:
+        raise AssertionError("GPU detection should not run when auto config is off")
+
+    monkeypatch.setattr(run_infer_server, "detect_visible_gpu_profile", _fail_gpu_probe)
+
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            "/models/rwkv-demo.pth",
+            "--infer-auto-config",
+            "off",
+        ]
+    )
+
+    assert args.infer_auto_config_applied is False
+    assert args.max_batch_size == 32
+    assert args.batch_collect_ms == 5
+    assert args.max_num_seqs == 512
+    assert args.max_num_batched_tokens == 16384
+    assert args.rwkv_prefill_token_budget == 2048
+    assert args.rwkv_prefill_max_batch_size == 128
+    assert args.max_state_slots == -1
+    assert args.gpu_memory_utilization == 0.9
 
 
 def test_main_serves_nano_vllm_backend(monkeypatch, tmp_path: Path) -> None:
