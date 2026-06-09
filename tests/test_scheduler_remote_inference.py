@@ -79,22 +79,21 @@ def test_build_command_uses_remote_backend_arguments(tmp_path: Path) -> None:
     assert "17" in command
 
 
-def test_remote_dispatch_resources_use_worker_slots(tmp_path: Path) -> None:
+def test_remote_dispatch_resources_use_model_slots(tmp_path: Path) -> None:
     opts = DispatchOptions(
         log_dir=tmp_path,
         pid_dir=tmp_path,
         run_log_dir=tmp_path,
         job_order=("free_response",),
         infer_base_url="http://127.0.0.1:8081",
-        infer_models=("remote-demo",),
-        max_concurrent_jobs=3,
+        infer_models=("remote-a", "remote-b"),
     )
     running = {
-        "job-a": RunningEntry(pid=101, gpu=None),
-        "job-b": RunningEntry(pid=102, gpu=None),
+        "code_human_eval__human_eval_test_nocot_remote_a": RunningEntry(pid=101, gpu=None),
+        "unrelated-model-job": RunningEntry(pid=102, gpu=None),
     }
 
-    assert actions._resolve_available_dispatch_resources(opts, running) == ["slot-1"]
+    assert actions._resolve_available_dispatch_resources(opts, running) == ["model:remote_b"]
 
 
 def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_path: Path) -> None:
@@ -132,7 +131,6 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
         job_order=("code_human_eval",),
         infer_base_url="http://127.0.0.1:19083/v1",
         infer_models=("remote-a", "remote-b", "remote-c"),
-        max_concurrent_jobs=3,
     )
     items = [
         _item("remote-a", "human_eval_test"),
@@ -145,7 +143,7 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
     actions._launch_queue_items(
         opts=opts,
         queue=items,
-        available_resources=("slot-1", "slot-2", "slot-3"),
+        available_resources=("model:remote_a", "model:remote_b", "model:remote_c"),
         question_counts={},
         batch_profiler=actions.BatchProfiler(tmp_path / "batch_cache.json"),
         pending_since={item.job_id: 1.0 for item in items},
@@ -159,6 +157,56 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
     assert len(list((tmp_path / "pid").glob("*.pid"))) == 3
 
 
+def test_remote_launch_continues_past_empty_model_slot(monkeypatch, tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text("[]", encoding="utf-8")
+    launched: list[str] = []
+    item = queue.QueueItem(
+        job_name="code_human_eval",
+        job_id=f"code_human_eval__human_eval_test_nocot_{actions.safe_slug('remote-c')}",
+        dataset_slug="human_eval_test",
+        model_path=None,
+        model_slug=actions.safe_slug("remote-c"),
+        model_name="remote-c",
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_model="remote-c",
+    )
+
+    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+
+    def _fake_launch_job(job_id, _command, **_kwargs):
+        launched.append(job_id)
+        return SimpleNamespace(pid=1000 + len(launched))
+
+    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+
+    opts = DispatchOptions(
+        log_dir=tmp_path / "log",
+        pid_dir=tmp_path / "pid",
+        run_log_dir=tmp_path / "run",
+        job_order=("code_human_eval",),
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_models=("remote-b", "remote-c"),
+    )
+    actions.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
+    actions._launch_queue_items(
+        opts=opts,
+        queue=[item],
+        available_resources=("model:remote_b", "model:remote_c"),
+        question_counts={},
+        batch_profiler=actions.BatchProfiler(tmp_path / "batch_cache.json"),
+        pending_since={item.job_id: 1.0},
+        launch_times={},
+        job_metadata={},
+        lease_manager=None,
+        claimed_job_ids=set(),
+    )
+
+    assert launched == [item.job_id]
+
+
 def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
     request = SchedulerStartRequest(
         only_jobs=["free_response"],
@@ -168,7 +216,6 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
         infer_timeout_s=42.0,
         infer_max_workers=7,
         infer_protocol="vllm",
-        max_concurrent_jobs=5,
     )
 
     opts = request.to_dispatch_options()
@@ -180,7 +227,6 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
     assert opts.infer_timeout_s == 42.0
     assert opts.infer_max_workers == 7
     assert opts.infer_protocol == "vllm"
-    assert opts.max_concurrent_jobs == 5
 
 
 def test_scheduler_cli_accepts_remote_inference_flags() -> None:
@@ -196,8 +242,6 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "64",
             "--infer-protocol",
             "vllm",
-            "--max-concurrent-jobs",
-            "4",
         ]
     )
 
@@ -205,7 +249,6 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_models == ["remote-demo"]
     assert args.remote_batch_size == 64
     assert args.infer_protocol == "vllm"
-    assert args.max_concurrent_jobs == 4
 
 
 def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:

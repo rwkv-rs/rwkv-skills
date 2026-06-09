@@ -93,7 +93,6 @@ class SchedulerStartRequest:
     batch_cache: str | None = None
     overwrite: bool = False
     disable_checker: bool = False
-    max_concurrent_jobs: int | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "SchedulerStartRequest":
@@ -204,7 +203,6 @@ class SchedulerStartRequest:
             clean_param_swap=self.clean_param_swap,
             batch_cache_path=batch_cache_path,
             disable_checker=self.disable_checker,
-            max_concurrent_jobs=self.max_concurrent_jobs,
         )
 
 

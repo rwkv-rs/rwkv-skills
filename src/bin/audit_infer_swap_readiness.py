@@ -83,7 +83,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--infer-max-workers", type=int)
     parser.add_argument("--remote-batch-size", type=int)
-    parser.add_argument("--max-concurrent-jobs", type=int, default=1)
     parser.add_argument("--run-mode", default="new", choices=("auto", "new", "resume", "rerun"))
     parser.add_argument("--only-jobs", nargs="+", default=list(run_infer_swap_eval.DEFAULT_JOBS))
     parser.add_argument("--only-datasets", nargs="+", default=list(run_infer_swap_eval.DEFAULT_DATASETS))

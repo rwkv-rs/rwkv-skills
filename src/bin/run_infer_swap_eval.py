@@ -92,7 +92,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--infer-max-workers", type=int, help="Override profile infer workers")
     parser.add_argument("--remote-batch-size", type=int, help="Override profile remote batch size")
-    parser.add_argument("--max-concurrent-jobs", type=int, default=1)
     parser.add_argument("--run-mode", default="new", choices=("auto", "new", "resume", "rerun"))
     parser.add_argument("--only-jobs", nargs="+", default=list(DEFAULT_JOBS))
     parser.add_argument("--only-datasets", nargs="+", default=list(DEFAULT_DATASETS))
@@ -191,8 +190,6 @@ def build_scheduler_args(args: argparse.Namespace) -> list[str]:
         str(workers),
         "--remote-batch-size",
         str(batch_size),
-        "--max-concurrent-jobs",
-        str(int(args.max_concurrent_jobs)),
         "--only-jobs",
         *[str(item) for item in args.only_jobs],
         "--only-datasets",
@@ -299,7 +296,6 @@ def _validate_launch_parameters_against_args(
         ("seed policy", params.get("infer_seed_policy"), str(dispatch_args.infer_seed_policy)),
         ("workers", _optional_int(params.get("infer_max_workers")), expected_workers),
         ("remote batch", _optional_int(params.get("remote_batch_size")), expected_batch),
-        ("max concurrent jobs", _optional_int(params.get("max_concurrent_jobs")), int(dispatch_args.max_concurrent_jobs)),
         ("run mode", params.get("run_mode"), str(dispatch_args.run_mode)),
         ("job count", _optional_int(params.get("job_count")), len(expected_jobs)),
         ("dataset count", _optional_int(params.get("dataset_count")), len(expected_datasets)),

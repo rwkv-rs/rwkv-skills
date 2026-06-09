@@ -54,7 +54,6 @@ class RemoteProbeResult:
     largest_successful_concurrency: int | None
     suggested_infer_max_workers: int | None
     suggested_remote_batch_size: int | None
-    suggested_max_concurrent_jobs: int
     target_gpu_utilization: float | None
     saturating_concurrency: int | None
     points: tuple[RemoteProbePoint, ...]
@@ -292,7 +291,6 @@ def probe_remote_inference(
         largest_successful_concurrency=largest_successful,
         suggested_infer_max_workers=selected,
         suggested_remote_batch_size=selected,
-        suggested_max_concurrent_jobs=1,
         target_gpu_utilization=target_gpu_utilization,
         saturating_concurrency=saturating,
         cold_first_request_latency_s=cold_first_request_latency_s,

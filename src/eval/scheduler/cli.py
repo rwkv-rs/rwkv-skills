@@ -294,11 +294,6 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         help="将 GPU 视为空闲的显存占用阈值 (MB)",
     )
     parser.add_argument(
-        "--max-concurrent-jobs",
-        type=int,
-        help="限制同时运行的评测 worker 数；远端推理模式下未指定时默认 1",
-    )
-    parser.add_argument(
         "--skip-missing-dataset",
         action="store_true",
         help="缺少数据集时跳过该任务",
@@ -394,11 +389,6 @@ def _dispatch_options_from_args(
         clean_param_swap=bool(args.clean_param_swap),
         batch_cache_path=batch_cache,
         disable_checker=bool(args.disable_checker),
-        max_concurrent_jobs=(
-            int(args.max_concurrent_jobs)
-            if getattr(args, "max_concurrent_jobs", None) is not None
-            else None
-        ),
     )
 
 

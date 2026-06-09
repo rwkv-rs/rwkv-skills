@@ -100,7 +100,6 @@ class DispatchOptions(QueueOptions):
     clean_param_swap: bool = False
     batch_cache_path: Path | None = None
     disable_checker: bool = False
-    max_concurrent_jobs: int | None = None
 
 
 @dataclass(slots=True)
@@ -303,19 +302,17 @@ def _resolve_available_dispatch_resources(
     opts: DispatchOptions,
     running_entries: Mapping[str, RunningEntry],
 ) -> list[str]:
-    running_count = len(running_entries)
     if _dispatch_uses_remote_inference(opts):
-        limit = opts.max_concurrent_jobs if opts.max_concurrent_jobs is not None else 1
-        available = max(0, int(limit) - running_count)
-        return [f"slot-{index + 1}" for index in range(available)]
+        occupied_model_slugs = _running_remote_model_slugs(running_entries, opts.infer_models)
+        return [
+            f"model:{model_slug}"
+            for model in opts.infer_models
+            if (model_slug := safe_slug(model)) not in occupied_model_slugs
+        ]
 
     idle_gpus = list_idle_gpus(opts.gpu_idle_max_mem)
     running_gpus = {entry.gpu for entry in running_entries.values() if entry.gpu}
-    available = [gpu for gpu in idle_gpus if gpu not in running_gpus]
-    if opts.max_concurrent_jobs is not None:
-        remaining = max(0, int(opts.max_concurrent_jobs) - running_count)
-        available = available[:remaining]
-    return available
+    return [gpu for gpu in idle_gpus if gpu not in running_gpus]
 
 
 def _running_remote_model_slugs(
@@ -332,6 +329,13 @@ def _running_remote_model_slugs(
                 occupied.add(model_slug)
                 break
     return occupied
+
+
+def _remote_resource_model_slug(resource: str) -> str | None:
+    if not resource.startswith("model:"):
+        return None
+    model_slug = resource.removeprefix("model:").strip()
+    return model_slug or None
 
 
 def _launch_target_label(item: QueueItem, resource: str) -> str:
@@ -363,11 +367,27 @@ def _launch_queue_items(
     )
 
     queue_index = 0
+    skipped_remote_job_ids: set[str] = set()
     for resource in available_resources:
         item: QueueItem | None = None
         while queue_index < len(queue):
-            candidate = queue[queue_index]
-            queue_index += 1
+            if remote_mode:
+                resource_model_slug = _remote_resource_model_slug(resource)
+                candidate = None
+                for maybe in queue:
+                    if maybe.job_id in skipped_remote_job_ids:
+                        continue
+                    candidate_model_slug = safe_slug(maybe.infer_model or maybe.model_name or maybe.model_slug)
+                    if resource_model_slug is not None and candidate_model_slug != resource_model_slug:
+                        continue
+                    candidate = maybe
+                    skipped_remote_job_ids.add(candidate.job_id)
+                    break
+                if candidate is None:
+                    break
+            else:
+                candidate = queue[queue_index]
+                queue_index += 1
             if remote_mode:
                 candidate_model_slug = safe_slug(candidate.infer_model or candidate.model_name or candidate.model_slug)
                 if candidate_model_slug in occupied_remote_models:
@@ -387,6 +407,8 @@ def _launch_queue_items(
                 continue
             item = candidate
             break
+        if item is None and remote_mode:
+            continue
         if item is None:
             break
 
@@ -794,8 +816,8 @@ def action_dispatch(
             running_count = len(running_entries)
             suffix = f"（当前运行 {running_count} 个任务）" if running_count else ""
             if _dispatch_uses_remote_inference(opts):
-                print(f"⏳ 远端推理 worker 已达到并发上限，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
-                wait_reason = "remote_slots_exhausted"
+                print(f"⏳ 远端推理模型槽已占满，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
+                wait_reason = "remote_model_slots_exhausted"
             else:
                 print(f"⏳ 未检测到空闲 GPU，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
                 wait_reason = "no_gpu"

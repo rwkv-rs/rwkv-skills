@@ -76,7 +76,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--infer-max-workers", type=int)
     parser.add_argument("--remote-batch-size", type=int)
-    parser.add_argument("--max-concurrent-jobs", type=int, default=1)
     parser.add_argument("--run-mode", default="new", choices=("auto", "new", "resume", "rerun"))
     parser.add_argument("--only-jobs", nargs="+", default=list(run_infer_swap_eval.DEFAULT_JOBS))
     parser.add_argument("--only-datasets", nargs="+", default=list(run_infer_swap_eval.DEFAULT_DATASETS))
@@ -154,8 +153,6 @@ def run_launch_bundle(args: argparse.Namespace) -> InferSwapLaunchBundle:
             str(args.infer_protocol),
             "--infer-seed-policy",
             str(args.infer_seed_policy),
-            "--max-concurrent-jobs",
-            str(int(args.max_concurrent_jobs)),
             "--run-mode",
             str(args.run_mode),
             "--only-jobs",
@@ -307,7 +304,6 @@ def build_launch_parameters(args: argparse.Namespace) -> dict[str, Any]:
         "infer_seed_policy": str(args.infer_seed_policy),
         "infer_max_workers": workers,
         "remote_batch_size": batch_size,
-        "max_concurrent_jobs": int(args.max_concurrent_jobs),
         "run_mode": str(args.run_mode),
         "only_jobs": list(only_jobs),
         "job_count": len(only_jobs),
@@ -374,8 +370,6 @@ def build_run_infer_swap_eval_argv(args: argparse.Namespace, *, action: str) -> 
         str(args.infer_protocol),
         "--infer-seed-policy",
         str(args.infer_seed_policy),
-        "--max-concurrent-jobs",
-        str(int(args.max_concurrent_jobs)),
         "--run-mode",
         str(args.run_mode),
         "--only-jobs",
