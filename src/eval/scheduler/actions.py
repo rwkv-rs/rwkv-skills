@@ -318,6 +318,22 @@ def _resolve_available_dispatch_resources(
     return available
 
 
+def _running_remote_model_slugs(
+    running_entries: Mapping[str, RunningEntry],
+    infer_models: Sequence[str],
+) -> set[str]:
+    model_slugs = {safe_slug(model) for model in infer_models if str(model).strip()}
+    if not model_slugs:
+        return set()
+    occupied: set[str] = set()
+    for job_id in running_entries:
+        for model_slug in model_slugs:
+            if job_id.endswith(f"_{model_slug}"):
+                occupied.add(model_slug)
+                break
+    return occupied
+
+
 def _launch_target_label(item: QueueItem, resource: str) -> str:
     if item.is_remote:
         return resource
@@ -340,6 +356,11 @@ def _launch_queue_items(
     remote_mode = _dispatch_uses_remote_inference(opts)
     resource_label = "Free slots" if remote_mode else "Idle GPUs"
     print(f"🧮 Pending={len(queue)} | {resource_label}={', '.join(available_resources)}")
+    occupied_remote_models = (
+        _running_remote_model_slugs(load_running(opts.pid_dir), opts.infer_models)
+        if remote_mode
+        else set()
+    )
 
     queue_index = 0
     for resource in available_resources:
@@ -347,6 +368,17 @@ def _launch_queue_items(
         while queue_index < len(queue):
             candidate = queue[queue_index]
             queue_index += 1
+            if remote_mode:
+                candidate_model_slug = safe_slug(candidate.infer_model or candidate.model_name or candidate.model_slug)
+                if candidate_model_slug in occupied_remote_models:
+                    log_job_event(
+                        "job_defer",
+                        candidate.job_id,
+                        reason="remote_model_busy",
+                        infer_model=str(candidate.infer_model or candidate.model_name or ""),
+                        worker_slot=resource,
+                    )
+                    continue
             if lease_manager is not None and not lease_manager.claim(
                 candidate.job_id,
                 lease_meta=_lease_meta_for_item(candidate),
@@ -544,6 +576,8 @@ def _launch_queue_items(
             payload["infer_model"] = str(item.infer_model or item.model_name)
             payload["worker_slot"] = resource
         log_job_event("job_launch", item.job_id, **payload)
+        if remote_mode:
+            occupied_remote_models.add(safe_slug(item.infer_model or item.model_name or item.model_slug))
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:

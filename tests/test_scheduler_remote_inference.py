@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.bin.param_search_free_response import parse_args as parse_param_search_free_response_args
 from src.bin.param_search_select import parse_args as parse_param_search_select_args
@@ -94,6 +95,68 @@ def test_remote_dispatch_resources_use_worker_slots(tmp_path: Path) -> None:
     }
 
     assert actions._resolve_available_dispatch_resources(opts, running) == ["slot-1"]
+
+
+def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text("[]", encoding="utf-8")
+    launched: list[tuple[str, str]] = []
+
+    def _item(model_name: str, dataset_slug: str) -> queue.QueueItem:
+        return queue.QueueItem(
+            job_name="code_human_eval",
+            job_id=f"code_human_eval__{dataset_slug}_nocot_{actions.safe_slug(model_name)}",
+            dataset_slug=dataset_slug,
+            model_path=None,
+            model_slug=actions.safe_slug(model_name),
+            model_name=model_name,
+            infer_base_url="http://127.0.0.1:19083/v1",
+            infer_model=model_name,
+        )
+
+    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+
+    def _fake_launch_job(job_id, _command, **_kwargs):
+        model_name = next(item.model_name for item in items if item.job_id == job_id)
+        launched.append((job_id, str(model_name)))
+        return SimpleNamespace(pid=1000 + len(launched))
+
+    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+
+    opts = DispatchOptions(
+        log_dir=tmp_path / "log",
+        pid_dir=tmp_path / "pid",
+        run_log_dir=tmp_path / "run",
+        job_order=("code_human_eval",),
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_models=("remote-a", "remote-b", "remote-c"),
+        max_concurrent_jobs=3,
+    )
+    items = [
+        _item("remote-a", "human_eval_test"),
+        _item("remote-a", "human_eval_cn_test"),
+        _item("remote-b", "human_eval_test"),
+        _item("remote-c", "human_eval_test"),
+    ]
+
+    actions.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
+    actions._launch_queue_items(
+        opts=opts,
+        queue=items,
+        available_resources=("slot-1", "slot-2", "slot-3"),
+        question_counts={},
+        batch_profiler=actions.BatchProfiler(tmp_path / "batch_cache.json"),
+        pending_since={item.job_id: 1.0 for item in items},
+        launch_times={},
+        job_metadata={},
+        lease_manager=None,
+        claimed_job_ids=set(),
+    )
+
+    assert [model for _job_id, model in launched] == ["remote-a", "remote-b", "remote-c"]
+    assert len(list((tmp_path / "pid").glob("*.pid"))) == 3
 
 
 def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
