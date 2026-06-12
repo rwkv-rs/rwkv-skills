@@ -15,7 +15,6 @@ infer_timeout_s = 900
 infer_max_workers = 4
 
 [runner]
-result_store = "json"
 benchmark_kind = "tau2_bench"
 prompt_style = "rwkv_official_json"
 tool_catalog_format = "json"

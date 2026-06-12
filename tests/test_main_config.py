@@ -29,7 +29,7 @@ path = "weights/model.pth"
 device = "cuda:1"
 
 [runner]
-result_store = "json"
+result_store = "db"
 cot_mode = "cot"
 db_write_queue = 2048
 extra_args = ["--foo", "bar"]
@@ -46,7 +46,7 @@ extra_args = ["--foo", "bar"]
     assert config.dataset.split == "test"
     assert config.model.path == "weights/model.pth"
     assert config.model.device == "cuda:1"
-    assert config.runner.result_store == "json"
+    assert config.runner.result_store == "db"
     assert config.runner.cot_mode == "cot"
     assert config.runner.db_write_queue == 2048
     assert config.runner.extra_args == ("--foo", "bar")
@@ -209,7 +209,7 @@ def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypa
             "dataset": {"name": "longcodeqa"},
             "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
             "runner": {
-                "result_store": "json",
+                "result_store": "db",
                 "long_doc_mode": "off",
                 "answer_max_tokens": 64,
                 "avg_ks": [1.0],
@@ -234,10 +234,10 @@ def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypa
     assert "longcodebench" in resolved.argv
     assert "--answer-max-tokens" in resolved.argv
     assert "64" in resolved.argv
-    assert resolved.env["RWKV_EVAL_STORE"] == "json"
+    assert "RWKV_EVAL_STORE" not in resolved.env
 
 
-def test_resolve_run_config_can_select_json_result_store(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_run_config_rejects_json_result_store(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
             "dataset": {"name": "tau3_bench_airline"},
@@ -255,9 +255,9 @@ def test_resolve_run_config_can_select_json_result_store(monkeypatch, tmp_path: 
     dataset_path.write_text("[]\n", encoding="utf-8")
     monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
 
-    resolved = main_module.resolve_run_config(config)
+    with pytest.raises(ValueError, match="DB-only"):
+        main_module.resolve_run_config(config)
 
-    assert resolved.env["RWKV_EVAL_STORE"] == "json"
     assert "RWKV_EVAL_STORE" not in main_module.resolve_run_config(
         main_module.RunConfig.from_mapping(
             {

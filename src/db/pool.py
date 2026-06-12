@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import psycopg
+from psycopg import sql
 from psycopg_pool import ConnectionPool
 
 from src.eval.scheduler.config import DBConfig, DEFAULT_DB_CONFIG
@@ -16,12 +18,12 @@ class Db:
     pool: ConnectionPool
 
 
-def _build_conninfo(config: DBConfig) -> str:
+def _build_conninfo(config: DBConfig, *, dbname: str | None = None) -> str:
     parts = [
         f"host={config.host}",
         f"port={int(config.port)}",
         f"user={config.user}",
-        f"dbname={config.dbname}",
+        f"dbname={dbname or config.dbname}",
     ]
     if config.password:
         parts.append(f"password={config.password}")
@@ -29,6 +31,20 @@ def _build_conninfo(config: DBConfig) -> str:
     if sslmode:
         parts.append(f"sslmode={sslmode}")
     return " ".join(parts)
+
+
+def _ensure_database_exists(config: DBConfig) -> None:
+    target_db = str(config.dbname or "").strip()
+    if not target_db:
+        raise ValueError("database name must not be empty")
+    maintenance_db = "template1" if target_db == "postgres" else "postgres"
+    conninfo = _build_conninfo(config, dbname=maintenance_db)
+    with psycopg.connect(conninfo, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
+            if cur.fetchone() is not None:
+                return
+            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_db)))
 
 
 def init_db_pool(
@@ -41,6 +57,7 @@ def init_db_pool(
     if _DB is not None:
         return _DB
     resolved = config or DEFAULT_DB_CONFIG
+    _ensure_database_exists(resolved)
     pool = ConnectionPool(
         conninfo=_build_conninfo(resolved),
         min_size=max(1, int(min_size)),

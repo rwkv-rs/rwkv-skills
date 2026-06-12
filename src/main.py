@@ -443,8 +443,9 @@ def resolve_run_config(config: RunConfig) -> ResolvedRun:
     )
     env = run_context.env_overrides(dataset_slug=dataset_slug)
     if config.runner.result_store:
-        env = dict(env)
-        env["RWKV_EVAL_STORE"] = config.runner.result_store
+        normalized_store = config.runner.result_store.strip().lower()
+        if normalized_store not in {"db", "postgres", "postgresql", "sql"}:
+            raise ValueError("runner.result_store is DB-only; remove it or set it to 'db'")
     with _patched_environ(env):
         dataset_path = _resolve_dataset_path(config.dataset, dataset_slug=dataset_slug)
     argv = _build_runner_argv(config, runner=runner, benchmark=benchmark, dataset_path=dataset_path)

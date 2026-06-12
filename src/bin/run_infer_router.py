@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
+from contextlib import asynccontextmanager
 import json
 from typing import Any, Mapping, Sequence
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
+import httpx
 import uvicorn
-
-from src.infer.backend import normalize_api_base
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -28,11 +27,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=19081, help="Bind port")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="Backend request timeout")
+    parser.add_argument(
+        "--forward-max-workers",
+        type=int,
+        default=256,
+        help="Max blocking HTTP forwarding threads; keep above aggregate eval-side request concurrency",
+    )
     parser.add_argument("--log-level", default="info", help="uvicorn log level")
     return parser.parse_args(argv)
 
 
 RouteMap = dict[str, tuple[str, ...]]
+
+
+def normalize_api_base(base_url: str) -> str:
+    base = str(base_url or "").strip()
+    if not base:
+        raise ValueError("infer base URL cannot be empty")
+    if "://" not in base:
+        base = f"http://{base}"
+    base = base.rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
 
 
 def parse_routes(raw_routes: Sequence[str]) -> RouteMap:
@@ -81,10 +96,36 @@ def _backend_urls_for_model(model: str, routes: RouteMap) -> tuple[str, ...]:
     return urls
 
 
-def create_app(routes: Mapping[str, str | Sequence[str]], *, timeout_s: float = 600.0) -> FastAPI:
+def create_app(
+    routes: Mapping[str, str | Sequence[str]],
+    *,
+    timeout_s: float = 600.0,
+    forward_max_workers: int = 256,
+) -> FastAPI:
     route_map = normalize_routes(routes)
     route_offsets = {model: 0 for model in route_map}
-    app = FastAPI(title="RWKV Skills Infer Router", version="0.1.0")
+    forward_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, int(forward_max_workers)),
+        thread_name_prefix="infer-router-forward",
+    )
+    forward_http_client = _build_forward_http_client(
+        max_connections=max(1, int(forward_max_workers)),
+        timeout_s=float(timeout_s),
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.forward_executor = forward_executor
+        app.state.forward_http_client = forward_http_client
+        try:
+            yield
+        finally:
+            forward_http_client.close()
+            forward_executor.shutdown(wait=False, cancel_futures=False)
+
+    app = FastAPI(title="RWKV Skills Infer Router", version="0.1.0", lifespan=lifespan)
+    app.state.forward_executor = forward_executor
+    app.state.forward_http_client = forward_http_client
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -93,6 +134,17 @@ def create_app(routes: Mapping[str, str | Sequence[str]], *, timeout_s: float = 
             "models": sorted(route_map),
             "route_counts": {model: len(urls) for model, urls in sorted(route_map.items())},
         }
+
+    @app.get("/v1/backpressure")
+    @app.get("/openai/v1/backpressure")
+    async def backpressure(request: Request) -> dict[str, object]:
+        return await _collect_backpressure(
+            route_map,
+            forward_executor=request.app.state.forward_executor,
+            http_client=request.app.state.forward_http_client,
+            authorization=request.headers.get("authorization"),
+            timeout_s=min(float(timeout_s), 5.0),
+        )
 
     @app.get("/v1/models")
     @app.get("/openai/v1/models")
@@ -150,6 +202,8 @@ async def _forward_json_request(
                 payload,
                 urls=urls,
                 route_offsets=route_offsets,
+                forward_executor=request.app.state.forward_executor,
+                http_client=request.app.state.forward_http_client,
                 authorization=request.headers.get("authorization"),
                 content_type=request.headers.get("content-type") or "application/json",
                 timeout_s=timeout_s,
@@ -158,13 +212,16 @@ async def _forward_json_request(
     target_url = f"{base_url}/{backend_path}"
     authorization = request.headers.get("authorization")
     content_type = request.headers.get("content-type") or "application/json"
-    return await asyncio.to_thread(
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        request.app.state.forward_executor,
         _post_bytes,
         target_url,
         body,
         authorization,
         content_type,
         timeout_s,
+        request.app.state.forward_http_client,
     )
 
 
@@ -173,6 +230,8 @@ async def _forward_contents_batch_request(
     *,
     urls: Sequence[str],
     route_offsets: dict[str, int],
+    forward_executor: concurrent.futures.Executor,
+    http_client: httpx.Client,
     authorization: str | None,
     content_type: str,
     timeout_s: float,
@@ -180,15 +239,18 @@ async def _forward_contents_batch_request(
     model = str(payload.get("model") or "").strip()
     subrequests = _split_contents_payload(payload, urls=urls, start_offset=route_offsets.get(model, 0))
     route_offsets[model] = route_offsets.get(model, 0) + len(subrequests)
+    loop = asyncio.get_running_loop()
     results = await asyncio.gather(
         *(
-            asyncio.to_thread(
+            loop.run_in_executor(
+                forward_executor,
                 _post_raw,
                 f"{base_url}/chat/completions",
                 json.dumps(subpayload, ensure_ascii=False).encode("utf-8"),
                 authorization,
                 content_type,
                 timeout_s,
+                http_client,
             )
             for base_url, _indices, subpayload in subrequests
         )
@@ -271,12 +333,162 @@ def _merge_contents_batch_responses(
     return template
 
 
+async def _collect_backpressure(
+    routes: RouteMap,
+    *,
+    forward_executor: concurrent.futures.Executor,
+    http_client: httpx.Client,
+    authorization: str | None,
+    timeout_s: float,
+) -> dict[str, object]:
+    loop = asyncio.get_running_loop()
+    pending: list[tuple[str, str, asyncio.Future[tuple[int, object]]]] = []
+    for model, urls in sorted(routes.items()):
+        for base_url in urls:
+            future = loop.run_in_executor(
+                forward_executor,
+                _get_json,
+                f"{base_url}/batch-metrics",
+                authorization,
+                timeout_s,
+                http_client,
+            )
+            pending.append((model, base_url, future))
+    results: dict[str, list[tuple[str, int, object]]] = {model: [] for model in routes}
+    for model, base_url, future in pending:
+        status_code, payload = await future
+        results.setdefault(model, []).append((base_url, status_code, payload))
+    return _build_backpressure_payload(routes, results)
+
+
+def _build_backpressure_payload(
+    routes: RouteMap,
+    backend_results: Mapping[str, Sequence[tuple[str, int, object]]],
+) -> dict[str, object]:
+    models: dict[str, object] = {}
+    for model, urls in sorted(routes.items()):
+        backend_entries = [
+            _backend_backpressure_entry(base_url, status_code, payload)
+            for base_url, status_code, payload in backend_results.get(model, ())
+        ]
+        known_urls = {str(entry.get("base_url")) for entry in backend_entries if isinstance(entry, dict)}
+        for base_url in urls:
+            if base_url not in known_urls:
+                backend_entries.append(
+                    {
+                        "base_url": base_url,
+                        "status": "error",
+                        "error": "missing backend metrics result",
+                    }
+                )
+        aggregate = _aggregate_backpressure(backend_entries)
+        models[model] = {
+            "model": model,
+            "status": aggregate["status"],
+            "route_count": len(urls),
+            "aggregate": aggregate,
+            "backends": backend_entries,
+        }
+    overall_status = "ok"
+    if any(isinstance(entry, dict) and entry.get("status") != "ok" for entry in models.values()):
+        overall_status = "degraded"
+    return {"status": overall_status, "models": models}
+
+
+def _backend_backpressure_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        return {
+            "base_url": base_url,
+            "status": "error",
+            "http_status": int(status_code),
+            "error": str(payload),
+        }
+    pending = payload.get("pending") if isinstance(payload.get("pending"), dict) else {}
+    totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+    status = "ok" if int(status_code) and int(status_code) < 400 else "error"
+    entry: dict[str, object] = {
+        "base_url": base_url,
+        "status": status,
+        "http_status": int(status_code),
+        "model_name": payload.get("model_name"),
+        "max_batch_size": _optional_int(payload.get("max_batch_size")),
+        "batch_collect_ms": _optional_int(payload.get("batch_collect_ms")),
+        "pending_queue": _int_or_zero(pending.get("pending_queue")),
+        "total_batches": _int_or_zero(totals.get("total_batches")),
+        "total_requests": _int_or_zero(totals.get("total_requests")),
+        "failed_batches": _int_or_zero(totals.get("failed_batches")),
+        "last_total_tok_s": _optional_float(totals.get("last_total_tok_s")),
+        "last_output_tok_s": _optional_float(totals.get("last_output_tok_s")),
+        "avg_batch_size": _optional_float(totals.get("avg_batch_size")),
+    }
+    if status != "ok":
+        entry["error"] = payload.get("error") or payload.get("detail") or "backend metrics request failed"
+    return entry
+
+
+def _aggregate_backpressure(backends: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    ok_backends = [entry for entry in backends if entry.get("status") == "ok"]
+    route_count = len(backends)
+    ok_count = len(ok_backends)
+    if ok_count == route_count:
+        status = "ok"
+    elif ok_count > 0:
+        status = "degraded"
+    else:
+        status = "error"
+    max_batch_values = [
+        int(value)
+        for entry in ok_backends
+        if (value := _optional_int(entry.get("max_batch_size"))) is not None
+    ]
+    last_total_tok_s_values = [
+        float(value)
+        for entry in ok_backends
+        if (value := _optional_float(entry.get("last_total_tok_s"))) is not None
+    ]
+    return {
+        "status": status,
+        "route_count": route_count,
+        "ok_route_count": ok_count,
+        "pending_queue": sum(_int_or_zero(entry.get("pending_queue")) for entry in ok_backends),
+        "max_batch_size": sum(max_batch_values) if max_batch_values else None,
+        "failed_batches": sum(_int_or_zero(entry.get("failed_batches")) for entry in ok_backends),
+        "total_batches": sum(_int_or_zero(entry.get("total_batches")) for entry in ok_backends),
+        "total_requests": sum(_int_or_zero(entry.get("total_requests")) for entry in ok_backends),
+        "last_total_tok_s": sum(last_total_tok_s_values) if last_total_tok_s_values else None,
+    }
+
+
+def _get_json(
+    url: str,
+    authorization: str | None,
+    timeout_s: float,
+    http_client: httpx.Client,
+) -> tuple[int, object]:
+    headers = {"Accept": "application/json"}
+    if authorization:
+        headers["Authorization"] = authorization
+    try:
+        response = http_client.get(url, headers=headers, timeout=max(float(timeout_s), 0.1))
+        return int(response.status_code), _decode_json_or_text(response.content)
+    except httpx.RequestError as exc:
+        return 0, {"error": str(exc)}
+
+
+def _decode_json_or_text(raw: bytes) -> object:
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw.decode("utf-8", errors="replace")
+
+
 def _post_raw(
     url: str,
     body: bytes,
     authorization: str | None,
     content_type: str,
     timeout_s: float,
+    http_client: httpx.Client,
 ) -> tuple[int, bytes, str]:
     headers = {
         "Content-Type": content_type,
@@ -284,18 +496,16 @@ def _post_raw(
     }
     if authorization:
         headers["Authorization"] = authorization
-    req = urllib_request.Request(url, data=body, method="POST", headers=headers)
     try:
-        with urllib_request.urlopen(req, timeout=max(float(timeout_s), 1.0)) as resp:
-            raw = resp.read()
-            media_type = resp.headers.get_content_type() or "application/json"
-            return int(resp.status), raw, media_type
-    except urllib_error.HTTPError as exc:
-        raw = exc.read()
-        media_type = exc.headers.get_content_type() if exc.headers else "application/json"
-        return int(exc.code), raw, media_type
-    except urllib_error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"backend request failed: {exc.reason}") from exc
+        response = http_client.post(
+            url,
+            content=body,
+            headers=headers,
+            timeout=max(float(timeout_s), 1.0),
+        )
+        return int(response.status_code), response.content, _response_media_type(response)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"backend request failed: {exc}") from exc
 
 
 def _post_bytes(
@@ -304,15 +514,63 @@ def _post_bytes(
     authorization: str | None,
     content_type: str,
     timeout_s: float,
+    http_client: httpx.Client,
 ) -> Response:
-    status_code, raw, media_type = _post_raw(url, body, authorization, content_type, timeout_s)
+    status_code, raw, media_type = _post_raw(url, body, authorization, content_type, timeout_s, http_client)
     return Response(content=raw, status_code=status_code, media_type=media_type)
+
+
+def _build_forward_http_client(*, max_connections: int, timeout_s: float) -> httpx.Client:
+    timeout = max(float(timeout_s), 1.0)
+    connections = max(1, int(max_connections))
+    return httpx.Client(
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=connections,
+            max_keepalive_connections=connections,
+            keepalive_expiry=60.0,
+        ),
+        timeout=httpx.Timeout(timeout),
+    )
+
+
+def _response_media_type(response: httpx.Response) -> str:
+    content_type = str(response.headers.get("content-type") or "application/json")
+    media_type = content_type.split(";", 1)[0].strip()
+    return media_type or "application/json"
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_zero(value: object) -> int:
+    parsed = _optional_int(value)
+    return 0 if parsed is None else parsed
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     routes = parse_routes(args.route)
-    app = create_app(routes, timeout_s=float(args.timeout_s))
+    app = create_app(
+        routes,
+        timeout_s=float(args.timeout_s),
+        forward_max_workers=int(args.forward_max_workers),
+    )
     uvicorn.run(
         app,
         host=str(args.host),
