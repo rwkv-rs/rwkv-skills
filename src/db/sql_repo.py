@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
@@ -515,6 +515,57 @@ class SqlEvalDbRepository:
             raise RuntimeError("failed to upsert completion")
         return int(row[0])
 
+    def insert_completions_batch(
+        self,
+        *,
+        task_id: int,
+        rows: Sequence[tuple[dict[str, Any], dict[str, Any] | None]],
+        created_at: datetime,
+        status: str,
+    ) -> int:
+        if not rows:
+            return 0
+        params = []
+        for payload, context in rows:
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+            repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+            pass_index = strict_nonneg_int(payload.get("pass_index", 0), "pass_index")
+            params.append(
+                (
+                    int(task_id),
+                    _jsonb_param(context or {}),
+                    int(sample_index),
+                    int(repeat_index),
+                    int(pass_index),
+                    created_at,
+                    _canonical_completion_status(status),
+                )
+            )
+        with self._connection() as conn:
+            with conn.pipeline():
+                with conn.cursor() as cur:
+                    for row_params in params:
+                        cur.execute(
+                            """
+                            INSERT INTO completions (
+                                task_id,
+                                context,
+                                sample_index,
+                                avg_repeat_index,
+                                pass_index,
+                                created_at,
+                                status
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (task_id, sample_index, avg_repeat_index, pass_index) DO UPDATE
+                            SET context = EXCLUDED.context,
+                                created_at = EXCLUDED.created_at,
+                                status = EXCLUDED.status
+                            """,
+                            row_params,
+                        )
+        return len(params)
+
     def insert_eval(
         self,
         *,
@@ -522,35 +573,48 @@ class SqlEvalDbRepository:
         payload: dict[str, Any],
         created_at: datetime,
     ) -> None:
+        self.insert_eval_batch(rows=((int(completions_id), payload),), created_at=created_at)
+
+    def insert_eval_batch(
+        self,
+        *,
+        rows: Sequence[tuple[int, dict[str, Any]]],
+        created_at: datetime,
+    ) -> int:
+        if not rows:
+            return 0
         with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO eval (
-                        completions_id,
-                        answer,
-                        ref_answer,
-                        is_passed,
-                        fail_reason,
-                        created_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (completions_id) DO UPDATE
-                    SET answer = EXCLUDED.answer,
-                        ref_answer = EXCLUDED.ref_answer,
-                        is_passed = EXCLUDED.is_passed,
-                        fail_reason = EXCLUDED.fail_reason,
-                        created_at = EXCLUDED.created_at
-                    """,
-                    (
-                        int(completions_id),
-                        str(payload.get("answer") or ""),
-                        str(payload.get("ref_answer") or ""),
-                        bool(payload.get("is_passed", False)),
-                        str(payload.get("fail_reason") or ""),
-                        created_at,
-                    ),
-                )
+            with conn.pipeline():
+                with conn.cursor() as cur:
+                    for completions_id, payload in rows:
+                        cur.execute(
+                            """
+                            INSERT INTO eval (
+                                completions_id,
+                                answer,
+                                ref_answer,
+                                is_passed,
+                                fail_reason,
+                                created_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (completions_id) DO UPDATE
+                            SET answer = EXCLUDED.answer,
+                                ref_answer = EXCLUDED.ref_answer,
+                                is_passed = EXCLUDED.is_passed,
+                                fail_reason = EXCLUDED.fail_reason,
+                                created_at = EXCLUDED.created_at
+                            """,
+                            (
+                                int(completions_id),
+                                str(payload.get("answer") or ""),
+                                str(payload.get("ref_answer") or ""),
+                                bool(payload.get("is_passed", False)),
+                                str(payload.get("fail_reason") or ""),
+                                created_at,
+                            ),
+                        )
+        return len(rows)
 
     def insert_score(self, *, task_id: int, payload: dict[str, Any]) -> None:
         created_at = payload.get("created_at")
@@ -603,47 +667,60 @@ class SqlEvalDbRepository:
         payload: dict[str, Any],
         created_at: datetime,
     ) -> None:
+        self.insert_checker_batch(rows=((int(completions_id), payload),), created_at=created_at)
+
+    def insert_checker_batch(
+        self,
+        *,
+        rows: Sequence[tuple[int, dict[str, Any]]],
+        created_at: datetime,
+    ) -> int:
+        if not rows:
+            return 0
         with self._connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO checker (
-                        completions_id,
-                        answer_correct,
-                        instruction_following_error,
-                        world_knowledge_error,
-                        math_error,
-                        reasoning_logic_error,
-                        thought_contains_correct_answer,
-                        needs_human_review,
-                        reason,
-                        created_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (completions_id) DO UPDATE
-                    SET answer_correct = EXCLUDED.answer_correct,
-                        instruction_following_error = EXCLUDED.instruction_following_error,
-                        world_knowledge_error = EXCLUDED.world_knowledge_error,
-                        math_error = EXCLUDED.math_error,
-                        reasoning_logic_error = EXCLUDED.reasoning_logic_error,
-                        thought_contains_correct_answer = EXCLUDED.thought_contains_correct_answer,
-                        needs_human_review = EXCLUDED.needs_human_review,
-                        reason = EXCLUDED.reason,
-                        created_at = EXCLUDED.created_at
-                    """,
-                    (
-                        int(completions_id),
-                        bool(payload.get("answer_correct", False)),
-                        bool(payload.get("instruction_following_error", False)),
-                        bool(payload.get("world_knowledge_error", False)),
-                        bool(payload.get("math_error", False)),
-                        bool(payload.get("reasoning_logic_error", False)),
-                        bool(payload.get("thought_contains_correct_answer", False)),
-                        bool(payload.get("needs_human_review", False)),
-                        str(payload.get("reason") or ""),
-                        created_at,
-                    ),
-                )
+            with conn.pipeline():
+                with conn.cursor() as cur:
+                    for completions_id, payload in rows:
+                        cur.execute(
+                            """
+                            INSERT INTO checker (
+                                completions_id,
+                                answer_correct,
+                                instruction_following_error,
+                                world_knowledge_error,
+                                math_error,
+                                reasoning_logic_error,
+                                thought_contains_correct_answer,
+                                needs_human_review,
+                                reason,
+                                created_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (completions_id) DO UPDATE
+                            SET answer_correct = EXCLUDED.answer_correct,
+                                instruction_following_error = EXCLUDED.instruction_following_error,
+                                world_knowledge_error = EXCLUDED.world_knowledge_error,
+                                math_error = EXCLUDED.math_error,
+                                reasoning_logic_error = EXCLUDED.reasoning_logic_error,
+                                thought_contains_correct_answer = EXCLUDED.thought_contains_correct_answer,
+                                needs_human_review = EXCLUDED.needs_human_review,
+                                reason = EXCLUDED.reason,
+                                created_at = EXCLUDED.created_at
+                            """,
+                            (
+                                int(completions_id),
+                                bool(payload.get("answer_correct", False)),
+                                bool(payload.get("instruction_following_error", False)),
+                                bool(payload.get("world_knowledge_error", False)),
+                                bool(payload.get("math_error", False)),
+                                bool(payload.get("reasoning_logic_error", False)),
+                                bool(payload.get("thought_contains_correct_answer", False)),
+                                bool(payload.get("needs_human_review", False)),
+                                str(payload.get("reason") or ""),
+                                created_at,
+                            ),
+                        )
+        return len(rows)
 
     def fetch_latest_scores(self) -> list[dict[str, Any]]:
         with self._connection() as conn:

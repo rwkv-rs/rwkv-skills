@@ -41,6 +41,7 @@ def _positive_int_env(name: str, default: int) -> int:
 # each SQL statement bounded and prevents psycopg buffer allocation failures.
 _EVAL_INSERT_FLUSH_ROWS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_ROWS", 32)
 _EVAL_INSERT_FLUSH_CHARS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_CHARS", 2_000_000)
+_CHECKER_INSERT_FLUSH_ROWS = _positive_int_env("RWKV_CHECKER_INSERT_FLUSH_ROWS", 64)
 
 
 def _get_cached_git_sha() -> str:
@@ -483,20 +484,20 @@ class EvalDbService:
             return 0
         task_id_int = int(task_id)
         now = self._now_cn()
-        inserted = 0
+        rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for payload in payloads:
             if not self._should_persist_completion_payload(payload):
                 continue
             context = self._build_completion_context(payload)
-            self._repo.insert_completion(
-                task_id=task_id_int,
-                payload=payload,
-                context=context,
-                created_at=now,
-                status="Completed",
-            )
-            inserted += 1
-        return inserted
+            rows.append((payload, context))
+        if not rows:
+            return 0
+        return self._repo.insert_completions_batch(
+            task_id=task_id_int,
+            rows=rows,
+            created_at=now,
+            status="Completed",
+        )
 
     def ingest_eval_payloads(
         self,
@@ -558,19 +559,10 @@ class EvalDbService:
     ) -> int:
         if not rows:
             return 0
-        known_ids = self._repo.fetch_existing_eval_completion_ids(task_id=task_id)
-        inserted = 0
-        for completions_id, payload in rows:
-            if completions_id in known_ids:
-                continue
-            self._repo.insert_eval(
-                completions_id=completions_id,
-                payload=payload,
-                created_at=created_at,
-            )
-            known_ids.add(completions_id)
-            inserted += 1
-        return inserted
+        return self._repo.insert_eval_batch(
+            rows=rows,
+            created_at=created_at,
+        )
 
     def ingest_eval_payload_groups(
         self,
@@ -670,6 +662,7 @@ class EvalDbService:
             task_id=task_id_int,
         )
         inserted = 0
+        pending_rows: list[tuple[int, dict[str, Any]]] = []
         for payload in payloads:
             sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
             repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
@@ -679,13 +672,19 @@ class EvalDbService:
                 continue
             checker_payload = dict(payload)
             checker_payload["needs_human_review"] = self._checker_needs_human_review(payload)
-            self._repo.insert_checker(
-                completions_id=completions_id,
-                payload=checker_payload,
+            pending_rows.append((completions_id, checker_payload))
+            existing_checker_ids.add(completions_id)
+            if len(pending_rows) >= _CHECKER_INSERT_FLUSH_ROWS:
+                inserted += self._repo.insert_checker_batch(
+                    rows=pending_rows,
+                    created_at=created_at,
+                )
+                pending_rows = []
+        if pending_rows:
+            inserted += self._repo.insert_checker_batch(
+                rows=pending_rows,
                 created_at=created_at,
             )
-            existing_checker_ids.add(completions_id)
-            inserted += 1
         return inserted
 
     def list_latest_scores(self) -> list[dict[str, Any]]:

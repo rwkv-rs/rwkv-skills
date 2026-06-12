@@ -21,6 +21,43 @@ def test_eval_ingest_dedupes_by_completion() -> None:
     assert repo.inserted == [10]
 
 
+def test_completion_ingest_uses_batch_repo_method() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+
+    inserted = service.insert_completion_payloads_batch(
+        task_id="123",
+        payloads=[
+            _completion_payload(),
+            {**_completion_payload(), "sample_index": 1},
+            {**_completion_payload(), "_stage": "draft", "sample_index": 2},
+        ],
+    )
+
+    assert inserted == 2
+    assert len(repo.completion_batches) == 1
+    assert [row[0]["sample_index"] for row in repo.completion_batches[0]] == [0, 1]
+
+
+def test_checker_ingest_uses_batch_repo_method() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+
+    inserted = service.ingest_checker_payloads(
+        task_id="123",
+        payloads=[
+            _checker_payload(0),
+            _checker_payload(1),
+            _checker_payload(2),
+        ],
+    )
+
+    assert inserted == 2
+    assert repo.checker_batches == [[10, 11]]
+
+
 def test_eval_strategy_groups_use_separate_tasks(monkeypatch) -> None:
     service = object.__new__(EvalDbService)
     service.calls = []  # type: ignore[attr-defined]
@@ -99,22 +136,62 @@ def _completion_payload() -> dict:
     }
 
 
+def _checker_payload(sample_index: int) -> dict:
+    return {
+        "sample_index": sample_index,
+        "repeat_index": 0,
+        "pass_index": 0,
+        "answer_correct": sample_index == 0,
+        "instruction_following_error": False,
+        "world_knowledge_error": False,
+        "math_error": False,
+        "reasoning_logic_error": False,
+        "thought_contains_correct_answer": False,
+        "reason": "",
+    }
+
+
 class _FakeRepo:
     def __init__(self) -> None:
         self.known: set[int] = set()
         self.inserted: list[int] = []
+        self.completion_batches: list[list[tuple[dict, dict]]] = []
+        self.checker_batches: list[list[int]] = []
 
     def fetch_completion_id_map(self, *, task_id: int, status: str | None = None):
         assert task_id == 123
         assert status == "Completed"
-        return {(0, 0, 0): 10}
+        return {(0, 0, 0): 10, (1, 0, 0): 11}
 
     def fetch_existing_eval_completion_ids(self, *, task_id: int):
         assert task_id == 123
         return set(self.known)
+
+    def fetch_existing_checker_completion_ids(self, *, task_id: int):
+        assert task_id == 123
+        return set()
+
+    def insert_completions_batch(self, *, task_id: int, rows: list[tuple[dict, dict]], created_at, status: str):
+        assert task_id == 123
+        assert status == "Completed"
+        _ = created_at
+        self.completion_batches.append(list(rows))
+        return len(rows)
 
     def insert_eval(self, *, completions_id: int, payload: dict, created_at):
         _ = created_at
         _ = payload
         self.known.add(completions_id)
         self.inserted.append(completions_id)
+
+    def insert_eval_batch(self, *, rows: list[tuple[int, dict]], created_at):
+        _ = created_at
+        for completions_id, _payload in rows:
+            self.known.add(completions_id)
+            self.inserted.append(completions_id)
+        return len(rows)
+
+    def insert_checker_batch(self, *, rows: list[tuple[int, dict]], created_at):
+        _ = created_at
+        self.checker_batches.append([completions_id for completions_id, _payload in rows])
+        return len(rows)
