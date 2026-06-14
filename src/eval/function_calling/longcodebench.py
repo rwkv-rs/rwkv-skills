@@ -29,6 +29,12 @@ from src.eval.function_calling.runner_common import (
     _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
+from src.eval.function_calling.final_answer import (
+    build_final_answer_json_call_prompt,
+    parse_final_answer_call,
+    render_final_answer_call,
+)
+from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
 from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_long_text, normalize_newlines
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
@@ -49,8 +55,8 @@ _ANSWER_PREFIX_RE = re.compile(
 _CHOICE_LINE_RE = re.compile(r"^\s*([A-Z])\)", re.MULTILINE)
 _FENCED_BLOCK_RE = re.compile(r"^\s*```(?:json|text)?\s*(.*?)\s*```\s*$", re.IGNORECASE | re.DOTALL)
 _INLINE_BOLD_CHOICE_RE = re.compile(r"\*\*\s*\(?([A-Z])\)?\s*[\).:]", re.IGNORECASE)
-_LONGCODEQA_ANSWER_CONTRACT_RE = re.compile(r"(?:^|\n)\s*(?:final\s+answer|answer)\s*:\s*$", re.IGNORECASE)
-_LONGCODEQA_ANSWER_SUFFIX = "\n\nReturn exactly one option letter only. Do not include explanation.\nAnswer:"
+_LONGCODEQA_FINAL_ANSWER_DESCRIPTION = "Exactly one option letter from the allowed choices."
+_LONGCODEQA_PROMPT_HISTORY_SLACK = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,7 +138,7 @@ def build_longcodeqa_prompt(
     repo_text: str | None = None,
 ) -> tuple[str, bool]:
     if repo_text is None:
-        return normalize_newlines(record.prompt), False
+        return _ensure_longcodeqa_answer_contract(record.prompt), False
     source_prompt = normalize_newlines(record.prompt)
     source_repo = normalize_newlines(record.repo_text)
     replacement = normalize_newlines(repo_text)
@@ -158,6 +164,7 @@ def build_longcodeqa_budgeted_prompt(
     original_prompt = normalize_newlines(record.prompt)
     repo_text = normalize_newlines(record.repo_text)
     if not long_doc_config.enabled:
+        prompt = _ensure_longcodeqa_answer_contract(original_prompt)
         trace = {
             "mode": "off",
             "enabled": False,
@@ -167,10 +174,11 @@ def build_longcodeqa_budgeted_prompt(
             "compacted": False,
             "chunk_count": 0,
             "selected_chunk_ids": [],
-            "prompt_chars": len(original_prompt),
+            "prompt_chars": len(prompt),
             "replacement_found": bool(repo_text and repo_text in original_prompt),
+            "output_format": "rwkv_final_answer_json_call",
         }
-        return original_prompt, trace
+        return prompt, trace
 
     compaction = compact_long_text(
         repo_text,
@@ -206,6 +214,7 @@ def build_longcodeqa_budgeted_prompt(
         "selected_chunk_ids": list(compaction.selected_chunk_ids),
         "prompt_chars": len(prompt),
         "replacement_found": replacement_found,
+        "output_format": "rwkv_final_answer_json_call",
     }
     if compaction.router_error:
         trace["router_error"] = compaction.router_error
@@ -252,9 +261,15 @@ def normalize_longcodeqa_answer(text: str, *, allowed_letters: Sequence[str] = (
 
 def _ensure_longcodeqa_answer_contract(prompt: str) -> str:
     normalized = normalize_newlines(prompt).rstrip()
-    if _LONGCODEQA_ANSWER_CONTRACT_RE.search(normalized):
-        return normalized
-    return f"{normalized}{_LONGCODEQA_ANSWER_SUFFIX}"
+    return build_final_answer_json_call_prompt(
+        normalized,
+        answer_description=_LONGCODEQA_FINAL_ANSWER_DESCRIPTION,
+        history_max_chars=len(normalized) + _LONGCODEQA_PROMPT_HISTORY_SLACK,
+        extra_system_lines=(
+            "The answer field must contain exactly one option letter.",
+            "Do not put explanations, code, or choice text in arguments.answer.",
+        ),
+    )
 
 
 def _clean_longcodeqa_answer_text(text: str) -> str:
@@ -451,7 +466,13 @@ def _run_longcodebench(
             )[0]
             for _, record in repeated
         ]
-        run.engine.generate(prompts, sampling=sampling, batch_size=len(prompts), progress_desc="LongCodeBench-Probe")
+        run.engine.generate(
+            prompts,
+            sampling=sampling,
+            batch_size=len(prompts),
+            progress_desc="LongCodeBench-Probe",
+            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
+        )
         print(f"probe-only run completed: {len(prompts)} prompt(s)")
         return 0
 
@@ -509,6 +530,7 @@ def _run_longcodebench(
                         sampling=sampling,
                         batch_size=len(prompts),
                         progress_desc="LongCodeBench",
+                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
                         prompt_seeds=[
                             sample_repeat_seed(
                                 key.sample_index,
@@ -524,8 +546,22 @@ def _run_longcodebench(
                         output = outputs_by_index[index]
                         prompt, trace = prompt_rows[index]
                         allowed_letters = _choice_letters(record.question)
+                        parse_error = ""
+                        parsed_call: dict[str, Any] = {}
+                        parsed_call_id = ""
+                        parsed_answer = ""
+                        try:
+                            final_call = parse_final_answer_call(
+                                output.text,
+                                context_label="longcodeqa final answer",
+                            )
+                            parsed_answer = final_call.answer
+                            parsed_call = dict(final_call.call)
+                            parsed_call_id = final_call.call_id
+                        except Exception as exc:  # noqa: BLE001
+                            parse_error = str(exc)
                         score = score_longcodeqa_answer(
-                            output.text,
+                            parsed_answer,
                             record.correct_letter,
                             allowed_letters=allowed_letters,
                         )
@@ -549,8 +585,11 @@ def _run_longcodebench(
                             "num_turns": 1,
                             "cost": 0.0,
                             "is_passed": score.exact_match,
-                            "error": None,
+                            "error": parse_error or None,
                         }
+                        sandbox_return = (
+                            render_final_answer_call(score.prediction, call_id=parsed_call_id) if score.prediction else ""
+                        )
                         payload["agent_info"] = {
                             "dataset": LONGCODEQA_DATASET,
                             "task_id": record.task_id,
@@ -562,16 +601,27 @@ def _run_longcodebench(
                             "correct_letter": score.correct_letter,
                             "exact_match": score.exact_match,
                             "allowed_letters": list(allowed_letters),
+                            "final_answer_call": sandbox_return,
+                            "decoded_final_answer_call": parsed_call,
+                            "parse_error": parse_error,
                             "prompt_goal": record.prompt_goal,
                             "is_hard_label": record.is_hard_label,
                             "long_doc": trace,
                         }
-                        payload["agent_trace"] = [{"stage": "answer", "text": score.prediction}]
+                        payload["agent_trace"] = [
+                            {
+                                "stage": "answer",
+                                "text": score.prediction,
+                                "raw_completion": output.text,
+                                "sandbox_return": sandbox_return,
+                                "parse_error": parse_error,
+                            }
+                        ]
                         payload["task_id"] = record.task_id
                         payload["domain"] = "long_code"
                         payload["instruction"] = record.question
                         writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -595,7 +645,7 @@ def _run_longcodebench(
                 sampling_payload=sampling_payload,
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise
@@ -644,8 +694,6 @@ def _longcodebench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceC
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
-        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
-        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 

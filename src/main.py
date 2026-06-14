@@ -202,8 +202,6 @@ class RunnerSection:
     long_doc_min_chars: int | None = None
     long_doc_max_evidence_chunks: int | None = None
     long_doc_max_evidence_chars: int | None = None
-    long_doc_model_max_tokens: int | None = None
-    long_doc_model_parallel_batch_size: int | None = None
     tool_router_mode: str | None = None
     tool_router_max_tools: int | None = None
     tool_router_trigger_tool_count: int | None = None
@@ -211,8 +209,18 @@ class RunnerSection:
     tool_router_context_chars: int | None = None
     tool_router_max_tokens: int | None = None
     tool_router_description_chars: int | None = None
-    tool_router_parallel_chunk_tools: int | None = None
-    tool_router_parallel_batch_size: int | None = None
+    candidate_router_mode: str | None = None
+    candidate_router_chunk_tools: int | None = None
+    candidate_router_batch_size: int | None = None
+    candidate_router_context_chars: int | None = None
+    candidate_router_prompt_max_chars: int | None = None
+    candidate_router_candidate_max_tokens: int | None = None
+    candidate_router_aggregate_max_tokens: int | None = None
+    candidate_router_max_candidates: int | None = None
+    candidate_router_tool_schema_mode: str | None = None
+    candidate_router_evidence_chars: int | None = None
+    candidate_router_policy_chars: int | None = None
+    disable_candidate_router_grounding: bool = False
     enable_think: bool = False
     stop_tokens: tuple[int, ...] = ()
     ban_tokens: tuple[int, ...] = ()
@@ -270,14 +278,6 @@ class RunnerSection:
                 payload.get("long_doc_max_evidence_chars"),
                 field_name="runner.long_doc_max_evidence_chars",
             ),
-            long_doc_model_max_tokens=_maybe_int(
-                payload.get("long_doc_model_max_tokens"),
-                field_name="runner.long_doc_model_max_tokens",
-            ),
-            long_doc_model_parallel_batch_size=_maybe_int(
-                payload.get("long_doc_model_parallel_batch_size"),
-                field_name="runner.long_doc_model_parallel_batch_size",
-            ),
             tool_router_mode=_maybe_str(payload.get("tool_router_mode")),
             tool_router_max_tools=_maybe_int(payload.get("tool_router_max_tools"), field_name="runner.tool_router_max_tools"),
             tool_router_trigger_tool_count=_maybe_int(
@@ -297,13 +297,50 @@ class RunnerSection:
                 payload.get("tool_router_description_chars"),
                 field_name="runner.tool_router_description_chars",
             ),
-            tool_router_parallel_chunk_tools=_maybe_int(
-                payload.get("tool_router_parallel_chunk_tools"),
-                field_name="runner.tool_router_parallel_chunk_tools",
+            candidate_router_mode=_maybe_str(payload.get("candidate_router_mode")),
+            candidate_router_chunk_tools=_maybe_int(
+                payload.get("candidate_router_chunk_tools"),
+                field_name="runner.candidate_router_chunk_tools",
             ),
-            tool_router_parallel_batch_size=_maybe_int(
-                payload.get("tool_router_parallel_batch_size"),
-                field_name="runner.tool_router_parallel_batch_size",
+            candidate_router_batch_size=_maybe_int(
+                payload.get("candidate_router_batch_size"),
+                field_name="runner.candidate_router_batch_size",
+            ),
+            candidate_router_context_chars=_maybe_int(
+                payload.get("candidate_router_context_chars"),
+                field_name="runner.candidate_router_context_chars",
+            ),
+            candidate_router_prompt_max_chars=_maybe_int(
+                payload.get("candidate_router_prompt_max_chars"),
+                field_name="runner.candidate_router_prompt_max_chars",
+            ),
+            candidate_router_candidate_max_tokens=_maybe_int(
+                payload.get("candidate_router_candidate_max_tokens"),
+                field_name="runner.candidate_router_candidate_max_tokens",
+            ),
+            candidate_router_aggregate_max_tokens=_maybe_int(
+                payload.get("candidate_router_aggregate_max_tokens"),
+                field_name="runner.candidate_router_aggregate_max_tokens",
+            ),
+            candidate_router_max_candidates=_maybe_int(
+                payload.get("candidate_router_max_candidates"),
+                field_name="runner.candidate_router_max_candidates",
+            ),
+            candidate_router_tool_schema_mode=_maybe_str(payload.get("candidate_router_tool_schema_mode")),
+            candidate_router_evidence_chars=_maybe_int(
+                payload.get("candidate_router_evidence_chars"),
+                field_name="runner.candidate_router_evidence_chars",
+            ),
+            candidate_router_policy_chars=_maybe_int(
+                payload.get("candidate_router_policy_chars"),
+                field_name="runner.candidate_router_policy_chars",
+            ),
+            disable_candidate_router_grounding=bool(
+                _maybe_bool(
+                    payload.get("disable_candidate_router_grounding"),
+                    field_name="runner.disable_candidate_router_grounding",
+                )
+                or False
             ),
             enable_think=bool(_maybe_bool(payload.get("enable_think"), field_name="runner.enable_think") or False),
             stop_tokens=_tuple_int(payload.get("stop_tokens"), field_name="runner.stop_tokens"),
@@ -696,8 +733,6 @@ def _build_runner_argv(
         _append_flag(argv, "--long-doc-min-chars", runner_cfg.long_doc_min_chars)
         _append_flag(argv, "--long-doc-max-evidence-chunks", runner_cfg.long_doc_max_evidence_chunks)
         _append_flag(argv, "--long-doc-max-evidence-chars", runner_cfg.long_doc_max_evidence_chars)
-        _append_flag(argv, "--long-doc-model-max-tokens", runner_cfg.long_doc_model_max_tokens)
-        _append_flag(argv, "--long-doc-model-parallel-batch-size", runner_cfg.long_doc_model_parallel_batch_size)
     elif group is RunnerGroup.INSTRUCTION_FOLLOWING:
         if runner_cfg.enable_think:
             argv.append("--enable-think")
@@ -719,8 +754,6 @@ def _build_runner_argv(
         _append_flag(argv, "--long-doc-min-chars", runner_cfg.long_doc_min_chars)
         _append_flag(argv, "--long-doc-max-evidence-chunks", runner_cfg.long_doc_max_evidence_chunks)
         _append_flag(argv, "--long-doc-max-evidence-chars", runner_cfg.long_doc_max_evidence_chars)
-        _append_flag(argv, "--long-doc-model-max-tokens", runner_cfg.long_doc_model_max_tokens)
-        _append_flag(argv, "--long-doc-model-parallel-batch-size", runner_cfg.long_doc_model_parallel_batch_size)
         _append_flag(argv, "--tool-router-mode", runner_cfg.tool_router_mode)
         _append_flag(argv, "--tool-router-max-tools", runner_cfg.tool_router_max_tools)
         _append_flag(argv, "--tool-router-trigger-tool-count", runner_cfg.tool_router_trigger_tool_count)
@@ -728,8 +761,19 @@ def _build_runner_argv(
         _append_flag(argv, "--tool-router-context-chars", runner_cfg.tool_router_context_chars)
         _append_flag(argv, "--tool-router-max-tokens", runner_cfg.tool_router_max_tokens)
         _append_flag(argv, "--tool-router-description-chars", runner_cfg.tool_router_description_chars)
-        _append_flag(argv, "--tool-router-parallel-chunk-tools", runner_cfg.tool_router_parallel_chunk_tools)
-        _append_flag(argv, "--tool-router-parallel-batch-size", runner_cfg.tool_router_parallel_batch_size)
+        _append_flag(argv, "--candidate-router-mode", runner_cfg.candidate_router_mode)
+        _append_flag(argv, "--candidate-router-chunk-tools", runner_cfg.candidate_router_chunk_tools)
+        _append_flag(argv, "--candidate-router-batch-size", runner_cfg.candidate_router_batch_size)
+        _append_flag(argv, "--candidate-router-context-chars", runner_cfg.candidate_router_context_chars)
+        _append_flag(argv, "--candidate-router-prompt-max-chars", runner_cfg.candidate_router_prompt_max_chars)
+        _append_flag(argv, "--candidate-router-candidate-max-tokens", runner_cfg.candidate_router_candidate_max_tokens)
+        _append_flag(argv, "--candidate-router-aggregate-max-tokens", runner_cfg.candidate_router_aggregate_max_tokens)
+        _append_flag(argv, "--candidate-router-max-candidates", runner_cfg.candidate_router_max_candidates)
+        _append_flag(argv, "--candidate-router-tool-schema-mode", runner_cfg.candidate_router_tool_schema_mode)
+        _append_flag(argv, "--candidate-router-evidence-chars", runner_cfg.candidate_router_evidence_chars)
+        _append_flag(argv, "--candidate-router-policy-chars", runner_cfg.candidate_router_policy_chars)
+        if runner_cfg.disable_candidate_router_grounding:
+            argv.append("--disable-candidate-router-grounding")
         _append_flag(argv, "--user-model", runner_cfg.user_model)
         _append_flag(argv, "--user-api-key", runner_cfg.user_api_key)
         _append_flag(argv, "--user-base-url", runner_cfg.user_base_url)

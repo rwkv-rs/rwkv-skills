@@ -22,8 +22,10 @@ from src.eval.agent_bench.tau_official import (
     normalize_tau_official_task_payload,
     _parse_tau_agent_decision,
     _recover_tau_agent_decision_from_text,
+    _requested_tau_reservation_id_from_user,
     _tau_litellm_model_name,
     _tau_llm_timeout_args,
+    _tau_messages_to_prompt_messages,
 )
 from src.eval.env_config import OpenAIModelConfig, normalize_openai_base_url
 from src.eval.function_calling.tau_runner import _tau_official_completion_payload
@@ -255,6 +257,23 @@ def test_tau_official_recovers_search_reservation_alias_without_hallucinated_id(
 
     assert name == "respond"
     assert "reservation ID" in arguments["content"]
+
+
+def test_tau_user_request_text_ignores_tool_response_reservation_ids() -> None:
+    requested_id = _requested_tau_reservation_id_from_user(
+        [
+            {"role": "user", "content": "I want to cancel my trip from Philadelphia to LaGuardia."},
+            {
+                "role": "user",
+                "content": (
+                    '<tool_response>\n{"requestor":"assistant","ok":true,'
+                    '"output":"{\\"reservation_id\\": \\"MZDDS4\\"}"}\n</tool_response>'
+                ),
+            },
+        ]
+    )
+
+    assert requested_id is None
 
 
 def test_tau_official_recovers_ask_user_alias() -> None:
@@ -1172,6 +1191,2039 @@ def test_tau_official_agent_repeated_user_lookup_answers_baggage_from_requested_
     assert "###STOP###" in message.content
 
 
+def test_tau_official_agent_missing_info_response_uses_user_id_from_user_text() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need the relevant reservation ID, user ID, payment method, flight number, or travel date."},
+        prompt_messages=[{"role": "user", "content": "My user ID is amelia_davis_8890."}],
+    )
+
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "amelia_davis_8890"}
+
+
+def test_tau_official_agent_route_date_scan_cancels_matching_reservation() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "I accidentally booked two flights for May 17. Please cancel the flight from ATL to JFK.",
+        },
+        {"role": "user", "content": "My user ID is mohamed_hernandez_5188."},
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"mohamed_hernandez_5188"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"mohamed_hernandez_5188\\", '
+                '\\"reservations\\": [\\"35V5SM\\", \\"XXDC1M\\"]}"}'
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"35V5SM"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"35V5SM\\", \\"origin\\": \\"LAX\\", \\"destination\\": \\"SFO\\", '
+                '\\"cabin\\": \\"business\\", \\"flights\\": [{\\"flight_number\\": \\"HAT155\\", '
+                '\\"origin\\": \\"LAX\\", \\"destination\\": \\"SFO\\", \\"date\\": \\"2024-05-24\\"}]}"}'
+            ),
+        },
+    ]
+
+    next_scan = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=messages,
+    )
+
+    assert next_scan.tool_calls[0].name == "get_reservation_details"
+    assert next_scan.tool_calls[0].arguments == {"reservation_id": "XXDC1M"}
+
+    messages.extend(
+        [
+            {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"XXDC1M"}}'},
+            {
+                "role": "user",
+                "content": (
+                    'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                    '"{\\"reservation_id\\": \\"XXDC1M\\", \\"origin\\": \\"ATL\\", \\"destination\\": \\"JFK\\", '
+                    '\\"cabin\\": \\"business\\", \\"flights\\": [{\\"flight_number\\": \\"HAT101\\", '
+                    '\\"origin\\": \\"ATL\\", \\"destination\\": \\"JFK\\", \\"date\\": \\"2024-05-17\\"}]}"}'
+                ),
+            },
+        ]
+    )
+
+    cancel = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=messages,
+    )
+
+    assert cancel.tool_calls[0].name == "cancel_reservation"
+    assert cancel.tool_calls[0].arguments == {"reservation_id": "XXDC1M"}
+
+
+def test_tau_official_agent_route_scan_batches_uninspected_reservations() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details", "get_reservation_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Please cancel my trip from Philadelphia to LaGuardia."},
+        {"role": "user", "content": "My user ID is raj_sanchez_7340."},
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"raj_sanchez_7340"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"raj_sanchez_7340\\", '
+                '\\"reservations\\": [\\"MZDDS4\\", \\"60RX9E\\", \\"S5IK51\\", \\"OUEA45\\", \\"Q69X3R\\"]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_user_details",
+        {"user_id": "raj_sanchez_7340"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is not None
+    assert [call.name for call in message.tool_calls] == ["get_reservation_details"] * 5
+    assert [call.arguments for call in message.tool_calls] == [
+        {"reservation_id": "MZDDS4"},
+        {"reservation_id": "60RX9E"},
+        {"reservation_id": "S5IK51"},
+        {"reservation_id": "OUEA45"},
+        {"reservation_id": "Q69X3R"},
+    ]
+
+
+def test_tau_official_agent_respond_after_batched_scan_uses_matching_reservation() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_reservation_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Please cancel my trip from Philadelphia to LaGuardia."},
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"raj_sanchez_7340"}}'},
+        {
+            "role": "user",
+            "content": (
+                '<tool_response>\n{"requestor":"assistant","ok":true,"output":'
+                '{"user_id":"raj_sanchez_7340","membership":"silver",'
+                '"reservations":["MZDDS4","Q69X3R"]}}\n</tool_response>'
+            ),
+        },
+        {
+            "role": "agent",
+            "content": (
+                '<tool_call>\n{"name":"get_reservation_details","arguments":{"reservation_id":"MZDDS4"}}\n</tool_call>\n'
+                '<tool_call>\n{"name":"get_reservation_details","arguments":{"reservation_id":"Q69X3R"}}\n</tool_call>'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                '<tool_response>\n{"requestor":"assistant","ok":true,"output":'
+                '{"reservation_id":"MZDDS4","origin":"MIA","destination":"LAX","cabin":"business",'
+                '"created_at":"2024-05-14T11:06:55","insurance":"no","flights":[{"date":"2024-05-17"}]}}\n'
+                '</tool_response>'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                '<tool_response>\n{"requestor":"assistant","ok":true,"output":'
+                '{"reservation_id":"Q69X3R","origin":"PHL","destination":"LGA","cabin":"economy",'
+                '"created_at":"2024-05-14T09:52:38","insurance":"no",'
+                '"flights":[{"origin":"PHL","destination":"CLT","date":"2024-05-20"},'
+                '{"origin":"CLT","destination":"LGA","date":"2024-05-20"}]}}\n'
+                '</tool_response>'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need the relevant reservation ID before I can safely call a tool."},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "Q69X3R" in message.content
+    assert "cannot cancel" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_prompt_messages_expand_duck_typed_multi_tool_message() -> None:
+    class ToolMessage:
+        pass
+
+    class UserMessage:
+        pass
+
+    tool_message = SimpleNamespace(role="tool", content='{"reservation_id":"Q69X3R"}', error=False)
+    multi_tool_message = SimpleNamespace(role="tool", tool_messages=[tool_message])
+
+    rows = _tau_messages_to_prompt_messages(
+        [multi_tool_message],
+        ToolMessage=ToolMessage,
+        UserMessage=UserMessage,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["role"] == "user"
+    assert "Q69X3R" in rows[0]["content"]
+    assert '"ok":true' in rows[0]["content"]
+
+
+def test_tau_official_agent_normalizes_passenger_date_of_birth_alias() -> None:
+    tools = [
+        {
+            "name": "update_reservation_passengers",
+            "description": "Update passengers",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reservation_id": {"type": "string"},
+                    "passengers": {"type": "array"},
+                },
+                "required": ["reservation_id", "passengers"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"update_reservation_passengers"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "update_reservation_passengers",
+        {
+            "reservation_id": "3RK2T9",
+            "passengers": [{"first_name": "Anya", "last_name": "Garcia", "date_of_birth": "1992-11-12"}],
+        },
+        prompt_messages=[{"role": "user", "content": "Change the passenger name on reservation 3RK2T9."}],
+    )
+
+    assert message.tool_calls[0].arguments["passengers"] == [
+        {"first_name": "Anya", "last_name": "Garcia", "dob": "1992-11-12"}
+    ]
+
+
+def test_tau_official_agent_baggage_respond_uses_existing_reservation_details() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_reservation_details"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "How many suitcases can I bring on reservation JMO1MG?"},
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"JMO1MG"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"JMO1MG\\", \\"total_baggages\\": 1, \\"nonfree_baggages\\": 0}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need the relevant reservation ID, user ID, payment method, flight number, or travel date."},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "JMO1MG" in message.content
+    assert "1 total suitcases" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_baggage_update_does_not_use_allowance_response() -> None:
+    tools = [
+        {
+            "name": "update_reservation_baggages",
+            "description": "Update baggage count",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reservation_id": {"type": "string"},
+                    "total_baggages": {"type": "integer"},
+                    "nonfree_baggages": {"type": "integer"},
+                    "payment_id": {"type": "string"},
+                },
+                "required": ["reservation_id", "total_baggages", "nonfree_baggages", "payment_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"update_reservation_baggages"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Please add 2 checked bags to reservation JMO1MG."},
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"JMO1MG"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"JMO1MG\\", \\"total_baggages\\": 1, '
+                '\\"nonfree_baggages\\": 0}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need a payment method before I can update the baggage."},
+        prompt_messages=messages,
+    )
+
+    assert message.content == "I need a payment method before I can update the baggage."
+
+
+def test_tau_official_agent_update_request_stops_after_known_reservation_details() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details"}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Please change all passengers on reservation YAX4DR to business class "
+                "and add 2 checked bags."
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"YAX4DR"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"YAX4DR\\", \\"user_id\\": \\"chen_lee_6825\\"}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_user_details",
+        {"user_id": "chen_lee_6825"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is None
+    assert "cannot safely identify another matching action" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_payment_balance_request_responds_from_user_profile() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details"}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "Please check my gift card and certificate balances. My user ID is mohamed_silva_9265.",
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"mohamed_silva_9265"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"mohamed_silva_9265\\", \\"payment_methods\\": {'
+                '\\"gift_card_8020792\\": {\\"source\\": \\"gift_card\\", \\"amount\\": 198.0}, '
+                '\\"certificate_3765853\\": {\\"source\\": \\"certificate\\", \\"amount\\": 500.0}, '
+                '\\"credit_card_5843230\\": {\\"source\\": \\"credit_card\\"}}}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_user_details",
+        {"user_id": "mohamed_silva_9265"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is None
+    assert "gift_card_8020792: $198.00" in message.content
+    assert "certificate_3765853: $500.00" in message.content
+    assert "total gift card balance: $198.00" in message.content
+    assert "total certificate balance: $500.00" in message.content
+    assert "###STOP###" not in message.content
+
+
+def test_tau_official_agent_booking_airport_loop_asks_for_missing_date() -> None:
+    tools = [
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"list_all_airports", "search_direct_flight"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {"role": "user", "content": "I want to book a flight from San Francisco to New York for three passengers."}
+        ],
+    )
+
+    assert message.content is not None
+    assert "travel date" in message.content
+
+
+def test_tau_official_agent_booking_changes_with_user_id_fetches_profile() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Hello! I have an upcoming trip from New York to Chicago, and I would like to make "
+                    "some changes to the booking. Could you assist me with that?"
+                ),
+            },
+            {"role": "assistant", "content": "Could you provide the travel date for the new flight?"},
+            {
+                "role": "user",
+                "content": (
+                    "I prefer not to provide the travel date. Please check the booking using my user ID "
+                    "omar_rossi_1241."
+                ),
+            },
+        ],
+    )
+
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "omar_rossi_1241"}
+
+
+def test_tau_official_agent_generic_booking_changes_asks_for_specifics() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Hello! I have an upcoming trip from New York to Chicago, and I would like to make "
+                    "some changes to the booking. Could you assist me with that?"
+                ),
+            }
+        ],
+    )
+
+    assert message.tool_calls is None
+    assert "specific changes" in message.content
+    assert "user ID or reservation ID" in message.content
+
+
+def test_tau_official_agent_multi_update_booking_changes_after_scan() -> None:
+    tools = [
+        {
+            "name": "update_reservation_flights",
+            "description": "Update flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reservation_id": {"type": "string"},
+                    "cabin": {"type": "string"},
+                    "flights": {"type": "array"},
+                    "payment_id": {"type": "string"},
+                },
+                "required": ["reservation_id", "cabin", "flights", "payment_id"],
+            },
+        },
+        {
+            "name": "update_reservation_passengers",
+            "description": "Update passengers",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}, "passengers": {"type": "array"}},
+                "required": ["reservation_id", "passengers"],
+            },
+        },
+        {
+            "name": "update_reservation_baggages",
+            "description": "Update baggage count",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reservation_id": {"type": "string"},
+                    "total_baggages": {"type": "integer"},
+                    "nonfree_baggages": {"type": "integer"},
+                    "payment_id": {"type": "string"},
+                },
+                "required": ["reservation_id", "total_baggages", "nonfree_baggages", "payment_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    user = {
+        "user_id": "omar_rossi_1241",
+        "name": {"first_name": "Omar", "last_name": "Rossi"},
+        "dob": "1970-06-06",
+        "membership": "gold",
+        "payment_methods": {
+            "gift_card_8190333": {"source": "gift_card", "amount": 280.0},
+            "credit_card_6754990": {"source": "credit_card"},
+        },
+        "reservations": ["UM3OG5", "5RJ7UH", "FQ8APE", "QKRY03"],
+    }
+    reservations = [
+        {"reservation_id": "UM3OG5", "origin": "SEA", "destination": "DFW", "cabin": "economy", "flights": []},
+        {"reservation_id": "5RJ7UH", "origin": "LAX", "destination": "SFO", "cabin": "economy", "flights": []},
+        {
+            "reservation_id": "FQ8APE",
+            "user_id": "omar_rossi_1241",
+            "origin": "EWR",
+            "destination": "ORD",
+            "cabin": "basic_economy",
+            "flights": [
+                {"flight_number": "HAT056", "origin": "EWR", "destination": "IAH", "date": "2024-05-25", "price": 71},
+                {"flight_number": "HAT138", "origin": "IAH", "destination": "ORD", "date": "2024-05-25", "price": 60},
+            ],
+            "passengers": [{"first_name": "Ivan", "last_name": "Garcia", "dob": "1960-12-01"}],
+            "total_baggages": 0,
+            "nonfree_baggages": 0,
+        },
+        {"reservation_id": "QKRY03", "origin": "MCO", "destination": "DTW", "cabin": "basic_economy", "flights": []},
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "For my upcoming trip from New York to Chicago, I want to change the passenger to myself, "
+                "upgrade it to economy class, and have 3 checked bags. My user ID is omar_rossi_1241."
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"omar_rossi_1241"}}'},
+        {
+            "role": "user",
+            "content": 'Function output:\n{"requestor":"assistant","ok":true,"output":' + json.dumps(json.dumps(user)) + "}",
+        },
+    ]
+    for reservation in reservations:
+        messages.extend(
+            [
+                {
+                    "role": "agent",
+                    "content": json.dumps(
+                        {"name": "get_reservation_details", "arguments": {"reservation_id": reservation["reservation_id"]}}
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                        + json.dumps(json.dumps(reservation))
+                        + "}"
+                    ),
+                },
+            ]
+        )
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need more details."},
+        prompt_messages=messages,
+    )
+
+    calls = message.tool_calls
+    assert [call.name for call in calls] == [
+        "update_reservation_flights",
+        "update_reservation_passengers",
+        "update_reservation_baggages",
+    ]
+    assert calls[0].arguments == {
+        "reservation_id": "FQ8APE",
+        "cabin": "economy",
+        "flights": [
+            {"flight_number": "HAT056", "date": "2024-05-25"},
+            {"flight_number": "HAT138", "date": "2024-05-25"},
+        ],
+        "payment_id": "gift_card_8190333",
+    }
+    assert calls[1].arguments == {
+        "reservation_id": "FQ8APE",
+        "passengers": [{"first_name": "Omar", "last_name": "Rossi", "dob": "1970-06-06"}],
+    }
+    assert calls[2].arguments == {
+        "reservation_id": "FQ8APE",
+        "total_baggages": 3,
+        "nonfree_baggages": 0,
+        "payment_id": "gift_card_8190333",
+    }
+
+
+def test_tau_official_agent_booking_empty_direct_searches_onestop() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+        {
+            "name": "search_onestop_flight",
+            "description": "Search one-stop flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Book a flight from San Francisco to New York on July 15."},
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"search_direct_flight","arguments":'
+                '{"origin":"SFO","destination":"JFK","date":"2024-07-15"}}'
+            ),
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"[]"}'},
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_user_details",
+        {"user_id": "noah_muller_9847"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls[0].name == "search_onestop_flight"
+    assert message.tool_calls[0].arguments == {"origin": "SFO", "destination": "JFK", "date": "2024-07-15"}
+
+
+def test_tau_official_agent_booking_empty_direct_and_onestop_stops_with_unavailable_response() -> None:
+    tools = [
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+        {
+            "name": "search_onestop_flight",
+            "description": "Search one-stop flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Book a flight from San Francisco to New York on July 15."},
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"search_direct_flight","arguments":'
+                '{"origin":"SFO","destination":"JFK","date":"2024-07-15"}}'
+            ),
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"[]"}'},
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"search_onestop_flight","arguments":'
+                '{"origin":"SFO","destination":"JFK","date":"2024-07-15"}}'
+            ),
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"[]"}'},
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need the relevant reservation ID, user ID, payment method, flight number, or travel date."},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "no available flights" in message.content
+    assert "###STOP###" not in message.content
+
+
+def test_tau_official_agent_topic_switch_from_booking_to_delay_does_not_repeat_empty_flight_response() -> None:
+    tools = [
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+        {
+            "name": "search_onestop_flight",
+            "description": "Search one-stop flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Book a flight from San Francisco to New York on July 15."},
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"search_direct_flight","arguments":'
+                '{"origin":"SFO","destination":"JFK","date":"2024-07-15"}}'
+            ),
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"[]"}'},
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"search_onestop_flight","arguments":'
+                '{"origin":"SFO","destination":"JFK","date":"2024-07-15"}}'
+            ),
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"[]"}'},
+        {
+            "role": "agent",
+            "content": (
+                "I checked direct and one-stop flights from SFO to JFK on 2024-07-15, but there are no available "
+                "flights for that itinerary. Would you like to check other dates or continue with a different itinerary?"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Actually, I am frustrated with a delayed flight from my most recent reservation.",
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {
+            "content": (
+                "I checked direct and one-stop flights from SFO to JFK on 2024-07-15, but there are no available "
+                "flights for that itinerary. Would you like to check other dates or continue with a different itinerary?"
+            )
+        },
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "no available flights" not in message.content
+    assert "user id or reservation id" in message.content.lower()
+    assert "###STOP###" not in message.content
+
+
+def test_tau_official_agent_booking_uses_upcoming_request_date_when_history_date_is_mentioned() -> None:
+    tools = [
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {
+                "role": "user",
+                "content": (
+                    "Book a one-way flight from ORD to PHL on May 26. "
+                    "I want the exact same flight I took on May 10."
+                ),
+            }
+        ],
+    )
+
+    assert message.tool_calls[0].name == "search_direct_flight"
+    assert message.tool_calls[0].arguments == {"origin": "ORD", "destination": "PHL", "date": "2024-05-26"}
+
+
+def test_tau_official_agent_booking_with_user_id_fetches_profile_before_search() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["origin", "destination", "date"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {
+                "role": "user",
+                "content": "Book a one-way flight from ORD to PHL on May 26. My user ID is sophia_silva_7557.",
+            }
+        ],
+    )
+
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "sophia_silva_7557"}
+
+
+def test_tau_official_agent_insurance_request_does_not_trigger_booking_guard() -> None:
+    tools = [
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"list_all_airports", "get_reservation_details"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=[
+            {
+                "role": "user",
+                "content": (
+                    "I added insurance to my upcoming flight reservation PEP4E0, "
+                    "but it is not showing online."
+                ),
+            }
+        ],
+    )
+
+    assert message.tool_calls[0].name == "get_reservation_details"
+    assert message.tool_calls[0].arguments == {"reservation_id": "PEP4E0"}
+
+
+def test_tau_official_agent_insurance_request_responds_after_reservation_details() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        }
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_reservation_details"}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "I added insurance to reservation PEP4E0, but it is not showing online.",
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"PEP4E0"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"PEP4E0\\", \\"insurance\\": \\"no\\"}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_reservation_details",
+        {"reservation_id": "PEP4E0"},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "PEP4E0" in message.content
+    assert "does not have travel insurance" in message.content
+    assert "does not allow adding insurance" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_baggage_fetches_profile_then_uses_membership_allowance() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details", "get_reservation_details"}  # noqa: SLF001
+    before_profile = [
+        {"role": "user", "content": "How many suitcases can I bring on reservation JMO1MG?"},
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"JMO1MG"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"JMO1MG\\", \\"user_id\\": \\"anya_garcia_5901\\", '
+                '\\"cabin\\": \\"economy\\", \\"passengers\\": [{\\"first_name\\": \\"Anya\\"}, '
+                '{\\"first_name\\": \\"Mia\\"}], \\"total_baggages\\": 1, \\"nonfree_baggages\\": 0}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need more details."},
+        prompt_messages=before_profile,
+    )
+
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "anya_garcia_5901"}
+
+    after_profile = [
+        *before_profile,
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"anya_garcia_5901"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"anya_garcia_5901\\", \\"membership\\": \\"silver\\", '
+                '\\"reservations\\": [\\"JMO1MG\\"]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_reservation_details",
+        {"reservation_id": "JMO1MG"},
+        prompt_messages=after_profile,
+    )
+
+    assert message.content is not None
+    assert "silver membership" in message.content
+    assert "4 free checked suitcases" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_compensation_profile_regular_member_stops_wrong_tool_loop() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {"name": "list_all_airports", "description": "List airports", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_user_details", "list_all_airports"}  # noqa: SLF001
+    before_profile = [
+        {
+            "role": "user",
+            "content": "I want compensation for delayed flight HAT045. My user ID is mei_brown_7075.",
+        }
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=before_profile,
+    )
+
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "mei_brown_7075"}
+
+    after_profile = [
+        *before_profile,
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"mei_brown_7075"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"mei_brown_7075\\", \\"membership\\": \\"regular\\", '
+                '\\"reservations\\": [\\"DB1Y70\\", \\"MUGYUB\\", \\"3JA7XV\\", \\"CYPIDV\\"]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "list_all_airports",
+        {},
+        prompt_messages=after_profile,
+    )
+
+    assert message.content is not None
+    assert "regular membership" in message.content
+    assert "cannot offer compensation" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_compensation_scan_exhausted_stops_before_flight_search() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "search_direct_flight",
+            "description": "Search direct flights",
+            "parameters": {"type": "object"},
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_reservation_details", "get_user_details", "search_direct_flight"}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "I am upset because a business flight was canceled earlier this month and I want compensation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "My user ID is sophia_silva_7557. I do not have the reservation ID or flight number handy."
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"sophia_silva_7557"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"sophia_silva_7557\\", \\"membership\\": \\"regular\\", '
+                '\\"reservations\\": [\\"KC18K6\\"]}"}'
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"KC18K6"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"KC18K6\\", \\"user_id\\": \\"sophia_silva_7557\\", '
+                '\\"origin\\": \\"MSP\\", \\"destination\\": \\"CLT\\", \\"flight_type\\": \\"one_way\\", '
+                '\\"cabin\\": \\"basic_economy\\", \\"flights\\": [{\\"flight_number\\": \\"HAT300\\", '
+                '\\"origin\\": \\"MSP\\", \\"destination\\": \\"EWR\\", \\"date\\": \\"2024-05-21\\"}], '
+                '\\"passengers\\": [], \\"payment_history\\": [], \\"created_at\\": \\"2024-05-04T14:07:11\\", '
+                '\\"total_baggages\\": 0, \\"nonfree_baggages\\": 0, \\"insurance\\": \\"yes\\"}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "search_direct_flight",
+        {"origin": "MSP", "destination": "EWR", "date": "2024-05-25"},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "already checked the available reservation records" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_repeated_flight_status_asks_for_user_id_for_compensation() -> None:
+    tools = [
+        {
+            "name": "get_flight_status",
+            "description": "Get flight status",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flight_number": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["flight_number", "date"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "I want compensation for delayed flight HAT045 from Phoenix to Seattle.",
+        },
+        {
+            "role": "agent",
+            "content": '{"name":"get_flight_status","arguments":{"flight_number":"HAT045","date":"2024-05-15"}}',
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"delayed"}'},
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_flight_status",
+        {"flight_number": "HAT045", "date": "2024-05-15"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is None
+    assert message.content is not None
+    assert "user id" in message.content.lower()
+    assert "compensation eligibility" in message.content
+
+
+def test_tau_official_agent_failed_flight_status_asks_for_identity_for_compensation() -> None:
+    tools = [
+        {
+            "name": "get_flight_status",
+            "description": "Get flight status",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flight_number": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["flight_number", "date"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": "I want compensation because flight HAT039 from Atlanta to Seattle was delayed.",
+        },
+        {
+            "role": "agent",
+            "content": '{"name":"get_flight_status","arguments":{"flight_number":"HAT039","date":"2025-06-10"}}',
+        },
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":false,"output":'
+                '"Error: Flight HAT039 not found on date 2025-06-10"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_flight_status",
+        {"flight_number": "HAT039", "date": "2025-06-10"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is None
+    assert message.content is not None
+    assert "user id" in message.content.lower()
+    assert "reservation id" in message.content.lower()
+    assert "compensation eligibility" in message.content
+
+
+def test_tau_official_agent_compensation_batches_reservation_scan_after_user_lookup() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "send_certificate",
+            "description": "Send certificate",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}, "amount": {"type": "integer"}},
+                "required": ["user_id", "amount"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "I want compensation because delayed flight HAT039 caused problems. "
+                "My user ID is ethan_martin_2396."
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"ethan_martin_2396"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"ethan_martin_2396\\", \\"membership\\": \\"silver\\", '
+                '\\"reservations\\": [\\"GXWCPN\\", \\"M61CQM\\"]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_reservation_details",
+        {"reservation_id": "GXWCPN"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is not None
+    assert [call.name for call in message.tool_calls] == ["get_reservation_details", "get_reservation_details"]
+    assert [call.arguments["reservation_id"] for call in message.tool_calls] == ["GXWCPN", "M61CQM"]
+
+
+def test_tau_official_agent_compensation_sends_certificate_for_matching_delayed_reservation() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "send_certificate",
+            "description": "Send certificate",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}, "amount": {"type": "integer"}},
+                "required": ["user_id", "amount"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "I want compensation because delayed flight HAT039 caused problems. "
+                "My user ID is ethan_martin_2396."
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"ethan_martin_2396"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"ethan_martin_2396\\", \\"membership\\": \\"silver\\", '
+                '\\"reservations\\": [\\"M61CQM\\"]}"}'
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"M61CQM"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"M61CQM\\", \\"user_id\\": \\"ethan_martin_2396\\", '
+                '\\"flights\\": [{\\"flight_number\\": \\"HAT223\\", \\"date\\": \\"2024-05-15\\"}, '
+                '{\\"flight_number\\": \\"HAT039\\", \\"date\\": \\"2024-05-15\\"}], '
+                '\\"passengers\\": [{\\"first_name\\": \\"Ethan\\"}, {\\"first_name\\": \\"Mia\\"}, '
+                '{\\"first_name\\": \\"Liam\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I am checking compensation eligibility."},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "send_certificate"
+    assert message.tool_calls[0].arguments == {"user_id": "ethan_martin_2396", "amount": 150}
+
+
+def test_tau_official_agent_compensation_without_flight_number_scans_profile_reservations() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "send_certificate",
+            "description": "Send certificate",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}, "amount": {"type": "integer"}},
+                "required": ["user_id", "amount"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    before_profile = [
+        {
+            "role": "user",
+            "content": (
+                "I am frustrated with a delayed flight in my most recent reservation. "
+                "My user ID is noah_muller_9847."
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I need more information."},
+        prompt_messages=before_profile,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "get_user_details"
+    assert message.tool_calls[0].arguments == {"user_id": "noah_muller_9847"}
+
+    after_profile = [
+        *before_profile,
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"noah_muller_9847"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"noah_muller_9847\\", \\"membership\\": \\"gold\\", '
+                '\\"reservations\\": [\\"SDZQKO\\", \\"4OG6T3\\"]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I am checking."},
+        prompt_messages=after_profile,
+    )
+
+    assert message.tool_calls is not None
+    assert [call.name for call in message.tool_calls] == ["get_reservation_details", "get_reservation_details"]
+    assert [call.arguments["reservation_id"] for call in message.tool_calls] == ["SDZQKO", "4OG6T3"]
+
+    after_reservations = [
+        *after_profile,
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"SDZQKO"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"SDZQKO\\", \\"user_id\\": \\"noah_muller_9847\\", '
+                '\\"insurance\\": \\"no\\", \\"created_at\\": \\"2024-05-13T03:26:54\\", '
+                '\\"passengers\\": [{\\"first_name\\": \\"Noah\\"}, {\\"first_name\\": \\"Lucas\\"}]}"}'
+            ),
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"4OG6T3"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"4OG6T3\\", \\"user_id\\": \\"noah_muller_9847\\", '
+                '\\"insurance\\": \\"yes\\", \\"created_at\\": \\"2024-05-09T15:14:07\\", '
+                '\\"passengers\\": [{\\"first_name\\": \\"Noah\\"}]}"}'
+            ),
+        },
+        {"role": "user", "content": "Can I get compensation for that delayed flight?"},
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "respond",
+        {"content": "I am checking compensation."},
+        prompt_messages=after_reservations,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "send_certificate"
+    assert message.tool_calls[0].arguments == {"user_id": "noah_muller_9847", "amount": 50}
+
+
+def test_tau_official_agent_basic_economy_multi_cancel_upgrades_before_cancel() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "update_reservation_flights",
+            "description": "Update reservation flights",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reservation_id": {"type": "string"},
+                    "cabin": {"type": "string"},
+                    "flights": {"type": "array"},
+                    "payment_id": {"type": "string"},
+                },
+                "required": ["reservation_id", "cabin", "flights", "payment_id"],
+            },
+        },
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    first_checked_reservation = [
+        {
+            "role": "user",
+            "content": "I want to cancel my upcoming flights with reservation IDs XEHM4B and 59XX6W.",
+        },
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"XEHM4B"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"XEHM4B\\", \\"user_id\\": \\"daiki_muller_1116\\", '
+                '\\"cabin\\": \\"basic_economy\\", \\"insurance\\": \\"no\\", '
+                '\\"payment_history\\": [{\\"payment_id\\": \\"credit_card_2408938\\", \\"amount\\": 296}], '
+                '\\"flights\\": [{\\"flight_number\\": \\"HAT005\\", \\"date\\": \\"2024-05-20\\"}, '
+                '{\\"flight_number\\": \\"HAT178\\", \\"date\\": \\"2024-05-30\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=first_checked_reservation,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "get_reservation_details"
+    assert message.tool_calls[0].arguments == {"reservation_id": "59XX6W"}
+
+    checked_reservations = [
+        *first_checked_reservation,
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"59XX6W"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"59XX6W\\", \\"user_id\\": \\"daiki_muller_1116\\", '
+                '\\"cabin\\": \\"economy\\", \\"insurance\\": \\"yes\\", \\"created_at\\": \\"2024-05-12T04:19:15\\", '
+                '\\"flights\\": [{\\"flight_number\\": \\"HAT007\\", \\"date\\": \\"2024-05-19\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=checked_reservations,
+    )
+
+    assert message.tool_calls is None
+    assert message.content is not None
+    assert "basic economy" in message.content
+    assert "###STOP###" not in message.content
+
+    with_upgrade_request = [
+        *checked_reservations,
+        {"role": "user", "content": "Please upgrade XEHM4B to economy first and then cancel both reservations."},
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=with_upgrade_request,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "update_reservation_flights"
+    assert message.tool_calls[0].arguments == {
+        "reservation_id": "XEHM4B",
+        "cabin": "economy",
+        "flights": [
+            {"flight_number": "HAT005", "date": "2024-05-20"},
+            {"flight_number": "HAT178", "date": "2024-05-30"},
+        ],
+        "payment_id": "credit_card_2408938",
+    }
+
+    after_upgrade = [
+        *with_upgrade_request,
+        {
+            "role": "agent",
+            "content": (
+                '{"name":"update_reservation_flights","arguments":{"reservation_id":"XEHM4B","cabin":"economy",'
+                '"flights":[{"flight_number":"HAT005","date":"2024-05-20"},'
+                '{"flight_number":"HAT178","date":"2024-05-30"}],"payment_id":"credit_card_2408938"}}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"XEHM4B\\", \\"status\\": null}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=after_upgrade,
+    )
+
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].name == "cancel_reservation"
+    assert message.tool_calls[0].arguments == {"reservation_id": "XEHM4B"}
+
+
+def test_tau_official_agent_delayed_flight_without_change_or_cancel_refuses_compensation() -> None:
+    tools = [
+        {
+            "name": "get_user_details",
+            "description": "Get user details",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "get_flight_status",
+            "description": "Get flight status",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "flight_number": {"type": "string"},
+                    "date": {"type": "string"},
+                },
+                "required": ["flight_number", "date"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "I want compensation for delayed flight HAT045. "
+                "My user ID is mei_brown_7075 and I do not want to change or cancel the flight."
+            ),
+        },
+        {
+            "role": "agent",
+            "content": '{"name":"get_flight_status","arguments":{"flight_number":"HAT045","date":"2024-05-15"}}',
+        },
+        {'role': 'user', 'content': 'Function output:\n{"requestor":"assistant","ok":true,"output":"delayed"}'},
+        {"role": "agent", "content": '{"name":"get_user_details","arguments":{"user_id":"mei_brown_7075"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"user_id\\": \\"mei_brown_7075\\", \\"membership\\": \\"gold\\"}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "get_flight_status",
+        {"flight_number": "HAT045", "date": "2024-05-15"},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "does not allow compensation" in message.content
+    assert "change or cancel" in message.content
+    assert "###STOP###" in message.content
+
+
 def test_tau_official_agent_repeated_user_lookup_cancels_requested_reservation_instead_of_scanning_all() -> None:
     tools = [
         {
@@ -1313,6 +3365,96 @@ def test_tau_official_agent_cancel_intent_redirects_wrong_write_to_read_then_can
     assert message.tool_calls[0].arguments == {"reservation_id": "EHGLP3"}
 
 
+def test_tau_official_agent_cancel_intent_refuses_when_policy_disallows_cancel() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"get_reservation_details", "cancel_reservation"}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "Please cancel my reservation. The confirmation code is EHGLP3."},
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"EHGLP3"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"EHGLP3\\", \\"user_id\\": \\"emma_kim_9957\\", '
+                '\\"cabin\\": \\"basic_economy\\", \\"insurance\\": \\"no\\", '
+                '\\"created_at\\": \\"2024-05-04T23:12:06\\", '
+                '\\"flights\\": [{\\"flight_number\\": \\"HAT156\\", \\"date\\": \\"2024-05-17\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "EHGLP3"},
+        prompt_messages=messages,
+    )
+
+    assert message.content is not None
+    assert "EHGLP3" in message.content
+    assert "cannot cancel" in message.content
+    assert "###STOP###" in message.content
+
+
+def test_tau_official_agent_missing_required_tool_args_asks_instead_of_calling_tool() -> None:
+    tools = [
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {"cancel_reservation"}  # noqa: SLF001
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {},
+        prompt_messages=[{"role": "user", "content": "Please cancel my reservation."}],
+    )
+
+    assert message.tool_calls is None
+    assert message.content is not None
+    assert "reservation id" in message.content.lower()
+
+
 def test_tau_official_agent_cancel_intent_does_not_repeat_successful_cancel() -> None:
     tools = [
         {
@@ -1368,17 +3510,95 @@ def test_tau_official_agent_cancel_intent_does_not_repeat_successful_cancel() ->
     assert "###STOP###" in message.content
 
 
+def test_tau_official_agent_multi_cancel_checks_next_requested_id_before_refusing() -> None:
+    tools = [
+        {
+            "name": "get_reservation_details",
+            "description": "Get reservation details",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {
+            "name": "cancel_reservation",
+            "description": "Cancel reservation",
+            "parameters": {
+                "type": "object",
+                "properties": {"reservation_id": {"type": "string"}},
+                "required": ["reservation_id"],
+            },
+        },
+        {"name": "respond", "description": "Respond", "parameters": {"type": "object"}},
+    ]
+    agent = RWKVTauOfficialAgent(
+        engine=SimpleNamespace(),
+        sampling=SimpleNamespace(),
+        tools=tools,
+        domain_policy="Follow airline policy.",
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+    )
+    agent._current_tool_names = {tool["name"] for tool in tools}  # noqa: SLF001
+    messages = [
+        {"role": "user", "content": "I want to cancel my upcoming flights with reservation IDs XEHM4B and 59XX6W."},
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"XEHM4B"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"XEHM4B\\", \\"cabin\\": \\"basic_economy\\", '
+                '\\"insurance\\": \\"no\\", \\"created_at\\": \\"2024-05-01T05:17:41\\", '
+                '\\"flights\\": [{\\"date\\": \\"2024-05-20\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=messages,
+    )
+
+    assert message.tool_calls[0].name == "get_reservation_details"
+    assert message.tool_calls[0].arguments == {"reservation_id": "59XX6W"}
+
+    after_second_details = [
+        *messages,
+        {"role": "agent", "content": '{"name":"get_reservation_details","arguments":{"reservation_id":"59XX6W"}}'},
+        {
+            "role": "user",
+            "content": (
+                'Function output:\n{"requestor":"assistant","ok":true,"output":'
+                '"{\\"reservation_id\\": \\"59XX6W\\", \\"cabin\\": \\"business\\", '
+                '\\"insurance\\": \\"no\\", \\"created_at\\": \\"2024-05-12T04:19:15\\", '
+                '\\"flights\\": [{\\"date\\": \\"2024-05-29\\"}]}"}'
+            ),
+        },
+    ]
+
+    message = agent._decision_to_assistant_message(  # noqa: SLF001
+        "cancel_reservation",
+        {"reservation_id": "XEHM4B"},
+        prompt_messages=after_second_details,
+    )
+
+    assert message.tool_calls[0].name == "cancel_reservation"
+    assert message.tool_calls[0].arguments == {"reservation_id": "59XX6W"}
+
+
 def test_tau_official_budget_compacts_tool_schemas_without_dropping_tools() -> None:
     tools = [
         {
             "name": f"tool_{index}",
-            "description": f"Tool {index} " + ("very long description " * 80),
+            "description": f"Tool {index} " + ("very long description " * 20),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "record_id": {
                         "type": "string",
-                        "description": "Identifier " * 30,
+                        "description": "Identifier " * 10,
                     }
                 },
                 "required": ["record_id"],
@@ -1392,12 +3612,12 @@ def test_tau_official_budget_compacts_tool_schemas_without_dropping_tools() -> N
         tools=tools,
         domain_policy="Follow the policy.",
         history_max_chars=1200,
-        prompt_max_chars=4096,
+        prompt_max_chars=4600,
     )
 
     prompt = agent._build_prompt([{"role": "user", "content": "Use the right tool for record R-1."}])  # noqa: SLF001
 
-    assert len(prompt) <= 4096
+    assert len(prompt) <= 4600
     for index in range(8):
         assert f'"name":"tool_{index}"' in prompt
         assert f"tool_{index}" in agent._current_tool_names  # noqa: SLF001
@@ -1536,46 +3756,32 @@ def test_tau_official_agent_prompt_compacts_long_tool_outputs() -> None:
     assert len(prompt) <= 5000
 
 
-def test_tau_official_agent_compacts_domain_policy_with_model_parallel_router() -> None:
-    class _EvidenceEngine:
-        def generate(self, prompts, **kwargs):  # noqa: ANN001
-            assert kwargs["batch_size"] > 1
-            return [
-                SimpleNamespace(
-                    text='{"relevant":true,"score":3}'
-                    if "waiver code ALPHA7" in prompt
-                    else '{"relevant":false,"score":0}',
-                    finish_reason="stop",
-                )
-                for prompt in prompts
-            ]
-
+def test_tau_official_agent_compacts_domain_policy_with_lexical_router() -> None:
     long_policy = "\n".join(
         [f"irrelevant policy row {index:03d}" for index in range(40)]
         + ["waiver code ALPHA7 requires supervisor approval before refund"]
         + [f"archive policy row {index:03d}" for index in range(40)]
     )
     agent = RWKVTauOfficialAgent(
-        engine=_EvidenceEngine(),
+        engine=SimpleNamespace(),
         sampling=SimpleNamespace(),
         tools=[],
         domain_policy=long_policy,
         history_max_chars=12000,
         prompt_max_chars=5000,
         long_doc_config=LongDocEvidenceConfig(
-            mode="model_parallel",
+            mode="lexical",
             max_chunk_chars=240,
             overlap_lines=1,
             min_long_text_chars=400,
             max_evidence_chunks=1,
             max_evidence_chars=320,
-            model_parallel_batch_size=8,
         ),
     )
 
     prompt = agent._build_prompt([{"role": "user", "content": "Can this refund use the special waiver?"}])  # noqa: SLF001
 
-    assert "mode=model_parallel" in prompt
+    assert "mode=lexical" in prompt
     assert "waiver code ALPHA7 requires supervisor approval before refund" in prompt
     assert "irrelevant policy row 000" not in prompt
     assert len(prompt) <= 5000

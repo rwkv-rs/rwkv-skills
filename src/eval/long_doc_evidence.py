@@ -18,15 +18,13 @@ from lexical_chunk_router import long_doc as lexical_long_doc
 from lexical_chunk_router.rwkv import clamp_router_sampling
 
 ALLOWED_ANSWER_FORMATS = frozenset({"scalar_string", "scalar_number_string"})
-LongDocEvidenceMode = Literal["lexical", "model_parallel"]
-LONG_DOC_MODE_CHOICES: tuple[str, ...] = ("off", "lexical", "model_parallel")
+LongDocEvidenceMode = Literal["lexical"]
+LONG_DOC_MODE_CHOICES: tuple[str, ...] = ("off", "lexical")
 DEFAULT_LONG_DOC_MAX_CHARS = 1000
 DEFAULT_LONG_DOC_OVERLAP_LINES = 3
 DEFAULT_LONG_DOC_MIN_CHARS = 6000
 DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS = 4
 DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS = 6000
-DEFAULT_LONG_DOC_MODEL_MAX_TOKENS = 96
-DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +65,6 @@ class LongDocEvidenceConfig:
     min_long_text_chars: int = DEFAULT_LONG_DOC_MIN_CHARS
     max_evidence_chunks: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS
     max_evidence_chars: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS
-    model_max_tokens: int = DEFAULT_LONG_DOC_MODEL_MAX_TOKENS
-    model_parallel_batch_size: int = DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,38 +267,6 @@ def select_relevant_chunks(
     ]
 
 
-def select_relevant_chunks_model_parallel(
-    chunks: Sequence[TextChunk],
-    query: str,
-    *,
-    engine: Any | None,
-    sampling: Any | None,
-    max_chunks: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS,
-    max_chars: int = DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS,
-    max_tokens: int = DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
-    batch_size: int = DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
-    progress_desc: str = "LongDocEvidence",
-    prompt_seed: int | None = None,
-) -> tuple[list[SelectedEvidenceChunk], str, str | None]:
-    selected, reason, error = lexical_long_doc.select_evidence_chunks_model_parallel(
-        [_to_plugin_text_chunk(chunk) for chunk in chunks],
-        query,
-        backend=engine,
-        sampling=sampling,
-        max_chunks=max_chunks,
-        max_chars=max_chars,
-        max_tokens=max_tokens,
-        batch_size=batch_size,
-        progress_desc=progress_desc,
-        prompt_seed=prompt_seed,
-    )
-    normalized_reason = reason.replace("missing_backend", "missing_engine")
-    return [
-        SelectedEvidenceChunk(chunk=_to_eval_text_chunk(item.chunk), score=item.score)
-        for item in selected
-    ], normalized_reason, error
-
-
 def _take_evidence_chunks(
     scored: Sequence[SelectedEvidenceChunk],
     *,
@@ -351,6 +315,8 @@ def compact_long_text(
     prompt_seed: int | None = None,
 ) -> LongDocCompactionResult:
     cfg = config or LongDocEvidenceConfig()
+    if str(cfg.mode) not in LONG_DOC_MODE_CHOICES:
+        raise ValueError(f"unsupported long-doc mode {cfg.mode!r}; expected one of {', '.join(LONG_DOC_MODE_CHOICES)}")
     normalized = normalize_newlines(text)
     if not cfg.enabled:
         return LongDocCompactionResult(
@@ -368,63 +334,18 @@ def compact_long_text(
             selected_chunk_ids=(),
             compacted=False,
         )
-    if cfg.mode != "model_parallel":
-        result = lexical_long_doc.compact_text(
-            normalized,
-            query=query,
-            config=_lexical_long_doc_config(cfg),
-            label=label,
-        )
-        return LongDocCompactionResult(
-            text=result.text,
-            original_chars=result.original_chars,
-            chunk_count=result.chunk_count,
-            selected_chunk_ids=result.selected_chunk_ids,
-            compacted=result.compacted,
-        )
-    chunks = chunk_text_by_newline(
+    result = lexical_long_doc.compact_text(
         normalized,
-        max_chars=max(1, int(cfg.max_chunk_chars)),
-        overlap_lines=max(0, int(cfg.overlap_lines)),
-    )
-    reason = "lexical"
-    error: str | None = None
-    if cfg.mode == "model_parallel":
-        selected, reason, error = select_relevant_chunks_model_parallel(
-            chunks,
-            query,
-            engine=engine,
-            sampling=sampling,
-            max_chunks=max(1, int(cfg.max_evidence_chunks)),
-            max_chars=max(1, int(cfg.max_evidence_chars)),
-            max_tokens=max(1, int(cfg.model_max_tokens)),
-            batch_size=max(1, int(cfg.model_parallel_batch_size)),
-            progress_desc=progress_desc,
-            prompt_seed=prompt_seed,
-        )
-    else:
-        selected = select_relevant_chunks(
-            chunks,
-            query,
-            max_chunks=max(1, int(cfg.max_evidence_chunks)),
-            max_chars=max(1, int(cfg.max_evidence_chars)),
-        )
-    compacted = render_evidence_window(
-        selected,
+        query=query,
+        config=_lexical_long_doc_config(cfg),
         label=label,
-        original_chars=len(normalized),
-        chunk_count=len(chunks),
-        mode=cfg.mode,
-        reason=reason,
-        error=error,
     )
     return LongDocCompactionResult(
-        text=compacted,
-        original_chars=len(normalized),
-        chunk_count=len(chunks),
-        selected_chunk_ids=tuple(item.chunk.chunk_id for item in selected),
-        compacted=True,
-        router_error=error,
+        text=result.text,
+        original_chars=result.original_chars,
+        chunk_count=result.chunk_count,
+        selected_chunk_ids=result.selected_chunk_ids,
+        compacted=result.compacted,
     )
 
 
@@ -439,53 +360,17 @@ def compact_messages_for_long_context(
     prompt_seed: int | None = None,
 ) -> LongDocMessageCompaction:
     cfg = config or LongDocEvidenceConfig()
-    if cfg.mode != "model_parallel":
-        result = lexical_long_doc.compact_messages(
-            messages,
-            query=query,
-            config=_lexical_long_doc_config(cfg),
-        )
-        return LongDocMessageCompaction(
-            messages=result.messages,
-            compacted_message_count=result.compacted_message_count,
-            selected_chunk_ids=result.selected_chunk_ids,
-        )
-    normalized = [
-        {
-            "role": str(message.get("role") or "user").strip().lower() or "user",
-            "content": str(message.get("content") or ""),
-        }
-        for message in messages
-        if str(message.get("content") or "")
-    ]
-    resolved_query = (
-        query
-        if query is not None
-        else infer_query_from_messages(normalized, skip_longer_than=max(1, int(cfg.min_long_text_chars)))
+    if str(cfg.mode) not in LONG_DOC_MODE_CHOICES:
+        raise ValueError(f"unsupported long-doc mode {cfg.mode!r}; expected one of {', '.join(LONG_DOC_MODE_CHOICES)}")
+    result = lexical_long_doc.compact_messages(
+        messages,
+        query=query,
+        config=_lexical_long_doc_config(cfg),
     )
-    compacted_messages: list[dict[str, str]] = []
-    selected_by_message: dict[int, tuple[int, ...]] = {}
-    compacted_count = 0
-    for index, message in enumerate(normalized):
-        content = message["content"]
-        result = compact_long_text(
-            content,
-            query=resolved_query,
-            config=cfg,
-            label=f"message {index} role={message['role']}",
-            engine=engine,
-            sampling=sampling,
-            progress_desc=progress_desc,
-            prompt_seed=None if prompt_seed is None else int(prompt_seed) + index * 10_000,
-        )
-        if result.compacted:
-            compacted_count += 1
-            selected_by_message[index] = result.selected_chunk_ids
-        compacted_messages.append({"role": message["role"], "content": result.text})
     return LongDocMessageCompaction(
-        messages=compacted_messages,
-        compacted_message_count=compacted_count,
-        selected_chunk_ids=selected_by_message,
+        messages=result.messages,
+        compacted_message_count=result.compacted_message_count,
+        selected_chunk_ids=result.selected_chunk_ids,
     )
 
 
@@ -529,7 +414,7 @@ def render_evidence_window(
 
 
 def long_doc_config_from_env(prefix: str = "RWKV_LONG_DOC") -> LongDocEvidenceConfig:
-    mode = _env_choice(f"{prefix}_MODE", "lexical", ("lexical", "model_parallel"))
+    mode = _env_choice(f"{prefix}_MODE", "lexical", ("lexical",))
     return LongDocEvidenceConfig(
         enabled=_env_bool(f"{prefix}_ENABLED", True),
         mode=mode,  # type: ignore[arg-type]
@@ -538,11 +423,6 @@ def long_doc_config_from_env(prefix: str = "RWKV_LONG_DOC") -> LongDocEvidenceCo
         min_long_text_chars=_env_int(f"{prefix}_MIN_CHARS", DEFAULT_LONG_DOC_MIN_CHARS),
         max_evidence_chunks=_env_int(f"{prefix}_MAX_EVIDENCE_CHUNKS", DEFAULT_LONG_DOC_MAX_EVIDENCE_CHUNKS),
         max_evidence_chars=_env_int(f"{prefix}_MAX_EVIDENCE_CHARS", DEFAULT_LONG_DOC_MAX_EVIDENCE_CHARS),
-        model_max_tokens=_env_int(f"{prefix}_MODEL_MAX_TOKENS", DEFAULT_LONG_DOC_MODEL_MAX_TOKENS),
-        model_parallel_batch_size=_env_int(
-            f"{prefix}_MODEL_PARALLEL_BATCH_SIZE",
-            DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
-        ),
     )
 
 
@@ -718,7 +598,6 @@ __all__ = [
     "parse_answer_or_null_response",
     "render_evidence_window",
     "select_relevant_chunks",
-    "select_relevant_chunks_model_parallel",
     "summarize_chunks",
     "validate_task_definition",
     "write_jsonl",

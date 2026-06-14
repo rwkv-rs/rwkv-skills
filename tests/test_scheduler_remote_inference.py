@@ -8,6 +8,7 @@ from src.bin.param_search_select import parse_args as parse_param_search_select_
 from src.eval.scheduler import actions, queue
 from src.eval.scheduler.actions import DispatchOptions
 from src.eval.scheduler.admin import SchedulerStartRequest
+from src.eval.scheduler.backpressure import RemoteConcurrencyBudget, parse_remote_backpressure
 from src.eval.scheduler.cli import build_parser
 from src.eval.scheduler.jobs import JOB_CATALOGUE
 from src.eval.scheduler.state import RunningEntry
@@ -96,6 +97,36 @@ def test_remote_dispatch_resources_use_model_slots(tmp_path: Path) -> None:
     assert actions._resolve_available_dispatch_resources(opts, running) == ["model:remote_b"]
 
 
+def test_remote_dispatch_resources_respect_backpressure_without_adding_slots(tmp_path: Path) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("free_response",),
+        infer_base_url="http://127.0.0.1:8081",
+        infer_models=("remote-a", "remote-b"),
+    )
+    budgets = {
+        "remote_a": RemoteConcurrencyBudget(
+            model="remote-a",
+            model_slug="remote_a",
+            infer_max_workers=4,
+            remote_batch_size=4,
+            launch_allowed=False,
+            reason="backend_queue_pending",
+            pending_queue=1,
+        ),
+        "remote_b": RemoteConcurrencyBudget(
+            model="remote-b",
+            model_slug="remote_b",
+            infer_max_workers=4,
+            remote_batch_size=4,
+        ),
+    }
+
+    assert actions._resolve_available_dispatch_resources(opts, {}, remote_budgets=budgets) == ["model:remote_b"]
+
+
 def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_path: Path) -> None:
     dataset_path = tmp_path / "dataset.jsonl"
     dataset_path.write_text("[]", encoding="utf-8")
@@ -155,6 +186,71 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
 
     assert [model for _job_id, model in launched] == ["remote-a", "remote-b", "remote-c"]
     assert len(list((tmp_path / "pid").glob("*.pid"))) == 3
+
+
+def test_remote_launch_uses_backpressure_budget(monkeypatch, tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text("[]", encoding="utf-8")
+    item = queue.QueueItem(
+        job_name="code_human_eval",
+        job_id=f"code_human_eval__human_eval_test_nocot_{actions.safe_slug('remote-a')}",
+        dataset_slug="human_eval_test",
+        model_path=None,
+        model_slug=actions.safe_slug("remote-a"),
+        model_name="remote-a",
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_model="remote-a",
+    )
+    captured: dict[str, int | None] = {}
+
+    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: captured.update(_kwargs))
+
+    def _fake_build_command(*_args, **kwargs):
+        captured["batch_size"] = kwargs["batch_size"]
+        captured["infer_max_workers"] = kwargs["infer_max_workers"]
+        return ["python", "-c", "pass"]
+
+    monkeypatch.setattr(actions, "build_command", _fake_build_command)
+    monkeypatch.setattr(actions, "launch_job", lambda *_args, **_kwargs: SimpleNamespace(pid=1001))
+
+    opts = DispatchOptions(
+        log_dir=tmp_path / "log",
+        pid_dir=tmp_path / "pid",
+        run_log_dir=tmp_path / "run",
+        job_order=("code_human_eval",),
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_models=("remote-a",),
+        infer_max_workers=64,
+        remote_batch_size=64,
+    )
+    budget = RemoteConcurrencyBudget(
+        model="remote-a",
+        model_slug="remote_a",
+        infer_max_workers=12,
+        remote_batch_size=8,
+        reason="backpressure_ok",
+        max_batch_size=8,
+    )
+
+    actions.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
+    actions._launch_queue_items(
+        opts=opts,
+        queue=[item],
+        available_resources=("model:remote_a",),
+        question_counts={},
+        batch_profiler=actions.BatchProfiler(tmp_path / "batch_cache.json"),
+        pending_since={item.job_id: 1.0},
+        launch_times={},
+        job_metadata={},
+        lease_manager=None,
+        claimed_job_ids=set(),
+        remote_budgets={"remote_a": budget},
+    )
+
+    assert captured["batch_size"] == 8
+    assert captured["infer_max_workers"] == 12
+    assert captured["budget_reason"] == "backpressure_ok"
 
 
 def test_remote_launch_continues_past_empty_model_slot(monkeypatch, tmp_path: Path) -> None:
@@ -227,6 +323,7 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
     assert opts.infer_timeout_s == 42.0
     assert opts.infer_max_workers == 7
     assert opts.infer_protocol == "vllm"
+    assert opts.infer_backpressure is True
 
 
 def test_scheduler_cli_accepts_remote_inference_flags() -> None:
@@ -242,6 +339,12 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "64",
             "--infer-protocol",
             "vllm",
+            "--infer-backpressure-timeout-s",
+            "1.5",
+            "--infer-backpressure-pending-high-watermark",
+            "2",
+            "--infer-budget-min-workers",
+            "3",
         ]
     )
 
@@ -249,6 +352,36 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_models == ["remote-demo"]
     assert args.remote_batch_size == 64
     assert args.infer_protocol == "vllm"
+    assert args.infer_backpressure_timeout_s == 1.5
+    assert args.infer_backpressure_pending_high_watermark == 2
+    assert args.infer_budget_min_workers == 3
+
+
+def test_parse_remote_backpressure_payload_uses_router_aggregate() -> None:
+    parsed = parse_remote_backpressure(
+        {
+            "models": {
+                "remote-a": {
+                    "model": "remote-a",
+                    "status": "ok",
+                    "route_count": 1,
+                    "aggregate": {
+                        "ok_route_count": 1,
+                        "pending_queue": 0,
+                        "max_batch_size": 16,
+                        "failed_batches": 0,
+                        "last_total_tok_s": 12.5,
+                    },
+                }
+            }
+        }
+    )
+
+    signal = parsed["remote_a"]
+    assert signal.status == "ok"
+    assert signal.ok_route_count == 1
+    assert signal.pending_queue == 0
+    assert signal.max_batch_size == 16
 
 
 def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:

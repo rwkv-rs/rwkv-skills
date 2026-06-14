@@ -4,6 +4,7 @@ from typing import Annotated, Any, Callable, Dict, Optional, TypeVar
 from pydantic import BaseModel, Field
 
 from tau2.environment.db import DB
+from tau2.environment.safe_math import calculate_decimal_expression
 from tau2.environment.tool import Tool, as_tool
 from tau2.utils import get_dict_hash, update_pydantic_model_with_dict
 
@@ -209,6 +210,4 @@ class GenericToolKit(ToolKitBase):
         Raises:
             ValueError: If the expression is invalid.
         """
-        if not all(char in "0123456789+-*/(). " for char in expression):
-            raise ValueError("Invalid characters in expression")
-        return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
+        return calculate_decimal_expression(expression)

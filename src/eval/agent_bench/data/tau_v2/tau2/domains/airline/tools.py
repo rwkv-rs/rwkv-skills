@@ -24,6 +24,7 @@ from tau2.domains.airline.data_model import (
     ReservationFlight,
     User,
 )
+from tau2.environment.safe_math import calculate_decimal_expression
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 
 # TODO: Add an abstract base class for the tools
@@ -331,9 +332,7 @@ class AirlineTools(ToolKitBase):  # Tools
         Raises:
             ValueError: If the expression is invalid.
         """
-        if not all(char in "0123456789+-*/(). " for char in expression):
-            raise ValueError("Invalid characters in expression")
-        return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
+        return calculate_decimal_expression(expression)
 
     @is_tool(ToolType.WRITE)
     def cancel_reservation(self, reservation_id: str) -> Reservation:
@@ -351,6 +350,8 @@ class AirlineTools(ToolKitBase):  # Tools
         """
         reservation = self._get_reservation(reservation_id)
         logger.debug(reservation.model_dump_json(indent=4))
+        if reservation.status == "cancelled":
+            return reservation
         # reverse the payment
         refunds = []
         for payment in reservation.payment_history:
@@ -363,8 +364,15 @@ class AirlineTools(ToolKitBase):  # Tools
         reservation.payment_history.extend(refunds)
         reservation.status = "cancelled"
         logger.debug(self._get_reservation(reservation_id).model_dump_json(indent=4))
-        # Release seats
-        logger.warning("Seats release not implemented for cancellation!!!")
+        # Release seats reserved by this booking.
+        passenger_count = len(reservation.passengers)
+        for flight_info in reservation.flights:
+            flight_date_data = self._get_flight_instance(
+                flight_number=flight_info.flight_number,
+                date=flight_info.date,
+            )
+            if isinstance(flight_date_data, FlightDateStatusAvailable):
+                flight_date_data.available_seats[reservation.cabin] += passenger_count
         return reservation
 
     @is_tool(ToolType.READ)

@@ -49,11 +49,9 @@ def test_coding_runner_parser_accepts_swebench_options() -> None:
             "--swebench-harness-timeout-s",
             "3600",
             "--long-doc-mode",
-            "model_parallel",
+            "lexical",
             "--long-doc-max-evidence-chars",
             "3000",
-            "--long-doc-model-parallel-batch-size",
-            "8",
         ]
     )
     assert args.benchmark_kind == "swe_bench"
@@ -62,6 +60,5 @@ def test_coding_runner_parser_accepts_swebench_options() -> None:
     assert args.swebench_dataset_name == "princeton-nlp/SWE-bench_Lite"
     assert args.swebench_max_context_chars == 12000
     assert args.swebench_harness_timeout_s == 3600
-    assert args.long_doc_mode == "model_parallel"
+    assert args.long_doc_mode == "lexical"
     assert args.long_doc_max_evidence_chars == 3000
-    assert args.long_doc_model_parallel_batch_size == 8

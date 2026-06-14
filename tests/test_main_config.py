@@ -117,12 +117,12 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
                 "max_tool_errors": 20,
                 "prompt_max_chars": 8192,
                 "long_doc_mode": "off",
-                "long_doc_model_max_tokens": 64,
-                "long_doc_model_parallel_batch_size": 6,
                 "tool_router_mode": "lexical",
                 "tool_router_max_tools": 8,
-                "tool_router_parallel_chunk_tools": 3,
-                "tool_router_parallel_batch_size": 5,
+                "candidate_router_mode": "parallel",
+                "candidate_router_chunk_tools": 3,
+                "candidate_router_batch_size": 5,
+                "candidate_router_prompt_max_chars": 8192,
                 "user_model": "gpt-5.4-mini",
                 "user_base_url": "https://next-token.cc/v1",
                 "judge_model": "gpt-5.4",
@@ -148,17 +148,16 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert "8192" in resolved.argv
     assert "--long-doc-mode" in resolved.argv
     assert "off" in resolved.argv
-    assert "--long-doc-model-max-tokens" in resolved.argv
-    assert "64" in resolved.argv
-    assert "--long-doc-model-parallel-batch-size" in resolved.argv
-    assert "6" in resolved.argv
     assert "--tool-router-mode" in resolved.argv
     assert "lexical" in resolved.argv
     assert "--tool-router-max-tools" in resolved.argv
-    assert "--tool-router-parallel-chunk-tools" in resolved.argv
+    assert "--candidate-router-mode" in resolved.argv
+    assert "parallel" in resolved.argv
+    assert "--candidate-router-chunk-tools" in resolved.argv
     assert "3" in resolved.argv
-    assert "--tool-router-parallel-batch-size" in resolved.argv
+    assert "--candidate-router-batch-size" in resolved.argv
     assert "5" in resolved.argv
+    assert "--candidate-router-prompt-max-chars" in resolved.argv
     assert "--user-model" in resolved.argv
     assert "gpt-5.4-mini" in resolved.argv
     assert "--user-base-url" in resolved.argv
@@ -176,9 +175,8 @@ def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypat
             "runner": {
                 "benchmark_kind": "swe_bench",
                 "cot_mode": "cot",
-                "long_doc_mode": "model_parallel",
+                "long_doc_mode": "lexical",
                 "long_doc_max_evidence_chars": 3000,
-                "long_doc_model_parallel_batch_size": 8,
             },
         }
     )
@@ -196,11 +194,9 @@ def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypat
     assert resolved.runner.name == "code_swe_bench"
     assert resolved.module == "src.eval.coding.runner"
     assert "--long-doc-mode" in resolved.argv
-    assert "model_parallel" in resolved.argv
+    assert "lexical" in resolved.argv
     assert "--long-doc-max-evidence-chars" in resolved.argv
     assert "3000" in resolved.argv
-    assert "--long-doc-model-parallel-batch-size" in resolved.argv
-    assert "8" in resolved.argv
 
 
 def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypatch, tmp_path: Path) -> None:

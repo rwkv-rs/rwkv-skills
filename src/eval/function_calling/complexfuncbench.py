@@ -1095,7 +1095,7 @@ def _run_complexfuncbench(
                     }
                     for future in as_completed(futures):
                         writer.enqueue(future.result())
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -1119,7 +1119,7 @@ def _run_complexfuncbench(
                 tool_routing_config=tool_routing_config,
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

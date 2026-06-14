@@ -3,10 +3,9 @@ from __future__ import annotations
 import argparse
 import sys
 from contextlib import contextmanager
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
-from src.eval.function_calling.bfcl_exec import bfcl_official_ast_checker_status
+from src.eval.function_calling.bfcl_exec import _bfcl_ast_model_config_stub, bfcl_official_ast_checker_status
 from src.eval.function_calling.runner_common import ResolvedFunctionCallingRun
 from src.eval.function_calling.simple_tool_call import (
     SimpleToolCallEvaluation,
@@ -163,7 +162,9 @@ def _record_function_description(record: SimpleToolCallRecord) -> list[dict[str,
 def _record_possible_answer(record: SimpleToolCallRecord) -> list[dict[str, Any]]:
     raw = record.metadata.get("bfcl_official_ground_truth")
     if isinstance(raw, list):
-        return [dict(item) for item in raw if isinstance(item, Mapping)]
+        official_answers = [dict(item) for item in raw if isinstance(item, Mapping)]
+        if official_answers:
+            return official_answers
     result: list[dict[str, Any]] = []
     for expected in record.expected_tool_calls:
         result.append({expected.name: {key: list(value) for key, value in expected.argument_options.items()}})
@@ -222,7 +223,7 @@ def _load_official_ast_checker(root: str) -> tuple[Callable[..., Any], Any]:
         if not parts:
             parts.append(f"missing official BFCL checker under {status.official_root}")
         raise RuntimeError("; ".join(parts))
-    with _official_import_context(status.official_root):
+    with _official_import_context(status.official_root), _bfcl_ast_model_config_stub():
         from bfcl_eval.constants.enums import Language
         from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker
 

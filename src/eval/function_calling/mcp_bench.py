@@ -212,7 +212,7 @@ class McpBenchWorkerClient:
             return
         try:
             self._request("close_task", {})
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     def close(self) -> None:
@@ -223,7 +223,7 @@ class McpBenchWorkerClient:
             if self._proc.poll() is None:
                 try:
                     self._request("shutdown", {})
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
         finally:
             if self._proc.poll() is None:
@@ -1140,7 +1140,7 @@ def _run_mcp_bench(
                             worker.close_task()
                         except Exception:
                             pass
-            except BaseException:
+            except Exception:
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -1173,7 +1173,7 @@ def _run_mcp_bench(
                 },
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

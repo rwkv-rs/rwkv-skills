@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
-from src.eval.env_config import resolve_judge_model_config
+from src.eval.env_config import resolve_judge_max_workers, resolve_judge_model_config
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
@@ -21,6 +21,7 @@ from src.eval.function_calling.browsecomp import (
     judge_browsecomp_answers,
 )
 from src.eval.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     clamp_function_calling_sampling,
@@ -29,6 +30,11 @@ from src.eval.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text, truncate_text
+from src.eval.function_calling.final_answer import (
+    final_answer_tool_schema,
+    parse_final_answer_call,
+    render_final_answer_call,
+)
 from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
@@ -43,6 +49,12 @@ from src.eval.function_calling.rwkv_prompt import (
     render_json_function_call,
 )
 from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response
+from src.eval.function_calling.tool_router import (
+    ToolRoutingConfig,
+    route_tools_for_prompt,
+    tool_routing_config_from_args,
+)
+from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_messages_for_long_context, infer_query_from_messages
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 
@@ -54,6 +66,7 @@ DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT = Path("/tmp/rwkv-official-refs/BrowseComp
 DEFAULT_BROWSECOMP_PLUS_CHUNK_CHARS = 1400
 DEFAULT_BROWSECOMP_PLUS_CHUNK_OVERLAP = 220
 DEFAULT_BROWSECOMP_PLUS_TOP_K = 5
+DEFAULT_BROWSECOMP_PLUS_PROMPT_MAX_CHARS = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,15 +108,7 @@ BROWSECOMP_PLUS_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "required": ["docid"],
         },
     },
-    {
-        "name": "final_answer",
-        "description": "Finish with the exact final answer and concise supporting evidence.",
-        "parameters": {
-            "type": "object",
-            "properties": {"answer": {"type": "string"}},
-            "required": ["answer"],
-        },
-    },
+    final_answer_tool_schema(answer_description="The exact BrowseComp-Plus answer with concise evidence when useful."),
 )
 
 
@@ -314,24 +319,31 @@ def build_browsecomp_plus_prompt(
     messages: Sequence[Mapping[str, Any]],
     *,
     history_max_chars: int,
+    tools: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
+    rendered_tools = [dict(tool) for tool in (tools or BROWSECOMP_PLUS_TOOL_SCHEMAS)]
     system_prompt = normalize_rwkv_text(
         "\n".join(
             [
                 "Tools:",
-                json.dumps(BROWSECOMP_PLUS_TOOL_SCHEMAS, ensure_ascii=False, indent=2),
+                json.dumps(rendered_tools, ensure_ascii=False, indent=2),
                 "Output JSON schema:",
                 json.dumps(
                     {
                         "type": "object",
                         "required": ["name", "arguments"],
                         "additionalProperties": False,
-                        "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+                        "properties": {
+                            "name": {"type": "string"},
+                            "arguments": {"type": "object"},
+                            "id": {"type": "string"},
+                        },
                     },
                     ensure_ascii=False,
                     indent=2,
                 ),
                 "Return exactly one JSON function call object.",
+                "Include id when producing final_answer; use id final_answer.",
                 "Use search and get_document_chunks to gather chunked evidence.",
                 "Use final_answer only when ready to answer.",
                 "Return no prose, no markdown, and no extra text outside the JSON value.",
@@ -339,6 +351,68 @@ def build_browsecomp_plus_prompt(
         )
     )
     return build_rwkv_json_call_prompt(system_prompt, messages, history_max_chars=history_max_chars)
+
+
+def build_browsecomp_plus_budgeted_prompt(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    history_max_chars: int,
+    prompt_max_chars: int,
+    long_doc_config: LongDocEvidenceConfig,
+    tool_routing_config: ToolRoutingConfig | None = None,
+    engine: Any | None = None,
+    sampling: Any | None = None,
+    prompt_seed: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    query = infer_query_from_messages(messages, skip_longer_than=max(1, int(long_doc_config.min_long_text_chars)))
+    compaction = compact_messages_for_long_context(
+        messages,
+        query=query,
+        config=long_doc_config,
+        engine=engine,
+        sampling=sampling,
+        progress_desc="BrowseCompPlus-LongDoc",
+        prompt_seed=prompt_seed,
+    )
+    tool_route = route_tools_for_prompt(
+        BROWSECOMP_PLUS_TOOL_SCHEMAS,
+        compaction.messages,
+        config=tool_routing_config or ToolRoutingConfig(),
+        engine=engine,
+        sampling=sampling,
+        control_tool_names=("final_answer",),
+        progress_desc="BrowseCompPlus-ToolRouter",
+        prompt_seed=None if prompt_seed is None else int(prompt_seed) + 1_000_000,
+    )
+    effective_history_chars = max(0, int(history_max_chars))
+    if prompt_max_chars > 0:
+        effective_history_chars = min(effective_history_chars, max(0, int(prompt_max_chars) - 2048))
+    prompt = build_browsecomp_plus_prompt(
+        compaction.messages,
+        history_max_chars=effective_history_chars,
+        tools=tool_route.selected_tools,
+    )
+    if prompt_max_chars > 0 and len(prompt) > prompt_max_chars:
+        overage = len(prompt) - int(prompt_max_chars)
+        effective_history_chars = max(0, effective_history_chars - overage - 128)
+        prompt = build_browsecomp_plus_prompt(
+            compaction.messages,
+            history_max_chars=effective_history_chars,
+            tools=tool_route.selected_tools,
+        )
+    trace = {
+        "mode": long_doc_config.mode if long_doc_config.enabled else "off",
+        "enabled": bool(long_doc_config.enabled),
+        "query_chars": len(query),
+        "compacted_message_count": int(compaction.compacted_message_count),
+        "selected_chunk_ids": {str(key): list(value) for key, value in compaction.selected_chunk_ids.items()},
+        "history_max_chars": int(history_max_chars),
+        "effective_history_chars": int(effective_history_chars),
+        "prompt_chars": len(prompt),
+        "output_format": "rwkv_json_function_call",
+        "tool_route": tool_route.trace_payload(),
+    }
+    return prompt, trace
 
 
 def _browsecomp_plus_completion_to_eval_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -356,6 +430,22 @@ def _browsecomp_plus_completion_to_eval_payload(payload: dict[str, object]) -> d
         fail_reason=reason if not passed else "",
         answer=str(agent_info.get("final_answer") or ""),
         ref_answer=str(agent_info.get("reference_answer") or ""),
+    )
+
+
+def _browsecomp_plus_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    mode = str(getattr(args, "long_doc_mode", "lexical") or "lexical").strip().lower()
+    enabled = mode != "off"
+    if mode == "off":
+        mode = "lexical"
+    return LongDocEvidenceConfig(
+        enabled=enabled,
+        mode=mode,  # type: ignore[arg-type]
+        max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
+        overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
+        min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
+        max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
+        max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
     )
 
 
@@ -395,17 +485,30 @@ def _run_browsecomp_plus(
     if sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     sampling = clamp_function_calling_sampling(sampling, max(1, int(args.decision_max_tokens or 1024)))
-    sampling_payload = normalize_sampling_config_by_stage([(1, sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
+    prompt_max_chars = int(args.prompt_max_chars or DEFAULT_BROWSECOMP_PLUS_PROMPT_MAX_CHARS)
+    long_doc_config = _browsecomp_plus_long_doc_config(args)
+    tool_routing_config = tool_routing_config_from_args(args)
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, sampling)]),
+        long_doc_config=long_doc_config,
+        tool_routing_config=tool_routing_config,
+        prompt_max_chars=prompt_max_chars,
+    )
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
 
     if args.probe_only:
         repeated = repeat_probe_entries(selected_entries, batch_size=max(1, int(args.batch_size or 1)))
         prompts = [
-            build_browsecomp_plus_prompt(
+            build_browsecomp_plus_budgeted_prompt(
                 [{"role": "user", "content": BrowseCompPlusEnv(record).initial_user_message()}],
                 history_max_chars=history_max_chars,
-            )
+                prompt_max_chars=prompt_max_chars,
+                long_doc_config=long_doc_config,
+                tool_routing_config=tool_routing_config,
+                engine=run.engine,
+                sampling=sampling,
+            )[0]
             for _index, record in repeated
         ]
         run.engine.generate(
@@ -421,7 +524,12 @@ def _run_browsecomp_plus(
     judge_cfg = resolve_judge_model_config()
     if judge_cfg is None:
         raise ValueError("BrowseComp-Plus requires JUDGE_MODEL + JUDGE_API_KEY")
-    judge = BrowseCompJudgeConfig(api_key=judge_cfg.api_key, model=judge_cfg.model_name, base_url=judge_cfg.base_url)
+    judge = BrowseCompJudgeConfig(
+        api_key=judge_cfg.api_key,
+        model=judge_cfg.model_name,
+        base_url=judge_cfg.base_url,
+        max_workers=resolve_judge_max_workers(getattr(args, "judge_max_workers", None), default=4),
+    )
 
     job_name = _resolve_job_name("function_browsecomp_plus", run_context=run_context)
     ctx = prepare_function_calling_run(
@@ -465,10 +573,13 @@ def _run_browsecomp_plus(
                         sampling=sampling,
                         sampling_payload=sampling_payload,
                         history_max_chars=history_max_chars,
+                        prompt_max_chars=prompt_max_chars,
+                        long_doc_config=long_doc_config,
+                        tool_routing_config=tool_routing_config,
                         judge=judge,
                     )
                     writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -491,10 +602,15 @@ def _run_browsecomp_plus(
                 problems=plan.sample_size,
                 task=job_name,
                 task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
-                extra={"cot_mode": CoTMode.COT.value, "history_max_chars": history_max_chars},
+                extra={
+                    "cot_mode": CoTMode.COT.value,
+                    "history_max_chars": history_max_chars,
+                    "prompt_max_chars": prompt_max_chars,
+                    "sampling_config": sampling_payload,
+                },
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise
@@ -513,6 +629,9 @@ def _run_one_browsecomp_plus_attempt(
     sampling: Any,
     sampling_payload: dict[str, Any],
     history_max_chars: int,
+    prompt_max_chars: int,
+    long_doc_config: LongDocEvidenceConfig,
+    tool_routing_config: ToolRoutingConfig,
     judge: BrowseCompJudgeConfig,
 ) -> dict[str, Any]:
     env = BrowseCompPlusEnv(record)
@@ -521,9 +640,20 @@ def _run_one_browsecomp_plus_attempt(
     trace: list[dict[str, Any]] = []
     fail_reason = ""
     final_answer = ""
+    final_answer_call_id = ""
+    decoded_final_answer_call: dict[str, Any] = {}
     max_steps = max(1, int(getattr(args, "max_steps", 12) or 12))
     for step_index in range(1, max_steps + 1):
-        prompt = build_browsecomp_plus_prompt(messages, history_max_chars=history_max_chars)
+        prompt, long_doc_trace = build_browsecomp_plus_budgeted_prompt(
+            messages,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+            long_doc_config=long_doc_config,
+            tool_routing_config=tool_routing_config,
+            engine=run.engine,
+            sampling=sampling,
+            prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=step_index * 10),
+        )
         output = run.engine.generate(
             [prompt],
             sampling=sampling,
@@ -541,6 +671,10 @@ def _run_one_browsecomp_plus_attempt(
             if not decoded:
                 raise ValueError("model returned no tool call")
             call = decoded[0]
+            if str(call.get("name") or "").strip() == "final_answer":
+                final_call = parse_final_answer_call(output.text, context_label="browsecomp-plus final answer")
+                call = dict(final_call.call)
+                final_answer_call_id = final_call.call_id
         except Exception as exc:  # noqa: BLE001
             fail_reason = str(exc)
             trace.append({"step": step_index, "raw": output.text, "parse_error": fail_reason})
@@ -548,18 +682,23 @@ def _run_one_browsecomp_plus_attempt(
         result = env.step(call)
         messages.append({"role": "assistant", "content": render_json_function_call(call["name"], call["arguments"])})
         messages.append({"role": "user", "content": render_function_output_user_block(result.observation)})
-        trace.append(
-            {
-                "step": step_index,
-                "decision_completion": output.text,
-                "decoded_call": call,
-                "observation": truncate_text(result.observation, 4000),
-                "done": result.done,
-                "details": result.details or {},
-            }
-        )
+        trace_entry = {
+            "step": step_index,
+            "decision_completion": output.text,
+            "decoded_call": call,
+            "observation": truncate_text(result.observation, 4000),
+            "done": result.done,
+            "details": result.details or {},
+            "long_doc": long_doc_trace,
+        }
         if result.done:
             final_answer = result.final_answer
+            if str(call.get("name") or "").strip() == "final_answer":
+                decoded_final_answer_call = dict(call)
+                if final_answer:
+                    trace_entry["sandbox_return"] = render_final_answer_call(final_answer, call_id=final_answer_call_id)
+        trace.append(trace_entry)
+        if result.done:
             break
     if not final_answer and not fail_reason:
         fail_reason = "browsecomp_plus produced no final answer"
@@ -595,10 +734,24 @@ def _run_one_browsecomp_plus_attempt(
     }
     payload["agent_info"] = {
         "final_answer": final_answer,
+        "final_answer_call": render_final_answer_call(final_answer, call_id=final_answer_call_id) if final_answer else "",
+        "decoded_final_answer_call": decoded_final_answer_call,
         "reference_answer": record.answer,
         "judge_reason": judge_reason,
         "fail_reason": fail_reason,
         "cot_mode": CoTMode.COT.value,
+        "long_context": {
+            "prompt_max_chars": int(prompt_max_chars),
+            "history_max_chars": int(history_max_chars),
+            "long_doc": {
+                "enabled": bool(long_doc_config.enabled),
+                "mode": long_doc_config.mode,
+            },
+            "tool_router": {
+                "mode": tool_routing_config.mode,
+                "max_tools": int(tool_routing_config.max_tools),
+            },
+        },
     }
     payload["agent_trace"] = trace
     payload["task_id"] = record.task_id
@@ -728,7 +881,7 @@ def _load_documents_for_query(source_path: str, query_id: str) -> list[dict[str,
 def _pyserini_available() -> bool:
     try:
         from pyserini.search.lucene import LuceneSearcher  # noqa: F401
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return True
 
@@ -779,6 +932,7 @@ __all__ = [
     "_run_browsecomp_plus",
     "browsecomp_plus_index_path",
     "browsecomp_plus_source_path",
+    "build_browsecomp_plus_budgeted_prompt",
     "build_browsecomp_plus_prompt",
     "load_browsecomp_plus_manifest_records",
     "load_browsecomp_plus_rows_from_decrypted_jsonl",

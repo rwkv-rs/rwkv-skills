@@ -90,18 +90,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum selected evidence characters for SWE-bench retrieved context",
     )
     parser.add_argument(
-        "--long-doc-model-max-tokens",
-        type=int,
-        default=96,
-        help="Generation token cap for model_parallel chunk routing",
-    )
-    parser.add_argument(
-        "--long-doc-model-parallel-batch-size",
-        type=int,
-        default=8,
-        help="Batch size for model_parallel chunk routing",
-    )
-    parser.add_argument(
         "--probe-only",
         action="store_true",
         help="Run a single-batch probe and skip scoring",
@@ -270,8 +258,6 @@ def _coding_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
-        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
-        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 
@@ -284,8 +270,6 @@ def _long_doc_config_payload(config: LongDocEvidenceConfig) -> dict[str, object]
         "min_long_text_chars": int(config.min_long_text_chars),
         "max_evidence_chunks": int(config.max_evidence_chunks),
         "max_evidence_chars": int(config.max_evidence_chars),
-        "model_max_tokens": int(config.model_max_tokens),
-        "model_parallel_batch_size": int(config.model_parallel_batch_size),
     }
 
 
@@ -509,7 +493,7 @@ def main(
                 max_context_chars=args.swebench_max_context_chars,
                 long_doc_config=long_doc_config,
             )
-    except BaseException:
+    except Exception:
         runtime.handle_attempt_stage_failure(writer)
         raise
 
@@ -615,7 +599,7 @@ def main(
             },
         )
         runtime.record_score(score_payload)
-    except BaseException as exc:
+    except Exception as exc:
         runtime.fail_task(error=str(exc))
         raise
     _print_done_message(benchmark_kind, cot_mode, result.sample_count)

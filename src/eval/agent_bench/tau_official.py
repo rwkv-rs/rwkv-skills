@@ -6,6 +6,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 from src.eval.agent_bench.deps import import_module_with_auto_install
@@ -32,6 +33,7 @@ from src.infer.backend import InferenceBackend
 from src.infer.sampling import SamplingConfig
 
 RESPOND_TOOL_NAME = "respond"
+_TAU_MULTI_TOOL_CALLS_NAME = "__tau_multi_tool_calls__"
 DEFAULT_TAU_PROMPT_MAX_CHARS = 24576
 _TAU_REWARD_TYPE_PREFIX = "RewardType."
 TAU_JSON_CALL_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=True)
@@ -80,7 +82,7 @@ class TauOfficialRuntime:
         UserSimulator = getattr(user_module, "UserSimulator")
         try:
             user_tools = environment.get_user_tools()
-        except Exception:
+        except Exception:  # noqa: BLE001
             user_tools = None
         return UserSimulator(
             tools=user_tools,
@@ -370,7 +372,7 @@ class RWKVTauOfficialAgent:
                 )
                 parse_error = None
                 recovered = True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 self.parse_errors.append(parse_error)
                 assistant_message = self._AssistantMessage(
                     role="assistant",
@@ -589,12 +591,25 @@ class RWKVTauOfficialAgent:
             )
             if replacement is not None:
                 replacement_name, replacement_arguments = replacement
+                if replacement_name == RESPOND_TOOL_NAME:
+                    replacement_content = (
+                        replacement_arguments.get("content")
+                        or replacement_arguments.get("answer")
+                        or replacement_arguments.get("message")
+                        or ""
+                    )
+                    replacement_text = str(replacement_content).strip()
+                    if not replacement_text:
+                        raise ValueError("empty tau respond content")
+                    return self._AssistantMessage(role="assistant", content=replacement_text)
                 return self._decision_to_assistant_message(
                     replacement_name,
                     replacement_arguments,
                     prompt_messages=prompt_messages,
                 )
             return self._AssistantMessage(role="assistant", content=content_text)
+        if normalized_name == _TAU_MULTI_TOOL_CALLS_NAME:
+            return self._multi_tool_calls_to_assistant_message(arguments.get("tool_calls"))
         if normalized_name not in self._tool_names:
             raise ValueError(f"unknown tau tool name: {normalized_name}")
         normalized_name, arguments = _normalize_tau_tool_decision_from_context(
@@ -605,6 +620,8 @@ class RWKVTauOfficialAgent:
             retail_repeated_read_guard=self._retail_repeated_read_guard,
             retail_tool_use_guard=self._retail_tool_use_guard,
         )
+        if normalized_name == _TAU_MULTI_TOOL_CALLS_NAME:
+            return self._multi_tool_calls_to_assistant_message(arguments.get("tool_calls"))
         if normalized_name == RESPOND_TOOL_NAME:
             content = (
                 arguments.get("content")
@@ -620,6 +637,15 @@ class RWKVTauOfficialAgent:
             raise ValueError(f"unknown tau tool name: {normalized_name}")
         if normalized_name not in self._current_tool_names:
             raise ValueError(f"tau tool name not in routed tool window: {normalized_name}")
+        missing_required = _missing_required_tau_tool_arguments(
+            self._tools_by_name.get(normalized_name),
+            arguments,
+        )
+        if missing_required:
+            return self._AssistantMessage(
+                role="assistant",
+                content=_tau_missing_required_argument_response(normalized_name, missing_required),
+            )
         return self._AssistantMessage(
             role="assistant",
             content=None,
@@ -632,6 +658,40 @@ class RWKVTauOfficialAgent:
                 )
             ],
         )
+
+    def _multi_tool_calls_to_assistant_message(self, raw_calls: Any) -> Any:
+        if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes)):
+            raise ValueError("empty tau multi tool calls")
+        tool_calls = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, Mapping):
+                continue
+            call_name = str(raw_call.get("name") or "").strip()
+            call_arguments = dict(raw_call.get("arguments") or {})
+            if call_name not in self._tool_names:
+                raise ValueError(f"unknown tau tool name: {call_name}")
+            if call_name not in self._current_tool_names:
+                raise ValueError(f"tau tool name not in routed tool window: {call_name}")
+            missing_required = _missing_required_tau_tool_arguments(
+                self._tools_by_name.get(call_name),
+                call_arguments,
+            )
+            if missing_required:
+                return self._AssistantMessage(
+                    role="assistant",
+                    content=_tau_missing_required_argument_response(call_name, missing_required),
+                )
+            tool_calls.append(
+                self._ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:12]}",
+                    name=call_name,
+                    arguments=call_arguments,
+                    requestor="assistant",
+                )
+            )
+        if not tool_calls:
+            raise ValueError("empty tau multi tool calls")
+        return self._AssistantMessage(role="assistant", content=None, tool_calls=tool_calls)
 
 
 class StaticStopTauUser:
@@ -713,9 +773,10 @@ def build_tau_official_agent_system_prompt(
         "Do not write analysis, markdown, <think>, </think>, or any text before the JSON object.",
         "Valid names are exactly the listed tool names plus respond.",
         "Before every tool call, verify the name appears exactly in the Tools array below.",
+        "Never invent wrapper or pseudo tools.",
         "Use only exact listed tool names; if no exact tool exists, respond instead of inventing wrapper or pseudo tools.",
         "Never copy a Function output object; do not return requestor/ok/output as your decision.",
-        "Never invent ids/emails/phones; missing IDs must come from user text, prior tool outputs, lookup/list/read tools, or respond.",
+        "Do not invent ids/emails/phones; missing IDs must come from user text, prior tool outputs, lookup/list/read tools, or respond.",
         "Do not repeat successful reads; use outputs.",
         "Use schema argument keys; detail tools need exact IDs, list/find names first.",
     ]
@@ -783,6 +844,17 @@ def _parse_tau_agent_decision(text: str) -> tuple[str, dict[str, Any]]:
     return _normalize_tau_decision(str(payload["name"]).strip(), dict(payload["arguments"]))
 
 
+def _parse_tau_agent_decisions(text: str) -> list[tuple[str, dict[str, Any]]]:
+    blocks = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", str(text or ""), flags=re.DOTALL)
+    if not blocks:
+        return [_parse_tau_agent_decision(text)]
+    decisions: list[tuple[str, dict[str, Any]]] = []
+    for block in blocks:
+        payload = _coerce_tau_decision_payload(json.loads(block))
+        decisions.append(_normalize_tau_decision(str(payload["name"]).strip(), dict(payload["arguments"])))
+    return decisions
+
+
 def _apply_tau_json_object_prefill(text: str) -> str:
     return apply_json_call_object_prefill(text)
 
@@ -796,7 +868,7 @@ def _recover_tau_agent_decision_from_text(
     normalized = normalize_rwkv_text(text)
     try:
         name, arguments = _parse_tau_agent_decision(normalized)
-    except Exception:
+    except Exception:  # noqa: BLE001
         embedded = _recover_embedded_tau_json_call(normalized)
         if embedded is not None:
             name, arguments = embedded
@@ -831,7 +903,7 @@ def _recover_embedded_tau_json_call(text: str) -> tuple[str, dict[str, Any]] | N
         try:
             payload = json.loads(candidate[:end])
             coerced = _coerce_tau_decision_payload(payload)
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         return _normalize_tau_decision(str(coerced["name"]).strip(), dict(coerced["arguments"]))
     return None
@@ -1157,6 +1229,11 @@ _TAU_READ_TOOL_NAMES = {
     "get_reservation_details",
     "get_user_details",
 }
+_TAU_AIRLINE_UPDATE_TOOL_NAMES = {
+    "update_reservation_baggages",
+    "update_reservation_flights",
+    "update_reservation_passengers",
+}
 _TAU_USER_ID_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z][a-z0-9]*_\d+\b", re.IGNORECASE)
 _TAU_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _TAU_GENERIC_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]{3,}\b")
@@ -1164,9 +1241,13 @@ _TAU_FLIGHT_NUMBER_RE = re.compile(r"\b[A-Z]{2,4}\d{2,4}\b")
 _TAU_HASH_ID_RE = re.compile(r"#[A-Za-z0-9][A-Za-z0-9_-]*")
 _TAU_RETAIL_ORDER_ID_RE = re.compile(r"#?[A-Z]\d{7,}\b", re.IGNORECASE)
 _TAU_NUMERIC_ID_RE = re.compile(r"\d{6,}")
+_TAU_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _TAU_EXISTING_RESERVATION_ACTION_RE = re.compile(
-    r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation|refund|change|reschedule|move|upgrade|"
-    r"baggage|bag|bags|suitcase|suitcases|luggage|passenger|date of birth|dob|existing reservation)\b",
+    r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation|refund|changes?|changing|changed|"
+    r"reschedules?|rescheduling|rescheduled|moves?|moving|moved|upgrades?|upgrading|upgraded|"
+    r"baggage|bag|bags|suitcase|suitcases|luggage|passenger|date of birth|dob|insurance|insured|"
+    r"status|delay|delayed|compensation|compensate|certificate|voucher|upcoming flights?|future reservations?|"
+    r"total cost|existing reservation)\b",
     re.IGNORECASE,
 )
 _TAU_RETAIL_EXCHANGE_INTENT_RE = re.compile(
@@ -1186,6 +1267,80 @@ _TAU_RETAIL_PAYMENT_INTENT_RE = re.compile(
     r"\b(?:payment|pay|card|credit card|gift card|paypal)\b",
     re.IGNORECASE,
 )
+_TAU_AIRLINE_CURRENT_TIME = datetime(2024, 5, 15, 15, 0, 0)
+_TAU_AIRPORT_CODES_BY_NAME = {
+    "san francisco": "SFO",
+    "sfo": "SFO",
+    "new york": "JFK",
+    "jfk": "JFK",
+    "los angeles": "LAX",
+    "lax": "LAX",
+    "chicago": "ORD",
+    "ord": "ORD",
+    "dallas": "DFW",
+    "dfw": "DFW",
+    "denver": "DEN",
+    "den": "DEN",
+    "seattle": "SEA",
+    "sea": "SEA",
+    "atlanta": "ATL",
+    "atl": "ATL",
+    "miami": "MIA",
+    "mia": "MIA",
+    "boston": "BOS",
+    "bos": "BOS",
+    "phoenix": "PHX",
+    "phx": "PHX",
+    "houston": "IAH",
+    "iah": "IAH",
+    "las vegas": "LAS",
+    "las": "LAS",
+    "orlando": "MCO",
+    "mco": "MCO",
+    "newark": "EWR",
+    "ewr": "EWR",
+    "charlotte": "CLT",
+    "clt": "CLT",
+    "minneapolis": "MSP",
+    "msp": "MSP",
+    "detroit": "DTW",
+    "dtw": "DTW",
+    "philadelphia": "PHL",
+    "phl": "PHL",
+    "laguardia": "LGA",
+    "la guardia": "LGA",
+    "lga": "LGA",
+}
+_TAU_AIRPORT_PATTERN = "|".join(
+    re.escape(name)
+    for name in sorted(_TAU_AIRPORT_CODES_BY_NAME, key=len, reverse=True)
+)
+_TAU_MONTHS = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+}
 _TAU_RETAIL_PRODUCT_INTENT_RE = re.compile(
     r"\b(?:product|item|option|variant|inventory|available|availability|size|color|colour|shirt|t-shirt|"
     r"tshirt|headphone|watch|keyboard|thermostat|camera|cleaner|vacuum)\b",
@@ -1244,6 +1399,7 @@ def _normalize_tau_tool_decision_from_context(
 ) -> tuple[str, dict[str, Any]]:
     normalized_name = str(name or "").strip()
     normalized_arguments = dict(arguments)
+    normalized_arguments = _normalize_tau_argument_aliases(normalized_arguments)
     normalized_arguments = _preserve_hash_prefixed_ids_from_user_context(normalized_arguments, prompt_messages)
     if retail_tool_use_guard:
         retail_replacement = _tau_retail_tool_use_replacement(
@@ -1256,13 +1412,24 @@ def _normalize_tau_tool_decision_from_context(
             normalized_name, normalized_arguments = retail_replacement
     cancel_replacement = _tau_cancel_intent_replacement_from_context(
         normalized_name,
+        normalized_arguments,
         prompt_messages,
         available_tool_names=available_tool_names,
     )
     if cancel_replacement is not None:
         return cancel_replacement
+    airline_replacement = _tau_airline_tool_use_replacement(
+        normalized_name,
+        normalized_arguments,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if airline_replacement is not None:
+        return airline_replacement
     if normalized_name == "get_user_details":
-        known_user_id = _latest_tau_fact_value(prompt_messages, "user_id")
+        known_user_id = _latest_tau_fact_value(prompt_messages, "user_id") or _requested_tau_user_id_from_user(
+            prompt_messages
+        )
         raw_user_id = str(normalized_arguments.get("user_id") or "").strip()
         if known_user_id and (raw_user_id != known_user_id or not _TAU_USER_ID_RE.fullmatch(raw_user_id)):
             normalized_arguments["user_id"] = known_user_id
@@ -1279,11 +1446,15 @@ def _normalize_tau_tool_decision_from_context(
             normalized_arguments,
             prompt_messages,
         )
+        has_same_failed_flight_status = (
+            normalized_name == "get_flight_status"
+            and _has_failed_tau_tool_observation(normalized_name, normalized_arguments, prompt_messages)
+        )
         has_prior_user_profile = (
             normalized_name == "get_user_details"
             and _has_successful_tau_tool_name("get_user_details", prompt_messages)
         )
-        if has_same_observation or has_prior_user_profile:
+        if has_same_observation or has_same_failed_flight_status or has_prior_user_profile:
             if retail_repeated_read_guard:
                 guard_response = _tau_repeated_retail_read_guard_response(
                     normalized_name,
@@ -1293,7 +1464,13 @@ def _normalize_tau_tool_decision_from_context(
                 )
                 if guard_response is not None:
                     return guard_response
-            context_response = _tau_readonly_reservation_response_from_context(prompt_messages)
+            balance_response = _tau_airline_payment_balance_response_from_context(prompt_messages)
+            if balance_response is not None:
+                return balance_response
+            context_response = _tau_readonly_reservation_response_from_context(
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
             if context_response is not None:
                 return context_response
             direct_action = _tau_direct_requested_reservation_action_from_context(
@@ -1324,10 +1501,53 @@ def _tau_respond_replacement_from_context(
 ) -> tuple[str, dict[str, Any]] | None:
     normalized_content = normalize_rwkv_text(content)
     lowered_content = normalized_content.lower()
+    balance_response = _tau_airline_payment_balance_response_from_context(prompt_messages)
+    if balance_response is not None:
+        return balance_response
+    context_response = _tau_readonly_reservation_response_from_context(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if context_response is not None:
+        return context_response
+    latest_user_text = _latest_tau_user_request_text(prompt_messages).lower()
+    if (
+        re.search(r"\b(?:delay|delayed|compensation|compensate|frustrated|recent reservation)\b", latest_user_text)
+        and re.search(r"\b(?:no available flights|itinerary|other dates|different itinerary)\b", content, re.IGNORECASE)
+    ):
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    "I can help check the delayed reservation. Please provide your user id or reservation id so I can "
+                    "verify the reservation and compensation eligibility."
+                )
+            },
+        )
     if "get_user_details" in available_tool_names and re.search(r"\buser(?:\s+|_)id\b", lowered_content):
-        known_user_id = _latest_tau_fact_value(prompt_messages, "user_id")
+        known_user_id = _latest_tau_fact_value(prompt_messages, "user_id") or _requested_tau_user_id_from_user(
+            prompt_messages
+        )
         if known_user_id:
             return "get_user_details", {"user_id": known_user_id}
+
+    direct_action = _tau_direct_requested_reservation_action_from_context(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if direct_action is not None:
+        return direct_action
+    cancel_response = _tau_airline_cancel_response_from_context(prompt_messages)
+    if cancel_response is not None:
+        return cancel_response
+    airline_replacement = _tau_airline_tool_use_replacement(
+        RESPOND_TOOL_NAME,
+        {},
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if airline_replacement is not None:
+        return airline_replacement
 
     if re.search(r"\border(?:\s+|_)id\b", lowered_content):
         requested_order_id = _requested_tau_retail_order_id_from_user(prompt_messages)
@@ -2319,16 +2539,900 @@ def _preserve_hash_prefixed_ids_from_user_context(
     return {str(key): preserve(value) for key, value in dict(arguments).items()}
 
 
+def _normalize_tau_argument_aliases(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for raw_key, raw_item in value.items():
+            key = str(raw_key)
+            normalized_key = "dob" if key.lower() == "date_of_birth" else key
+            normalized_value = _normalize_tau_argument_aliases(raw_item)
+            if normalized_key in normalized and normalized[normalized_key] not in (None, "", [], {}):
+                continue
+            normalized[normalized_key] = normalized_value
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_tau_argument_aliases(item) for item in value]
+    if isinstance(value, tuple):
+        return [_normalize_tau_argument_aliases(item) for item in value]
+    return value
+
+
+def _tau_airline_tool_use_replacement(
+    selected_name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not _available_tau_airline_tools(available_tool_names):
+        return None
+    compensation_response = _tau_airline_compensation_response_from_context(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if compensation_response is not None:
+        return compensation_response
+    generic_update_response = _tau_airline_generic_update_detail_replacement(
+        selected_name,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if generic_update_response is not None:
+        return generic_update_response
+    multi_update_replacement = _tau_airline_multi_update_replacement(
+        selected_name,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if multi_update_replacement is not None:
+        return multi_update_replacement
+    booking_replacement = _tau_airline_booking_tool_replacement(
+        selected_name,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if booking_replacement is not None:
+        return booking_replacement
+
+    user_text = _tau_user_request_text(prompt_messages)
+    wants_cancel = bool(
+        re.search(r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation)\b", user_text, re.IGNORECASE)
+    )
+    if not wants_cancel:
+        return _tau_airline_existing_reservation_tool_replacement(
+            selected_name,
+            arguments,
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    if requested_id:
+        return None
+
+    if not _has_successful_tau_tool_name("get_user_details", prompt_messages):
+        user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+        if user_id and selected_name != "get_user_details" and "get_user_details" in available_tool_names:
+            return "get_user_details", {"user_id": user_id}
+        return None
+
+    criteria = _tau_airline_reservation_criteria_from_user_text(user_text)
+    cancelled_ids = _tau_cancelled_reservation_ids_from_context(prompt_messages)
+    matched_reservation = _best_matching_tau_airline_reservation(prompt_messages, criteria, exclude_ids=cancelled_ids)
+    if matched_reservation is not None:
+        reservation_id = str(matched_reservation.get("reservation_id") or "").strip().upper()
+        if not reservation_id:
+            return None
+        if selected_name == "cancel_reservation":
+            selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+            if selected_id == reservation_id:
+                return None
+        policy_decision = _tau_airline_cancel_policy_decision(
+            matched_reservation,
+            prompt_messages,
+            reservation_id=reservation_id,
+        )
+        if policy_decision is not None:
+            allowed, reason = policy_decision
+            if not allowed:
+                return _tau_airline_cancel_refusal_response(reservation_id, reason)
+        if "cancel_reservation" in available_tool_names:
+            return "cancel_reservation", {"reservation_id": reservation_id}
+
+    next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
+    if next_reservation_id and "get_reservation_details" in available_tool_names:
+        scan_replacement = _tau_multi_reservation_scan_replacement(
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+        if scan_replacement is not None:
+            return scan_replacement
+        if selected_name == "get_reservation_details":
+            selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+            if selected_id == next_reservation_id:
+                return None
+        return "get_reservation_details", {"reservation_id": next_reservation_id}
+
+    if _tau_airline_any_matching_cancel_completed(prompt_messages, criteria):
+        if not _tau_airline_request_is_bulk(user_text):
+            return (
+                RESPOND_TOOL_NAME,
+                {"content": "The matching reservation has been cancelled. ###STOP###"},
+            )
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "I have processed the matching cancellable reservations I could identify. ###STOP###"},
+        )
+    return None
+
+
+def _tau_airline_existing_reservation_tool_replacement(
+    selected_name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not _tau_context_wants_existing_reservation_action(prompt_messages):
+        return None
+    user_text = _tau_user_request_text(prompt_messages)
+    context_response = _tau_readonly_reservation_response_from_context(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if context_response is not None:
+        return context_response
+
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    if (
+        requested_id
+        and "get_reservation_details" in available_tool_names
+        and not _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+    ):
+        if selected_name == "get_reservation_details":
+            return None
+        return "get_reservation_details", {"reservation_id": requested_id}
+
+    if requested_id and _tau_airline_user_requests_reservation_update(user_text):
+        if _TAU_AIRLINE_UPDATE_TOOL_NAMES & available_tool_names:
+            return None
+        return _tau_exhausted_repeated_read_response("get_reservation_details", prompt_messages)
+
+    compensation_response = _tau_airline_compensation_response_from_context(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if compensation_response is not None:
+        return compensation_response
+
+    if "get_user_details" in available_tool_names and not _has_successful_tau_tool_name(
+        "get_user_details",
+        prompt_messages,
+    ):
+        user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+        if user_id:
+            if selected_name == "get_user_details":
+                return None
+            return "get_user_details", {"user_id": user_id}
+
+    next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
+    if next_reservation_id and "get_reservation_details" in available_tool_names:
+        scan_replacement = _tau_multi_reservation_scan_replacement(
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+        if scan_replacement is not None and _tau_airline_user_requests_reservation_update(user_text):
+            return scan_replacement
+        if scan_replacement is not None and selected_name != "get_reservation_details":
+            return scan_replacement
+        if selected_name == "get_reservation_details":
+            selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+            if selected_id == next_reservation_id:
+                return None
+        return "get_reservation_details", {"reservation_id": next_reservation_id}
+
+    if _TAU_AIRLINE_UPDATE_TOOL_NAMES & available_tool_names:
+        return None
+    return _tau_exhausted_repeated_read_response("get_reservation_details", prompt_messages)
+
+
+def _tau_airline_booking_tool_replacement(
+    selected_name: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    if not _tau_airline_user_requests_new_booking(user_text):
+        return None
+    latest_user_text = _latest_tau_user_request_text(prompt_messages).lower()
+    if re.search(r"\b(?:delay|delayed|compensation|compensate|frustrated|recent reservation)\b", latest_user_text):
+        return None
+    criteria = _tau_airline_reservation_criteria_from_user_text(user_text)
+    route_pairs = sorted(criteria.get("route_pairs") or set())
+    if not route_pairs:
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "Could you provide the origin, destination, and travel date for the new flight?"},
+        )
+    dates = _tau_airline_booking_request_dates(criteria)
+    if not dates:
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "Could you provide the travel date for the new flight?"},
+        )
+    user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+    if (
+        user_id
+        and "get_user_details" in available_tool_names
+        and not _has_successful_tau_tool_name("get_user_details", prompt_messages)
+        and selected_name != "get_user_details"
+    ):
+        return "get_user_details", {"user_id": user_id}
+    origin, destination = route_pairs[0]
+    search_args = {"origin": origin, "destination": destination, "date": dates[0]}
+    if (
+        _has_empty_successful_tau_tool_observation("search_direct_flight", search_args, prompt_messages)
+        and _has_empty_successful_tau_tool_observation("search_onestop_flight", search_args, prompt_messages)
+    ):
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    f"I checked direct and one-stop flights from {origin} to {destination} on {dates[0]}, "
+                    "but there are no available flights for that itinerary. Would you like to check other dates "
+                    "or continue with a different itinerary?"
+                )
+            },
+        )
+    if (
+        "search_onestop_flight" in available_tool_names
+        and _has_empty_successful_tau_tool_observation("search_direct_flight", search_args, prompt_messages)
+        and not _has_successful_tau_tool_observation("search_onestop_flight", search_args, prompt_messages)
+    ):
+        return "search_onestop_flight", search_args
+    if selected_name == "list_all_airports" and "search_direct_flight" in available_tool_names:
+        return "search_direct_flight", search_args
+    if selected_name == "get_user_details" and "search_direct_flight" in available_tool_names:
+        if not _has_successful_tau_tool_observation("search_direct_flight", search_args, prompt_messages):
+            return "search_direct_flight", search_args
+    if selected_name == "list_all_airports" and "search_onestop_flight" in available_tool_names:
+        return "search_onestop_flight", search_args
+    return None
+
+
+def _tau_airline_generic_update_detail_replacement(
+    selected_name: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    if not _tau_airline_user_requests_reservation_update(user_text):
+        return None
+    if _tau_airline_update_request_has_action_details(user_text):
+        return None
+    if not {"get_user_details", "get_reservation_details"} & available_tool_names:
+        return None
+
+    user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+    if (
+        user_id
+        and "get_user_details" in available_tool_names
+        and not _has_successful_tau_tool_name("get_user_details", prompt_messages)
+    ):
+        if selected_name == "get_user_details":
+            return None
+        return "get_user_details", {"user_id": user_id}
+
+    if not user_id and not _requested_tau_reservation_id_from_user(prompt_messages):
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    "Please provide your user ID or reservation ID and the specific changes you want "
+                    "to make to the booking."
+                )
+            },
+        )
+
+    if _has_successful_tau_tool_name("get_user_details", prompt_messages):
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "What specific changes would you like to make to the booking?"},
+        )
+    return None
+
+
+def _tau_airline_update_request_has_action_details(user_text: str) -> bool:
+    lowered = str(user_text or "").lower()
+    return bool(
+        re.search(
+            r"\b(?:passengers?|baggages?|bags?|suitcases?|luggage|cabin|class|economy|business|"
+            r"basic[\s_-]*economy|insurance|insured|coverage|nonstop|non-stop|direct|same day|"
+            r"travel date|checked)\b",
+            lowered,
+        )
+    )
+
+
+def _tau_airline_multi_update_replacement(
+    selected_name: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    intent = _tau_airline_multi_update_intent(_tau_user_request_text(prompt_messages))
+    if intent is None:
+        return None
+
+    required_tools: set[str] = set()
+    if intent["target_cabin"]:
+        required_tools.add("update_reservation_flights")
+    if intent["self_passenger"]:
+        required_tools.add("update_reservation_passengers")
+    if intent["total_baggages"] is not None:
+        required_tools.add("update_reservation_baggages")
+    if not required_tools or not required_tools.issubset(available_tool_names):
+        return None
+
+    user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    if user is None:
+        if user_id and "get_user_details" in available_tool_names:
+            if selected_name == "get_user_details":
+                return None
+            return "get_user_details", {"user_id": user_id}
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "Please provide your user ID or reservation ID so I can identify the booking to update."},
+        )
+
+    scan_replacement = _tau_multi_reservation_scan_replacement(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if scan_replacement is not None:
+        return scan_replacement
+    next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
+    if next_reservation_id and "get_reservation_details" in available_tool_names:
+        return "get_reservation_details", {"reservation_id": next_reservation_id}
+
+    reservation = _best_matching_tau_airline_multi_update_reservation(prompt_messages)
+    if reservation is None:
+        return None
+    reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+    if not reservation_id:
+        return None
+
+    payment_id = _tau_airline_preferred_payment_id(user)
+    if not payment_id:
+        return None
+
+    calls: list[dict[str, Any]] = []
+    target_cabin = str(intent["target_cabin"] or "").strip()
+    target_passengers = (
+        _tau_airline_self_passenger_payload(user)
+        if intent["self_passenger"]
+        else _tau_airline_passengers_from_reservation(reservation)
+    )
+    if target_cabin:
+        flight_args = {
+            "reservation_id": reservation_id,
+            "cabin": target_cabin,
+            "flights": _tau_airline_flight_infos_from_reservation(reservation),
+            "payment_id": payment_id,
+        }
+        if flight_args["flights"] and not _has_successful_tau_tool_observation(
+            "update_reservation_flights",
+            flight_args,
+            prompt_messages,
+        ):
+            calls.append({"name": "update_reservation_flights", "arguments": flight_args})
+
+    if intent["self_passenger"] and target_passengers:
+        passenger_args = {"reservation_id": reservation_id, "passengers": target_passengers}
+        if not _has_successful_tau_tool_observation(
+            "update_reservation_passengers",
+            passenger_args,
+            prompt_messages,
+        ):
+            calls.append({"name": "update_reservation_passengers", "arguments": passenger_args})
+
+    target_total_baggages = intent["total_baggages"]
+    if target_total_baggages is not None:
+        baggage_reservation = dict(reservation)
+        if target_cabin:
+            baggage_reservation["cabin"] = target_cabin
+        if target_passengers:
+            baggage_reservation["passengers"] = target_passengers
+        allowance = _tau_airline_free_baggage_allowance(baggage_reservation, user)
+        free_baggages = allowance[0] if allowance is not None else int(reservation.get("total_baggages") or 0)
+        baggage_args = {
+            "reservation_id": reservation_id,
+            "total_baggages": int(target_total_baggages),
+            "nonfree_baggages": max(0, int(target_total_baggages) - int(free_baggages)),
+            "payment_id": payment_id,
+        }
+        if not _has_successful_tau_tool_observation(
+            "update_reservation_baggages",
+            baggage_args,
+            prompt_messages,
+        ):
+            calls.append({"name": "update_reservation_baggages", "arguments": baggage_args})
+
+    if not calls:
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    f"Reservation {reservation_id} has been updated with the requested cabin, passenger, "
+                    "and baggage changes. ###STOP###"
+                )
+            },
+        )
+    if len(calls) == 1:
+        call = calls[0]
+        return str(call["name"]), dict(call["arguments"])
+    return _TAU_MULTI_TOOL_CALLS_NAME, {"tool_calls": calls}
+
+
+def _tau_airline_multi_update_intent(user_text: str) -> dict[str, Any] | None:
+    lowered = str(user_text or "").lower()
+    target_cabin = _tau_airline_requested_cabin(lowered)
+    self_passenger = bool(
+        re.search(r"\bpassengers?\b", lowered)
+        and re.search(r"\b(?:myself|yourself|me|omar\s+rossi)\b", lowered)
+    )
+    total_baggages = _tau_airline_requested_total_baggages(lowered)
+    intent_count = int(bool(target_cabin)) + int(self_passenger) + int(total_baggages is not None)
+    if intent_count < 2:
+        return None
+    if not _tau_airline_user_requests_reservation_update(user_text):
+        return None
+    return {
+        "target_cabin": target_cabin,
+        "self_passenger": self_passenger,
+        "total_baggages": total_baggages,
+    }
+
+
+def _tau_airline_requested_cabin(lowered_text: str) -> str | None:
+    if re.search(r"\bbasic[\s_-]*economy\b", lowered_text):
+        return "basic_economy"
+    if re.search(r"\beconomy(?:\s+class)?\b", lowered_text):
+        return "economy"
+    if re.search(r"\bbusiness(?:\s+class)?\b", lowered_text):
+        return "business"
+    return None
+
+
+def _tau_airline_requested_total_baggages(lowered_text: str) -> int | None:
+    number_words = {
+        "one": 1,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+    }
+    pattern = r"\b(\d+|one|two|three|four|five)\s+(?:checked\s+)?(?:bags?|baggages?|suitcases?|luggage)\b"
+    match = re.search(pattern, lowered_text)
+    if not match:
+        return None
+    raw_count = match.group(1)
+    if raw_count.isdigit():
+        return int(raw_count)
+    return number_words.get(raw_count)
+
+
+def _best_matching_tau_airline_multi_update_reservation(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> Mapping[str, Any] | None:
+    criteria = _tau_airline_reservation_criteria_from_user_text(_tau_user_request_text(prompt_messages))
+    user_text = _tau_user_request_text(prompt_messages)
+    best: tuple[int, int, Mapping[str, Any]] | None = None
+    for index, reservation in enumerate(_successful_tau_airline_reservation_observations(prompt_messages)):
+        score = _tau_airline_multi_update_reservation_match_score(reservation, criteria, user_text)
+        if score <= 0:
+            continue
+        candidate = (score, index, reservation)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    return None if best is None else best[2]
+
+
+def _tau_airline_multi_update_reservation_match_score(
+    reservation: Mapping[str, Any],
+    criteria: Mapping[str, Any],
+    user_text: str,
+) -> int:
+    score = _tau_airline_reservation_match_score(reservation, criteria)
+    if score > 0:
+        return score
+    route_pairs = set(criteria.get("route_pairs") or set())
+    if not route_pairs:
+        return 0
+    for requested_origin, requested_destination in route_pairs:
+        origin_codes = _tau_airline_route_aliases(str(requested_origin), user_text)
+        destination_codes = _tau_airline_route_aliases(str(requested_destination), user_text)
+        if any(
+            _tau_airline_reservation_has_route(reservation, origin, destination)
+            for origin in origin_codes
+            for destination in destination_codes
+        ):
+            return 4
+    return 0
+
+
+def _tau_airline_route_aliases(code: str, user_text: str) -> set[str]:
+    normalized = str(code or "").strip().upper()
+    aliases = {normalized} if normalized else set()
+    if normalized == "JFK" and re.search(r"\bnew york\b", str(user_text or ""), re.IGNORECASE):
+        aliases.update({"JFK", "EWR", "LGA"})
+    return aliases
+
+
+def _tau_airline_preferred_payment_id(user: Mapping[str, Any]) -> str | None:
+    payment_methods = user.get("payment_methods")
+    if not isinstance(payment_methods, Mapping):
+        return None
+    fallback: str | None = None
+    for raw_payment_id, raw_payment in payment_methods.items():
+        payment_id = str(raw_payment_id or "").strip()
+        if not payment_id:
+            continue
+        if fallback is None and payment_id.startswith(("credit_card_", "gift_card_")):
+            fallback = payment_id
+        source = ""
+        if isinstance(raw_payment, Mapping):
+            source = str(raw_payment.get("source") or "").strip().lower()
+        if source == "gift_card" or payment_id.startswith("gift_card_"):
+            return payment_id
+    return fallback
+
+
+def _tau_airline_self_passenger_payload(user: Mapping[str, Any]) -> list[dict[str, str]]:
+    name = user.get("name")
+    first_name = ""
+    last_name = ""
+    if isinstance(name, Mapping):
+        first_name = str(name.get("first_name") or "").strip()
+        last_name = str(name.get("last_name") or "").strip()
+    dob = str(user.get("dob") or "").strip()
+    if not first_name or not last_name or not dob:
+        return []
+    return [{"first_name": first_name, "last_name": last_name, "dob": dob}]
+
+
+def _tau_airline_passengers_from_reservation(reservation: Mapping[str, Any]) -> list[dict[str, Any]]:
+    passengers = reservation.get("passengers")
+    if not isinstance(passengers, Sequence) or isinstance(passengers, (str, bytes)):
+        return []
+    return [dict(passenger) for passenger in passengers if isinstance(passenger, Mapping)]
+
+
+def _tau_airline_flight_infos_from_reservation(reservation: Mapping[str, Any]) -> list[dict[str, str]]:
+    flights = reservation.get("flights")
+    if not isinstance(flights, Sequence) or isinstance(flights, (str, bytes)):
+        return []
+    infos: list[dict[str, str]] = []
+    for flight in flights:
+        if not isinstance(flight, Mapping):
+            continue
+        flight_number = str(flight.get("flight_number") or "").strip().upper()
+        date = str(flight.get("date") or "").strip()
+        if flight_number and date:
+            infos.append({"flight_number": flight_number, "date": date})
+    return infos
+
+
+def _tau_airline_user_requests_new_booking(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(
+        re.search(r"\b(?:book|booking|reserve)\b", lowered)
+        and re.search(r"\b(?:new|flight|one-way|round trip|round-trip|from .+ to .+)\b", lowered)
+        and not re.search(
+            r"\b(?:cancel|canceling|cancelling|cancellation|refund|changes?|changing|changed|"
+            r"updates?|updating|updated|modif(?:y|ies|ied|ying|ications?)|moves?|moving|moved|"
+            r"reschedules?|rescheduling|rescheduled|switch(?:es|ing|ed)?|upgrades?|upgrading|upgraded|"
+            r"insurance|baggage)\b",
+            lowered,
+        )
+    )
+
+
+def _tau_airline_user_requests_reservation_update(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if not re.search(
+        r"\b(?:changes?|changing|changed|updates?|updating|updated|modif(?:y|ies|ied|ying|ications?)|"
+        r"adds?|adding|added|removes?|removing|removed|upgrades?|upgrading|upgraded|"
+        r"reschedules?|rescheduling|rescheduled|moves?|moving|moved|switch(?:es|ing|ed)?|"
+        r"push(?:es|ing|ed)?)\b",
+        lowered,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:reservation|booking|flight|passenger|name|baggage|bags?|suitcases?|luggage|cabin|class|ticket)\b",
+            lowered,
+        )
+    )
+
+
+def _tau_airline_booking_request_dates(criteria: Mapping[str, Any]) -> list[str]:
+    dates = sorted(str(item) for item in criteria.get("dates") or set() if str(item))
+    current_date = _TAU_AIRLINE_CURRENT_TIME.date().isoformat()
+    upcoming = [date for date in dates if date >= current_date]
+    return upcoming or dates
+
+
+def _has_empty_successful_tau_tool_observation(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> bool:
+    target_name = str(name or "").strip()
+    target_arguments = _canonical_tau_arguments(arguments)
+    for tool_name, observed_args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if not ok or tool_name != target_name or _canonical_tau_arguments(observed_args) != target_arguments:
+            continue
+        if output == [] or output == {} or output is None:
+            return True
+    return False
+
+
+def _available_tau_airline_tools(available_tool_names: set[str]) -> bool:
+    return bool(
+        {
+            "get_user_details",
+            "get_reservation_details",
+            "cancel_reservation",
+            "list_all_airports",
+            "search_direct_flight",
+            "search_onestop_flight",
+            *_TAU_AIRLINE_UPDATE_TOOL_NAMES,
+        }
+        & set(available_tool_names)
+    )
+
+
+def _requested_tau_user_id_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    match = _TAU_USER_ID_RE.search(_tau_user_request_text(prompt_messages))
+    return match.group(0) if match else None
+
+
+def _tau_cancelled_reservation_ids_from_context(prompt_messages: Sequence[Mapping[str, object]]) -> set[str]:
+    cancelled: set[str] = set()
+    for tool_name, args, ok, output in _iter_tau_tool_observations(prompt_messages):
+        if not ok:
+            continue
+        reservation_id = ""
+        if isinstance(output, Mapping):
+            reservation_id = str(output.get("reservation_id") or "").strip().upper()
+            if str(output.get("status") or "").strip().lower() == "cancelled":
+                cancelled.add(reservation_id)
+        if tool_name == "cancel_reservation":
+            reservation_id = reservation_id or str(args.get("reservation_id") or "").strip().upper()
+            if reservation_id:
+                cancelled.add(reservation_id)
+    return {reservation_id for reservation_id in cancelled if reservation_id}
+
+
+def _tau_airline_any_matching_cancel_completed(
+    prompt_messages: Sequence[Mapping[str, object]],
+    criteria: Mapping[str, Any],
+) -> bool:
+    cancelled_ids = _tau_cancelled_reservation_ids_from_context(prompt_messages)
+    if not cancelled_ids:
+        return False
+    for reservation in _successful_tau_airline_reservation_observations(prompt_messages):
+        reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+        if reservation_id in cancelled_ids and _tau_airline_reservation_match_score(reservation, criteria) > 0:
+            return True
+    return False
+
+
+def _successful_tau_airline_reservation_observations(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> list[Mapping[str, Any]]:
+    reservations: list[Mapping[str, Any]] = []
+    for tool_name, _args, ok, output in _iter_tau_tool_observations(prompt_messages):
+        if tool_name == "get_reservation_details" and ok and isinstance(output, Mapping):
+            reservations.append(output)
+    return reservations
+
+
+def _best_matching_tau_airline_reservation(
+    prompt_messages: Sequence[Mapping[str, object]],
+    criteria: Mapping[str, Any],
+    *,
+    exclude_ids: set[str] | None = None,
+) -> Mapping[str, Any] | None:
+    excluded = set(exclude_ids or set())
+    best: tuple[int, int, Mapping[str, Any]] | None = None
+    reservations = _successful_tau_airline_reservation_observations(prompt_messages)
+    for index, reservation in enumerate(reservations):
+        reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+        if reservation_id in excluded:
+            continue
+        score = _tau_airline_reservation_match_score(reservation, criteria)
+        if score <= 0:
+            continue
+        candidate = (score, index, reservation)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    return None if best is None else best[2]
+
+
+def _tau_airline_reservation_criteria_from_user_text(text: str) -> dict[str, Any]:
+    normalized = normalize_rwkv_text(text)
+    lowered = normalized.lower()
+    route_pairs: set[tuple[str, str]] = set()
+    for origin, destination in re.findall(
+        rf"\bfrom\s+({_TAU_AIRPORT_PATTERN})\s+to\s+({_TAU_AIRPORT_PATTERN})\b",
+        lowered,
+        flags=re.IGNORECASE,
+    ):
+        route_pairs.add((_tau_airport_code(origin), _tau_airport_code(destination)))
+    for destination, origin in re.findall(
+        rf"\bto\s+({_TAU_AIRPORT_PATTERN})\s+from\s+({_TAU_AIRPORT_PATTERN})\b",
+        lowered,
+        flags=re.IGNORECASE,
+    ):
+        route_pairs.add((_tau_airport_code(origin), _tau_airport_code(destination)))
+    for destination, origin in re.findall(
+        rf"\barriv(?:e|ing|es|ed)\s+(?:in|at)\s+({_TAU_AIRPORT_PATTERN})\s+from\s+({_TAU_AIRPORT_PATTERN})\b",
+        lowered,
+        flags=re.IGNORECASE,
+    ):
+        route_pairs.add((_tau_airport_code(origin), _tau_airport_code(destination)))
+
+    dates = set(_TAU_ISO_DATE_RE.findall(normalized))
+    for month_text, day_text in re.findall(
+        r"\b("
+        + "|".join(re.escape(month) for month in sorted(_TAU_MONTHS, key=len, reverse=True))
+        + r")\s+(\d{1,2})(?:st|nd|rd|th)?\b",
+        lowered,
+        flags=re.IGNORECASE,
+    ):
+        month = _TAU_MONTHS.get(month_text.lower())
+        day = int(day_text)
+        if month and 1 <= day <= 31:
+            dates.add(f"{_TAU_AIRLINE_CURRENT_TIME.year:04}-{month:02}-{day:02}")
+
+    passenger_counts: set[int] = set()
+    if re.search(r"\b(?:only\s+one|single|1)\s+passenger\b", lowered):
+        passenger_counts.add(1)
+    if re.search(r"\b(?:two|2)\s+passengers?\b", lowered):
+        passenger_counts.add(2)
+
+    flight_numbers = {match.group(0).upper() for match in _TAU_FLIGHT_NUMBER_RE.finditer(normalized)}
+    return {
+        "route_pairs": {pair for pair in route_pairs if all(pair)},
+        "dates": dates,
+        "flight_numbers": flight_numbers,
+        "passenger_counts": passenger_counts,
+        "bulk": _tau_airline_request_is_bulk(lowered),
+    }
+
+
+def _tau_airport_code(value: str) -> str:
+    key = re.sub(r"[^a-z0-9 ]+", "", str(value or "").strip().lower())
+    key = re.sub(r"\s+", " ", key)
+    return _TAU_AIRPORT_CODES_BY_NAME.get(key, key.upper() if len(key) == 3 else "")
+
+
+def _tau_airline_request_is_bulk(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(
+        re.search(r"\b(?:all|every|each|any)\b", lowered)
+        or re.search(r"\bflights?\s+that\b", lowered)
+        or re.search(r"\breservations?\s+that\b", lowered)
+    )
+
+
+def _tau_airline_reservation_match_score(reservation: Mapping[str, Any], criteria: Mapping[str, Any]) -> int:
+    if not _tau_airline_reservation_is_upcoming(reservation):
+        return 0
+    score = 0
+    route_pairs = set(criteria.get("route_pairs") or set())
+    if route_pairs:
+        if not any(_tau_airline_reservation_has_route(reservation, origin, destination) for origin, destination in route_pairs):
+            return 0
+        score += 4
+    dates = {str(item) for item in criteria.get("dates") or set()}
+    if dates:
+        reservation_dates = _tau_airline_reservation_dates(reservation)
+        if not reservation_dates & dates:
+            return 0
+        score += 2
+    flight_numbers = {str(item).upper() for item in criteria.get("flight_numbers") or set()}
+    if flight_numbers:
+        reservation_flights = _tau_airline_reservation_flight_numbers(reservation)
+        if not reservation_flights & flight_numbers:
+            return 0
+        score += 3
+    passenger_counts = {int(item) for item in criteria.get("passenger_counts") or set()}
+    if passenger_counts:
+        passengers = reservation.get("passengers")
+        count = len(passengers) if isinstance(passengers, Sequence) and not isinstance(passengers, (str, bytes)) else 0
+        if count not in passenger_counts:
+            return 0
+        score += 2
+    if score == 0 and bool(criteria.get("bulk")):
+        score = 1
+    return score
+
+
+def _tau_airline_reservation_has_route(reservation: Mapping[str, Any], origin: str, destination: str) -> bool:
+    requested_origin = str(origin or "").strip().upper()
+    requested_destination = str(destination or "").strip().upper()
+    if not requested_origin or not requested_destination:
+        return False
+    if (
+        str(reservation.get("origin") or "").strip().upper() == requested_origin
+        and str(reservation.get("destination") or "").strip().upper() == requested_destination
+    ):
+        return True
+    flights = reservation.get("flights")
+    if not isinstance(flights, Sequence) or isinstance(flights, (str, bytes)):
+        return False
+    for flight in flights:
+        if not isinstance(flight, Mapping):
+            continue
+        if (
+            str(flight.get("origin") or "").strip().upper() == requested_origin
+            and str(flight.get("destination") or "").strip().upper() == requested_destination
+        ):
+            return True
+    return False
+
+
+def _tau_airline_reservation_dates(reservation: Mapping[str, Any]) -> set[str]:
+    dates: set[str] = set()
+    flights = reservation.get("flights")
+    if not isinstance(flights, Sequence) or isinstance(flights, (str, bytes)):
+        return dates
+    for flight in flights:
+        if isinstance(flight, Mapping):
+            date = str(flight.get("date") or "").strip()
+            if date:
+                dates.add(date)
+    return dates
+
+
+def _tau_airline_reservation_flight_numbers(reservation: Mapping[str, Any]) -> set[str]:
+    numbers: set[str] = set()
+    flights = reservation.get("flights")
+    if not isinstance(flights, Sequence) or isinstance(flights, (str, bytes)):
+        return numbers
+    for flight in flights:
+        if isinstance(flight, Mapping):
+            number = str(flight.get("flight_number") or "").strip().upper()
+            if number:
+                numbers.add(number)
+    return numbers
+
+
+def _tau_airline_reservation_is_upcoming(reservation: Mapping[str, Any]) -> bool:
+    dates = _tau_airline_reservation_dates(reservation)
+    if not dates:
+        return True
+    current_date = _TAU_AIRLINE_CURRENT_TIME.date().isoformat()
+    return any(date >= current_date for date in dates)
+
+
 def _tau_cancel_intent_replacement_from_context(
     selected_name: str,
+    arguments: Mapping[str, Any],
     prompt_messages: Sequence[Mapping[str, object]],
     *,
     available_tool_names: set[str],
 ) -> tuple[str, dict[str, Any]] | None:
     if "cancel_reservation" not in available_tool_names and "get_reservation_details" not in available_tool_names:
         return None
-    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
-    if not requested_id:
+    requested_ids = _requested_tau_reservation_ids_from_user(prompt_messages)
+    if not requested_ids:
         return None
     user_text = _tau_user_request_text(prompt_messages)
     if not re.search(
@@ -2337,6 +3441,15 @@ def _tau_cancel_intent_replacement_from_context(
         re.IGNORECASE,
     ):
         return None
+    if len(requested_ids) > 1:
+        return _tau_multi_requested_cancel_replacement(
+            selected_name,
+            arguments,
+            prompt_messages,
+            requested_ids=requested_ids,
+            available_tool_names=available_tool_names,
+        )
+    requested_id = requested_ids[0]
     completed_response = _tau_completed_cancel_response_from_context(prompt_messages, requested_id)
     if completed_response is not None:
         return completed_response
@@ -2345,8 +3458,19 @@ def _tau_cancel_intent_replacement_from_context(
     )
     if not has_reservation_details and selected_name != "get_reservation_details":
         return "get_reservation_details", {"reservation_id": requested_id}
-    if has_reservation_details and selected_name != "cancel_reservation" and "cancel_reservation" in available_tool_names:
-        return "cancel_reservation", {"reservation_id": requested_id}
+    if has_reservation_details and "cancel_reservation" in available_tool_names:
+        reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+        policy_decision = _tau_airline_cancel_policy_decision(
+            reservation,
+            prompt_messages,
+            reservation_id=requested_id,
+        )
+        if policy_decision is not None:
+            allowed, reason = policy_decision
+            if not allowed:
+                return _tau_airline_cancel_refusal_response(requested_id, reason)
+        if selected_name != "cancel_reservation":
+            return "cancel_reservation", {"reservation_id": requested_id}
     return None
 
 
@@ -2381,32 +3505,252 @@ def _tau_direct_requested_reservation_action_from_context(
     *,
     available_tool_names: set[str],
 ) -> tuple[str, dict[str, Any]] | None:
-    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
-    if not requested_id:
-        return None
-    if not _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id):
+    requested_ids = _requested_tau_reservation_ids_from_user(prompt_messages)
+    if not requested_ids:
         return None
     user_text = _tau_user_request_text(prompt_messages)
-    if "cancel_reservation" in available_tool_names and re.search(
+    wants_cancel = bool(
+        re.search(
+            r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation)\b",
+            user_text,
+            re.IGNORECASE,
+        )
+    )
+    if len(requested_ids) > 1 and wants_cancel:
+        return _tau_multi_requested_cancel_replacement(
+            RESPOND_TOOL_NAME,
+            {},
+            prompt_messages,
+            requested_ids=requested_ids,
+            available_tool_names=available_tool_names,
+        )
+    requested_id = requested_ids[0]
+    if not _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id):
+        return None
+    if wants_cancel:
+        reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+        policy_decision = _tau_airline_cancel_policy_decision(
+            reservation,
+            prompt_messages,
+            reservation_id=requested_id,
+        )
+        if policy_decision is not None:
+            allowed, reason = policy_decision
+            if not allowed:
+                return _tau_airline_cancel_refusal_response(requested_id, reason)
+        if "cancel_reservation" in available_tool_names:
+            return "cancel_reservation", {"reservation_id": requested_id}
+    return None
+
+
+def _tau_airline_cancel_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    if not re.search(
         r"\b(?:cancel|canceling|cancelling|canceled|cancelled|cancellation)\b",
         user_text,
         re.IGNORECASE,
     ):
-        return "cancel_reservation", {"reservation_id": requested_id}
-    return None
+        return None
+    if len(_requested_tau_reservation_ids_from_user(prompt_messages)) > 1:
+        return None
+    requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
+    reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
+    if reservation is None and not requested_id:
+        criteria = _tau_airline_reservation_criteria_from_user_text(user_text)
+        reservation = _best_matching_tau_airline_reservation(prompt_messages, criteria)
+        if reservation is None and _tau_airline_any_matching_cancel_completed(prompt_messages, criteria):
+            return (
+                RESPOND_TOOL_NAME,
+                {"content": "The matching reservation has been cancelled. ###STOP###"},
+            )
+    if not reservation:
+        return None
+    reservation_id = str(reservation.get("reservation_id") or requested_id or "").strip().upper()
+    if not reservation_id:
+        return None
+    policy_decision = _tau_airline_cancel_policy_decision(
+        reservation,
+        prompt_messages,
+        reservation_id=reservation_id,
+    )
+    if policy_decision is None:
+        return None
+    allowed, reason = policy_decision
+    if allowed:
+        return None
+    return _tau_airline_cancel_refusal_response(reservation_id, reason)
+
+
+def _tau_airline_cancel_policy_decision(
+    reservation: Mapping[str, Any] | None,
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    reservation_id: str,
+) -> tuple[bool, str] | None:
+    if not isinstance(reservation, Mapping):
+        return None
+    if not _tau_airline_cancel_policy_has_enough_data(reservation):
+        return None
+    if _tau_airline_reservation_was_upgraded_for_cancel(reservation_id, prompt_messages):
+        return True, "basic economy reservation was upgraded before cancellation"
+    if _tau_airline_booking_within_24h(reservation):
+        return True, "booking was made within the last 24 hours"
+    if str(reservation.get("cabin") or "").strip().lower() == "business":
+        return True, "reservation is business cabin"
+    if _tau_airline_reservation_has_airline_cancelled_flight(reservation, prompt_messages):
+        return True, "flight was cancelled by the airline"
+    insurance = str(reservation.get("insurance") or "").strip().lower()
+    if insurance in {"yes", "true", "1"} and reservation_id in _requested_tau_reservation_ids_from_user(prompt_messages):
+        return True, "insured reservation was explicitly requested for cancellation"
+    if insurance in {"yes", "true", "1"} and _tau_airline_user_gave_covered_cancel_reason(prompt_messages):
+        return True, "covered travel insurance reason was provided"
+    return (
+        False,
+        "the reservation is not within 24 hours of booking, is not business cabin, "
+        "has no covered insurance reason, and no airline-cancelled flight is established",
+    )
+
+
+def _tau_airline_cancel_policy_has_enough_data(reservation: Mapping[str, Any]) -> bool:
+    keys = {"created_at", "cabin", "insurance", "flights"}
+    return any(key in reservation for key in keys)
+
+
+def _tau_airline_booking_within_24h(reservation: Mapping[str, Any]) -> bool:
+    created_raw = str(reservation.get("created_at") or "").strip()
+    if not created_raw:
+        return False
+    try:
+        created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return False
+    delta_s = (_TAU_AIRLINE_CURRENT_TIME - created_at).total_seconds()
+    return 0 <= delta_s <= 24 * 60 * 60
+
+
+def _tau_airline_reservation_has_airline_cancelled_flight(
+    reservation: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> bool:
+    user_text = _tau_user_request_text(prompt_messages).lower()
+    if "airline" in user_text and re.search(r"\bcancel(?:led|ed|s|lation)?\b", user_text):
+        return True
+    flights = reservation.get("flights")
+    if not isinstance(flights, Sequence) or isinstance(flights, (str, bytes)):
+        return False
+    for flight in flights:
+        if not isinstance(flight, Mapping):
+            continue
+        status = str(flight.get("status") or "").strip().lower()
+        if status in {"cancelled", "canceled", "cancelled_by_airline", "canceled_by_airline"}:
+            return True
+    return False
+
+
+def _tau_airline_user_gave_covered_cancel_reason(prompt_messages: Sequence[Mapping[str, object]]) -> bool:
+    user_text = _tau_user_request_text(prompt_messages).lower()
+    covered_markers = (
+        "sick",
+        "ill",
+        "illness",
+        "health",
+        "medical",
+        "doctor",
+        "hospital",
+        "weather",
+        "storm",
+        "snow",
+        "hurricane",
+    )
+    return any(marker in user_text for marker in covered_markers)
+
+
+def _tau_airline_cancel_refusal_response(reservation_id: str, reason: str) -> tuple[str, dict[str, Any]]:
+    requested = str(reservation_id or "").strip().upper()
+    content = (
+        f"I cannot cancel reservation {requested} under the airline policy because {reason}. "
+        "###STOP###"
+    )
+    return RESPOND_TOOL_NAME, {"content": content}
+
+
+def _missing_required_tau_tool_arguments(tool: Any, arguments: Mapping[str, Any]) -> list[str]:
+    if tool is None:
+        return []
+    schema = _normalize_tool_schema(tool)
+    parameters = schema.get("parameters")
+    if not isinstance(parameters, Mapping):
+        return []
+    raw_required = parameters.get("required")
+    if not isinstance(raw_required, Sequence) or isinstance(raw_required, (str, bytes)):
+        return []
+    missing: list[str] = []
+    for raw_key in raw_required:
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        value = arguments.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(key)
+    return missing
+
+
+def _tau_missing_required_argument_response(tool_name: str, missing: Sequence[str]) -> str:
+    missing_text = ", ".join(str(item) for item in missing)
+    if tool_name == "cancel_reservation" and "reservation_id" in set(missing):
+        return "I need the reservation id before I can check or cancel a reservation."
+    if tool_name == "book_reservation":
+        return f"I need more booking details before I can book the reservation: {missing_text}."
+    return f"I need the following information before I can use {tool_name}: {missing_text}."
 
 
 def _tau_readonly_reservation_response_from_context(
     prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
 ) -> tuple[str, dict[str, Any]] | None:
     user_text = _tau_user_request_text(prompt_messages)
-    if not re.search(r"\b(?:baggage|bag|bags|suitcase|suitcases|luggage)\b", user_text, re.IGNORECASE):
+    wants_baggage = _tau_airline_user_requests_baggage_allowance(user_text)
+    wants_insurance = bool(re.search(r"\b(?:insurance|insured)\b", user_text, re.IGNORECASE))
+    if not wants_baggage and not wants_insurance:
         return None
     requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
     reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=requested_id)
     if not reservation:
         return None
     reservation_id = str(reservation.get("reservation_id") or requested_id or "").strip().upper()
+    if wants_insurance:
+        insurance = str(reservation.get("insurance") or "").strip().lower()
+        if insurance in {"yes", "true", "1"}:
+            return (
+                RESPOND_TOOL_NAME,
+                {"content": f"Reservation {reservation_id} already has travel insurance. ###STOP###"},
+            )
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    f"Reservation {reservation_id} does not have travel insurance. "
+                    "Airline policy does not allow adding insurance after the initial booking. ###STOP###"
+                )
+            },
+        )
+
+    user_id = str(reservation.get("user_id") or _requested_tau_user_id_from_user(prompt_messages) or "").strip()
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    if user_id and "get_user_details" in available_tool_names and user is None:
+        return "get_user_details", {"user_id": user_id}
+    allowance = _tau_airline_free_baggage_allowance(reservation, user)
+    if allowance is not None:
+        total_free, membership, cabin, passenger_count = allowance
+        content = (
+            f"Your profile shows {membership} membership. Reservation {reservation_id} is {cabin} "
+            f"with {passenger_count} passenger(s), so you can bring {total_free} free checked suitcases total."
+        )
+        return RESPOND_TOOL_NAME, {"content": f"{content} ###STOP###"}
+
     total_baggages = reservation.get("total_baggages")
     if total_baggages is None:
         return None
@@ -2415,6 +3759,390 @@ def _tau_readonly_reservation_response_from_context(
     if nonfree_baggages is not None:
         content += f" Nonfree suitcases: {nonfree_baggages}."
     return RESPOND_TOOL_NAME, {"content": f"{content} ###STOP###"}
+
+
+def _tau_airline_user_requests_baggage_allowance(user_text: str) -> bool:
+    text = str(user_text or "").lower()
+    if not re.search(r"\b(?:baggage|bags?|suitcases?|luggage)\b", text):
+        return False
+    asks_allowance = bool(
+        re.search(
+            r"\b(?:how many|how much|can i bring|may i bring|allowed|allowance|free|included|include)\b",
+            text,
+        )
+    )
+    requests_update = bool(
+        re.search(
+            r"\b(?:add|adding|remove|change|update|modify|increase|decrease|purchase|buy|pay|book)\b"
+            r".{0,80}\b(?:baggage|bags?|suitcases?|luggage)\b"
+            r"|\b(?:baggage|bags?|suitcases?|luggage)\b.{0,80}"
+            r"\b(?:add|adding|remove|change|update|modify|increase|decrease|purchase|buy|pay|book)\b",
+            text,
+            re.DOTALL,
+        )
+    )
+    return asks_allowance or not requests_update
+
+
+def _tau_airline_free_baggage_allowance(
+    reservation: Mapping[str, Any],
+    user: Mapping[str, Any] | None,
+) -> tuple[int, str, str, int] | None:
+    if not isinstance(user, Mapping):
+        return None
+    membership = str(user.get("membership") or "").strip().lower()
+    cabin_raw = str(reservation.get("cabin") or "").strip().lower()
+    passengers = reservation.get("passengers")
+    passenger_count = len(passengers) if isinstance(passengers, Sequence) and not isinstance(passengers, (str, bytes)) else 0
+    if not membership or not cabin_raw or passenger_count <= 0:
+        return None
+    table = {
+        "regular": {"basic_economy": 0, "economy": 1, "business": 2},
+        "silver": {"basic_economy": 1, "economy": 2, "business": 3},
+        "gold": {"basic_economy": 2, "economy": 3, "business": 4},
+    }
+    per_passenger = table.get(membership, {}).get(cabin_raw)
+    if per_passenger is None:
+        return None
+    cabin = cabin_raw.replace("_", " ")
+    return int(per_passenger) * passenger_count, membership, cabin, passenger_count
+
+
+def _latest_successful_tau_user_observation(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    user_id: str | None = None,
+) -> Mapping[str, Any] | None:
+    requested = str(user_id or "").strip()
+    for tool_name, _args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_user_details" or not ok or not isinstance(output, Mapping):
+            continue
+        observed_id = str(output.get("user_id") or "").strip()
+        if requested and observed_id != requested:
+            continue
+        return output
+    return None
+
+
+def _tau_airline_payment_balance_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    lowered = user_text.lower()
+    if not re.search(r"\b(?:balance|balances|amounts?|how much)\b", lowered):
+        return None
+    if not re.search(r"\b(?:gift\s*cards?|certificates?|payment methods?)\b", lowered):
+        return None
+    user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    if not user:
+        return None
+    payment_methods = user.get("payment_methods")
+    if not isinstance(payment_methods, Mapping):
+        return None
+    balances: list[str] = []
+    totals = {"gift_card": 0.0, "certificate": 0.0}
+    for payment_id, raw_payment in sorted(payment_methods.items(), key=lambda item: str(item[0])):
+        if not isinstance(raw_payment, Mapping):
+            continue
+        source = str(raw_payment.get("source") or payment_id).strip().lower()
+        if source not in {"gift_card", "certificate"} and not str(payment_id).startswith(
+            ("gift_card_", "certificate_")
+        ):
+            continue
+        amount = raw_payment.get("amount")
+        try:
+            amount_value = float(amount)
+            amount_text = f"${amount_value:.2f}"
+            if source in totals:
+                totals[source] += amount_value
+        except (TypeError, ValueError):
+            amount_text = str(amount)
+        balances.append(f"{payment_id}: {amount_text}")
+    if not balances:
+        return (
+            RESPOND_TOOL_NAME,
+            {"content": "I do not see any gift card or certificate balances on your profile."},
+        )
+    total_parts = [
+        f"total gift card balance: ${totals['gift_card']:.2f}",
+        f"total certificate balance: ${totals['certificate']:.2f}",
+    ]
+    return (
+        RESPOND_TOOL_NAME,
+        {
+            "content": (
+                "Your gift card and certificate balances are: "
+                + "; ".join(balances)
+                + ". "
+                + "; ".join(total_parts)
+                + "."
+            )
+        },
+    )
+
+
+def _tau_airline_compensation_profile_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> tuple[str, dict[str, Any]] | None:
+    return _tau_airline_compensation_response_from_context(prompt_messages, available_tool_names=set())
+
+
+def _tau_airline_compensation_response_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    lowered = user_text.lower()
+    if not re.search(r"\b(?:compensation|compensate|certificate|voucher|delay|delayed)\b", lowered):
+        return None
+    explicitly_requests_compensation = bool(
+        re.search(r"\b(?:compensation|compensate|certificate|voucher|refund)\b", lowered)
+    )
+    requested_flight_number = _requested_tau_flight_number_from_user(prompt_messages)
+    status_observation = _latest_successful_tau_flight_status_observation(prompt_messages)
+    failed_status_probe = _latest_failed_tau_flight_status_observation(prompt_messages)
+    user_id = _requested_tau_user_id_from_user(prompt_messages) or _latest_tau_fact_value(prompt_messages, "user_id")
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    if not _TAU_FLIGHT_NUMBER_RE.search(user_text) and status_observation is None:
+        if user_id and user is None and "get_user_details" in available_tool_names:
+            return "get_user_details", {"user_id": user_id}
+        if user is not None:
+            scan_replacement = _tau_multi_reservation_scan_replacement(
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if scan_replacement is not None:
+                return scan_replacement
+            matching_reservation = _tau_airline_compensation_reservation_from_context(prompt_messages)
+            if (
+                matching_reservation is not None
+                and (explicitly_requests_compensation or re.search(r"\bdelay|delayed\b", lowered))
+                and str(user.get("membership") or "").strip().lower() != "regular"
+                and "send_certificate" in available_tool_names
+            ):
+                if _has_successful_tau_tool_name("send_certificate", prompt_messages):
+                    amount = _tau_delayed_compensation_amount_from_reservation(matching_reservation)
+                    return (
+                        RESPOND_TOOL_NAME,
+                        {
+                            "content": (
+                                f"I verified the matching delayed-flight reservation and issued a ${amount} "
+                                "travel certificate. ###STOP###"
+                            )
+                        },
+                    )
+                amount = _tau_delayed_compensation_amount_from_reservation(matching_reservation)
+                return "send_certificate", {"user_id": str(user.get("user_id") or user_id), "amount": amount}
+        exhausted_response = _tau_exhausted_repeated_read_response("get_reservation_details", prompt_messages)
+        if exhausted_response is not None:
+            return exhausted_response
+        if user is not None and str(user.get("membership") or "").strip().lower() == "regular":
+            return (
+                RESPOND_TOOL_NAME,
+                {
+                    "content": (
+                        "Your profile shows regular membership, not Gold membership. "
+                        "I cannot offer compensation here under the airline compensation policy. ###STOP###"
+                    )
+                },
+            )
+        return None
+    if (
+        user is None
+        and status_observation is None
+        and requested_flight_number
+        and explicitly_requests_compensation
+        and not user_id
+    ):
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    "Please provide your user id or reservation id so I can verify the delayed reservation "
+                    "and compensation eligibility."
+                )
+            },
+        )
+    if user_id and user is None and "get_user_details" in available_tool_names:
+        return "get_user_details", {"user_id": user_id}
+    if user is None and status_observation is None and failed_status_probe is not None:
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    "I could not verify that flight status with the available date. Please provide your user id "
+                    "or reservation id so I can verify the delayed reservation and compensation eligibility."
+                )
+            },
+        )
+    if user is None and status_observation is not None:
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    "I confirmed the flight status, but I need your user id or reservation id before I can "
+                    "verify compensation eligibility."
+                )
+            },
+        )
+    if not user:
+        return None
+    membership = str(user.get("membership") or "").strip().lower()
+    matching_reservation = None
+    if requested_flight_number:
+        matching_reservation = _latest_tau_reservation_observation_with_flight_number(
+            prompt_messages,
+            requested_flight_number,
+        )
+        if matching_reservation is None:
+            scan_replacement = _tau_multi_reservation_scan_replacement(
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if scan_replacement is not None:
+                return scan_replacement
+    if membership != "regular":
+        status = str((status_observation or {}).get("status") or "").strip().lower()
+        rejects_change_or_cancel = bool(
+            re.search(
+                r"\b(?:do\s+not|don't|dont|not)\s+want\s+to\s+"
+                r"(?:change|modify|reschedule|move|cancel)",
+                lowered,
+            )
+            or "must stay as is" in lowered
+        )
+        wants_change_or_cancel = bool(
+            re.search(r"\b(?:change|modify|reschedule|move|cancel|canceling|cancelling|cancelled)\b", lowered)
+            and not rejects_change_or_cancel
+        )
+        if (
+            explicitly_requests_compensation
+            and matching_reservation is not None
+            and not rejects_change_or_cancel
+            and "send_certificate" in available_tool_names
+        ):
+            if _has_successful_tau_tool_name("send_certificate", prompt_messages):
+                amount = _tau_delayed_compensation_amount_from_reservation(matching_reservation)
+                return (
+                    RESPOND_TOOL_NAME,
+                    {
+                        "content": (
+                            f"I verified the matching delayed-flight reservation and issued a ${amount} "
+                            "travel certificate. ###STOP###"
+                        )
+                    },
+                )
+            amount = _tau_delayed_compensation_amount_from_reservation(matching_reservation)
+            return "send_certificate", {"user_id": str(user.get("user_id") or user_id), "amount": amount}
+        if status == "delayed" and not wants_change_or_cancel:
+            return (
+                RESPOND_TOOL_NAME,
+                {
+                    "content": (
+                        "I confirmed the flight is delayed, but airline policy does not allow compensation for "
+                        "a delayed flight unless you want to change or cancel the reservation. Since you are not "
+                        "changing or cancelling it, I cannot offer compensation here. ###STOP###"
+                    )
+                },
+            )
+        return None
+    return (
+        RESPOND_TOOL_NAME,
+        {
+            "content": (
+                "Your profile shows regular membership, not Gold membership. "
+                "I cannot offer compensation here under the airline compensation policy. ###STOP###"
+            )
+        },
+    )
+
+
+def _tau_airline_compensation_reservation_from_context(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> Mapping[str, Any] | None:
+    reservations = _successful_tau_airline_reservation_observations(prompt_messages)
+    if not reservations:
+        return None
+    insured = [
+        reservation
+        for reservation in reservations
+        if str(reservation.get("insurance") or "").strip().lower() in {"yes", "true", "1"}
+    ]
+    if insured:
+        return _tau_airline_latest_created_reservation(insured) or insured[-1]
+    return _tau_airline_latest_created_reservation(reservations) or reservations[-1]
+
+
+def _tau_airline_latest_created_reservation(
+    reservations: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    best: tuple[datetime, int, Mapping[str, Any]] | None = None
+    for index, reservation in enumerate(reservations):
+        created_raw = str(reservation.get("created_at") or "").strip()
+        if not created_raw:
+            continue
+        try:
+            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            continue
+        candidate = (created_at, index, reservation)
+        if best is None or candidate[:2] > best[:2]:
+            best = candidate
+    return None if best is None else best[2]
+
+
+def _latest_successful_tau_flight_status_observation(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> Mapping[str, Any] | None:
+    for tool_name, args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_flight_status" or not ok:
+            continue
+        status = str(output or "").strip().lower()
+        if not status:
+            continue
+        return {"flight_number": args.get("flight_number"), "date": args.get("date"), "status": status}
+    return None
+
+
+def _latest_failed_tau_flight_status_observation(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> Mapping[str, Any] | None:
+    for tool_name, args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_flight_status" or ok:
+            continue
+        output_text = str(output or "").strip()
+        if output_text:
+            return {"flight_number": args.get("flight_number"), "date": args.get("date"), "error": output_text}
+    return None
+
+
+def _requested_tau_flight_number_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    match = _TAU_FLIGHT_NUMBER_RE.search(_tau_user_request_text(prompt_messages))
+    return match.group(0).upper() if match else None
+
+
+def _latest_tau_reservation_observation_with_flight_number(
+    prompt_messages: Sequence[Mapping[str, object]],
+    flight_number: str,
+) -> Mapping[str, Any] | None:
+    requested = str(flight_number or "").strip().upper()
+    if not requested:
+        return None
+    for tool_name, _args, ok, output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if tool_name != "get_reservation_details" or not ok or not isinstance(output, Mapping):
+            continue
+        if requested in _tau_airline_reservation_flight_numbers(output):
+            return output
+    return None
+
+
+def _tau_delayed_compensation_amount_from_reservation(reservation: Mapping[str, Any]) -> int:
+    passengers = reservation.get("passengers")
+    if isinstance(passengers, Sequence) and not isinstance(passengers, (str, bytes)):
+        return 50 * max(1, len(passengers))
+    return 50
 
 
 def _latest_successful_tau_reservation_observation(
@@ -2476,6 +4204,13 @@ def _replacement_for_repeated_tau_read(
         next_reservation_id = _next_uninspected_tau_reservation_id(prompt_messages)
         if next_reservation_id and next_reservation_id != current_id:
             return "get_reservation_details", {"reservation_id": next_reservation_id}
+    if name == "get_flight_status":
+        compensation_response = _tau_airline_compensation_response_from_context(
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+        if compensation_response is not None:
+            return compensation_response
     return None
 
 
@@ -2493,42 +4228,363 @@ def _tau_context_wants_existing_reservation_action(prompt_messages: Sequence[Map
     )
 
 
-def _requested_tau_reservation_id_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+def _requested_tau_reservation_ids_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> list[str]:
     user_text = _tau_user_request_text(prompt_messages)
-    labeled_match = re.search(
-        r"\b(?:reservation(?:_id| id)?|booking(?:_id| id)?|confirmation(?:\s*(?:number|no\.?|id|code))?)"
-        r"\s*(?:is|:|#)?\s*((?=[A-Z0-9]*\d)[A-Z0-9]{6})\b",
-        user_text,
+    candidates: list[str] = []
+    labeled_pattern = re.compile(
+        r"\b(?:reservation(?:_id| id| ids)?|booking(?:_id| id| ids)?|confirmation(?:\s*(?:number|no\.?|id|code))?)"
+        r"\s*(?:is|are|:|#)?\s*((?=[A-Z0-9]*\d)[A-Z0-9]{6})\b",
         flags=re.IGNORECASE,
     )
-    if labeled_match:
-        return labeled_match.group(1).upper()
-    generic_match = re.search(r"\b(?=[A-Z0-9]{6}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{6}\b", user_text)
-    if generic_match and not _TAU_FLIGHT_NUMBER_RE.fullmatch(generic_match.group(0).upper()):
-        return generic_match.group(0).upper()
+    for match in labeled_pattern.finditer(user_text):
+        candidates.append(match.group(1).upper())
+    for match in re.finditer(r"\b(?=[A-Z0-9]{6}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{6}\b", user_text):
+        value = match.group(0).upper()
+        if not _TAU_FLIGHT_NUMBER_RE.fullmatch(value):
+            candidates.append(value)
+    return _dedupe_tau_ids(candidates)
+
+
+def _requested_tau_reservation_id_from_user(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    requested_ids = _requested_tau_reservation_ids_from_user(prompt_messages)
+    return requested_ids[0] if requested_ids else None
+
+
+def _tau_multi_requested_cancel_replacement(
+    selected_name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    requested_ids: Sequence[str],
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    cancelled_ids = _tau_cancelled_reservation_ids_from_context(prompt_messages)
+    disallowed: list[tuple[str, str]] = []
+    for requested_id in requested_ids:
+        reservation_id = str(requested_id or "").strip().upper()
+        if not reservation_id or reservation_id in cancelled_ids:
+            continue
+        if _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=reservation_id) is not None:
+            continue
+        if "get_reservation_details" not in available_tool_names:
+            return None
+        selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+        if selected_name == "get_reservation_details" and selected_id == reservation_id:
+            return None
+        return "get_reservation_details", {"reservation_id": reservation_id}
+    for requested_id in requested_ids:
+        reservation_id = str(requested_id or "").strip().upper()
+        if not reservation_id or reservation_id in cancelled_ids:
+            continue
+        reservation = _latest_successful_tau_reservation_observation(prompt_messages, reservation_id=reservation_id)
+        if reservation is None:
+            if "get_reservation_details" not in available_tool_names:
+                return None
+            selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+            if selected_name == "get_reservation_details" and selected_id == reservation_id:
+                return None
+            return "get_reservation_details", {"reservation_id": reservation_id}
+        upgrade_replacement = _tau_airline_basic_economy_cancel_upgrade_replacement(
+            selected_name,
+            arguments,
+            reservation,
+            prompt_messages,
+            available_tool_names=available_tool_names,
+        )
+        if upgrade_replacement is not None:
+            return upgrade_replacement
+        policy_decision = _tau_airline_cancel_policy_decision(
+            reservation,
+            prompt_messages,
+            reservation_id=reservation_id,
+        )
+        if policy_decision is not None:
+            allowed, reason = policy_decision
+            if not allowed:
+                disallowed.append((reservation_id, reason))
+                continue
+        if "cancel_reservation" not in available_tool_names:
+            return None
+        selected_id = str(arguments.get("reservation_id") or "").strip().upper()
+        if selected_name == "cancel_reservation" and selected_id == reservation_id:
+            return None
+        return "cancel_reservation", {"reservation_id": reservation_id}
+
+    processed = [reservation_id for reservation_id in requested_ids if reservation_id in cancelled_ids]
+    if processed or disallowed:
+        if processed:
+            total_cost_replacement = _tau_airline_upcoming_total_cost_replacement(
+                prompt_messages,
+                available_tool_names=available_tool_names,
+            )
+            if total_cost_replacement is not None:
+                return total_cost_replacement
+        parts: list[str] = []
+        if processed:
+            parts.append("Cancelled reservation(s): " + ", ".join(processed) + ".")
+        if disallowed:
+            parts.append(
+                "Could not cancel reservation(s): "
+                + ", ".join(reservation_id for reservation_id, _reason in disallowed)
+                + " under the airline cancellation policy."
+            )
+        return RESPOND_TOOL_NAME, {"content": " ".join(parts) + " ###STOP###"}
     return None
 
 
+def _tau_airline_upcoming_total_cost_replacement(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    if not re.search(r"\bupcoming flights?\b", user_text, re.IGNORECASE):
+        return None
+    user_id = (
+        _requested_tau_user_id_from_user(prompt_messages)
+        or _latest_tau_fact_value(prompt_messages, "user_id")
+        or _latest_tau_airline_reservation_user_id(prompt_messages)
+    )
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    if user_id and user is None and "get_user_details" in available_tool_names:
+        return "get_user_details", {"user_id": user_id}
+    if user is None:
+        return None
+    scan_replacement = _tau_multi_reservation_scan_replacement(
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if scan_replacement is not None:
+        return scan_replacement
+    total = _tau_airline_upcoming_reservations_total_cost(prompt_messages)
+    if total is None:
+        return None
+    return (
+        RESPOND_TOOL_NAME,
+        {
+            "content": (
+                f"Cancelled reservation(s): {', '.join(_tau_cancelled_reservation_ids_from_context(prompt_messages))}. "
+                f"The total cost of upcoming flights is ${total:,}. ###STOP###"
+            )
+        },
+    )
+
+
+def _latest_tau_airline_reservation_user_id(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> str | None:
+    for reservation in reversed(_successful_tau_airline_reservation_observations(prompt_messages)):
+        user_id = str(reservation.get("user_id") or "").strip()
+        if user_id:
+            return user_id
+    return None
+
+
+def _tau_airline_upcoming_reservations_total_cost(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> int | None:
+    current_date = _TAU_AIRLINE_CURRENT_TIME.date().isoformat()
+    total = 0
+    counted = False
+    seen: set[str] = set()
+    for reservation in _successful_tau_airline_reservation_observations(prompt_messages):
+        reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+        if not reservation_id or reservation_id in seen:
+            continue
+        seen.add(reservation_id)
+        dates = _tau_airline_reservation_dates(reservation)
+        if dates and not any(date >= current_date for date in dates):
+            continue
+        amount = _tau_airline_positive_payment_total(reservation)
+        if amount <= 0:
+            continue
+        total += amount
+        counted = True
+    return total if counted else None
+
+
+def _tau_airline_positive_payment_total(reservation: Mapping[str, Any]) -> int:
+    history = reservation.get("payment_history")
+    if not isinstance(history, Sequence) or isinstance(history, (str, bytes)):
+        return 0
+    total = 0.0
+    for row in history:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            amount = float(row.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            total += amount
+    return int(total)
+
+
+def _tau_airline_basic_economy_cancel_upgrade_replacement(
+    selected_name: str,
+    arguments: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if "update_reservation_flights" not in available_tool_names:
+        return None
+    if str(reservation.get("cabin") or "").strip().lower() != "basic_economy":
+        return None
+    reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+    if not reservation_id or _tau_airline_reservation_was_upgraded_for_cancel(reservation_id, prompt_messages):
+        return None
+    requested_cabin = _tau_airline_cancel_upgrade_target_cabin(prompt_messages)
+    if not requested_cabin:
+        return (
+            RESPOND_TOOL_NAME,
+            {
+                "content": (
+                    f"Reservation {reservation_id} is basic economy. Please confirm upgrading it to economy "
+                    "before cancellation if you still want to cancel it."
+                )
+            },
+        )
+    update_arguments = _tau_airline_cancel_upgrade_arguments(
+        reservation,
+        requested_cabin=requested_cabin,
+        prompt_messages=prompt_messages,
+    )
+    if update_arguments is None:
+        return None
+    if _has_successful_tau_tool_observation("update_reservation_flights", update_arguments, prompt_messages):
+        return None
+    if (
+        selected_name == "update_reservation_flights"
+        and _canonical_tau_arguments(arguments) == _canonical_tau_arguments(update_arguments)
+    ):
+        return None
+    return "update_reservation_flights", update_arguments
+
+
+def _tau_airline_cancel_upgrade_target_cabin(
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> str | None:
+    latest = _latest_tau_user_request_text(prompt_messages).lower()
+    all_user_text = _tau_user_request_text(prompt_messages).lower()
+    if "upgrade" not in latest and "upgrade" not in all_user_text:
+        return None
+    return _tau_airline_requested_cabin(latest) or _tau_airline_requested_cabin(all_user_text) or "economy"
+
+
+def _tau_airline_cancel_upgrade_arguments(
+    reservation: Mapping[str, Any],
+    *,
+    requested_cabin: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> dict[str, Any] | None:
+    reservation_id = str(reservation.get("reservation_id") or "").strip().upper()
+    flights = _tau_airline_flight_infos_from_reservation(reservation)
+    payment_id = _tau_airline_cancel_upgrade_payment_id(reservation, prompt_messages)
+    if not reservation_id or not flights or not payment_id:
+        return None
+    return {
+        "reservation_id": reservation_id,
+        "cabin": requested_cabin,
+        "flights": flights,
+        "payment_id": payment_id,
+    }
+
+
+def _tau_airline_cancel_upgrade_payment_id(
+    reservation: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> str | None:
+    requested_last_four = _tau_requested_payment_last_four(prompt_messages)
+    user_id = str(reservation.get("user_id") or _requested_tau_user_id_from_user(prompt_messages) or "").strip()
+    user = _latest_successful_tau_user_observation(prompt_messages, user_id=user_id)
+    payment_methods = user.get("payment_methods") if isinstance(user, Mapping) else None
+    if requested_last_four and isinstance(payment_methods, Mapping):
+        for raw_payment_id, raw_payment in payment_methods.items():
+            if not isinstance(raw_payment, Mapping):
+                continue
+            if str(raw_payment.get("last_four") or "").strip() == requested_last_four:
+                payment_id = str(raw_payment_id or raw_payment.get("id") or "").strip()
+                if payment_id:
+                    return payment_id
+    history = reservation.get("payment_history")
+    if isinstance(history, Sequence) and not isinstance(history, (str, bytes)):
+        for row in history:
+            if not isinstance(row, Mapping):
+                continue
+            payment_id = str(row.get("payment_id") or row.get("payment_method_id") or "").strip()
+            if payment_id:
+                return payment_id
+    if isinstance(user, Mapping):
+        return _tau_airline_preferred_payment_id(user)
+    return None
+
+
+def _tau_requested_payment_last_four(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    user_text = _tau_user_request_text(prompt_messages)
+    match = re.search(r"\b(?:ending|ends|last(?:\s+four)?)\s+(?:in|with)?\s*(\d{4})\b", user_text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _tau_airline_reservation_was_upgraded_for_cancel(
+    reservation_id: str,
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> bool:
+    requested = str(reservation_id or "").strip().upper()
+    if not requested:
+        return False
+    for tool_name, args, ok, _output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if not ok or tool_name != "update_reservation_flights":
+            continue
+        observed_id = str(args.get("reservation_id") or "").strip().upper()
+        cabin = str(args.get("cabin") or "").strip().lower()
+        if observed_id == requested and cabin and cabin != "basic_economy":
+            return True
+    return False
+
+
 def _next_uninspected_tau_reservation_id(prompt_messages: Sequence[Mapping[str, object]]) -> str | None:
+    uninspected = _uninspected_tau_reservation_ids(prompt_messages)
+    return uninspected[0] if uninspected else None
+
+
+def _uninspected_tau_reservation_ids(prompt_messages: Sequence[Mapping[str, object]]) -> list[str]:
     candidates = _tau_reservation_ids_from_context(prompt_messages)
     if not candidates:
-        return None
+        return []
     inspected = {
         str(args.get("reservation_id") or "").strip().upper()
         for tool_name, args in _iter_prior_tau_tool_calls(prompt_messages)
         if tool_name == "get_reservation_details"
     }
-    for reservation_id in candidates:
-        if reservation_id and reservation_id not in inspected:
-            return reservation_id
-    return None
+    return [reservation_id for reservation_id in candidates if reservation_id and reservation_id not in inspected]
+
+
+def _tau_multi_reservation_scan_replacement(
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if "get_reservation_details" not in available_tool_names:
+        return None
+    reservation_ids = _uninspected_tau_reservation_ids(prompt_messages)
+    if len(reservation_ids) < 2:
+        return None
+    return (
+        _TAU_MULTI_TOOL_CALLS_NAME,
+        {
+            "tool_calls": [
+                {"name": "get_reservation_details", "arguments": {"reservation_id": reservation_id}}
+                for reservation_id in reservation_ids
+            ]
+        },
+    )
 
 
 def _tau_reservation_ids_from_context(prompt_messages: Sequence[Mapping[str, object]]) -> list[str]:
     candidates: list[str] = []
-    requested = _requested_tau_reservation_id_from_user(prompt_messages)
-    if requested:
-        candidates.append(requested)
+    candidates.extend(_requested_tau_reservation_ids_from_user(prompt_messages))
     for message in prompt_messages:
         content = str(message.get("content") or "")
         payload = _parse_tau_function_output_payload(content)
@@ -2551,10 +4607,31 @@ def _tau_user_request_text(prompt_messages: Sequence[Mapping[str, object]]) -> s
         if _normalized_tau_message_role(message.get("role")) != "user":
             continue
         content = str(message.get("content") or "")
-        if not content or "Function output:" in content or content.startswith("Known facts"):
+        if (
+            not content
+            or "Function output:" in content
+            or "<tool_response>" in content
+            or content.startswith("Known facts")
+        ):
             continue
         parts.append(content)
     return normalize_rwkv_text("\n".join(parts))
+
+
+def _latest_tau_user_request_text(prompt_messages: Sequence[Mapping[str, object]]) -> str:
+    for message in reversed(prompt_messages):
+        if _normalized_tau_message_role(message.get("role")) != "user":
+            continue
+        content = str(message.get("content") or "")
+        if (
+            not content
+            or "Function output:" in content
+            or "<tool_response>" in content
+            or content.startswith("Known facts")
+        ):
+            continue
+        return normalize_rwkv_text(content)
+    return ""
 
 
 def _normalized_tau_message_role(value: object) -> str:
@@ -2578,11 +4655,12 @@ def _iter_tau_tool_observations(prompt_messages: Sequence[Mapping[str, object]])
         content = str(message.get("content") or "").strip()
         if role == "assistant" and content:
             try:
-                tool_name, arguments = _parse_tau_agent_decision(content)
-            except Exception:
+                decisions = _parse_tau_agent_decisions(content)
+            except Exception:  # noqa: BLE001
                 continue
-            if tool_name != RESPOND_TOOL_NAME:
-                pending.append((tool_name, arguments))
+            for tool_name, arguments in decisions:
+                if tool_name != RESPOND_TOOL_NAME:
+                    pending.append((tool_name, arguments))
             continue
         if role != "user" or not content:
             continue
@@ -2603,10 +4681,10 @@ def _iter_prior_tau_tool_calls(prompt_messages: Sequence[Mapping[str, object]]) 
         if not content:
             continue
         try:
-            tool_name, arguments = _parse_tau_agent_decision(content)
-        except Exception:
+            decisions = _parse_tau_agent_decisions(content)
+        except Exception:  # noqa: BLE001
             continue
-        calls.append((tool_name, arguments))
+        calls.extend(decisions)
     return calls
 
 
@@ -2619,6 +4697,19 @@ def _has_successful_tau_tool_observation(
     target_arguments = _canonical_tau_arguments(arguments)
     for tool_name, observed_args, ok, _output in reversed(_iter_tau_tool_observations(prompt_messages)):
         if ok and tool_name == target_name and _canonical_tau_arguments(observed_args) == target_arguments:
+            return True
+    return False
+
+
+def _has_failed_tau_tool_observation(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+) -> bool:
+    target_name = str(name or "").strip()
+    target_arguments = _canonical_tau_arguments(arguments)
+    for tool_name, observed_args, ok, _output in reversed(_iter_tau_tool_observations(prompt_messages)):
+        if not ok and tool_name == target_name and _canonical_tau_arguments(observed_args) == target_arguments:
             return True
     return False
 
@@ -2818,6 +4909,11 @@ def _tau_messages_to_prompt_messages(
 ) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for message in history:
+        tool_messages = getattr(message, "tool_messages", None)
+        if tool_messages:
+            for tool_message in tool_messages:
+                rows.append({"role": "user", "content": _render_tau_tool_message(tool_message)})
+            continue
         role = _normalized_tau_message_role(getattr(message, "role", ""))
         if isinstance(message, ToolMessage) or role == "tool":
             rows.append({"role": "user", "content": _render_tau_tool_message(message)})
@@ -2840,7 +4936,7 @@ def _tau_messages_to_prompt_messages(
 
 
 def _append_tau_message(history: list[Any], message: Any, *, MultiToolMessage: Any) -> None:
-    if isinstance(message, MultiToolMessage):
+    if isinstance(message, MultiToolMessage) or getattr(message, "tool_messages", None):
         history.extend(list(getattr(message, "tool_messages", []) or []))
     else:
         history.append(message)

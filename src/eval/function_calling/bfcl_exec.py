@@ -5,8 +5,12 @@ import ast
 import importlib.util
 import json
 import math
+import sys
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
@@ -805,7 +809,7 @@ def _run_bfcl_exec(
                     payload["instruction"] = record.instruction
                     payload["metadata"] = dict(record.metadata)
                     writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -831,7 +835,7 @@ def _run_bfcl_exec(
                 extra={"cot_mode": CoTMode.COT.value, "history_max_chars": history_max_chars},
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise
@@ -922,14 +926,13 @@ def bfcl_official_ast_checker_status(official_root: str | Path | None = None) ->
     if not (root / "bfcl_eval" / "eval_checker" / "ast_eval" / "ast_checker.py").exists():
         return BfclOfficialAstStatus(False, str(root), (), f"missing official BFCL checker under {root}")
     try:
-        import sys
-
         added = False
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
             added = True
         try:
-            __import__("bfcl_eval.eval_checker.ast_eval.ast_checker")
+            with _bfcl_ast_model_config_stub():
+                __import__("bfcl_eval.eval_checker.ast_eval.ast_checker")
         finally:
             if added:
                 try:
@@ -939,6 +942,22 @@ def bfcl_official_ast_checker_status(official_root: str | Path | None = None) ->
     except Exception as exc:  # noqa: BLE001
         return BfclOfficialAstStatus(False, str(root), (), str(exc))
     return BfclOfficialAstStatus(True, str(root), (), "")
+
+
+@contextmanager
+def _bfcl_ast_model_config_stub():
+    module_name = "bfcl_eval.constants.model_config"
+    previous = sys.modules.get(module_name)
+    stub = ModuleType(module_name)
+    stub.MODEL_CONFIG_MAPPING = defaultdict(lambda: SimpleNamespace(underscore_to_dot=False))
+    sys.modules[module_name] = stub
+    try:
+        yield
+    finally:
+        if previous is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
 
 
 def _default_bfcl_official_root() -> Path:
@@ -1062,7 +1081,7 @@ def _expected_tool_calls_from_exec(calls: Sequence[str]) -> list[dict[str, Any]]
     for call in calls:
         try:
             name, args, kwargs = _parse_call(call)
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         arguments = dict(kwargs)
         if args:

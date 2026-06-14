@@ -29,6 +29,13 @@ from .process import FAILURE_MONITOR, JobFailure, handle_job_failure, launch_job
 from .profiler import BatchProfiler
 from .queue import QueueItem, build_queue, sort_queue_items
 from .question_counts import derive_question_counts
+from .backpressure import (
+    RemoteBackpressureError,
+    RemoteConcurrencyBudget,
+    compute_remote_concurrency_budgets,
+    fetch_remote_backpressure,
+    static_remote_concurrency_budgets,
+)
 from .state import (
     CompletedKey,
     CompletedRecord,
@@ -69,6 +76,10 @@ class QueueOptions:
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
+    infer_backpressure: bool = True
+    infer_backpressure_timeout_s: float = 2.0
+    infer_backpressure_pending_high_watermark: int = 0
+    infer_budget_min_workers: int = 1
     function_prompt_style: str | None = None
     function_tool_catalog_format: str | None = None
     function_cot_max_tokens: int | None = None
@@ -83,6 +94,17 @@ class QueueOptions:
     function_tool_router_max_tools: int | None = None
     function_tool_router_trigger_tool_count: int | None = None
     function_tool_router_trigger_catalog_chars: int | None = None
+    function_candidate_router_mode: str | None = None
+    function_candidate_router_chunk_tools: int | None = None
+    function_candidate_router_batch_size: int | None = None
+    function_candidate_router_prompt_max_chars: int | None = None
+    function_candidate_router_context_chars: int | None = None
+    function_candidate_router_candidate_max_tokens: int | None = None
+    function_candidate_router_aggregate_max_tokens: int | None = None
+    function_candidate_router_max_candidates: int | None = None
+    function_candidate_router_tool_schema_mode: str | None = None
+    function_candidate_router_evidence_chars: int | None = None
+    function_candidate_router_policy_chars: int | None = None
     function_max_rounds: int | None = None
     function_max_steps: int | None = None
     function_max_tool_errors: int | None = None
@@ -283,6 +305,53 @@ def _build_lease_manager(opts: QueueOptions) -> SchedulerLeaseManager | None:
     )
 
 
+def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteConcurrencyBudget]:
+    if not _dispatch_uses_remote_inference(opts):
+        return {}
+    if not opts.infer_backpressure:
+        budgets = static_remote_concurrency_budgets(
+            infer_models=opts.infer_models,
+            default_infer_max_workers=opts.infer_max_workers,
+            default_remote_batch_size=opts.remote_batch_size,
+            reason="static_backpressure_disabled",
+        )
+        _log_remote_budgets(budgets)
+        return budgets
+    try:
+        signals = fetch_remote_backpressure(
+            base_url=str(opts.infer_base_url or ""),
+            api_key=opts.infer_api_key,
+            timeout_s=float(opts.infer_backpressure_timeout_s),
+        )
+    except RemoteBackpressureError as exc:
+        budgets = static_remote_concurrency_budgets(
+            infer_models=opts.infer_models,
+            default_infer_max_workers=opts.infer_max_workers,
+            default_remote_batch_size=opts.remote_batch_size,
+            reason="static_backpressure_unavailable",
+        )
+        for budget in budgets.values():
+            budget.error = str(exc)
+        log_job_event("remote_backpressure_unavailable", "_dispatcher", error=str(exc))
+        _log_remote_budgets(budgets)
+        return budgets
+    budgets = compute_remote_concurrency_budgets(
+        infer_models=opts.infer_models,
+        backpressure=signals,
+        default_infer_max_workers=opts.infer_max_workers,
+        default_remote_batch_size=opts.remote_batch_size,
+        pending_high_watermark=opts.infer_backpressure_pending_high_watermark,
+        min_infer_max_workers=opts.infer_budget_min_workers,
+    )
+    _log_remote_budgets(budgets)
+    return budgets
+
+
+def _log_remote_budgets(budgets: Mapping[str, RemoteConcurrencyBudget]) -> None:
+    for budget in budgets.values():
+        log_job_event("remote_budget", budget.model_slug, **budget.to_event_payload())
+
+
 def _lease_meta_for_item(item: QueueItem) -> dict[str, object]:
     payload: dict[str, object] = {
         "job": item.job_name,
@@ -301,13 +370,16 @@ def _lease_meta_for_item(item: QueueItem) -> dict[str, object]:
 def _resolve_available_dispatch_resources(
     opts: DispatchOptions,
     running_entries: Mapping[str, RunningEntry],
+    remote_budgets: Mapping[str, RemoteConcurrencyBudget] | None = None,
 ) -> list[str]:
     if _dispatch_uses_remote_inference(opts):
         occupied_model_slugs = _running_remote_model_slugs(running_entries, opts.infer_models)
+        budgets = remote_budgets or {}
         return [
             f"model:{model_slug}"
             for model in opts.infer_models
             if (model_slug := safe_slug(model)) not in occupied_model_slugs
+            and (model_slug not in budgets or budgets[model_slug].launch_allowed)
         ]
 
     idle_gpus = list_idle_gpus(opts.gpu_idle_max_mem)
@@ -356,7 +428,11 @@ def _launch_queue_items(
     job_metadata: dict[str, dict[str, object]],
     lease_manager: SchedulerLeaseManager | None,
     claimed_job_ids: set[str],
+    skipped_missing_keys: set[CompletedKey] | None = None,
+    remote_budgets: Mapping[str, RemoteConcurrencyBudget] | None = None,
 ) -> None:
+    if skipped_missing_keys is None:
+        skipped_missing_keys = set()
     remote_mode = _dispatch_uses_remote_inference(opts)
     resource_label = "Free slots" if remote_mode else "Idle GPUs"
     print(f"🧮 Pending={len(queue)} | {resource_label}={', '.join(available_resources)}")
@@ -365,6 +441,7 @@ def _launch_queue_items(
         if remote_mode
         else set()
     )
+    budgets = remote_budgets or {}
 
     queue_index = 0
     skipped_remote_job_ids: set[str] = set()
@@ -390,6 +467,18 @@ def _launch_queue_items(
                 queue_index += 1
             if remote_mode:
                 candidate_model_slug = safe_slug(candidate.infer_model or candidate.model_name or candidate.model_slug)
+                budget = budgets.get(candidate_model_slug)
+                if budget is not None and not budget.launch_allowed:
+                    log_job_event(
+                        "job_defer",
+                        candidate.job_id,
+                        reason=budget.reason,
+                        infer_model=str(candidate.infer_model or candidate.model_name or ""),
+                        worker_slot=resource,
+                        pending_queue=budget.pending_queue,
+                        source_status=budget.source_status,
+                    )
+                    continue
                 if candidate_model_slug in occupied_remote_models:
                     log_job_event(
                         "job_defer",
@@ -416,15 +505,25 @@ def _launch_queue_items(
         dataset_slug = item.dataset_slug
         try:
             dataset_path = locate_dataset(dataset_slug, search=DATASET_ROOTS, output_root=DATA_OUTPUT_ROOT)
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
             if opts.skip_missing_dataset:
                 print(f"⚠️  {item.job_id} 缺少数据集：{exc}. 已跳过。")
+                skipped_missing_keys.add(
+                    CompletedKey(
+                        job=item.job_name,
+                        model_slug=item.model_slug,
+                        dataset_slug=dataset_slug,
+                        is_cot=job.is_cot,
+                    )
+                )
+                pending_since.pop(item.job_id, None)
+                job_metadata.pop(item.job_id, None)
                 if lease_manager is not None:
                     lease_manager.release((item.job_id,))
                 log_job_event(
                     "job_skip",
                     item.job_id,
-                    reason="missing_dataset",
+                    reason="unavailable_dataset",
                     dataset_slug=dataset_slug,
                 )
                 continue
@@ -494,8 +593,12 @@ def _launch_queue_items(
         questions = question_counts.get(dataset_slug)
 
         batch_size = None
-        if item.is_remote and opts.remote_batch_size is not None and job.batch_flag:
-            batch_size = max(1, int(opts.remote_batch_size))
+        item_budget = budgets.get(safe_slug(item.infer_model or item.model_name or item.model_slug)) if item.is_remote else None
+        if item.is_remote and job.batch_flag:
+            if item_budget is not None and item_budget.remote_batch_size is not None:
+                batch_size = max(1, int(item_budget.remote_batch_size))
+            elif opts.remote_batch_size is not None:
+                batch_size = max(1, int(opts.remote_batch_size))
         if not item.is_remote and item.model_path is not None:
             batch_size = batch_profiler.determine_batch_size(
                 job=job,
@@ -521,7 +624,11 @@ def _launch_queue_items(
             extra_args=extra_args,
             infer_api_key=opts.infer_api_key,
             infer_timeout_s=opts.infer_timeout_s,
-            infer_max_workers=opts.infer_max_workers,
+            infer_max_workers=(
+                item_budget.infer_max_workers
+                if item_budget is not None
+                else opts.infer_max_workers
+            ),
             infer_protocol=opts.infer_protocol,
             infer_seed_policy=opts.infer_seed_policy,
         )
@@ -537,6 +644,12 @@ def _launch_queue_items(
             job_name=item.job_name,
             job_id=item.job_id,
             batch_size=batch_size,
+            infer_max_workers=(
+                item_budget.infer_max_workers
+                if item_budget is not None
+                else opts.infer_max_workers
+            ),
+            budget_reason=(item_budget.reason if item_budget is not None else None),
             gpu=(None if item.is_remote else f"cuda:{resource}"),
             log_path=console_log_path,
         )
@@ -558,6 +671,11 @@ def _launch_queue_items(
         if item.is_remote:
             meta["infer_base_url"] = str(item.infer_base_url)
             meta["infer_model"] = str(item.infer_model or item.model_name)
+            if item_budget is not None:
+                meta["infer_max_workers"] = item_budget.infer_max_workers
+                meta["remote_budget_reason"] = item_budget.reason
+                if item_budget.remote_batch_size is not None:
+                    meta["remote_batch_size"] = item_budget.remote_batch_size
         else:
             meta["gpu"] = resource
 
@@ -597,6 +715,11 @@ def _launch_queue_items(
             payload["infer_base_url"] = str(item.infer_base_url)
             payload["infer_model"] = str(item.infer_model or item.model_name)
             payload["worker_slot"] = resource
+            if item_budget is not None:
+                payload["infer_max_workers"] = item_budget.infer_max_workers
+                payload["remote_budget_reason"] = item_budget.reason
+                if item_budget.remote_batch_size is not None:
+                    payload["remote_batch_size"] = item_budget.remote_batch_size
         log_job_event("job_launch", item.job_id, **payload)
         if remote_mode:
             occupied_remote_models.add(safe_slug(item.infer_model or item.model_name or item.model_slug))
@@ -641,6 +764,7 @@ def action_dispatch(
     job_metadata: dict[str, dict[str, object]] = {}
     completed_versions: dict[str, str | None] = {}
     session_completed: set[CompletedKey] = set()
+    skipped_missing_keys: set[CompletedKey] = set()
     cooldown_until: dict[str, float] = {}
     previous_running: set[str] = set()
     claimed_job_ids: set[str] = set()
@@ -721,7 +845,7 @@ def action_dispatch(
                 completed=completed,
                 session_completed=session_completed,
             ),
-            failed=failed_keys,
+            failed=failed_keys | skipped_missing_keys,
             running=tuple(set(running_entries.keys()) | cooldown_jobs | foreign_claimed_job_ids),
             question_counts=question_counts,
             job_priority=job_priority,
@@ -732,7 +856,12 @@ def action_dispatch(
             job_metadata=job_metadata,
             now=now,
         )
-        available_resources = _resolve_available_dispatch_resources(opts, running_entries)
+        remote_budgets = _resolve_remote_concurrency_budgets(opts) if _dispatch_uses_remote_inference(opts) else {}
+        available_resources = _resolve_available_dispatch_resources(
+            opts,
+            running_entries,
+            remote_budgets=remote_budgets,
+        )
         progress = _build_progress_snapshot(
             queue=queue,
             running_entries=running_entries,
@@ -815,7 +944,12 @@ def action_dispatch(
         if not available_resources:
             running_count = len(running_entries)
             suffix = f"（当前运行 {running_count} 个任务）" if running_count else ""
-            if _dispatch_uses_remote_inference(opts):
+            if _dispatch_uses_remote_inference(opts) and remote_budgets and any(
+                not budget.launch_allowed for budget in remote_budgets.values()
+            ):
+                print(f"⏳ 远端推理背压中，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
+                wait_reason = "remote_backpressure"
+            elif _dispatch_uses_remote_inference(opts):
                 print(f"⏳ 远端推理模型槽已占满，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
                 wait_reason = "remote_model_slots_exhausted"
             else:
@@ -842,6 +976,8 @@ def action_dispatch(
             job_metadata=job_metadata,
             lease_manager=lease_manager,
             claimed_job_ids=claimed_job_ids,
+            skipped_missing_keys=skipped_missing_keys,
+            remote_budgets=remote_budgets,
         )
 
         time.sleep(1)
@@ -939,6 +1075,17 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
     _append("--tool-router-max-tools", opts.function_tool_router_max_tools)
     _append("--tool-router-trigger-tool-count", opts.function_tool_router_trigger_tool_count)
     _append("--tool-router-trigger-catalog-chars", opts.function_tool_router_trigger_catalog_chars)
+    _append_str("--candidate-router-mode", opts.function_candidate_router_mode)
+    _append("--candidate-router-chunk-tools", opts.function_candidate_router_chunk_tools)
+    _append("--candidate-router-batch-size", opts.function_candidate_router_batch_size)
+    _append("--candidate-router-prompt-max-chars", opts.function_candidate_router_prompt_max_chars)
+    _append("--candidate-router-context-chars", opts.function_candidate_router_context_chars)
+    _append("--candidate-router-candidate-max-tokens", opts.function_candidate_router_candidate_max_tokens)
+    _append("--candidate-router-aggregate-max-tokens", opts.function_candidate_router_aggregate_max_tokens)
+    _append("--candidate-router-max-candidates", opts.function_candidate_router_max_candidates)
+    _append_str("--candidate-router-tool-schema-mode", opts.function_candidate_router_tool_schema_mode)
+    _append("--candidate-router-evidence-chars", opts.function_candidate_router_evidence_chars)
+    _append("--candidate-router-policy-chars", opts.function_candidate_router_policy_chars)
     _append("--max-rounds", opts.function_max_rounds)
     _append("--max-steps", opts.function_max_steps)
     _append("--max-tool-errors", opts.function_max_tool_errors)
@@ -1101,6 +1248,8 @@ def _backup_run_config(
     job_name: str,
     job_id: str,
     batch_size: int | None,
+    infer_max_workers: int | None,
+    budget_reason: str | None,
     gpu: str | None,
     log_path: Path,
 ) -> Path:
@@ -1129,6 +1278,8 @@ def _backup_run_config(
         job_name=job_name,
         job_id=job_id,
         batch_size=batch_size,
+        infer_max_workers=infer_max_workers,
+        budget_reason=budget_reason,
         gpu=gpu,
         dataset_path=dataset_path,
         log_path=log_path,
@@ -1152,6 +1303,8 @@ def _render_run_block(
     job_name: str,
     job_id: str,
     batch_size: int | None,
+    infer_max_workers: int | None,
+    budget_reason: str | None,
     gpu: str | None,
     dataset_path: Path,
     log_path: Path,
@@ -1183,6 +1336,10 @@ def _render_run_block(
         lines.append(f"gpu = {_toml_quote(gpu)}")
     if batch_size is not None:
         lines.append(f"batch_size = {int(batch_size)}")
+    if infer_max_workers is not None:
+        lines.append(f"infer_max_workers = {int(infer_max_workers)}")
+    if budget_reason:
+        lines.append(f"remote_budget_reason = {_toml_quote(str(budget_reason))}")
     return "\n".join(lines) + "\n"
 
 

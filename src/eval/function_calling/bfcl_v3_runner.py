@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -56,6 +57,11 @@ from src.eval.function_calling.rwkv_prompt import (
     extract_json_call_value_text,
     normalize_function_prompt_style,
 )
+from src.eval.function_calling.parallel_candidate_router import (
+    CandidateToolCall,
+    ParallelCandidateRouterConfig,
+    route_parallel_candidate_tool_call,
+)
 from src.eval.function_calling.tau_bench import TauToolCall
 from src.eval.function_calling.tool_router import (
     ToolRoutingConfig,
@@ -69,6 +75,15 @@ from src.infer.backend import RemoteInferenceBackend
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
+
+
+BFCL_V3_DEFAULT_PROMPT_MAX_CHARS = 28000
+_BFCL_CANDIDATE_ROUTER_POLICY = (
+    "BFCL v3 tool-call policy: return exactly one JSON function call for the next official sandbox action. "
+    "Use only listed tool names. Use ask_user only when required information is missing. "
+    "Use final_answer only when no environment tool should be called for this turn. "
+    "Do not invent tool names, arguments, tool results, state transitions, IDs, dates, or files."
+)
 
 @dataclass(slots=True)
 class _ActiveBfclEpisode:
@@ -249,6 +264,133 @@ def _trace_tool_calls(tool_calls: Sequence[TauToolCall]) -> list[dict[str, objec
     return [{"name": tool_call.name, "arguments": dict(tool_call.arguments)} for tool_call in tool_calls]
 
 
+def _candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig | None:
+    mode = str(getattr(args, "candidate_router_mode", "off") or "off").strip().lower()
+    if mode == "off":
+        return None
+    if mode != "parallel":
+        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off or parallel")
+    return ParallelCandidateRouterConfig(
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), 2),
+        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), 16),
+        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), 6000),
+        prompt_max_chars=_positive_int(getattr(args, "candidate_router_prompt_max_chars", None), 8192),
+        candidate_max_tokens=_positive_int(getattr(args, "candidate_router_candidate_max_tokens", None), 192),
+        aggregate_max_tokens=_positive_int(getattr(args, "candidate_router_aggregate_max_tokens", None), 192),
+        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), 12),
+        tool_schema_mode=str(getattr(args, "candidate_router_tool_schema_mode", "compact") or "compact"),
+        include_respond=False,
+        fallback_to_highest_confidence=True,
+        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), 220),
+        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), 1200),
+        ground_identifier_arguments=not bool(getattr(args, "disable_candidate_router_grounding", False)),
+    )
+
+
+def _positive_int(raw: object, default: int) -> int:
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(1, value)
+
+
+def _build_bfcl_prompt_with_budget(
+    *,
+    system_prompt: str,
+    messages: Sequence[Mapping[str, object]],
+    history_max_chars: int,
+    prompt_max_chars: int | None,
+) -> tuple[str, int, bool]:
+    requested_history = max(0, int(history_max_chars))
+    candidates = [requested_history]
+    if prompt_max_chars is not None and int(prompt_max_chars) > 0:
+        budget = int(prompt_max_chars)
+        candidates.extend(
+            [
+                min(requested_history, max(0, budget - len(system_prompt) - 256)),
+                min(requested_history, max(0, budget // 2)),
+                0,
+            ]
+        )
+    seen: set[int] = set()
+    last_prompt = ""
+    last_history = requested_history
+    for candidate_history in candidates:
+        candidate_history = max(0, int(candidate_history))
+        if candidate_history in seen:
+            continue
+        seen.add(candidate_history)
+        prompt = build_bfcl_rwkv_prompt(
+            system_prompt,
+            messages,
+            history_max_chars=candidate_history,
+        )
+        last_prompt = prompt
+        last_history = candidate_history
+        if prompt_max_chars is None or int(prompt_max_chars) <= 0 or len(prompt) <= int(prompt_max_chars):
+            return prompt, candidate_history, candidate_history != requested_history
+    return last_prompt, last_history, last_history != requested_history
+
+
+def _prompt_over_budget_error(prompt: str, *, prompt_max_chars: int | None, label: str) -> str | None:
+    if prompt_max_chars is None or int(prompt_max_chars) <= 0:
+        return None
+    if len(prompt) <= int(prompt_max_chars):
+        return None
+    return f"{label} prompt_chars={len(prompt)} exceeds prompt_max_chars={int(prompt_max_chars)}"
+
+
+def _candidate_decision_text(candidate: CandidateToolCall) -> str:
+    return json.dumps(
+        {"name": candidate.name, "arguments": dict(candidate.arguments)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _bfcl_candidate_facts_text(state: _ActiveBfclEpisode) -> str | None:
+    current_state = getattr(state.runtime_state, "current_state", None)
+    if not isinstance(current_state, Mapping) or not current_state:
+        return None
+    return json.dumps({"current_state": dict(current_state)}, ensure_ascii=False, sort_keys=True)
+
+
+def _bfcl_prompt_context_trace(
+    *,
+    state: _ActiveBfclEpisode,
+    system_prompt: str,
+    prompt: str,
+    history_max_chars: int,
+    prompt_max_chars: int | None,
+    requested_history_max_chars: int,
+    active_tools: Sequence[Mapping[str, Any]],
+    routed_tools: Sequence[Mapping[str, Any]],
+    candidate_router_tools: Sequence[Mapping[str, Any]] | None = None,
+    history_reduced: bool = False,
+) -> dict[str, object]:
+    return {
+        "system_prompt": system_prompt,
+        "prompt": prompt,
+        "prompt_chars": len(prompt),
+        "prompt_max_chars": int(prompt_max_chars) if prompt_max_chars is not None else None,
+        "history_max_chars": int(history_max_chars),
+        "requested_history_max_chars": int(requested_history_max_chars),
+        "history_reduced_for_budget": bool(history_reduced),
+        "prompt_messages": [dict(message) for message in state.prompt_messages],
+        "official_prompt_messages": [dict(message) for message in _bfcl_official_prompt_messages(state.prompt_messages)],
+        "active_tools": [dict(tool) for tool in active_tools],
+        "routed_tools": [dict(tool) for tool in routed_tools],
+        "candidate_router_tools": (
+            [dict(tool) for tool in candidate_router_tools] if candidate_router_tools is not None else None
+        ),
+        "runtime_state_snapshot": dict(getattr(state.runtime_state, "current_state", {}) or {}),
+        "turn_count": int(state.turn_count),
+        "step_count": int(state.step_count),
+        "tool_errors": int(state.tool_errors),
+    }
+
+
 def _bfcl_action_type_from_decision_text(text: str) -> str:
     try:
         import json
@@ -257,7 +399,7 @@ def _bfcl_action_type_from_decision_text(text: str) -> str:
             json.loads(extract_json_call_value_text(text)),
             context_label="BFCL tool call",
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "TOOL"
     name = str(payloads[0].get("name") or "").strip() if payloads else ""
     if name == "ask_user":
@@ -315,7 +457,9 @@ def _run_bfcl_official_json_generation_step(
     tool_sampling: Any,
     progress_suffix: str,
     history_max_chars: int,
+    prompt_max_chars: int | None,
     tool_routing_config: ToolRoutingConfig,
+    candidate_router_config: ParallelCandidateRouterConfig | None = None,
 ) -> _BfclGenerationStepOutcome:
     route, routed_tools = _route_bfcl_tools(
         state=state,
@@ -326,32 +470,118 @@ def _run_bfcl_official_json_generation_step(
         prompt_seed=_next_bfcl_stage_seed(state) + 10_000,
     )
     system_prompt = build_bfcl_system_prompt(routed_tools)
-    prompt = build_bfcl_rwkv_prompt(
-        system_prompt,
-        _bfcl_official_prompt_messages(state.prompt_messages),
-        history_max_chars=history_max_chars,
-    )
-    output = _generate_bfcl_stage(
-        state=state,
-        run=run,
-        prompt=prompt,
-        sampling=tool_sampling,
-        progress_desc=f"BFCLV3-Decision {progress_suffix}",
-        stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
-        constraint=build_bfcl_tool_call_constraint(
-            _bfcl_tools_with_control_functions(routed_tools),
-            prefilled_object=True,
-        ),
-        constraint_mode="strict",
-    )
-    decision_text = normalize_bfcl_decision_output(output.text)
-    trace_entry: dict[str, object] = {
-        "prompt_style": RWKV_OFFICIAL_JSON_PROMPT_STYLE,
-        "decision_completion": output.text,
-        "decision_text": decision_text,
-        "decision_stop_reason": output.finish_reason,
-        "tool_route": route.trace_payload(),
-    }
+    official_messages = _bfcl_official_prompt_messages(state.prompt_messages)
+
+    if candidate_router_config is not None:
+        pre_router_prompt = build_bfcl_rwkv_prompt(
+            system_prompt,
+            official_messages,
+            history_max_chars=max(0, int(history_max_chars)),
+        )
+        candidate_router_tools = _bfcl_tools_with_control_functions(routed_tools)
+        candidate_route = route_parallel_candidate_tool_call(
+            tools=candidate_router_tools,
+            messages=official_messages,
+            domain_policy=_BFCL_CANDIDATE_ROUTER_POLICY,
+            domain="bfcl_v3",
+            facts_text=_bfcl_candidate_facts_text(state),
+            engine=run.engine,
+            sampling=tool_sampling,
+            config=candidate_router_config,
+            progress_desc=f"BFCLV3-CandidateRouter {progress_suffix}",
+            prompt_seed=_next_bfcl_stage_seed(state) + 20_000,
+        )
+        selected_candidate = candidate_route.selected
+        decision_text = "" if selected_candidate is None else _candidate_decision_text(selected_candidate)
+        state.stages.append(
+            StageRecord(
+                prompt=candidate_route.aggregate_prompt,
+                completion=candidate_route.aggregate_completion or decision_text,
+                stop_reason=candidate_route.aggregate_finish_reason,
+            )
+        )
+        trace_entry: dict[str, object] = {
+            "prompt_style": RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+            "decision_completion": candidate_route.aggregate_completion,
+            "decision_text": decision_text,
+            "decision_stop_reason": candidate_route.aggregate_finish_reason,
+            "tool_route": route.trace_payload(include_prompt=True),
+            "candidate_router": candidate_route.trace_payload(include_prompts=True),
+            "full_context": _bfcl_prompt_context_trace(
+                state=state,
+                system_prompt=system_prompt,
+                prompt=pre_router_prompt,
+                history_max_chars=max(0, int(history_max_chars)),
+                prompt_max_chars=prompt_max_chars,
+                requested_history_max_chars=max(0, int(history_max_chars)),
+                active_tools=state.active_tools,
+                routed_tools=routed_tools,
+                candidate_router_tools=candidate_router_tools,
+                history_reduced=False,
+            ),
+        }
+        if selected_candidate is None:
+            return _failed_bfcl_step(
+                state,
+                trace_entry,
+                termination_reason="candidate_router_empty",
+                error=str(candidate_route.aggregate_error or "candidate router did not select a BFCL action"),
+            )
+    else:
+        prompt, rendered_history_max_chars, history_reduced = _build_bfcl_prompt_with_budget(
+            system_prompt=system_prompt,
+            messages=official_messages,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+        )
+        trace_entry = {
+            "prompt_style": RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+            "tool_route": route.trace_payload(include_prompt=True),
+            "full_context": _bfcl_prompt_context_trace(
+                state=state,
+                system_prompt=system_prompt,
+                prompt=prompt,
+                history_max_chars=rendered_history_max_chars,
+                prompt_max_chars=prompt_max_chars,
+                requested_history_max_chars=max(0, int(history_max_chars)),
+                active_tools=state.active_tools,
+                routed_tools=routed_tools,
+                history_reduced=history_reduced,
+            ),
+        }
+        budget_error = _prompt_over_budget_error(
+            prompt,
+            prompt_max_chars=prompt_max_chars,
+            label="BFCL v3 decision",
+        )
+        if budget_error is not None:
+            return _failed_bfcl_step(
+                state,
+                trace_entry,
+                termination_reason="prompt_over_budget",
+                error=budget_error,
+            )
+        output = _generate_bfcl_stage(
+            state=state,
+            run=run,
+            prompt=prompt,
+            sampling=tool_sampling,
+            progress_desc=f"BFCLV3-Decision {progress_suffix}",
+            stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
+            constraint=build_bfcl_tool_call_constraint(
+                _bfcl_tools_with_control_functions(routed_tools),
+                prefilled_object=True,
+            ),
+            constraint_mode="strict",
+        )
+        decision_text = normalize_bfcl_decision_output(output.text)
+        trace_entry.update(
+            {
+                "decision_completion": output.text,
+                "decision_text": decision_text,
+                "decision_stop_reason": output.finish_reason,
+            }
+        )
     if _looks_like_template_leak(decision_text):
         return _failed_bfcl_step(
             state,
@@ -359,7 +589,7 @@ def _run_bfcl_official_json_generation_step(
             termination_reason="template_leak",
             error="decision stage leaked internal template/control tokens",
         )
-    if output.finish_reason == "max_length":
+    if str(trace_entry.get("decision_stop_reason") or "") == "max_length":
         return _failed_bfcl_step(
             state,
             trace_entry,
@@ -413,7 +643,9 @@ def _run_bfcl_generation_step(
     progress_suffix: str,
     prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
     history_max_chars: int = 0,
+    prompt_max_chars: int | None = None,
     tool_routing_config: ToolRoutingConfig | None = None,
+    candidate_router_config: ParallelCandidateRouterConfig | None = None,
 ) -> _BfclGenerationStepOutcome:
     normalize_function_prompt_style(prompt_style)
     return _run_bfcl_official_json_generation_step(
@@ -422,7 +654,9 @@ def _run_bfcl_generation_step(
         tool_sampling=tool_sampling,
         progress_suffix=progress_suffix,
         history_max_chars=history_max_chars,
+        prompt_max_chars=prompt_max_chars,
         tool_routing_config=tool_routing_config or ToolRoutingConfig(),
+        candidate_router_config=candidate_router_config,
     )
 
 
@@ -434,7 +668,9 @@ def _run_bfcl_v3_official_episode(
     max_steps: int,
     max_tool_errors: int,
     history_max_chars: int,
+    prompt_max_chars: int | None = None,
     tool_routing_config: ToolRoutingConfig | None = None,
+    candidate_router_config: ParallelCandidateRouterConfig | None = None,
     prompt_style: str = RWKV_OFFICIAL_JSON_PROMPT_STYLE,
 ) -> list[dict[str, object]]:
     prompt_style = normalize_function_prompt_style(prompt_style)
@@ -470,7 +706,9 @@ def _run_bfcl_v3_official_episode(
                 progress_suffix=progress_suffix,
                 prompt_style=prompt_style,
                 history_max_chars=history_max_chars,
+                prompt_max_chars=prompt_max_chars,
                 tool_routing_config=tool_routing_config,
+                candidate_router_config=candidate_router_config,
             )
             trace_entry = {
                 "turn_index": turn_index,
@@ -649,10 +887,14 @@ def _run_bfcl_v3(
     max_steps = max(1, int(args.max_steps))
     max_tool_errors = max(1, int(args.max_tool_errors))
     history_max_chars = max(0, int(args.history_max_chars))
+    prompt_max_chars = max(0, int(getattr(args, "prompt_max_chars", None) or BFCL_V3_DEFAULT_PROMPT_MAX_CHARS))
     tool_routing_config = tool_routing_config_from_args(args)
+    candidate_router_config = _candidate_router_config_from_args(args)
     sampling_payload = attach_function_calling_context_metadata(
         normalize_sampling_config_by_stage([(1, tool_sampling)]),
         tool_routing_config=tool_routing_config,
+        candidate_router_config=candidate_router_config,
+        prompt_max_chars=prompt_max_chars,
     )
 
     if args.probe_only:
@@ -684,49 +926,76 @@ def _run_bfcl_v3(
                         "content": build_bfcl_user_block(turn_request),
                     }
                 )
-        probe_routes = [
-            _route_bfcl_tools(
-                state=state,
-                run=run,
-                tool_sampling=tool_sampling,
-                tool_routing_config=tool_routing_config,
-                progress_desc="BFCLV3-ToolRouter-Probe",
-                prompt_seed=sample_repeat_seed(state.sample_index, state.repeat_index, stage=10_001),
-            )
-            for state in probe_states
-        ]
-        decision_prompts = [
-            build_bfcl_rwkv_prompt(
-                build_bfcl_system_prompt(routed_tools),
-                _bfcl_official_prompt_messages(state.prompt_messages),
-                history_max_chars=history_max_chars,
-            )
-            for state, (_route, routed_tools) in zip(probe_states, probe_routes, strict=True)
-        ]
-        constraints = (
-            None
-            if isinstance(run.engine, RemoteInferenceBackend)
-            else [
-                build_bfcl_tool_call_constraint(
-                    _bfcl_tools_with_control_functions(routed_tools),
-                    prefilled_object=True,
+        if candidate_router_config is not None:
+            for state in probe_states:
+                _run_bfcl_generation_step(
+                    state=state,
+                    run=run,
+                    tool_sampling=tool_sampling,
+                    progress_suffix=f"probe sample {state.sample_index}",
+                    prompt_style=prompt_style,
+                    history_max_chars=history_max_chars,
+                    prompt_max_chars=prompt_max_chars,
+                    tool_routing_config=tool_routing_config,
+                    candidate_router_config=candidate_router_config,
                 )
-                for _route, routed_tools in probe_routes
-            ]
-        )
-        run.engine.generate(
-            decision_prompts,
-            sampling=tool_sampling,
-            batch_size=len(decision_prompts),
-            progress_desc="BFCLV3-Probe-Decision",
-            prompt_stop_suffixes=[list(BFCL_DECISION_STOP_SUFFIXES) for _ in decision_prompts],
-            constraints=constraints,
-            constraint_mode="off" if constraints is None else "strict",
-            prompt_seeds=[
-                sample_repeat_seed(state.sample_index, state.repeat_index, stage=1)
+        else:
+            probe_routes = [
+                _route_bfcl_tools(
+                    state=state,
+                    run=run,
+                    tool_sampling=tool_sampling,
+                    tool_routing_config=tool_routing_config,
+                    progress_desc="BFCLV3-ToolRouter-Probe",
+                    prompt_seed=sample_repeat_seed(state.sample_index, state.repeat_index, stage=10_001),
+                )
                 for state in probe_states
-            ],
-        )
+            ]
+            prompt_rows = [
+                _build_bfcl_prompt_with_budget(
+                    system_prompt=build_bfcl_system_prompt(routed_tools),
+                    messages=_bfcl_official_prompt_messages(state.prompt_messages),
+                    history_max_chars=history_max_chars,
+                    prompt_max_chars=prompt_max_chars,
+                )
+                for state, (_route, routed_tools) in zip(probe_states, probe_routes, strict=True)
+            ]
+            decision_prompts = [row[0] for row in prompt_rows]
+            over_budget = [
+                index
+                for index, prompt in enumerate(decision_prompts)
+                if _prompt_over_budget_error(prompt, prompt_max_chars=prompt_max_chars, label="BFCL v3 probe") is not None
+            ]
+            if over_budget:
+                first_index = over_budget[0]
+                raise ValueError(
+                    f"BFCL v3 probe prompt over budget at index={first_index}: "
+                    f"prompt_chars={len(decision_prompts[first_index])} prompt_max_chars={prompt_max_chars}"
+                )
+            constraints = (
+                None
+                if isinstance(run.engine, RemoteInferenceBackend)
+                else [
+                    build_bfcl_tool_call_constraint(
+                        _bfcl_tools_with_control_functions(routed_tools),
+                        prefilled_object=True,
+                    )
+                    for _route, routed_tools in probe_routes
+                ]
+            )
+            run.engine.generate(
+                decision_prompts,
+                sampling=tool_sampling,
+                batch_size=len(decision_prompts),
+                progress_desc="BFCLV3-Probe-Decision",
+                prompt_stop_suffixes=[list(BFCL_DECISION_STOP_SUFFIXES) for _ in decision_prompts],
+                constraints=constraints,
+                constraint_mode="off" if constraints is None else "strict",
+                prompt_seeds=[
+                    sample_repeat_seed(state.sample_index, state.repeat_index, stage=1)
+                    for state in probe_states
+                ],
+            )
         print(f"probe-only run completed: {len(probe_states)} prompt(s)")
         return 0
 
@@ -776,8 +1045,10 @@ def _run_bfcl_v3(
                             max_steps=max_steps,
                             max_tool_errors=max_tool_errors,
                             history_max_chars=history_max_chars,
+                            prompt_max_chars=prompt_max_chars,
                             prompt_style=prompt_style,
                             tool_routing_config=tool_routing_config,
+                            candidate_router_config=candidate_router_config,
                         )
                     else:
                         for _ in range(max_steps):
@@ -789,7 +1060,9 @@ def _run_bfcl_v3(
                                 progress_suffix=progress_suffix,
                                 prompt_style=prompt_style,
                                 history_max_chars=history_max_chars,
+                                prompt_max_chars=prompt_max_chars,
                                 tool_routing_config=tool_routing_config,
+                                candidate_router_config=candidate_router_config,
                             )
                             state.turn_count += 1
                             trace_entry = {
@@ -913,13 +1186,19 @@ def _run_bfcl_v3(
                         "ref_answer": build_bfcl_ref_answer(record),
                         "fail_reason": evaluation.fail_reason,
                         "cot_mode": CoTMode.COT.value,
+                        "history_max_chars": history_max_chars,
+                        "prompt_max_chars": prompt_max_chars,
+                        "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",
+                        "final_prompt_messages": [dict(message) for message in state.prompt_messages],
+                        "final_runtime_state_snapshot": dict(getattr(state.runtime_state, "current_state", {}) or {}),
+                        "active_tools": [dict(tool) for tool in state.active_tools],
                     }
                     payload["agent_trace"] = trace
                     payload["task_id"] = record.task_id
                     payload["domain"] = "function_call"
                     payload["instruction"] = record.instruction
                     writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -945,10 +1224,12 @@ def _run_bfcl_v3(
                 extra={
                     "cot_mode": CoTMode.COT.value,
                     "history_max_chars": history_max_chars,
+                    "prompt_max_chars": prompt_max_chars,
+                    "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",
                 },
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

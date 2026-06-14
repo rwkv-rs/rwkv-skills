@@ -97,7 +97,16 @@ def test_prepare_dataset_materializes_answer_judge_spec(tmp_path: Path, monkeypa
     assert paths == [output_root / "answer-judge" / "test.jsonl"]
     assert read_jsonl_items(paths[0]) == [
         {
-            "problem": "What is 2+2?",
+            "problem": (
+                "Problem:\n"
+                "What is 2+2?\n\n"
+                "Expected answer:\n"
+                "4\n\n"
+                "Predicted answer:\n"
+                "four\n\n"
+                "Decide whether the predicted answer matches the expected answer. "
+                "Return exactly `Judgement: Yes` or `Judgement: No`."
+            ),
             "expected_answer": "4",
             "predicted_answer": "four",
             "expected_judgement": "Judgement: Yes",

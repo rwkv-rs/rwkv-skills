@@ -11,32 +11,36 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
-from src.eval.env_config import resolve_judge_model_config
+from src.eval.env_config import resolve_judge_max_workers, resolve_judge_model_config
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
 )
+from src.eval.function_calling.final_answer import parse_final_answer_call, render_final_answer_call
 from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _resolve_function_calling_plan,
     _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
+from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
+from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_long_text
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage, prompt_delta
 
-from .context_budget import normalize_rwkv_text
+from .context_budget import normalize_rwkv_text, trim_history
 
 if TYPE_CHECKING:
     import argparse
@@ -67,6 +71,9 @@ class BrowseCompJudgeConfig:
 class BrowseCompJudgeOutcome:
     is_passed: bool
     reason: str
+
+
+_BROWSECOMP_DEFAULT_PROMPT_MAX_CHARS = 8192
 
 
 def decrypt_xor_base64(ciphertext_b64: str, password: str) -> str:
@@ -176,24 +183,80 @@ def build_browsecomp_answer_prompt(expected_context: str, cot: str, *, locale: s
     if normalized == "zh":
         suffix = "\n".join(
             [
-                "现在继续补完最终答案，且严格使用如下格式：",
-                "解释: <简短说明>",
-                "最终答案: <简洁最终答案>",
-                "置信度: <0% 到 100%>",
-                "解释: ",
+                "现在根据上面的思考调用 final_answer。",
+                "只返回一个 RWKV JSON function-call 对象。",
+                '格式: {"name":"final_answer","arguments":{"answer":"<简洁最终答案>"},"id":"final_answer"}',
+                "不要输出解释、置信度或 JSON 之外的文字。",
             ]
         )
     else:
         suffix = "\n".join(
             [
-                "Now continue by completing the final answer in this exact format:",
-                "Explanation: <brief explanation>",
-                "Exact Answer: <succinct final answer>",
-                "Confidence: <0% to 100%>",
-                "Explanation: ",
+                "Now call final_answer using the answer from the reasoning above.",
+                "Return exactly one RWKV JSON function-call object.",
+                'Format: {"name":"final_answer","arguments":{"answer":"<succinct final answer>"},"id":"final_answer"}',
+                "Do not output explanation, confidence, or any text outside the JSON value.",
             ]
         )
-    return f"{expected_context}{normalize_rwkv_text(cot)}</think>\n{suffix}"
+    return f"{expected_context}{normalize_rwkv_text(cot)}</think>\nUser: {suffix}\n\nAssistant: ```json\n{{"
+
+
+def build_browsecomp_budgeted_answer_prompt(
+    expected_context: str,
+    cot: str,
+    *,
+    question: str,
+    locale: str,
+    long_doc_config: LongDocEvidenceConfig,
+    prompt_max_chars: int,
+    engine: Any | None = None,
+    sampling: Any | None = None,
+    prompt_seed: int | None = None,
+) -> tuple[str, dict[str, Any]]:
+    source_cot = normalize_rwkv_text(cot)
+    compaction = compact_long_text(
+        source_cot,
+        query=normalize_rwkv_text(question),
+        config=long_doc_config,
+        label="browsecomp:cot",
+        engine=engine,
+        sampling=sampling,
+        progress_desc="BrowseComp-CoT-LongDoc",
+        prompt_seed=prompt_seed,
+    )
+    rendered_cot = compaction.text
+    trimmed_context_chars = 0
+    prompt = build_browsecomp_answer_prompt(expected_context, rendered_cot, locale=locale)
+    if prompt_max_chars > 0 and len(prompt) > prompt_max_chars:
+        empty_prompt = build_browsecomp_answer_prompt(expected_context, "", locale=locale)
+        cot_budget = max(0, int(prompt_max_chars) - len(empty_prompt) - 16)
+        fitted_cot = trim_history(rendered_cot, cot_budget)
+        trimmed_context_chars = max(0, len(rendered_cot) - len(fitted_cot))
+        rendered_cot = fitted_cot
+        prompt = build_browsecomp_answer_prompt(expected_context, rendered_cot, locale=locale)
+    trace = {
+        "mode": long_doc_config.mode if long_doc_config.enabled else "off",
+        "enabled": bool(long_doc_config.enabled),
+        "original_context_chars": len(source_cot),
+        "rendered_context_chars": len(rendered_cot),
+        "trimmed_context_chars": trimmed_context_chars,
+        "compacted": bool(compaction.compacted),
+        "chunk_count": int(compaction.chunk_count),
+        "selected_chunk_ids": list(compaction.selected_chunk_ids),
+        "prompt_chars": len(prompt),
+        "output_format": "rwkv_final_answer_json_call",
+    }
+    if compaction.router_error:
+        trace["router_error"] = compaction.router_error
+    return prompt, trace
+
+
+def _answer_stage_prompt_payload(full_prompt: str, prior_context: str) -> tuple[str, bool]:
+    """Store a compact stage prompt when possible, otherwise store the re-prompted context."""
+    try:
+        return prompt_delta(full_prompt, prior_context), False
+    except ValueError:
+        return full_prompt, True
 
 
 def judge_browsecomp_answers(
@@ -371,6 +434,28 @@ def _normalize_final_answer(text: str, *, locale: str) -> str:
     return body if body.startswith(prefix) else f"{prefix} {body}"
 
 
+def decode_browsecomp_final_answer(response: str, *, locale: str) -> tuple[str, dict[str, Any]]:
+    final_call = parse_final_answer_call(response, context_label="browsecomp final answer")
+    answer = _normalize_final_answer(final_call.answer, locale=locale)
+    return answer, dict(final_call.call)
+
+
+def _browsecomp_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
+    mode = str(getattr(args, "long_doc_mode", "lexical") or "lexical").strip().lower()
+    enabled = mode != "off"
+    if mode == "off":
+        mode = "lexical"
+    return LongDocEvidenceConfig(
+        enabled=enabled,
+        mode=mode,  # type: ignore[arg-type]
+        max_chunk_chars=max(1, int(getattr(args, "long_doc_max_chars", 1000) or 1000)),
+        overlap_lines=max(0, int(getattr(args, "long_doc_overlap_lines", 3) or 0)),
+        min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
+        max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
+        max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
+    )
+
+
 def _browsecomp_completion_to_eval_payload(payload: dict[str, object]) -> dict[str, object]:
     agent_result = payload.get("agent_result")
     if not isinstance(agent_result, dict):
@@ -432,6 +517,8 @@ def _run_browsecomp(
     answer_sampling = answer_sampling.clamp(args.answer_max_tokens)
 
     batch_size = max(1, int(args.batch_size or 32))
+    prompt_max_chars = int(args.prompt_max_chars or _BROWSECOMP_DEFAULT_PROMPT_MAX_CHARS)
+    long_doc_config = _browsecomp_long_doc_config(args)
     selected_entries = [(int(sample_index), records[int(sample_index)]) for sample_index in plan.sample_indices]
 
     if args.probe_only:
@@ -458,10 +545,15 @@ def _run_browsecomp(
         api_key=judge_cfg.api_key,
         model=judge_cfg.model_name,
         base_url=judge_cfg.base_url,
+        max_workers=resolve_judge_max_workers(getattr(args, "judge_max_workers", None), default=4),
     )
 
     job_name = _resolve_job_name("function_browsecomp", run_context=run_context)
-    sampling_payload = normalize_sampling_config_by_stage([(1, cot_sampling), (2, answer_sampling)])
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, cot_sampling), (2, answer_sampling)]),
+        long_doc_config=long_doc_config,
+        prompt_max_chars=prompt_max_chars,
+    )
     ctx = prepare_function_calling_run(
         dataset_slug=str(run.dataset_slug),
         model_name=run.model_name,
@@ -519,20 +611,39 @@ def _run_browsecomp(
                     cot_by_index = {int(output.prompt_index): output for output in cot_outputs}
                     answer_prompts: list[str] = []
                     answer_stage_prompts: list[str] = []
+                    answer_long_doc_traces: list[dict[str, Any]] = []
                     for index, (_key, record) in enumerate(chunk):
                         cot_output = cot_by_index[index]
-                        answer_prompt = build_browsecomp_answer_prompt(
+                        answer_prompt, answer_trace = build_browsecomp_budgeted_answer_prompt(
                             cot_prompts[index],
                             cot_output.text,
+                            question=record.question,
                             locale=record.locale,
+                            long_doc_config=long_doc_config,
+                            prompt_max_chars=prompt_max_chars,
+                            engine=run.engine,
+                            sampling=answer_sampling,
+                            prompt_seed=sample_repeat_seed(
+                                _key.sample_index,
+                                _key.repeat_index,
+                                pass_index=_key.pass_index,
+                                stage=10,
+                            ),
                         )
+                        answer_prompt_payload, prompt_delta_fallback = _answer_stage_prompt_payload(
+                            answer_prompt,
+                            f"{cot_output.prompt}{cot_output.text}",
+                        )
+                        answer_trace["prompt_delta_fallback"] = prompt_delta_fallback
                         answer_prompts.append(answer_prompt)
-                        answer_stage_prompts.append(prompt_delta(answer_prompt, f"{cot_output.prompt}{cot_output.text}"))
+                        answer_stage_prompts.append(answer_prompt_payload)
+                        answer_long_doc_traces.append(answer_trace)
                     answer_outputs = run.engine.generate(
                         answer_prompts,
                         sampling=answer_sampling,
                         batch_size=len(answer_prompts),
                         progress_desc="BrowseComp-Answer",
+                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in answer_prompts],
                         prompt_seeds=[
                             sample_repeat_seed(
                                 key.sample_index,
@@ -544,20 +655,54 @@ def _run_browsecomp(
                         ],
                     )
                     answer_by_index = {int(output.prompt_index): output for output in answer_outputs}
-                    judged = judge_browsecomp_answers(
-                        [
-                            (
-                                record,
-                                _normalize_final_answer(answer_by_index[index].text, locale=record.locale),
-                            )
-                            for index, (_key, record) in enumerate(chunk)
-                        ],
-                        config=judge,
-                    )
+                    final_rows: list[dict[str, Any]] = []
+                    judge_inputs: list[tuple[BrowseCompRecord, str]] = []
+                    judge_positions: list[int] = []
+                    judged: list[BrowseCompJudgeOutcome] = [
+                        BrowseCompJudgeOutcome(is_passed=False, reason="browsecomp final answer not parsed")
+                        for _ in chunk
+                    ]
+                    for index, (_key, record) in enumerate(chunk):
+                        output = answer_by_index[index]
+                        parse_error = ""
+                        final_answer = ""
+                        decoded_call: dict[str, Any] = {}
+                        try:
+                            final_answer, decoded_call = decode_browsecomp_final_answer(output.text, locale=record.locale)
+                        except Exception as exc:  # noqa: BLE001
+                            parse_error = str(exc)
+                        raw_answer = ""
+                        raw_arguments = decoded_call.get("arguments") if isinstance(decoded_call, Mapping) else {}
+                        if isinstance(raw_arguments, Mapping):
+                            raw_answer = str(raw_arguments.get("answer") or "").strip()
+                        raw_call_id = (
+                            str(decoded_call.get("id") or "").strip()
+                            if isinstance(decoded_call, Mapping)
+                            else ""
+                        )
+                        final_call = render_final_answer_call(raw_answer, call_id=raw_call_id) if raw_answer else ""
+                        final_rows.append(
+                            {
+                                "response": final_answer,
+                                "decoded_final_answer_call": decoded_call,
+                                "final_answer_call": final_call,
+                                "parse_error": parse_error,
+                            }
+                        )
+                        if parse_error:
+                            judged[index] = BrowseCompJudgeOutcome(is_passed=False, reason=parse_error)
+                        else:
+                            judge_positions.append(index)
+                            judge_inputs.append((record, final_answer))
+                    if judge_inputs:
+                        for position, outcome in zip(judge_positions, judge_browsecomp_answers(judge_inputs, config=judge)):
+                            judged[position] = outcome
                     for index, ((key, record), outcome) in enumerate(zip(chunk, judged)):
                         cot_output = cot_by_index[index]
                         answer_output = answer_by_index[index]
-                        final_answer = _normalize_final_answer(answer_output.text, locale=record.locale)
+                        final_row = final_rows[index]
+                        final_answer = str(final_row["response"])
+                        parse_error = str(final_row["parse_error"])
                         stages = [
                             StageRecord(
                                 prompt=cot_prompts[index],
@@ -584,6 +729,7 @@ def _run_browsecomp(
                             "num_turns": 2,
                             "cost": 0.0,
                             "is_passed": bool(outcome.is_passed),
+                            "error": parse_error or None,
                         }
                         payload["agent_info"] = {
                             "question": record.question,
@@ -593,16 +739,27 @@ def _run_browsecomp(
                             "locale": record.locale,
                             "cot_mode": CoTMode.COT.value,
                             "topic": record.topic or "",
+                            "final_answer_call": final_row["final_answer_call"],
+                            "decoded_final_answer_call": final_row["decoded_final_answer_call"],
+                            "parse_error": parse_error,
+                            "long_doc": answer_long_doc_traces[index],
                         }
                         payload["agent_trace"] = [
                             {"stage": "cot", "text": cot_output.text},
-                            {"stage": "answer", "text": final_answer},
+                            {
+                                "stage": "answer",
+                                "text": final_answer,
+                                "raw_completion": answer_output.text,
+                                "sandbox_return": final_row["final_answer_call"],
+                                "parse_error": parse_error,
+                                "long_doc": answer_long_doc_traces[index],
+                            },
                         ]
                         payload["task_id"] = record.task_id
                         payload["domain"] = "function_call"
                         payload["instruction"] = record.question
                         writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -632,7 +789,7 @@ def _run_browsecomp(
                 },
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

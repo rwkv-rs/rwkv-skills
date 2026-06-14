@@ -76,10 +76,9 @@ ABLATION_RUNNER_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_MODEL_SPECS: tuple[str, ...] = (
-    "18081:rwkv7-g1e-13.3b-20260309-ctx8192:64",
-    "18082:rwkv7-g1e-7.2b-20260301-ctx8192:128",
-    "18083:rwkv7-g1f-13.3b-20260415-ctx8192:64",
-    "18084:rwkv7-g1f-7.2b-20260414-ctx8192:128",
+    "19083:rwkv7-g1f-2.9b-20260420-ctx8192:192",
+    "19083:rwkv7-g1g-13.3b-20260523-ctx8192:128",
+    "19083:rwkv7-g1g-2.9b-20260526-ctx8192:192",
 )
 
 

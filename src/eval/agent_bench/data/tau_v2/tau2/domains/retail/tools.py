@@ -15,6 +15,7 @@ from tau2.domains.retail.data_model import (
     Variant,
 )
 from tau2.domains.retail.utils import RETAIL_DB_PATH
+from tau2.environment.safe_math import calculate_decimal_expression
 from tau2.environment.toolkit import ToolKitBase, ToolType, is_tool
 
 
@@ -133,9 +134,7 @@ class RetailTools(ToolKitBase):  # Tools
         Raises:
             ValueError: If the expression is invalid.
         """
-        if not all(char in "0123456789+-*/(). " for char in expression):
-            raise ValueError("Invalid characters in expression")
-        return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
+        return calculate_decimal_expression(expression)
 
     @is_tool(ToolType.WRITE)
     def cancel_pending_order(self, order_id: str, reason: str) -> Order:

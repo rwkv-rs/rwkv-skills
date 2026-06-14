@@ -4,7 +4,15 @@ import types
 
 from src.eval.evaluating import RunContext, RunMode, TaskExecutionState
 from src.eval.execution_plan import AttemptKey
+from src.eval.scheduler.config import DBConfig
+from src.eval.function_calling import browsecomp_plus as browsecomp_plus_module
 from src.eval.function_calling import common as function_calling_common
+from src.eval.function_calling.browsecomp import (
+    BrowseCompJudgeConfig,
+    BrowseCompJudgeOutcome,
+    build_browsecomp_answer_prompt,
+)
+from src.eval.function_calling.browsecomp_plus import BrowseCompPlusRecord, build_browsecomp_plus_budgeted_prompt
 from src.eval.function_calling.common import (
     FunctionCallingRunContext,
     attach_function_calling_context_metadata,
@@ -16,6 +24,11 @@ from src.eval.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.function_calling.context_budget import normalize_rwkv_text
+from src.eval.function_calling.final_answer import (
+    build_final_answer_json_call_prompt,
+    parse_final_answer_call,
+    render_final_answer_call,
+)
 from src.eval.function_calling.rwkv_prompt import build_rwkv_json_call_prompt, extract_json_call_value_text
 from src.eval.function_calling.mcp_bench import (
     McpBenchItem,
@@ -150,6 +163,151 @@ def test_extract_json_call_value_accepts_rwkv_agentic_tool_call_format() -> None
         extract_json_call_value_text('**Tool Call:** lookup(id="A1")')
         == '{"name":"lookup","arguments":{"id":"A1"}}'
     )
+
+
+def test_final_answer_helper_renders_and_parses_rwkv_call() -> None:
+    prompt = build_final_answer_json_call_prompt("Question: Who?", history_max_chars=4000)
+    rendered = render_final_answer_call("Alice")
+    parsed = parse_final_answer_call('```json\n{"name":"final_answer","arguments":{"answer":"Alice"},"id":"call_7"}\n```')
+    openai_shape = parse_final_answer_call(
+        '{"tool_calls":[{"id":"call_8","type":"function","function":{"name":"final_answer","arguments":"{\\"answer\\":\\"Bob\\"}"}}]}'
+    )
+
+    assert prompt.endswith("Assistant: ```json\n{")
+    assert '"name": "final_answer"' in prompt
+    assert rendered == '{"name":"final_answer","arguments":{"answer":"Alice"},"id":"final_answer"}'
+    assert parsed.answer == "Alice"
+    assert parsed.call_id == "call_7"
+    assert parsed.call["id"] == "call_7"
+    assert parsed.call["name"] == "final_answer"
+    assert openai_shape.answer == "Bob"
+    assert openai_shape.call_id == "call_8"
+
+
+def test_browsecomp_answer_prompt_requests_final_answer_json_call() -> None:
+    prompt = build_browsecomp_answer_prompt("User: question\n\nAssistant: <think>", "reasoning", locale="en")
+
+    assert "final_answer" in prompt
+    assert '"id":"final_answer"' in prompt
+    assert prompt.endswith("Assistant: ```json\n{")
+
+
+def test_browsecomp_plus_budgeted_prompt_compacts_long_tool_output() -> None:
+    long_output = "\n".join(
+        [f"irrelevant evidence row {index}" for index in range(80)]
+        + ["target evidence: Zurich is the answer"]
+        + [f"archive evidence row {index}" for index in range(80)]
+    )
+
+    prompt, trace = build_browsecomp_plus_budgeted_prompt(
+        [
+            {"role": "user", "content": "Question: Where is the answer?"},
+            {"role": "assistant", "content": '{"name":"search","arguments":{"query":"answer"}}'},
+            {"role": "user", "content": "Function output:\n" + long_output},
+        ],
+        history_max_chars=12000,
+        prompt_max_chars=5000,
+        long_doc_config=LongDocEvidenceConfig(
+            enabled=True,
+            mode="lexical",
+            max_chunk_chars=240,
+            overlap_lines=0,
+            min_long_text_chars=400,
+            max_evidence_chunks=2,
+            max_evidence_chars=500,
+        ),
+        tool_routing_config=ToolRoutingConfig(
+            mode="lexical",
+            max_tools=1,
+            trigger_tool_count=1,
+            trigger_catalog_chars=1,
+        ),
+    )
+
+    assert "Long document compacted" in prompt
+    assert "target evidence: Zurich is the answer" in prompt
+    assert '"name": "search"' in prompt
+    assert '"name": "final_answer"' in prompt
+    assert '"name": "get_document_chunks"' not in prompt
+    assert trace["compacted_message_count"] == 1
+    assert trace["tool_route"]["routed"] is True
+    assert trace["tool_route"]["selected_names"] == ["search", "final_answer"]
+    assert trace["prompt_chars"] <= 5000
+
+
+def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_return(monkeypatch) -> None:
+    raw_completion = '```json\n{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"call_42"}\n```'
+
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate(
+            self,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            prompt_seeds=None,
+            prompt_stop_suffixes=None,
+            constraints=None,
+            constraint_mode="off",
+        ):
+            self.calls.append(
+                {
+                    "prompts": list(prompts),
+                    "sampling": sampling,
+                    "batch_size": batch_size,
+                    "progress_desc": progress_desc,
+                    "prompt_seeds": prompt_seeds,
+                    "prompt_stop_suffixes": prompt_stop_suffixes,
+                    "constraints": constraints,
+                    "constraint_mode": constraint_mode,
+                }
+            )
+            return [types.SimpleNamespace(text=raw_completion, finish_reason="stop")]
+
+    def _fake_judge(inputs, config):
+        assert config.model == "judge"
+        assert [(record.task_id, answer) for record, answer in inputs] == [("bc-plus-1", "Zurich")]
+        return [BrowseCompJudgeOutcome(is_passed=True, reason="matched")]
+
+    monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
+
+    engine = FakeEngine()
+    payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
+        args=types.SimpleNamespace(max_steps=1),
+        run=types.SimpleNamespace(engine=engine, benchmark_name="browsecomp_plus", dataset_split="test"),
+        record=BrowseCompPlusRecord(
+            task_id="bc-plus-1",
+            query_id="q1",
+            question="Which city is the answer?",
+            answer="Zurich",
+            metadata={},
+        ),
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        sampling=object(),
+        sampling_payload={"max_generate_tokens": 64},
+        history_max_chars=4000,
+        prompt_max_chars=4000,
+        long_doc_config=LongDocEvidenceConfig(enabled=False),
+        tool_routing_config=ToolRoutingConfig(mode="off"),
+        judge=BrowseCompJudgeConfig(api_key="", model="judge"),
+    )
+
+    sandbox_return = '{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"call_42"}'
+    assert payload["completion1"] == raw_completion
+    assert payload["agent_info"]["final_answer"] == "Zurich"
+    assert payload["agent_info"]["final_answer_call"] == sandbox_return
+    assert payload["agent_info"]["decoded_final_answer_call"] == {
+        "name": "final_answer",
+        "arguments": {"answer": "Zurich"},
+        "id": "call_42",
+    }
+    assert payload["agent_trace"][0]["decision_completion"] == raw_completion
+    assert payload["agent_trace"][0]["sandbox_return"] == sandbox_return
 
 
 def test_rwkv_json_call_prompt_collapses_history_to_single_user_and_assistant_turn() -> None:
@@ -335,21 +493,18 @@ def test_attach_function_calling_context_metadata_distinguishes_ablations() -> N
     assert payload["long_context"]["prompt_max_chars"] == 8192
     assert payload["long_context"]["long_doc"]["enabled"] is False
     assert payload["long_context"]["long_doc"]["mode"] == "lexical"
-    assert payload["long_context"]["long_doc"]["model_max_tokens"] > 0
-    assert payload["long_context"]["long_doc"]["model_parallel_batch_size"] > 0
     assert payload["long_context"]["tool_router"]["mode"] == "lexical"
     assert payload["long_context"]["tool_router"]["max_tools"] == 8
     assert payload["long_context"]["tool_router"]["description_chars"] > 0
-    assert payload["long_context"]["tool_router"]["parallel_chunk_tools"] > 0
-    assert payload["long_context"]["tool_router"]["parallel_batch_size"] > 0
 
 
 def test_prepare_function_calling_run_uses_explicit_run_context(monkeypatch) -> None:
     captured: dict[str, object] = {}
+    init_configs: list[object] = []
     fake_service = object()
     fake_runtime = types.SimpleNamespace(create_writer=lambda max_queue: ("writer", max_queue))
 
-    monkeypatch.setattr(function_calling_common, "init_eval_store", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(function_calling_common, "init_eval_store", lambda config=None: init_configs.append(config))
     monkeypatch.setattr(function_calling_common, "create_eval_service", lambda: fake_service)
 
     def _fake_prepare_task_execution(**kwargs):
@@ -370,6 +525,7 @@ def test_prepare_function_calling_run_uses_explicit_run_context(monkeypatch) -> 
     monkeypatch.setattr(function_calling_common, "set_task_env", lambda _task_id: None)
 
     run_context = RunContext(job_name="function_tau_bench", run_mode=RunMode.RESUME)
+    db_config = DBConfig(host="127.0.0.1", port=15432, user="test", dbname="isolated")
     ctx = prepare_function_calling_run(
         dataset_slug="tau_bench_retail_test",
         model_name="demo-model",
@@ -381,8 +537,10 @@ def test_prepare_function_calling_run_uses_explicit_run_context(monkeypatch) -> 
         effective_sample_count=1,
         db_write_queue=8,
         run_context=run_context,
+        db_config=db_config,
     )
 
+    assert init_configs == [db_config]
     assert captured["job_name"] == "function_tau_bench"
     assert captured["run_mode"] is RunMode.RESUME
     assert ctx.service is fake_service

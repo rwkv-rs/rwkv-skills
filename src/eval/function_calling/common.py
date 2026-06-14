@@ -15,7 +15,7 @@ from src.eval.evaluating import TaskRunController, TaskRunState, attempt_tuple, 
 from src.eval.execution_plan import AttemptKey, avg_k_metric_key
 from src.eval.field_common import build_task_sampling_config, set_task_env
 from src.eval.metrics.at_k import compute_avg_at_k
-from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.config import DBConfig, DEFAULT_DB_CONFIG
 from src.infer.sampling import SamplingConfig
 
 if TYPE_CHECKING:
@@ -155,6 +155,7 @@ def attach_function_calling_context_metadata(
     *,
     long_doc_config: "LongDocEvidenceConfig | None" = None,
     tool_routing_config: "ToolRoutingConfig | None" = None,
+    candidate_router_config: object | None = None,
     prompt_max_chars: int | None = None,
 ) -> dict[str, object]:
     payload = dict(sampling_payload)
@@ -170,8 +171,6 @@ def attach_function_calling_context_metadata(
             "min_long_text_chars": int(getattr(long_doc_config, "min_long_text_chars", 0)),
             "max_evidence_chunks": int(getattr(long_doc_config, "max_evidence_chunks", 0)),
             "max_evidence_chars": int(getattr(long_doc_config, "max_evidence_chars", 0)),
-            "model_max_tokens": int(getattr(long_doc_config, "model_max_tokens", 0)),
-            "model_parallel_batch_size": int(getattr(long_doc_config, "model_parallel_batch_size", 0)),
         }
     if tool_routing_config is not None:
         context["tool_router"] = {
@@ -182,8 +181,25 @@ def attach_function_calling_context_metadata(
             "context_chars": int(getattr(tool_routing_config, "context_chars", 0)),
             "max_tokens": int(getattr(tool_routing_config, "max_tokens", 0)),
             "description_chars": int(getattr(tool_routing_config, "description_chars", 0)),
-            "parallel_chunk_tools": int(getattr(tool_routing_config, "parallel_chunk_tools", 0)),
-            "parallel_batch_size": int(getattr(tool_routing_config, "parallel_batch_size", 0)),
+        }
+    if candidate_router_config is not None:
+        context["candidate_router"] = {
+            "mode": "parallel",
+            "chunk_tools": int(getattr(candidate_router_config, "chunk_tools", 0)),
+            "batch_size": int(getattr(candidate_router_config, "batch_size", 0)),
+            "context_chars": int(getattr(candidate_router_config, "context_chars", 0)),
+            "prompt_max_chars": int(getattr(candidate_router_config, "prompt_max_chars", 0)),
+            "candidate_max_tokens": int(getattr(candidate_router_config, "candidate_max_tokens", 0)),
+            "aggregate_max_tokens": int(getattr(candidate_router_config, "aggregate_max_tokens", 0)),
+            "max_candidates": int(getattr(candidate_router_config, "max_candidates", 0)),
+            "tool_schema_mode": str(getattr(candidate_router_config, "tool_schema_mode", "")),
+            "include_respond": bool(getattr(candidate_router_config, "include_respond", False)),
+            "fallback_to_highest_confidence": bool(
+                getattr(candidate_router_config, "fallback_to_highest_confidence", False)
+            ),
+            "evidence_chars": int(getattr(candidate_router_config, "evidence_chars", 0)),
+            "policy_chars": int(getattr(candidate_router_config, "policy_chars", 0)),
+            "ground_identifier_arguments": bool(getattr(candidate_router_config, "ground_identifier_arguments", False)),
         }
     if context:
         payload["long_context"] = context
@@ -232,8 +248,9 @@ def prepare_function_calling_run(
     db_write_queue: int,
     run_context: "RunContext | None" = None,
     judger_model_name: str | None = None,
+    db_config: DBConfig | None = None,
 ) -> FunctionCallingRunContext:
-    init_eval_store(DEFAULT_DB_CONFIG)
+    init_eval_store(db_config or DEFAULT_DB_CONFIG)
     service = create_eval_service()
     resolved_job_name = run_context.job_name if run_context is not None else job_name
     task_state = prepare_task_execution(

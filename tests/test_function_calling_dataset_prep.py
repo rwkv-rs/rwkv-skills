@@ -9,6 +9,20 @@ from src.eval.datasets.runtime import read_jsonl_items
 from src.eval.function_calling import BrowseCompRecord, McpBenchItem, McpBenchTaskSpec
 
 
+_MCP_BENCH_SPLIT_FILES = (
+    "mcpbench_tasks_single_runner_format.json",
+    "mcpbench_tasks_multi_2server_runner_format.json",
+    "mcpbench_tasks_multi_3server_runner_format.json",
+)
+
+
+def _stage_mcp_bench_split_files(tasks_root: Path, file_names: tuple[str, ...] = _MCP_BENCH_SPLIT_FILES) -> None:
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    payload = {"server_tasks": []}
+    for file_name in file_names:
+        (tasks_root / file_name).write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_available_function_calling_datasets_lists_registered_specs() -> None:
     names = set(available_function_calling_datasets())
 
@@ -289,15 +303,16 @@ def test_prepare_dataset_materializes_longcodeqa_spec(tmp_path: Path, monkeypatc
 
 
 def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch) -> None:
-    source_root = tmp_path / "rwkv_rs"
-    tasks_root = source_root / "mcp_bench" / "tasks"
-    runtime_root = source_root / "mcp_bench" / "runtime"
-    tasks_root.mkdir(parents=True)
+    datasets_root = tmp_path / "rwkv_rs"
+    source_root = datasets_root / "mcp_bench"
+    tasks_root = source_root / "tasks"
+    runtime_root = source_root / "runtime"
+    _stage_mcp_bench_split_files(tasks_root)
     runtime_root.mkdir(parents=True)
 
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.mcp_bench.rwkv_rs_datasets_root",
-        lambda: source_root,
+        lambda: datasets_root,
     )
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.mcp_bench.load_mcp_bench_task_items",
@@ -342,22 +357,24 @@ def test_prepare_dataset_materializes_mcp_bench_spec(tmp_path: Path, monkeypatch
             },
             "runtime_root": str(runtime_root),
             "tasks_root": str(tasks_root),
-            "task_assets_commit_hint": "local_rwkv_rs_snapshot",
+            "task_assets_commit_hint": "official_accenture_mcp_bench",
+            "official_source_root": str(source_root),
         }
     ]
 
 
 def test_prepare_dataset_materializes_mcp_bench_split_specs(tmp_path: Path, monkeypatch) -> None:
-    source_root = tmp_path / "rwkv_rs"
-    tasks_root = source_root / "mcp_bench" / "tasks"
-    runtime_root = source_root / "mcp_bench" / "runtime"
-    tasks_root.mkdir(parents=True)
+    datasets_root = tmp_path / "rwkv_rs"
+    source_root = datasets_root / "mcp_bench"
+    tasks_root = source_root / "tasks"
+    runtime_root = source_root / "runtime"
+    _stage_mcp_bench_split_files(tasks_root, ("mcpbench_tasks_single_runner_format.json",))
     runtime_root.mkdir(parents=True)
     seen_file_names: list[tuple[str, ...] | None] = []
 
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.mcp_bench.rwkv_rs_datasets_root",
-        lambda: source_root,
+        lambda: datasets_root,
     )
 
     def _load_items(_tasks_root, _runtime_root, *, file_names=None):
@@ -385,18 +402,21 @@ def test_prepare_dataset_materializes_mcp_bench_split_specs(tmp_path: Path, monk
     assert paths == [output_root / "mcp_bench_single" / "test.jsonl"]
     [row] = read_jsonl_items(paths[0])
     assert row["task_file"] == "mcpbench_tasks_single_runner_format.json"
+    assert row["task_assets_commit_hint"] == "official_accenture_mcp_bench"
+    assert row["official_source_root"] == str(source_root)
     assert seen_file_names == [("mcpbench_tasks_single_runner_format.json",)]
 
 
 def test_prepare_dataset_materializes_mcp_bench_runtime_tasks_layout(tmp_path: Path, monkeypatch) -> None:
-    source_root = tmp_path / "rwkv_rs"
-    runtime_root = source_root / "mcp_bench" / "runtime"
+    datasets_root = tmp_path / "rwkv_rs"
+    source_root = datasets_root / "mcp_bench"
+    runtime_root = source_root / "runtime"
     tasks_root = runtime_root / "tasks"
-    tasks_root.mkdir(parents=True)
+    _stage_mcp_bench_split_files(tasks_root)
 
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.mcp_bench.rwkv_rs_datasets_root",
-        lambda: source_root,
+        lambda: datasets_root,
     )
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.mcp_bench.load_mcp_bench_task_items",
@@ -419,6 +439,8 @@ def test_prepare_dataset_materializes_mcp_bench_runtime_tasks_layout(tmp_path: P
     item = read_jsonl_items(paths[0])[0]
     assert item["tasks_root"] == str(tasks_root)
     assert item["runtime_root"] == str(runtime_root)
+    assert item["task_assets_commit_hint"] == "official_accenture_mcp_bench"
+    assert item["official_source_root"] == str(source_root)
 
 
 def test_prepare_dataset_materializes_bfcl_v3_spec(tmp_path: Path, monkeypatch) -> None:
@@ -601,6 +623,21 @@ def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkey
                 "source_path": str(question_path.resolve()),
                 "possible_answer_path": str(answer_path.resolve()),
                 "execution_result_type": [],
+                "bfcl_official_function": [
+                    {
+                        "name": "calculate_area",
+                        "description": "Calculate area",
+                        "parameters": {
+                            "type": "dict",
+                            "properties": {"base": {"type": "integer"}, "height": {"type": "integer"}},
+                            "required": ["base", "height"],
+                        },
+                    }
+                ],
+                "bfcl_official_ground_truth": [
+                    {"calculate_area": {"base": [10], "height": [5], "unit": ["units", ""]}}
+                ],
+                "bfcl_official_language": "python",
             },
         }
     ]

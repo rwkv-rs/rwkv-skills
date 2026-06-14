@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import signal
+import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 import psutil
@@ -36,19 +38,19 @@ def kill_process_on_port(port):
     return False
 
 
-def run_server(command, port):
+def run_server(command: Sequence[str], port: int):
     """Run a server command with proper cleanup handling."""
     # First kill any existing process on the port
     kill_process_on_port(port)
 
     process = None
     try:
-        process = subprocess.Popen(command, shell=True)
+        process = subprocess.Popen(list(command))
         process.wait()
     except KeyboardInterrupt:
         logger.info(f"\nShutting down server on port {port}...")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error running command '{command}': {e}")
+        logger.error(f"Error running command '{shlex.join(command)}': {e}")
     finally:
         if process and process.poll() is None:
             try:
@@ -65,7 +67,7 @@ def run_server(command, port):
 def main():
     # Define server commands with their ports
     servers = [
-        ("sh scripts/start_tau2_server.sh", 8001),
+        (["sh", "scripts/start_tau2_server.sh"], 8001),
     ]
 
     # Set up signal handlers

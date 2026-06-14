@@ -17,7 +17,7 @@ from typing import Iterable
 
 try:  # pragma: no cover - avoid heavy deps in tests
     from src.server.perf_logging import perf_logger  # pyright: ignore[reportMissingImports]
-except Exception:  # pragma: no cover
+except ModuleNotFoundError:  # pragma: no cover
     class _NoopPerfLogger:
         enabled = False
 

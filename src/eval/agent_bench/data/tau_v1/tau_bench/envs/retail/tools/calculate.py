@@ -1,7 +1,7 @@
 # Copyright Sierra
 
 from typing import Any, Dict
-from tau_bench.envs.tool import Tool
+from tau_bench.envs.tool import Tool, calculate_decimal_expression
 
 
 class Calculate(Tool):
@@ -10,8 +10,7 @@ class Calculate(Tool):
         if not all(char in "0123456789+-*/(). " for char in expression):
             return "Error: invalid characters in expression"
         try:
-            # Evaluate the mathematical expression safely
-            return str(round(float(eval(expression, {"__builtins__": None}, {})), 2))
+            return calculate_decimal_expression(expression)
         except Exception as e:
             return f"Error: {e}"
 

@@ -417,7 +417,7 @@ def _run_simple_tool_call(
                     payload["instruction"] = record.instruction
                     payload["metadata"] = dict(record.metadata)
                     writer.enqueue(payload)
-            except BaseException:
+            except Exception:
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -443,7 +443,7 @@ def _run_simple_tool_call(
                 extra={"cot_mode": CoTMode.COT.value, "history_max_chars": history_max_chars},
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

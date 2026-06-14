@@ -13,7 +13,6 @@ from .rwkv import (
     generation_text,
     json_call_stop_suffixes,
     normalize_rwkv_text,
-    truncate_text as truncate_rwkv_text,
 )
 
 DEFAULT_TOOL_ROUTER_MAX_TOOLS = 12
@@ -22,10 +21,8 @@ DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS = 6000
 DEFAULT_TOOL_ROUTER_CONTEXT_CHARS = 5000
 DEFAULT_TOOL_ROUTER_MAX_TOKENS = 256
 DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS = 240
-DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS = 4
-DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE = 8
-ToolRouterMode = Literal["off", "lexical", "model", "model_parallel"]
-TOOL_ROUTER_MODE_CHOICES: tuple[str, ...] = ("off", "lexical", "model", "model_parallel")
+ToolRouterMode = Literal["off", "lexical", "model"]
+TOOL_ROUTER_MODE_CHOICES: tuple[str, ...] = ("off", "lexical", "model")
 
 _LATIN_TERM_RE = re.compile(r"[a-z0-9_]{2,}")
 _CJK_SPAN_RE = re.compile("[\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff]{2,}")
@@ -45,8 +42,6 @@ class ToolRouterConfig:
     context_chars: int = DEFAULT_TOOL_ROUTER_CONTEXT_CHARS
     max_tokens: int = DEFAULT_TOOL_ROUTER_MAX_TOKENS
     description_chars: int = DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS
-    parallel_chunk_tools: int = DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS
-    parallel_batch_size: int = DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE
     fallback_to_all_on_empty: bool = True
     enable_domain_hints: bool = True
 
@@ -70,7 +65,6 @@ class ToolRouteResult:
     lexical_names: tuple[str, ...] = ()
     heuristic_names: tuple[str, ...] = ()
     model_names: tuple[str, ...] = ()
-    parallel_chunk_count: int = 0
 
     def trace_payload(self, *, include_prompt: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -87,8 +81,6 @@ class ToolRouteResult:
             payload["heuristic_names"] = list(self.heuristic_names)
         if self.model_names:
             payload["model_names"] = list(self.model_names)
-        if self.parallel_chunk_count:
-            payload["parallel_chunk_count"] = int(self.parallel_chunk_count)
         if self.error:
             payload["error"] = self.error
         if self.router_completion:
@@ -134,6 +126,8 @@ def route_tools_for_context(
     prompt_seed: int | None = None,
 ) -> ToolRouteResult:
     cfg = config or ToolRouterConfig()
+    if str(cfg.mode) not in TOOL_ROUTER_MODE_CHOICES:
+        raise ValueError(f"unsupported tool router mode {cfg.mode!r}; expected one of {', '.join(TOOL_ROUTER_MODE_CHOICES)}")
     all_tools = list(tools)
     total_count = len(all_tools)
     catalog_chars = tool_catalog_chars(all_tools)
@@ -209,21 +203,6 @@ def route_tools_for_context(
             lexical_names=lexical_names,
             heuristic_names=heuristic_names,
         )
-    if cfg.mode == "model_parallel":
-        return _route_tools_with_parallel_model(
-            all_tools,
-            context=context,
-            config=cfg,
-            backend=backend,
-            sampling=sampling,
-            total_tool_count=total_count,
-            catalog_chars=catalog_chars,
-            control_names=control_names,
-            lexical_names=lexical_names,
-            heuristic_names=heuristic_names,
-            progress_desc=progress_desc,
-            prompt_seed=prompt_seed,
-        )
     prompt = build_tool_router_prompt(all_tools, context=context, config=cfg)
     model_names: tuple[str, ...] = ()
     completion = ""
@@ -278,102 +257,6 @@ def route_tools_for_context(
         heuristic_names=heuristic_names,
         model_names=model_names,
     )
-
-
-def _route_tools_with_parallel_model(
-    all_tools: Sequence[Any],
-    *,
-    context: str,
-    config: ToolRouterConfig,
-    backend: Any | None,
-    sampling: Any | None,
-    total_tool_count: int,
-    catalog_chars: int,
-    control_names: set[str],
-    lexical_names: Sequence[str],
-    heuristic_names: Sequence[str],
-    progress_desc: str,
-    prompt_seed: int | None,
-) -> ToolRouteResult:
-    routeable_tools = [tool for tool in all_tools if tool_name(tool) and tool_name(tool) not in control_names]
-    tool_chunks = _chunk_tools(routeable_tools, chunk_size=config.parallel_chunk_tools)
-    model_names: list[str] = []
-    completion_rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    if backend is None or sampling is None:
-        errors.append("model_parallel router requested without backend/sampling")
-    elif not tool_chunks:
-        errors.append("model_parallel router has no routeable tools")
-    else:
-        prompts = [build_tool_router_prompt(chunk, context=context, config=config) for chunk in tool_chunks]
-        try:
-            outputs = backend.generate(
-                prompts,
-                sampling=clamp_router_sampling(sampling, max_tokens=config.max_tokens),
-                batch_size=min(len(prompts), max(1, int(config.parallel_batch_size))),
-                progress_desc=progress_desc,
-                prompt_stop_suffixes=json_call_stop_suffixes(len(prompts)),
-                prompt_seeds=None if prompt_seed is None else [int(prompt_seed) + index for index in range(len(prompts))],
-                show_progress=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - routing falls back to lexical/full window.
-            outputs = []
-            errors.append(str(exc))
-
-        for chunk_index, (chunk, output) in enumerate(zip(tool_chunks, outputs, strict=False)):
-            completion = generation_text(output)
-            valid_names = {tool_name(tool) for tool in chunk if tool_name(tool)}
-            try:
-                parsed_names = [name for name in parse_tool_router_response(completion) if name in valid_names]
-            except Exception as exc:  # noqa: BLE001 - one chunk failure should not discard other chunks.
-                parsed_names = []
-                errors.append(f"chunk {chunk_index}: {exc}")
-            model_names.extend(parsed_names)
-            completion_rows.append(
-                {
-                    "chunk": chunk_index,
-                    "tool_names": sorted(valid_names),
-                    "selected_tools": parsed_names,
-                    "completion": truncate_rwkv_text(normalize_rwkv_text(completion), 500),
-                }
-            )
-
-    deduped_model_names = tuple(_dedupe_names(model_names))
-    ranked_names = tuple(_dedupe_names([*heuristic_names, *deduped_model_names, *lexical_names]))
-    selected = _tools_by_ranked_names(
-        all_tools,
-        ranked_names,
-        max_tools=max(1, int(config.max_tools)),
-        control_names=control_names,
-        fallback_to_all_on_empty=config.fallback_to_all_on_empty,
-    )
-    if deduped_model_names:
-        reason = "model_parallel"
-    elif errors and lexical_names:
-        reason = "model_parallel_error_lexical_fallback"
-    elif errors:
-        reason = "model_parallel_error_full_fallback"
-    elif lexical_names:
-        reason = "model_parallel_empty_lexical_fallback"
-    else:
-        reason = "model_parallel_empty_full_fallback"
-    return _route_result(
-        all_tools,
-        selected,
-        total_tool_count=total_tool_count,
-        catalog_chars=catalog_chars,
-        mode=config.mode,
-        routed=True,
-        reason=reason,
-        router_completion=json.dumps(completion_rows, ensure_ascii=False, separators=(",", ":")),
-        error="; ".join(errors) if errors else None,
-        lexical_names=lexical_names,
-        heuristic_names=heuristic_names,
-        model_names=deduped_model_names,
-        parallel_chunk_count=len(tool_chunks),
-    )
-
 
 def build_tool_router_prompt(
     tools: Sequence[Any],
@@ -803,7 +686,6 @@ def _route_result(
     lexical_names: Sequence[str] = (),
     heuristic_names: Sequence[str] = (),
     model_names: Sequence[str] = (),
-    parallel_chunk_count: int = 0,
 ) -> ToolRouteResult:
     selected = list(selected_tools)
     if not selected and all_tools:
@@ -822,7 +704,6 @@ def _route_result(
         lexical_names=tuple(lexical_names),
         heuristic_names=tuple(heuristic_names),
         model_names=tuple(model_names),
-        parallel_chunk_count=int(parallel_chunk_count),
     )
 
 
@@ -838,12 +719,6 @@ def _extract_router_name_fields(text: str) -> list[str]:
             if value:
                 names.append(value)
     return _dedupe_names(names)
-
-
-def _chunk_tools(tools: Sequence[Any], *, chunk_size: int) -> list[list[Any]]:
-    size = max(1, int(chunk_size))
-    rows = list(tools)
-    return [rows[index : index + size] for index in range(0, len(rows), size)]
 
 
 def _query_terms(text: str) -> tuple[str, ...]:
@@ -891,8 +766,6 @@ __all__ = [
     "DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS",
     "DEFAULT_TOOL_ROUTER_MAX_TOKENS",
     "DEFAULT_TOOL_ROUTER_MAX_TOOLS",
-    "DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE",
-    "DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS",
     "DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS",
     "DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT",
     "TOOL_ROUTER_MODE_CHOICES",

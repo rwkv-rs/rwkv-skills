@@ -4,10 +4,11 @@ import os
 from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
-from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext
+from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext, download_git_repo
 from src.eval.function_calling.complexfuncbench import (
     DEFAULT_COMPLEXFUNC_MAX_ROWS,
     load_complexfuncbench_rows_from_source,
+    require_complexfuncbench_official_root,
 )
 from src.eval.scheduler.config import REPO_ROOT
 
@@ -16,6 +17,9 @@ from ..data_utils import download_file
 _COMPLEXFUNC_HF_URL = (
     "https://huggingface.co/datasets/zai-org/ComplexFuncBench/resolve/main/ComplexFuncBench.jsonl"
 )
+_COMPLEXFUNC_GIT_URL = "https://github.com/zai-org/ComplexFuncBench.git"
+_COMPLEXFUNC_GIT_REVISION = "main"
+_COMPLEXFUNC_GIT_ROOT_NAME = "ComplexFuncBench"
 
 
 def complexfuncbench_official_root() -> Path | None:
@@ -25,7 +29,35 @@ def complexfuncbench_official_root() -> Path | None:
     )
     if override:
         return Path(override).expanduser().resolve()
+    for candidate in (
+        REPO_ROOT / "references" / "ComplexFuncBench",
+        REPO_ROOT.parent / "ComplexFuncBench",
+        Path("/tmp/rwkv-official-refs/ComplexFuncBench"),
+        Path("/tmp/ref-ComplexFuncBench"),
+    ):
+        try:
+            return require_complexfuncbench_official_root(candidate)
+        except FileNotFoundError:
+            continue
     return None
+
+
+def _resolve_or_download_complexfuncbench_official_root(
+    context: DatasetPrepareContext,
+    *,
+    dataset_name: str,
+) -> Path:
+    existing = complexfuncbench_official_root()
+    if existing is not None:
+        return require_complexfuncbench_official_root(existing)
+    return require_complexfuncbench_official_root(
+        download_git_repo(
+            context.cache_root / dataset_name,
+            _COMPLEXFUNC_GIT_URL,
+            revision=_COMPLEXFUNC_GIT_REVISION,
+            root_name=_COMPLEXFUNC_GIT_ROOT_NAME,
+        )
+    )
 
 
 def complexfuncbench_source_root() -> Path:
@@ -84,7 +116,7 @@ def _load_complexfuncbench_official_rows(
     if split != "test":
         raise ValueError(f"{dataset_name} only provides test split")
     source_path = complexfuncbench_source_path(context.data_root, dataset_name)
-    official_root = complexfuncbench_official_root()
+    official_root = _resolve_or_download_complexfuncbench_official_root(context, dataset_name=dataset_name)
     max_rows = int(os.environ.get("RWKV_COMPLEXFUNCBENCH_MAX_ROWS", str(DEFAULT_COMPLEXFUNC_MAX_ROWS)))
     response_eval = str(os.environ.get("RWKV_COMPLEXFUNCBENCH_RESPONSE_EVAL", "1")).strip().lower()
     rows = load_complexfuncbench_rows_from_source(
@@ -111,6 +143,12 @@ def prepare_complexfuncbench_official(output_root: Path, split: str = "test") ->
             context,
         ),
         source_kind="complexfuncbench_official",
+        manifest_extra_factory=lambda _split, _context: {
+            "official_source": "zai-org/ComplexFuncBench",
+            "source_dataset_url": _COMPLEXFUNC_HF_URL,
+            "official_repo_url": _COMPLEXFUNC_GIT_URL,
+            "official_repo_revision": _COMPLEXFUNC_GIT_REVISION,
+        },
     )
 
 
@@ -126,6 +164,13 @@ def prepare_complexfuncbench_subset(output_root: Path, split: str = "test") -> C
             context,
         ),
         source_kind="complexfuncbench_official",
+        manifest_extra_factory=lambda _split, _context: {
+            "official_source": "zai-org/ComplexFuncBench",
+            "source_dataset_url": _COMPLEXFUNC_HF_URL,
+            "official_repo_url": _COMPLEXFUNC_GIT_URL,
+            "official_repo_revision": _COMPLEXFUNC_GIT_REVISION,
+            "subset": True,
+        },
     )
 
 

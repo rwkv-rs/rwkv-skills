@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from src.eval.function_calling.tool_router import (
     ToolRoutingConfig,
     parse_tool_router_response,
@@ -72,86 +74,20 @@ def test_model_tool_router_merges_model_and_lexical_names() -> None:
     assert "book_flight" in route.lexical_names
 
 
-def test_model_parallel_tool_router_shards_catalog_and_batches_calls() -> None:
-    class _Engine:
-        model_name = "router-test"
-
-        def __init__(self) -> None:
-            self.prompt_count = 0
-            self.batch_size = 0
-
-        def generate(self, prompts, **kwargs):  # noqa: ANN001
-            self.prompt_count = len(prompts)
-            self.batch_size = kwargs["batch_size"]
-            assert all("Tool catalog:" in prompt for prompt in prompts)
-            return [
-                SimpleNamespace(text='{"selected_tools":["lookup_weather"]}', finish_reason="stop"),
-                SimpleNamespace(text='{"selected_tools":["refund_order"]}', finish_reason="stop"),
-            ]
-
-    engine = _Engine()
-    tools = [
-        _tool("lookup_weather", "Read city weather forecast", "city"),
-        _tool("book_flight", "Book an airline ticket", "origin", "destination"),
-        _tool("refund_order", "Refund a retail order", "order_id"),
-        _tool("cancel_order", "Cancel a retail order", "order_id"),
-    ]
-
-    route = route_tools_for_prompt(
-        tools,
-        [{"role": "user", "content": "Check weather, then refund order ORD-7."}],
-        config=ToolRoutingConfig(
-            mode="model_parallel",
-            max_tools=3,
-            trigger_tool_count=1,
-            trigger_catalog_chars=1,
-            parallel_chunk_tools=2,
-            parallel_batch_size=4,
-        ),
-        engine=engine,
-        sampling=SimpleNamespace(),
-    )
-
-    assert engine.prompt_count == 2
-    assert engine.batch_size == 2
-    assert route.model_names == ("lookup_weather", "refund_order")
-    assert route.selected_names[:2] == ("lookup_weather", "refund_order")
-    assert route.trace_payload()["parallel_chunk_count"] == 2
-
-
-def test_model_parallel_tool_router_recovers_names_from_runaway_json() -> None:
-    class _Engine:
-        model_name = "router-test"
-
-        def generate(self, prompts, **kwargs):  # noqa: ANN001, ARG002
-            return [
-                SimpleNamespace(
-                    text='{"name":"get_reservation_details","arguments":"{\\"reservation_id\\":\\"HXDUBJ\\"}","id":"unterminated',
-                    finish_reason="length",
-                )
-            ]
-
-    tools = [
-        _tool("get_reservation_details", "Get reservation details", "reservation_id"),
-        _tool("cancel_reservation", "Cancel a reservation", "reservation_id"),
-    ]
-
-    route = route_tools_for_prompt(
-        tools,
-        [{"role": "user", "content": "Reservation HXDUBJ needs review."}],
-        config=ToolRoutingConfig(
-            mode="model_parallel",
-            max_tools=1,
-            trigger_tool_count=1,
-            trigger_catalog_chars=1,
-            parallel_chunk_tools=2,
-        ),
-        engine=_Engine(),
-        sampling=SimpleNamespace(),
-    )
-
-    assert route.model_names == ("get_reservation_details",)
-    assert route.selected_names == ("get_reservation_details",)
+def test_tool_router_rejects_removed_model_parallel_mode() -> None:
+    with pytest.raises(ValueError, match="unsupported tool router mode"):
+        route_tools_for_prompt(
+            [_tool("lookup_weather", "Read city weather forecast", "city")],
+            [{"role": "user", "content": "Check weather."}],
+            config=ToolRoutingConfig(  # type: ignore[arg-type]
+                mode="model_parallel",
+                max_tools=1,
+                trigger_tool_count=1,
+                trigger_catalog_chars=1,
+            ),
+            engine=object(),
+            sampling=SimpleNamespace(),
+        )
 
 
 def test_tool_router_prioritizes_tau_state_anchor_over_noisy_model_choice() -> None:

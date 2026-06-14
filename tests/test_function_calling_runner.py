@@ -51,6 +51,14 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "10",
             "--tool-router-trigger-catalog-chars",
             "2048",
+            "--candidate-router-mode",
+            "parallel",
+            "--candidate-router-chunk-tools",
+            "2",
+            "--candidate-router-batch-size",
+            "4",
+            "--candidate-router-prompt-max-chars",
+            "8192",
             "--model-path",
             "model.pth",
         ]
@@ -70,6 +78,10 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.tool_router_max_tools == 8
     assert args.tool_router_trigger_tool_count == 10
     assert args.tool_router_trigger_catalog_chars == 2048
+    assert args.candidate_router_mode == "parallel"
+    assert args.candidate_router_chunk_tools == 2
+    assert args.candidate_router_batch_size == 4
+    assert args.candidate_router_prompt_max_chars == 8192
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
@@ -371,11 +383,8 @@ def test_function_calling_runner_main_dispatches_simple_tool_call_runner(monkeyp
     monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
     monkeypatch.setattr(
         function_calling_runner,
-        "_run_simple_tool_call",
-        lambda _args, _run, *, default_job_name, run_context=None: called.append(
-            (default_job_name, _run.dataset_slug)
-        )
-        or 0,
+        "_run_bfcl_ast",
+        lambda _args, _run, *, run_context=None: called.append(("function_bfcl_ast", _run.dataset_slug)) or 0,
     )
 
     rc = function_calling_runner.main(["--dataset", "bfcl_simple_python_test.jsonl", "--model-path", "model.pth"])
@@ -741,6 +750,139 @@ def test_run_bfcl_generation_step_returns_plain_ask_branch() -> None:
     assert outcome.action_type == "ASK"
     assert outcome.tool_call is None
     assert outcome.final_answer == "Which id should I look up?"
+
+
+def test_run_bfcl_generation_step_uses_parallel_candidate_router_with_full_trace() -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate(self, prompts, **kwargs):  # noqa: ANN001
+            self.calls.append({"prompts": list(prompts), **dict(kwargs)})
+            if len(prompts) == 2:
+                return [
+                    SimpleNamespace(
+                        text=(
+                            '{"name":"lookup","arguments":{"id":"A1"},'
+                            '"confidence":0.9,"evidence":"user requested A1"}'
+                        ),
+                        finish_reason="stop",
+                    ),
+                    SimpleNamespace(
+                        text=(
+                            '{"name":"final_answer","arguments":{"answer":"done"},'
+                            '"confidence":0.1,"evidence":"weak handoff"}'
+                        ),
+                        finish_reason="stop",
+                    ),
+                ]
+            return [
+                SimpleNamespace(
+                    text=(
+                        '{"name":"lookup","arguments":{"id":"A1"},'
+                        '"confidence":0.95,"evidence":"best candidate"}'
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+
+    record = BfclTaskRecord(
+        task_id="candidate-demo",
+        instruction="Find A1",
+        tools=(
+            {
+                "name": "lookup",
+                "description": "Lookup state",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+        initial_state={"selected": "A1"},
+    )
+    state = bfcl_v3_runner._start_bfcl_episode(
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        record=record,
+    )
+    engine = _FakeEngine()
+
+    outcome = bfcl_v3_runner._run_bfcl_generation_step(
+        state=state,
+        run=SimpleNamespace(engine=engine),
+        tool_sampling=object(),
+        progress_suffix="sample 0 step 1",
+        history_max_chars=4000,
+        prompt_max_chars=8192,
+        candidate_router_config=bfcl_v3_runner.ParallelCandidateRouterConfig(
+            chunk_tools=2,
+            prompt_max_chars=8192,
+            include_respond=False,
+            ground_identifier_arguments=False,
+        ),
+    )
+
+    assert outcome.ok is True
+    assert outcome.action_type == "TOOL"
+    assert outcome.tool_call is not None
+    assert outcome.tool_call.name == "lookup"
+    assert len(engine.calls) == 2
+    trace = outcome.trace_entry
+    assert trace["decision_text"] == '{"name":"lookup","arguments":{"id":"A1"}}'
+    assert trace["candidate_router"]["mode"] == "parallel_candidate"
+    assert trace["candidate_router"]["chunks"][0]["prompt"]
+    assert trace["candidate_router"]["chunks"][0]["tools"][0]["name"] == "lookup"
+    assert trace["full_context"]["prompt_messages"] == state.prompt_messages
+    assert trace["full_context"]["runtime_state_snapshot"] == {"selected": "A1"}
+    assert trace["full_context"]["active_tools"][0]["name"] == "lookup"
+
+
+def test_run_bfcl_generation_step_hard_rejects_over_budget_prompt_without_model_call() -> None:
+    class _FakeEngine:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def generate(self, prompts, **kwargs):  # noqa: ANN001, ARG002
+            self.calls.append(list(prompts))
+            return [SimpleNamespace(text='{"name":"lookup","arguments":{}}', finish_reason="stop")]
+
+    record = BfclTaskRecord(
+        task_id="budget-demo",
+        instruction="Find A1",
+        tools=(
+            {
+                "name": "lookup",
+                "description": "Lookup state " + ("very long description " * 80),
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        ),
+    )
+    state = bfcl_v3_runner._start_bfcl_episode(
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        record=record,
+    )
+    engine = _FakeEngine()
+
+    outcome = bfcl_v3_runner._run_bfcl_generation_step(
+        state=state,
+        run=SimpleNamespace(engine=engine),
+        tool_sampling=object(),
+        progress_suffix="sample 0 step 1",
+        history_max_chars=4000,
+        prompt_max_chars=256,
+    )
+
+    assert outcome.ok is False
+    assert state.termination_reason == "prompt_over_budget"
+    assert "prompt_chars=" in str(outcome.trace_entry["error"])
+    assert outcome.trace_entry["full_context"]["prompt_chars"] > 256
+    assert engine.calls == []
 
 
 def test_start_bfcl_episode_wraps_non_official_request_in_rwkv_user_block() -> None:

@@ -8,7 +8,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
@@ -25,6 +25,12 @@ from src.eval.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.function_calling.context_budget import normalize_rwkv_text
+from src.eval.function_calling.final_answer import (
+    build_final_answer_json_call_prompt,
+    parse_final_answer_call,
+    render_final_answer_call,
+)
+from src.eval.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES
 from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _resolve_function_calling_plan,
@@ -83,6 +89,8 @@ _LONG_BENCH_ZH_DATASETS = frozenset({"multifieldqa_zh", "dureader", "vcsum", "ls
 _WORD_OR_CJK_RE = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]")
 _ANSWER_PREFIX_RE = re.compile(r"^\s*(?:final\s+answer|answer|答案|最终答案)\s*[:：]\s*", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_LONGBENCH_FINAL_ANSWER_DESCRIPTION = "The concise answer to the LongBench question."
+_LONGBENCH_PROMPT_HISTORY_SLACK = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,11 +198,18 @@ def build_longbench_prompt(
             "",
             "Question:",
             question,
-            "",
-            "Answer:",
         ]
     )
-    return normalize_rwkv_text("\n".join(lines))
+    instruction = normalize_rwkv_text("\n".join(lines))
+    return build_final_answer_json_call_prompt(
+        instruction,
+        answer_description=_LONGBENCH_FINAL_ANSWER_DESCRIPTION,
+        history_max_chars=len(instruction) + _LONGBENCH_PROMPT_HISTORY_SLACK,
+        extra_system_lines=(
+            "Put only the concise benchmark answer in arguments.answer.",
+            "Do not include analysis or citations unless the dataset question asks for them.",
+        ),
+    )
 
 
 def build_longbench_budgeted_prompt(
@@ -241,6 +256,7 @@ def build_longbench_budgeted_prompt(
         "chunk_count": int(compaction.chunk_count),
         "selected_chunk_ids": list(compaction.selected_chunk_ids),
         "prompt_chars": len(prompt),
+        "output_format": "rwkv_final_answer_json_call",
     }
     if compaction.router_error:
         trace["router_error"] = compaction.router_error
@@ -385,7 +401,13 @@ def _run_longbench(
             )[0]
             for _, record in repeated
         ]
-        run.engine.generate(prompts, sampling=sampling, batch_size=len(prompts), progress_desc="LongBench-Probe")
+        run.engine.generate(
+            prompts,
+            sampling=sampling,
+            batch_size=len(prompts),
+            progress_desc="LongBench-Probe",
+            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
+        )
         print(f"probe-only run completed: {len(prompts)} prompt(s)")
         return 0
 
@@ -443,6 +465,7 @@ def _run_longbench(
                         sampling=sampling,
                         batch_size=len(prompts),
                         progress_desc="LongBench",
+                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
                         prompt_seeds=[
                             sample_repeat_seed(
                                 key.sample_index,
@@ -457,7 +480,21 @@ def _run_longbench(
                     for index, (key, record) in enumerate(chunk):
                         output = outputs_by_index[index]
                         prompt, trace = prompt_rows[index]
-                        prediction = normalize_longbench_answer(output.text)
+                        parse_error = ""
+                        parsed_call: dict[str, Any] = {}
+                        parsed_call_id = ""
+                        parsed_answer = ""
+                        try:
+                            final_call = parse_final_answer_call(
+                                output.text,
+                                context_label="longbench final answer",
+                            )
+                            parsed_answer = final_call.answer
+                            parsed_call = dict(final_call.call)
+                            parsed_call_id = final_call.call_id
+                        except Exception as exc:  # noqa: BLE001
+                            parse_error = str(exc)
+                        prediction = normalize_longbench_answer(parsed_answer)
                         score = score_longbench_answer(prediction, record.answers)
                         payload = SampleRecord(
                             benchmark_name=run.benchmark_name,
@@ -479,8 +516,11 @@ def _run_longbench(
                             "num_turns": 1,
                             "cost": 0.0,
                             "is_passed": score.passed,
-                            "error": None,
+                            "error": parse_error or None,
                         }
+                        sandbox_return = (
+                            render_final_answer_call(prediction, call_id=parsed_call_id) if prediction else ""
+                        )
                         payload["agent_info"] = {
                             "dataset": record.dataset,
                             "task_id": record.task_id,
@@ -490,17 +530,28 @@ def _run_longbench(
                             "best_reference": score.best_reference,
                             "f1": score.f1,
                             "exact_match": score.exact_match,
+                            "final_answer_call": sandbox_return,
+                            "decoded_final_answer_call": parsed_call,
+                            "parse_error": parse_error,
                             "category": record.category,
                             "language": record.language,
                             "length": record.length,
                             "long_doc": trace,
                         }
-                        payload["agent_trace"] = [{"stage": "answer", "text": prediction}]
+                        payload["agent_trace"] = [
+                            {
+                                "stage": "answer",
+                                "text": prediction,
+                                "raw_completion": output.text,
+                                "sandbox_return": sandbox_return,
+                                "parse_error": parse_error,
+                            }
+                        ]
                         payload["task_id"] = record.task_id
                         payload["domain"] = "long_context"
                         payload["instruction"] = record.input
                         writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -524,7 +575,7 @@ def _run_longbench(
                 sampling_payload=sampling_payload,
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise
@@ -573,8 +624,6 @@ def _longbench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfi
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
-        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
-        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 

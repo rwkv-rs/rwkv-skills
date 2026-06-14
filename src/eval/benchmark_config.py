@@ -45,8 +45,6 @@ _CONFIG_KEY_ALIASES = {
     "long_doc_max_evidence_chunks": "long_context_max_evidence_chunks",
     "long_doc_max_evidence_chars": "long_context_max_evidence_chars",
     "long_doc_query_chars": "long_context_query_chars",
-    "long_doc_model_max_tokens": "long_context_model_max_tokens",
-    "long_doc_model_parallel_batch_size": "long_context_model_parallel_batch_size",
 }
 
 _CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
@@ -80,8 +78,6 @@ class BenchmarkModelConfig:
     long_context_max_evidence_chunks: int | None = None
     long_context_max_evidence_chars: int | None = None
     long_context_query_chars: int | None = None
-    long_context_model_max_tokens: int | None = None
-    long_context_model_parallel_batch_size: int | None = None
     history_max_chars: int | None = None
     prompt_max_chars: int | None = None
     max_steps: int | None = None
@@ -365,8 +361,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     long_context_max_evidence_chunks: int | None = None
     long_context_max_evidence_chars: int | None = None
     long_context_query_chars: int | None = None
-    long_context_model_max_tokens: int | None = None
-    long_context_model_parallel_batch_size: int | None = None
     history_max_chars: int | None = None
     prompt_max_chars: int | None = None
     max_steps: int | None = None
@@ -466,12 +460,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         elif key == "long_context_query_chars":
             long_context_query_chars = _coerce_int(raw)
             continue
-        elif key == "long_context_model_max_tokens":
-            long_context_model_max_tokens = _coerce_int(raw)
-            continue
-        elif key == "long_context_model_parallel_batch_size":
-            long_context_model_parallel_batch_size = _coerce_int(raw)
-            continue
         elif key == "history_max_chars":
             history_max_chars = _coerce_int(raw)
             continue
@@ -548,8 +536,6 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         long_context_max_evidence_chunks=long_context_max_evidence_chunks,
         long_context_max_evidence_chars=long_context_max_evidence_chars,
         long_context_query_chars=long_context_query_chars,
-        long_context_model_max_tokens=long_context_model_max_tokens,
-        long_context_model_parallel_batch_size=long_context_model_parallel_batch_size,
         history_max_chars=history_max_chars,
         prompt_max_chars=prompt_max_chars,
         max_steps=max_steps,

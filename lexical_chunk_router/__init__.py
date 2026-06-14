@@ -20,7 +20,6 @@ from .long_doc import (
     parse_long_doc_router_response,
     render_evidence_window,
     select_evidence_chunks,
-    select_evidence_chunks_model_parallel,
 )
 from .rwkv import (
     JSON_CALL_STOP_SUFFIXES,
@@ -82,7 +81,6 @@ __all__ = [
     "route_tools",
     "route_tools_for_context",
     "select_evidence_chunks",
-    "select_evidence_chunks_model_parallel",
     "summarize_tool",
     "tool_catalog_chars",
     "tool_name",

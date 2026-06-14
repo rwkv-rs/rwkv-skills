@@ -16,6 +16,7 @@ from src.eval.function_calling.longbench import (
 from .common import LocalRowsDatasetSpec, rwkv_rs_datasets_root
 
 _REQUIRED_FIELDS = ("task_id", "dataset", "input", "context", "answers")
+_LONGBENCH_HF_SOURCE = "THUDM/LongBench"
 
 
 def longbench_root() -> Path:
@@ -50,7 +51,9 @@ def _build_longbench_spec(
 
     payload_extra = {
         "benchmark": "LongBench",
+        "official_source": _LONGBENCH_HF_SOURCE,
         "source": "local_or_huggingface",
+        "source_mode": "local_root" if configured_source.exists() else "huggingface",
         "default_local_root": str(configured_source),
         **(extra or {}),
     }
@@ -70,9 +73,9 @@ def _load_hf_longbench_rows(*, split: str, include_datasets: set[str] | None) ->
     selected = sorted(include_datasets or LONG_BENCH_DATASETS)
     rows: list[dict[str, Any]] = []
     for dataset in selected:
-        source_path = f"hf://THUDM/LongBench/{dataset}/{split}"
+        source_path = f"hf://{_LONGBENCH_HF_SOURCE}/{dataset}/{split}"
         for index, row in enumerate(
-            iter_hf_dataset("THUDM/LongBench", config=dataset, split=split, trust_remote_code=True)
+            iter_hf_dataset(_LONGBENCH_HF_SOURCE, config=dataset, split=split, trust_remote_code=True)
         ):
             payload = dict(row)
             payload.setdefault("dataset", dataset)

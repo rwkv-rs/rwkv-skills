@@ -3,7 +3,7 @@ from __future__ import annotations
 """Compatibility wrapper around the packaged RWKV long-context tool router."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from lexical_chunk_router import tool_router as _tool_router
 
@@ -11,13 +11,11 @@ DEFAULT_TOOL_ROUTER_CONTEXT_CHARS = _tool_router.DEFAULT_TOOL_ROUTER_CONTEXT_CHA
 DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS = _tool_router.DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS
 DEFAULT_TOOL_ROUTER_MAX_TOKENS = _tool_router.DEFAULT_TOOL_ROUTER_MAX_TOKENS
 DEFAULT_TOOL_ROUTER_MAX_TOOLS = _tool_router.DEFAULT_TOOL_ROUTER_MAX_TOOLS
-DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE = _tool_router.DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE
-DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS = _tool_router.DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS
 DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS = _tool_router.DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS
 DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT = _tool_router.DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT
 TOOL_ROUTER_MODE_CHOICES = _tool_router.TOOL_ROUTER_MODE_CHOICES
 
-ToolRouterMode = _tool_router.ToolRouterMode
+ToolRouterMode = Literal["off", "lexical", "model"]
 ToolRouteResult = _tool_router.ToolRouteResult
 
 
@@ -30,8 +28,6 @@ class ToolRoutingConfig:
     context_chars: int = DEFAULT_TOOL_ROUTER_CONTEXT_CHARS
     max_tokens: int = DEFAULT_TOOL_ROUTER_MAX_TOKENS
     description_chars: int = DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS
-    parallel_chunk_tools: int = DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS
-    parallel_batch_size: int = DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE
     fallback_to_all_on_empty: bool = True
     enable_domain_hints: bool = True
 
@@ -72,18 +68,6 @@ def tool_routing_config_from_args(args: Any) -> ToolRoutingConfig:
             "tool_router_description_chars",
             DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS,
             minimum=40,
-        ),
-        parallel_chunk_tools=_arg_int(
-            args,
-            "tool_router_parallel_chunk_tools",
-            DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS,
-            minimum=1,
-        ),
-        parallel_batch_size=_arg_int(
-            args,
-            "tool_router_parallel_batch_size",
-            DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE,
-            minimum=1,
         ),
     )
 
@@ -160,8 +144,6 @@ __all__ = [
     "DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS",
     "DEFAULT_TOOL_ROUTER_MAX_TOKENS",
     "DEFAULT_TOOL_ROUTER_MAX_TOOLS",
-    "DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE",
-    "DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS",
     "DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS",
     "DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT",
     "TOOL_ROUTER_MODE_CHOICES",

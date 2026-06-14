@@ -28,12 +28,11 @@ from src.eval.function_calling.tool_router import (
     DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS,
     DEFAULT_TOOL_ROUTER_MAX_TOKENS,
     DEFAULT_TOOL_ROUTER_MAX_TOOLS,
-    DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE,
-    DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS,
     DEFAULT_TOOL_ROUTER_TRIGGER_CATALOG_CHARS,
     DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT,
     TOOL_ROUTER_MODE_CHOICES,
 )
+from src.eval.function_calling.parallel_candidate_router import ParallelCandidateRouterConfig
 from src.eval.function_calling.agentbench import _run_agentbench
 from src.eval.function_calling.api_bank import _run_api_bank
 from src.eval.function_calling.bfcl_ast import _run_bfcl_ast
@@ -55,11 +54,7 @@ from src.eval.function_calling.tau_runner import (
     _run_tau,
 )
 from src.eval.function_calling.toolalpaca import _run_toolalpaca
-from src.eval.long_doc_evidence import (
-    DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
-    DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
-    LONG_DOC_MODE_CHOICES,
-)
+from src.eval.long_doc_evidence import LONG_DOC_MODE_CHOICES
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, split_benchmark_and_split
 from src.infer.backend import (
@@ -96,7 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-model", help="Model name for official tau NL assertion judge")
     parser.add_argument("--judge-api-key", help="API key for official tau NL assertion judge")
     parser.add_argument("--judge-base-url", help="OpenAI-compatible base URL for official tau NL assertion judge")
-    parser.add_argument("--judge-max-workers", type=int, help="Reserved for judge clients that support worker pools")
+    parser.add_argument("--judge-max-workers", type=int, help="Max concurrent workers for BrowseComp judge clients")
     parser.add_argument(
         "--disable-checker",
         action="store_true",
@@ -192,18 +187,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS,
         help="Description character cap per tool in the router catalog",
     )
-    parser.add_argument(
-        "--tool-router-parallel-chunk-tools",
-        type=int,
-        default=DEFAULT_TOOL_ROUTER_PARALLEL_CHUNK_TOOLS,
-        help="Tool count per model_parallel router shard",
-    )
-    parser.add_argument(
-        "--tool-router-parallel-batch-size",
-        type=int,
-        default=DEFAULT_TOOL_ROUTER_PARALLEL_BATCH_SIZE,
-        help="Batch size for model_parallel router shard calls",
-    )
     parser.add_argument("--long-doc-max-chars", type=int, default=1000, help="Long-document chunk max characters")
     parser.add_argument("--long-doc-overlap-lines", type=int, default=3, help="Long-document chunk overlap lines")
     parser.add_argument(
@@ -225,16 +208,75 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Maximum selected evidence characters when compacting one long message",
     )
     parser.add_argument(
-        "--long-doc-model-max-tokens",
-        type=int,
-        default=DEFAULT_LONG_DOC_MODEL_MAX_TOKENS,
-        help="Generation token cap for model_parallel long-document chunk routing",
+        "--candidate-router-mode",
+        choices=("off", "parallel"),
+        default="off",
+        help="BFCL v3 candidate-layer router mode; parallel splits the tool table into shards before aggregation",
     )
     parser.add_argument(
-        "--long-doc-model-parallel-batch-size",
+        "--candidate-router-chunk-tools",
         type=int,
-        default=DEFAULT_LONG_DOC_MODEL_PARALLEL_BATCH_SIZE,
-        help="Batch size for model_parallel long-document chunk routing",
+        default=ParallelCandidateRouterConfig.chunk_tools,
+        help="Tool count per parallel candidate-router shard",
+    )
+    parser.add_argument(
+        "--candidate-router-batch-size",
+        type=int,
+        default=ParallelCandidateRouterConfig.batch_size,
+        help="Generation batch size for candidate-router shard calls",
+    )
+    parser.add_argument(
+        "--candidate-router-context-chars",
+        type=int,
+        default=ParallelCandidateRouterConfig.context_chars,
+        help="Conversation characters shown to each candidate-router shard",
+    )
+    parser.add_argument(
+        "--candidate-router-prompt-max-chars",
+        type=int,
+        default=ParallelCandidateRouterConfig.prompt_max_chars,
+        help="Hard prompt character budget for each candidate-router shard prompt",
+    )
+    parser.add_argument(
+        "--candidate-router-candidate-max-tokens",
+        type=int,
+        default=ParallelCandidateRouterConfig.candidate_max_tokens,
+        help="Generation token cap for each candidate-router shard",
+    )
+    parser.add_argument(
+        "--candidate-router-aggregate-max-tokens",
+        type=int,
+        default=ParallelCandidateRouterConfig.aggregate_max_tokens,
+        help="Generation token cap for candidate-router aggregation",
+    )
+    parser.add_argument(
+        "--candidate-router-max-candidates",
+        type=int,
+        default=ParallelCandidateRouterConfig.max_candidates,
+        help="Maximum candidate calls considered by the aggregator",
+    )
+    parser.add_argument(
+        "--candidate-router-tool-schema-mode",
+        choices=("minimal", "compact", "full"),
+        default=ParallelCandidateRouterConfig.tool_schema_mode,
+        help="Tool schema verbosity used inside candidate-router shard prompts",
+    )
+    parser.add_argument(
+        "--candidate-router-evidence-chars",
+        type=int,
+        default=ParallelCandidateRouterConfig.evidence_chars,
+        help="Maximum evidence characters retained per candidate-router candidate",
+    )
+    parser.add_argument(
+        "--candidate-router-policy-chars",
+        type=int,
+        default=ParallelCandidateRouterConfig.policy_chars,
+        help="Policy/system prompt excerpt characters shown to candidate-router prompts",
+    )
+    parser.add_argument(
+        "--disable-candidate-router-grounding",
+        action="store_true",
+        help="Disable candidate-router identifier grounding checks",
     )
     parser.add_argument("--cot-max-tokens", type=int, default=2048, help="Clamp CoT generation length")
     parser.add_argument("--answer-max-tokens", type=int, default=1024, help="Clamp final answer generation length")

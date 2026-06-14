@@ -34,7 +34,6 @@ from src.eval.function_calling.runner_common import (
 from src.eval.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     build_rwkv_json_call_prompt,
-    render_json_function_call,
 )
 from src.eval.function_calling.simple_tool_call import decode_simple_tool_call_response
 from src.eval.function_calling.tool_router import (
@@ -120,7 +119,7 @@ class AgentBenchControllerClient:
     def cancel(self, session_id: str) -> None:
         try:
             self._post("cancel", {}, headers={"session_id": session_id})
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     def _post(
@@ -338,7 +337,7 @@ def _run_agentbench(
                         tool_routing_config=tool_routing_config,
                     )
                     writer.enqueue(payload)
-            except BaseException:
+            except Exception:  # noqa: BLE001
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -364,7 +363,7 @@ def _run_agentbench(
                 extra={"cot_mode": CoTMode.COT.value, "controller_url": controller_url},
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise
@@ -588,8 +587,6 @@ def _agentbench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConf
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
-        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
-        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 

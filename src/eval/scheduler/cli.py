@@ -228,6 +228,29 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
     parser.add_argument(
+        "--disable-infer-backpressure",
+        action="store_true",
+        help="关闭远端推理背压读取，使用静态 --infer-max-workers/--remote-batch-size",
+    )
+    parser.add_argument(
+        "--infer-backpressure-timeout-s",
+        type=float,
+        default=2.0,
+        help="读取远端 /v1/backpressure 的超时秒数",
+    )
+    parser.add_argument(
+        "--infer-backpressure-pending-high-watermark",
+        type=int,
+        default=0,
+        help="远端 pending queue 超过该值时暂缓启动该模型的下一个 benchmark",
+    )
+    parser.add_argument(
+        "--infer-budget-min-workers",
+        type=int,
+        default=1,
+        help="背压预算下调时保留的最小远端请求并发",
+    )
+    parser.add_argument(
         "--function-prompt-style",
         choices=FUNCTION_PROMPT_STYLE_CHOICES,
         help="function-calling runner 的 --prompt-style",
@@ -268,6 +291,61 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         "--function-tool-router-trigger-catalog-chars",
         type=int,
         help="function-calling runner 的 --tool-router-trigger-catalog-chars",
+    )
+    parser.add_argument(
+        "--function-candidate-router-mode",
+        choices=("off", "parallel"),
+        help="function-calling runner 的 --candidate-router-mode",
+    )
+    parser.add_argument(
+        "--function-candidate-router-chunk-tools",
+        type=int,
+        help="function-calling runner 的 --candidate-router-chunk-tools",
+    )
+    parser.add_argument(
+        "--function-candidate-router-batch-size",
+        type=int,
+        help="function-calling runner 的 --candidate-router-batch-size",
+    )
+    parser.add_argument(
+        "--function-candidate-router-prompt-max-chars",
+        type=int,
+        help="function-calling runner 的 --candidate-router-prompt-max-chars",
+    )
+    parser.add_argument(
+        "--function-candidate-router-context-chars",
+        type=int,
+        help="function-calling runner 的 --candidate-router-context-chars",
+    )
+    parser.add_argument(
+        "--function-candidate-router-candidate-max-tokens",
+        type=int,
+        help="function-calling runner 的 --candidate-router-candidate-max-tokens",
+    )
+    parser.add_argument(
+        "--function-candidate-router-aggregate-max-tokens",
+        type=int,
+        help="function-calling runner 的 --candidate-router-aggregate-max-tokens",
+    )
+    parser.add_argument(
+        "--function-candidate-router-max-candidates",
+        type=int,
+        help="function-calling runner 的 --candidate-router-max-candidates",
+    )
+    parser.add_argument(
+        "--function-candidate-router-tool-schema-mode",
+        choices=("minimal", "compact", "full"),
+        help="function-calling runner 的 --candidate-router-tool-schema-mode",
+    )
+    parser.add_argument(
+        "--function-candidate-router-evidence-chars",
+        type=int,
+        help="function-calling runner 的 --candidate-router-evidence-chars",
+    )
+    parser.add_argument(
+        "--function-candidate-router-policy-chars",
+        type=int,
+        help="function-calling runner 的 --candidate-router-policy-chars",
     )
     parser.add_argument("--function-max-rounds", type=int, help="function-calling runner 的 --max-rounds")
     parser.add_argument("--function-max-steps", type=int, help="function-calling runner 的 --max-steps")
@@ -363,6 +441,12 @@ def _dispatch_options_from_args(
             if getattr(args, "remote_batch_size", None) is not None
             else None
         ),
+        infer_backpressure=not bool(getattr(args, "disable_infer_backpressure", False)),
+        infer_backpressure_timeout_s=float(getattr(args, "infer_backpressure_timeout_s", 2.0)),
+        infer_backpressure_pending_high_watermark=int(
+            getattr(args, "infer_backpressure_pending_high_watermark", 0)
+        ),
+        infer_budget_min_workers=int(getattr(args, "infer_budget_min_workers", 1)),
         function_prompt_style=getattr(args, "function_prompt_style", None),
         function_tool_catalog_format=getattr(args, "function_tool_catalog_format", None),
         function_cot_max_tokens=getattr(args, "function_cot_max_tokens", None),
@@ -377,6 +461,17 @@ def _dispatch_options_from_args(
         function_tool_router_max_tools=getattr(args, "function_tool_router_max_tools", None),
         function_tool_router_trigger_tool_count=getattr(args, "function_tool_router_trigger_tool_count", None),
         function_tool_router_trigger_catalog_chars=getattr(args, "function_tool_router_trigger_catalog_chars", None),
+        function_candidate_router_mode=getattr(args, "function_candidate_router_mode", None),
+        function_candidate_router_chunk_tools=getattr(args, "function_candidate_router_chunk_tools", None),
+        function_candidate_router_batch_size=getattr(args, "function_candidate_router_batch_size", None),
+        function_candidate_router_prompt_max_chars=getattr(args, "function_candidate_router_prompt_max_chars", None),
+        function_candidate_router_context_chars=getattr(args, "function_candidate_router_context_chars", None),
+        function_candidate_router_candidate_max_tokens=getattr(args, "function_candidate_router_candidate_max_tokens", None),
+        function_candidate_router_aggregate_max_tokens=getattr(args, "function_candidate_router_aggregate_max_tokens", None),
+        function_candidate_router_max_candidates=getattr(args, "function_candidate_router_max_candidates", None),
+        function_candidate_router_tool_schema_mode=getattr(args, "function_candidate_router_tool_schema_mode", None),
+        function_candidate_router_evidence_chars=getattr(args, "function_candidate_router_evidence_chars", None),
+        function_candidate_router_policy_chars=getattr(args, "function_candidate_router_policy_chars", None),
         function_max_rounds=getattr(args, "function_max_rounds", None),
         function_max_steps=getattr(args, "function_max_steps", None),
         function_max_tool_errors=getattr(args, "function_max_tool_errors", None),

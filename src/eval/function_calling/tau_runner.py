@@ -4,8 +4,6 @@ import argparse
 import json
 import os
 import time
-import uuid
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -23,7 +21,7 @@ from src.eval.benchmark_registry import CoTMode
 from src.eval.env_config import apply_openai_env, resolve_judge_model_config, resolve_required_user_model_config
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
-from src.eval.execution_plan import AttemptKey, build_attempt_keys, plan_attempt_count
+from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.common import (
     attach_function_calling_context_metadata,
@@ -34,7 +32,6 @@ from src.eval.function_calling.common import (
     prepare_function_calling_run,
     repeat_probe_entries,
 )
-from src.eval.function_calling.context_budget import trim_message_history
 from src.eval.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _resolve_function_calling_plan,
@@ -47,13 +44,9 @@ from src.eval.function_calling.rwkv_prompt import (
 from src.eval.function_calling.tau_bench import (
     TauManifestRecord,
     TauToolCall,
-    build_json_call_context,
     build_tau_system_prompt,
     load_tau_manifest_records,
-    parse_tool_call_or_final_answer,
-    render_assistant_tool_message,
     render_tau_user_prompt,
-    render_tool_result,
 )
 from src.eval.function_calling.tool_router import ToolRoutingConfig, tool_routing_config_from_args
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
@@ -505,8 +498,6 @@ def _tau_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
         min_long_text_chars=max(1, int(getattr(args, "long_doc_min_chars", 6000) or 6000)),
         max_evidence_chunks=max(1, int(getattr(args, "long_doc_max_evidence_chunks", 4) or 4)),
         max_evidence_chars=max(1, int(getattr(args, "long_doc_max_evidence_chars", 6000) or 6000)),
-        model_max_tokens=max(1, int(getattr(args, "long_doc_model_max_tokens", 96) or 96)),
-        model_parallel_batch_size=max(1, int(getattr(args, "long_doc_model_parallel_batch_size", 8) or 8)),
     )
 
 
@@ -607,7 +598,6 @@ def _run_tau(
         "retail_repeated_read_guard": retail_repeated_read_guard,
         "retail_tool_use_guard": retail_tool_use_guard,
         "retail_progressive_tool_disclosure": retail_progressive_tool_disclosure,
-        "state_prefix_cache": bool(str(getattr(args, "engine_mode", "") or "").strip() == "lightning"),
     }
     tau_history_cap = int(os.environ.get("RWKV_TAU_HISTORY_MAX_CHARS", str(DEFAULT_TAU_HISTORY_MAX_CHARS)))
     history_max_chars = max(0, min(int(args.history_max_chars), tau_history_cap))
@@ -741,7 +731,7 @@ def _run_tau(
                     }
                     for future in as_completed(futures):
                         writer.enqueue(future.result())
-            except BaseException:
+            except Exception:
                 runtime.handle_attempt_stage_failure(
                     writer,
                     timeout_s=float(args.db_close_timeout_s),
@@ -767,7 +757,7 @@ def _run_tau(
                 extra={"cot_mode": CoTMode.COT.value},
             ),
         )
-    except BaseException as exc:
+    except Exception as exc:
         if not ctx.runtime.state.is_terminal():
             ctx.runtime.fail_task(error=str(exc))
         raise

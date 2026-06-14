@@ -1,17 +1,40 @@
 from __future__ import annotations
 
 import json
+import types
 import zipfile
 from pathlib import Path
 
+from src.eval.function_calling import longcodebench as longcodebench_module
 from src.eval.function_calling.longcodebench import (
     LongCodeQARecord,
+    _run_longcodebench,
     build_longcodeqa_budgeted_prompt,
     load_longcodeqa_rows_from_source,
     normalize_longcodeqa_answer,
     score_longcodeqa_answer,
 )
+from src.eval.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
+from src.infer.sampling import GenerationOutput, SamplingConfig
+
+
+class _CollectingWriter:
+    def __init__(self) -> None:
+        self.payloads: list[dict[str, object]] = []
+
+    def enqueue(self, payload: dict[str, object]) -> None:
+        self.payloads.append(payload)
+
+
+class _FakeRuntime:
+    state = types.SimpleNamespace(is_terminal=lambda: True)
+
+    def handle_attempt_stage_failure(self, *_args, **_kwargs) -> None:
+        return None
+
+    def fail_task(self, *_args, **_kwargs) -> None:
+        return None
 
 
 def test_longcodeqa_answer_normalization_prefers_letter_answer() -> None:
@@ -67,9 +90,13 @@ def test_longcodeqa_default_prompt_preserves_official_prompt() -> None:
         prompt_max_chars=64,
     )
 
-    assert prompt == official_prompt
+    assert official_prompt in prompt
+    assert '"name": "final_answer"' in prompt
+    assert '"id": {' in prompt
+    assert prompt.rstrip().endswith("Assistant: ```json\n{")
     assert trace["mode"] == "off"
-    assert trace["prompt_chars"] == len(official_prompt)
+    assert trace["output_format"] == "rwkv_final_answer_json_call"
+    assert trace["prompt_chars"] == len(prompt)
 
 
 def test_longcodeqa_budgeted_prompt_replaces_repo_text_with_evidence() -> None:
@@ -101,15 +128,16 @@ def test_longcodeqa_budgeted_prompt_replaces_repo_text_with_evidence() -> None:
             max_evidence_chunks=2,
             max_evidence_chars=450,
         ),
-        prompt_max_chars=900,
+        prompt_max_chars=3000,
     )
 
     assert "Long document compacted" in prompt
     assert "target_symbol" in prompt
-    assert prompt.rstrip().endswith("Answer:")
+    assert '"name": "final_answer"' in prompt
+    assert prompt.rstrip().endswith("Assistant: ```json\n{")
     assert trace["compacted"] is True
     assert trace["replacement_found"] is True
-    assert trace["prompt_chars"] <= 900
+    assert trace["prompt_chars"] <= 3000
 
 
 def test_load_longcodeqa_rows_from_zip_source(tmp_path: Path) -> None:
@@ -133,3 +161,101 @@ def test_load_longcodeqa_rows_from_zip_source(tmp_path: Path) -> None:
     assert parsed["context_size"] == 32768
     assert parsed["correct_letter"] == "B"
     assert parsed["is_hard_label"] == "no"
+
+
+def test_run_longcodebench_keeps_raw_completion_separate_from_sandbox_return(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset = tmp_path / "longcodebench_test.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "task_id": "lc-1",
+                "prompt": "Answer with a letter.\nRepository: VALUE = 1\nQuestion:\nWhat is VALUE?\nA) 0\nB) 1",
+                "repo_text": "VALUE = 1",
+                "question": "Question:\nWhat is VALUE?\nA) 0\nB) 1",
+                "correct_letter": "B",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    raw_completion = '```json\n{"name":"final_answer","arguments":{"answer":"B"},"id":"call_lc"}\n```'
+
+    class FakeEngine:
+        def generate(self, prompts, **_kwargs):
+            return [
+                GenerationOutput(
+                    prompt_index=index,
+                    prompt=prompt,
+                    token_ids=[],
+                    text=raw_completion,
+                    finish_reason="stop_token",
+                )
+                for index, prompt in enumerate(prompts)
+            ]
+
+    captured: dict[str, object] = {}
+
+    def _fake_prepare_function_calling_run(**_kwargs):
+        writer = _CollectingWriter()
+        captured["writer"] = writer
+        return types.SimpleNamespace(
+            service=object(),
+            runtime=_FakeRuntime(),
+            writer=writer,
+            task_id="task",
+            skip_keys=frozenset(),
+        )
+
+    def _fake_finalize_function_calling_run(*, ctx, **_kwargs):
+        return list(ctx.writer.payloads), [], {}
+
+    monkeypatch.setattr(longcodebench_module, "resolve_sampling_config", lambda *_args, **_kwargs: SamplingConfig())
+    monkeypatch.setattr(longcodebench_module, "prepare_function_calling_run", _fake_prepare_function_calling_run)
+    monkeypatch.setattr(longcodebench_module, "finalize_function_calling_run", _fake_finalize_function_calling_run)
+
+    rc = _run_longcodebench(
+        types.SimpleNamespace(
+            max_samples=1,
+            avg_k=[1.0],
+            answer_max_tokens=64,
+            batch_size=1,
+            prompt_max_chars=4000,
+            long_doc_mode="off",
+            long_doc_max_chars=1000,
+            long_doc_overlap_lines=3,
+            long_doc_min_chars=6000,
+            long_doc_max_evidence_chunks=4,
+            long_doc_max_evidence_chars=6000,
+            db_write_queue=1,
+            db_close_timeout_s=0.1,
+            probe_only=False,
+        ),
+        ResolvedFunctionCallingRun(
+            benchmark_kind=FunctionCallingBenchmarkKind.LONGCODEBENCH,
+            dataset_path=dataset,
+            dataset_slug="longcodebench_test",
+            benchmark_name="longcodebench",
+            dataset_split="test",
+            model_name="demo-model",
+            engine=FakeEngine(),
+        ),
+    )
+
+    writer = captured["writer"]
+    assert rc == 0
+    assert isinstance(writer, _CollectingWriter)
+    [payload] = writer.payloads
+    sandbox_return = '{"name":"final_answer","arguments":{"answer":"B"},"id":"call_lc"}'
+    assert payload["completion1"] == raw_completion
+    assert payload["agent_info"]["prediction"] == "B"
+    assert payload["agent_info"]["final_answer_call"] == sandbox_return
+    assert payload["agent_info"]["decoded_final_answer_call"] == {
+        "name": "final_answer",
+        "arguments": {"answer": "B"},
+        "id": "call_lc",
+    }
+    assert payload["agent_trace"][0]["raw_completion"] == raw_completion
+    assert payload["agent_trace"][0]["sandbox_return"] == sandbox_return

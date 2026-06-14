@@ -59,7 +59,89 @@ class LocalRowsDatasetSpec(MaterializingDatasetSpec):
         return extra
 
 
+class OfficialRowsDatasetSpec(MaterializingDatasetSpec):
+    def __init__(
+        self,
+        name: str,
+        output_root: str | Path,
+        split: str,
+        *,
+        official_source: str,
+        resolve_source_root: Callable[["OfficialRowsDatasetSpec"], Path],
+        required_paths: Callable[[Path], Sequence[Path]],
+        load_official_records: Callable[[Path], Iterable[dict[str, Any]]],
+        download_source: Callable[["OfficialRowsDatasetSpec"], None] | None = None,
+        required_fields: tuple[str, ...] = (),
+        source_kind: str = "official_source",
+        extra: dict[str, Any] | Callable[[Path], dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(name, output_root, split, required_fields=required_fields, source_kind=source_kind)
+        self.official_source = official_source
+        self._resolve_source_root = resolve_source_root
+        self._required_paths = required_paths
+        self._load_official_records = load_official_records
+        self._download_source = download_source
+        self._extra = extra
+
+    def source_root(self) -> Path:
+        return self._resolve_source_root(self).expanduser().resolve()
+
+    def source_paths(self) -> tuple[Path, ...]:
+        root = self.source_root()
+        return tuple(path.expanduser().resolve() for path in self._required_paths(root))
+
+    def _missing_paths(self) -> list[Path]:
+        return [path for path in self.source_paths() if not path.exists()]
+
+    def _raise_missing(self, missing: Sequence[Path]) -> None:
+        joined = ", ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"missing official source paths for {self.name}: {joined}")
+
+    def download(self) -> None:
+        missing = self._missing_paths()
+        if not missing:
+            return
+        if self._download_source is None:
+            self._raise_missing(missing)
+        self._download_source(self)
+        missing_after = self._missing_paths()
+        if missing_after:
+            self._raise_missing(missing_after)
+
+    def load_records(self) -> Iterable[dict[str, Any]]:
+        missing = self._missing_paths()
+        if missing:
+            self._raise_missing(missing)
+        return list(self._load_official_records(self.source_root()))
+
+    def manifest_extra(self) -> dict[str, Any]:
+        root = self.source_root()
+        extra: dict[str, Any] = {
+            "official_source": self.official_source,
+            "source_root": str(root),
+            "source_paths": [str(path) for path in self.source_paths()],
+        }
+        if self._extra is not None:
+            payload = self._extra(root) if callable(self._extra) else self._extra
+            extra.update(dict(payload))
+        return extra
+
+
+def first_complete_source_root(
+    candidates: Sequence[Path] | Callable[[], Sequence[Path]],
+    required_paths: Callable[[Path], Sequence[Path]],
+) -> Path | None:
+    materialized = candidates() if callable(candidates) else candidates
+    for candidate in materialized:
+        root = candidate.expanduser().resolve()
+        if all(path.expanduser().resolve().exists() for path in required_paths(root)):
+            return root
+    return None
+
+
 __all__ = [
+    "OfficialRowsDatasetSpec",
+    "first_complete_source_root",
     "LocalRowsDatasetSpec",
     "rwkv_rs_datasets_root",
 ]

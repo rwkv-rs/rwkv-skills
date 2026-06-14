@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import pytest
 
 from lexical_chunk_router import (
     LongDocConfig,
@@ -109,97 +109,31 @@ def test_plugin_route_tools_selects_lexical_window() -> None:
     assert route.trace_payload()["reason"] == "lexical"
 
 
-def test_plugin_compact_text_model_parallel_uses_rwkv_backend_protocol() -> None:
-    class _Backend:
-        def __init__(self) -> None:
-            self.prompt_count = 0
-            self.batch_size = 0
-
-        def generate(self, prompts, **kwargs):  # noqa: ANN001
-            self.prompt_count = len(prompts)
-            self.batch_size = kwargs["batch_size"]
-            return [
-                SimpleNamespace(
-                    text='{"relevant":true,"score":3}'
-                    if "special-policy ALPHA7" in prompt
-                    else '{"relevant":false,"score":0}',
-                    finish_reason="stop",
-                )
-                for prompt in prompts
-            ]
-
-    backend = _Backend()
-    text = "\n".join(
-        [f"noise policy row {index:03d}" for index in range(20)]
-        + ["special-policy ALPHA7 requires supervisor approval"]
-        + [f"archive policy row {index:03d}" for index in range(20)]
-    )
-
-    result = compact_text(
-        text,
-        query="What is the approval requirement?",
-        config=LongDocConfig(
-            mode="model_parallel",
-            max_chunk_chars=160,
-            overlap_lines=1,
-            min_long_text_chars=200,
-            max_evidence_chunks=1,
-            max_evidence_chars=240,
-            model_parallel_batch_size=8,
-        ),
-        backend=backend,
-        sampling=SimpleNamespace(),
-    )
-
-    assert backend.prompt_count > 1
-    assert backend.batch_size > 1
-    assert result.trace_payload()["mode"] == "model_parallel"
-    assert "special-policy ALPHA7 requires supervisor approval" in result.text
-    assert "noise policy row 000" not in result.text
+def test_plugin_compact_text_rejects_removed_model_parallel_mode() -> None:
+    with pytest.raises(ValueError, match="unsupported long-doc mode"):
+        compact_text(
+            "special-policy ALPHA7 requires supervisor approval\n" * 30,
+            query="What is the approval requirement?",
+            config=LongDocConfig(  # type: ignore[arg-type]
+                mode="model_parallel",
+                max_chunk_chars=160,
+                min_long_text_chars=200,
+            ),
+        )
 
 
-def test_plugin_route_tools_model_parallel_uses_rwkv_backend_protocol() -> None:
-    class _Backend:
-        def __init__(self) -> None:
-            self.prompt_count = 0
-            self.batch_size = 0
-
-        def generate(self, prompts, **kwargs):  # noqa: ANN001
-            self.prompt_count = len(prompts)
-            self.batch_size = kwargs["batch_size"]
-            assert all("Tool catalog:" in prompt for prompt in prompts)
-            return [
-                SimpleNamespace(text='{"selected_tools":["lookup_weather"]}', finish_reason="stop"),
-                SimpleNamespace(text='{"selected_tools":["refund_order"]}', finish_reason="stop"),
-            ]
-
-    backend = _Backend()
-    tools = [
-        _tool("lookup_weather", "Read city weather forecast", "city"),
-        _tool("book_flight", "Book an airline ticket", "origin", "destination"),
-        _tool("refund_order", "Refund a retail order", "order_id"),
-        _tool("cancel_order", "Cancel a retail order", "order_id"),
-    ]
-
-    route = route_tools(
-        tools,
-        [{"role": "user", "content": "Check weather, then refund order ORD-7."}],
-        config=ToolRouterConfig(
-            mode="model_parallel",
-            max_tools=3,
-            trigger_tool_count=1,
-            trigger_catalog_chars=1,
-            parallel_chunk_tools=2,
-            parallel_batch_size=4,
-        ),
-        backend=backend,
-        sampling=SimpleNamespace(),
-    )
-
-    assert backend.prompt_count == 2
-    assert backend.batch_size == 2
-    assert route.model_names == ("lookup_weather", "refund_order")
-    assert route.trace_payload()["parallel_chunk_count"] == 2
+def test_plugin_route_tools_rejects_removed_model_parallel_mode() -> None:
+    with pytest.raises(ValueError, match="unsupported tool router mode"):
+        route_tools(
+            [_tool("lookup_weather", "Read city weather forecast", "city")],
+            [{"role": "user", "content": "Check weather."}],
+            config=ToolRouterConfig(  # type: ignore[arg-type]
+                mode="model_parallel",
+                max_tools=1,
+                trigger_tool_count=1,
+                trigger_catalog_chars=1,
+            ),
+        )
 
 
 def test_plugin_route_tools_keeps_retail_state_hints() -> None:

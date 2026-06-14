@@ -104,6 +104,21 @@ def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkey
                 "source_path": str(question_path.resolve()),
                 "possible_answer_path": str(answer_path.resolve()),
                 "execution_result_type": [],
+                "bfcl_official_function": [
+                    {
+                        "name": "calculate_area",
+                        "description": "Calculate area",
+                        "parameters": {
+                            "type": "dict",
+                            "properties": {"base": {"type": "integer"}, "height": {"type": "integer"}},
+                            "required": ["base", "height"],
+                        },
+                    }
+                ],
+                "bfcl_official_ground_truth": [
+                    {"calculate_area": {"base": [10], "height": [5], "unit": ["units", ""]}}
+                ],
+                "bfcl_official_language": "python",
             },
         }
     ]
@@ -797,11 +812,8 @@ def test_function_calling_runner_dispatches_simple_tool_call_runner(monkeypatch)
     monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
     monkeypatch.setattr(
         function_calling_runner,
-        "_run_simple_tool_call",
-        lambda _args, _run, *, default_job_name, run_context=None: called.append(
-            (default_job_name, _run.dataset_slug)
-        )
-        or 0,
+        "_run_bfcl_ast",
+        lambda _args, _run, *, run_context=None: called.append(("function_bfcl_ast", _run.dataset_slug)) or 0,
     )
 
     rc = function_calling_runner.main(["--dataset", "bfcl_simple_python_test.jsonl", "--model-path", "model.pth"])
