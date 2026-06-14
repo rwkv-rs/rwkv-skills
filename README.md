@@ -38,7 +38,7 @@ You can override the default endpoint/token via environment variables (`HF_ENDPO
 ## Dataset preparation
 Datasets are stored under `data/` by default. You can call the prepper to generate JSONL files:
 ```bash
-python - <<'PY'
+uv run python - <<'PY'
 from pathlib import Path
 from src.eval.datasets.data_prepper.data_manager import prepare_dataset
 
@@ -79,7 +79,7 @@ You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (na
 The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler jobs now dispatch directly to the field runners:
 `src.eval.knowledge.runner`, `src.eval.maths.runner`, `src.eval.coding.runner`, `src.eval.instruction_following.runner`, `src.eval.function_calling.runner`.
 
-Free-response sets that require LLM judging (e.g. `gsm8k_test` / `math_500_test` / `answer_judge_test` / `gaokao2023en_test`) are automatically dispatched to `src.eval.maths.runner --judge-mode llm`; other free-response tasks use `src.eval.maths.runner --judge-mode exact`.
+Formal maths free-response sets whose answers may be mathematically equivalent without textually matching are automatically dispatched to `src.eval.maths.runner --judge-mode llm`; other free-response tasks use `src.eval.maths.runner --judge-mode exact`.
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`.
@@ -91,7 +91,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("human_eval", Path("data"))` downloads the official `HumanEval.jsonl.gz` and writes `data/human_eval/test.jsonl`.
 - Run via CLI:
   ```bash
-  python -m src.eval.coding.runner \
+  uv run python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/human_eval/test.jsonl \
     --benchmark-kind human_eval \
@@ -105,7 +105,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("mbpp", Path("data"))` uses the EvalPlus variant MBPP+ and converts 4-space indentation in prompts into tabs.
 - Run via CLI:
   ```bash
-  python -m src.eval.coding.runner \
+  uv run python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/mbpp/test.jsonl \
     --benchmark-kind mbpp \
@@ -119,7 +119,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_v6 (lite) split and writes `data/livecodebench/test.jsonl` (override with `RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG`).
 - Run via CLI:
   ```bash
-  python -m src.eval.coding.runner \
+  uv run python -m src.eval.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
     --benchmark-kind livecodebench \
@@ -139,7 +139,7 @@ Contributions are welcome—please implement missing pieces and update the docs 
 If you have JSON summaries from older versions (`rwkv-mmlu` / `rwkv-skills`) under `results_old/`, you can migrate them into the current `results/scores/` layout to avoid rerunning everything:
 
 ```bash
-python -m src.bin.migrate_old_results --source results_old
+uv run python -m src.bin.migrate_old_results --source results_old
 # use --dry-run to preview outputs; use --overwrite to replace existing results
 ```
 
@@ -147,9 +147,8 @@ python -m src.bin.migrate_old_results --source results_old
 ### C.1 One-time setup
 1. Prepare PostgreSQL and ensure connectivity (set `.env` / env vars).
    `.env` reference: `.env.example`
-2. Prepare model weights:
-   `/home/jay/workspace/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1a-0.1b-20250728-ctx4096.pth`
-3. Prepare dataset directory: `/home/jay/workspace/rwkv-skills/data` (contains task JSONL files).
+2. Prepare model weights under `weights/`, or pass an explicit path through `--models`.
+3. Prepare the dataset directory under `data/` (contains task JSONL files).
 
 ### C.2 Queue preview
 Purpose: verify all 8 entries are schedulable and dataset paths resolve.

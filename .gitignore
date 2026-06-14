@@ -19,3 +19,15 @@ config_backup
 
 tau_bench/
 tau2_bench/
+
+# Local benchmark/runtime artifacts
+/logs/
+/out/
+/tmp/
+summary-*/
+/.codex
+/.memsearch/
+/weights/
+/references/
+/manual-skills/
+/rwkv-long-doc-evidence-qa/
