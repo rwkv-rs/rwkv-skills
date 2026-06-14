@@ -485,7 +485,75 @@ def evaluate_free_response(
     dataset = list(JsonlFreeAnswerLoader(str(dataset_path)))
     completion_payloads = list(_iter_completions(completions))
     grouped: dict[str, list[_ScoredCompletion]] = {group: [] for group in STRATEGY_GROUPS}
-    primary_group = STRATEGY_C if any(_has_stage(payload, 2) for payload in completion_payloads) else STRATEGY_A
+    primary_group = STRATEGY_A
+
+    def apply_judge(group: str) -> None:
+        if judge is None:
+            return
+        records = grouped[group]
+        judge_inputs: list[tuple[str, str, str]] = []
+        judge_indices: list[int] = []
+        for idx, record in enumerate(records):
+            if record.final_passed:
+                continue
+            judge_inputs.append((record.question, record.reference, record.display_answer))
+            judge_indices.append(idx)
+        if not judge_inputs:
+            return
+        judged_flags = judge.judge(judge_inputs)
+        stats = judge.last_run_stats
+        if stats is not None:
+            judge_stats_by_group[group] = stats.as_dict()
+        for idx, judged in zip(judge_indices, judged_flags, strict=True):
+            record = records[idx]
+            record.final_passed = bool(judged)
+            if judged:
+                record.fail_reason = ""
+            else:
+                record.fail_reason = (
+                    f"{record.fail_reason};judge_false" if record.fail_reason else "judge_false"
+                )
+
+    def score_group(
+        group: str,
+        payload: dict[str, Any],
+        *,
+        sample_index: int,
+        repeat_index: int,
+        question: str,
+        reference: str,
+    ) -> _ScoredCompletion:
+        scoring_text = _strategy_scoring_text(group, payload)
+        verify_result = _math_verify(reference, scoring_text)
+        return _ScoredCompletion(
+            source_payload=payload,
+            sample_index=sample_index,
+            repeat_index=repeat_index,
+            question=question,
+            reference=reference,
+            scoring_text=scoring_text,
+            display_answer=verify_result.answer,
+            math_passed=verify_result.passed,
+            final_passed=verify_result.passed,
+            fail_reason=verify_result.fail_reason,
+        )
+
+    def inherit_from_a(a_record: _ScoredCompletion) -> _ScoredCompletion:
+        return _ScoredCompletion(
+            source_payload=a_record.source_payload,
+            sample_index=a_record.sample_index,
+            repeat_index=a_record.repeat_index,
+            question=a_record.question,
+            reference=a_record.reference,
+            scoring_text=a_record.scoring_text,
+            display_answer=a_record.display_answer,
+            math_passed=a_record.math_passed,
+            final_passed=a_record.final_passed,
+            fail_reason=a_record.fail_reason,
+        )
+
+    judge_stats_by_group: dict[str, dict[str, object]] = {}
+    record_contexts: list[tuple[dict[str, Any], int, int, str, str]] = []
 
     for payload in completion_payloads:
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
@@ -498,50 +566,37 @@ def evaluate_free_response(
             question = record.question
             reference = resolve_reference_answer(record)
 
-        for group in STRATEGY_GROUPS:
-            scoring_text = _strategy_scoring_text(group, payload)
-            verify_result = _math_verify(reference, scoring_text)
+        record_contexts.append((payload, sample_index, repeat_index, question, reference))
+        grouped[STRATEGY_A].append(
+            score_group(
+                STRATEGY_A,
+                payload,
+                sample_index=sample_index,
+                repeat_index=repeat_index,
+                question=question,
+                reference=reference,
+            )
+        )
+
+    apply_judge(STRATEGY_A)
+
+    for group in (STRATEGY_B, STRATEGY_C):
+        for idx, (payload, sample_index, repeat_index, question, reference) in enumerate(record_contexts):
+            a_record = grouped[STRATEGY_A][idx]
+            if a_record.final_passed:
+                grouped[group].append(inherit_from_a(a_record))
+                continue
             grouped[group].append(
-                _ScoredCompletion(
-                    source_payload=payload,
+                score_group(
+                    group,
+                    payload,
                     sample_index=sample_index,
                     repeat_index=repeat_index,
                     question=question,
                     reference=reference,
-                    scoring_text=scoring_text,
-                    display_answer=verify_result.answer,
-                    math_passed=verify_result.passed,
-                    final_passed=verify_result.passed,
-                    fail_reason=verify_result.fail_reason,
                 )
             )
-
-    judge_stats_by_group: dict[str, dict[str, object]] = {}
-    if judge is not None:
-        for group in STRATEGY_GROUPS:
-            records = grouped[group]
-            judge_inputs: list[tuple[str, str, str]] = []
-            judge_indices: list[int] = []
-            for idx, record in enumerate(records):
-                if record.math_passed:
-                    continue
-                judge_inputs.append((record.question, record.reference, record.display_answer))
-                judge_indices.append(idx)
-            if not judge_inputs:
-                continue
-            judged_flags = judge.judge(judge_inputs)
-            stats = judge.last_run_stats
-            if stats is not None:
-                judge_stats_by_group[group] = stats.as_dict()
-            for idx, judged in zip(judge_indices, judged_flags, strict=True):
-                record = records[idx]
-                record.final_passed = bool(judged)
-                if judged:
-                    record.fail_reason = ""
-                else:
-                    record.fail_reason = (
-                        f"{record.fail_reason};judge_false" if record.fail_reason else "judge_false"
-                    )
+        apply_judge(group)
 
     rows_by_group: dict[str, list[tuple[int, int, bool]]] = {}
     metrics_by_group: dict[str, dict[str, float]] = {}

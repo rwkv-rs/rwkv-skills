@@ -69,6 +69,10 @@ class SchedulerStartRequest:
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
+    infer_backpressure: bool = True
+    infer_backpressure_timeout_s: float = 2.0
+    infer_backpressure_pending_high_watermark: int = 0
+    infer_budget_min_workers: int = 1
     distributed_claims: bool = False
     scheduler_node_id: str = ""
     lease_duration_s: int = 900
@@ -194,6 +198,10 @@ class SchedulerStartRequest:
                 if self.remote_batch_size is not None
                 else None
             ),
+            infer_backpressure=bool(self.infer_backpressure),
+            infer_backpressure_timeout_s=float(self.infer_backpressure_timeout_s),
+            infer_backpressure_pending_high_watermark=int(self.infer_backpressure_pending_high_watermark),
+            infer_budget_min_workers=int(self.infer_budget_min_workers),
             distributed_claims=bool(self.distributed_claims),
             scheduler_node_id=(str(self.scheduler_node_id or "").strip() or None),
             lease_duration_s=int(self.lease_duration_s),

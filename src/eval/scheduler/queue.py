@@ -309,18 +309,19 @@ def sort_queue_items(
     counts = question_counts or {}
     priorities = job_priority or {}
 
-    def _key(item: QueueItem) -> tuple[int, int, int, int, str, str]:
+    def _key(item: QueueItem) -> tuple[int, int, int, int, int, str, str]:
         job = JOB_CATALOGUE.get(item.job_name)
         is_cot = job.is_cot if job else False
         questions = counts.get(item.dataset_slug, _UNKNOWN_QUESTION_COUNT)
         job_rank = priorities.get(item.job_name, len(priorities))
+        function_rank = 0 if job is not None and job.domain == "function_calling" else 1
         # Prioritise specific datasets: non-CoT runs first, then CoT, then everything else.
         if item.dataset_slug in _EARLY_DATASET_SLUGS:
             dataset_rank = 0 if not is_cot else 1
         else:
             dataset_rank = 2
         nocot_rank = 0 if not is_cot else 1
-        return (job_rank, dataset_rank, questions, nocot_rank, item.dataset_slug, item.job_id)
+        return (job_rank, function_rank, dataset_rank, questions, nocot_rank, item.dataset_slug, item.job_id)
 
     queue.sort(key=_key)
     return queue

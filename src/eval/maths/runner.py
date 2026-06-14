@@ -271,7 +271,7 @@ def main(
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
             )
-        except BaseException:
+        except Exception:
             runtime.handle_attempt_stage_failure(writer, timeout_s=close_timeout_s)
             raise
 
@@ -332,7 +332,7 @@ def main(
             extra={"cot_mode": CoTMode.COT.value},
         )
         runtime.record_score(score_payload)
-    except BaseException as exc:
+    except Exception as exc:
         runtime.fail_task(error=str(exc))
         raise
     if judge_mode is JudgeMode.LLM:

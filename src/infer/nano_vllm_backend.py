@@ -5,10 +5,11 @@ from __future__ import annotations
 import importlib
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from tqdm import tqdm
 
@@ -80,6 +81,7 @@ class NanoVLLMInferenceBackend:
     scheduler: object
     model_runner: object
     _lock: threading.Lock
+    _last_batch_metrics: dict[str, object]
 
     @classmethod
     def from_config(cls, config: NanoVLLMBackendConfig) -> "NanoVLLMInferenceBackend":
@@ -98,6 +100,7 @@ class NanoVLLMInferenceBackend:
             scheduler=scheduler,
             model_runner=model_runner,
             _lock=threading.Lock(),
+            _last_batch_metrics={},
         )
 
     @property
@@ -106,6 +109,9 @@ class NanoVLLMInferenceBackend:
         if raw_name:
             return str(raw_name)
         return Path(str(self.config.model_path)).stem
+
+    def last_batch_metrics(self) -> dict[str, object]:
+        return dict(self._last_batch_metrics)
 
     def generate(
         self,
@@ -177,18 +183,38 @@ class NanoVLLMInferenceBackend:
     ) -> None:
         seq_records: dict[int, tuple[int, str, object, Sequence[str] | None]] = {}
         sampling_params = self._to_sampling_params(sampling)
+        prompt_token_count = 0
         for local_index, prompt in enumerate(prompts):
             seq = self.engine.add_request(prompt, sampling_params)
+            prompt_token_count += _prompt_token_count(self.engine, prompt)
             stop_suffixes = None if prompt_stop_suffixes is None else prompt_stop_suffixes[local_index]
             stop_token_seqs = self._build_stop_token_seqs(sampling=sampling, stop_suffixes=stop_suffixes)
             if stop_token_seqs:
                 setattr(seq, "stop_token_seqs", stop_token_seqs)
             seq_records[int(getattr(seq, "seq_id"))] = (start + local_index, prompt, seq, stop_suffixes)
 
+        step_count = 0
+        engine_step_tokens = 0
+        generated_tokens = 0
+        completed_sequences = 0
+        max_active_seq = _active_sequence_count(self.engine, self.scheduler)
+        start_time = time.perf_counter()
         while not self.engine.is_finished():
+            active_before = _active_sequence_count(self.engine, self.scheduler)
+            if active_before is not None:
+                max_active_seq = max(int(max_active_seq or 0), int(active_before))
             raw_outputs, _num_tokens = self.engine.step()
+            step_count += 1
+            engine_step_tokens += _safe_int(_num_tokens)
             for seq_id, token_ids in raw_outputs:
-                prompt_index, prompt, seq, stop_suffixes = seq_records[int(seq_id)]
+                record = seq_records.get(int(seq_id))
+                if record is None:
+                    record = _fallback_seq_record(seq_records, raw_seq_id=int(seq_id), batch_start=start)
+                if record is None:
+                    continue
+                prompt_index, prompt, seq, stop_suffixes = record
+                completed_sequences += 1
+                generated_tokens += len(token_ids)
                 text = self._decode_token_ids(token_ids)
                 text, trimmed = _trim_at_stop_suffix(text, stop_suffixes)
                 output = GenerationOutput(
@@ -204,6 +230,20 @@ class NanoVLLMInferenceBackend:
                 if on_complete is not None:
                     on_complete(output)
                 progress.update(1)
+        elapsed_s = max(time.perf_counter() - start_time, 1e-9)
+        self._last_batch_metrics = {
+            "actual_batch_size": len(prompts),
+            "prompt_prefill_tokens": int(prompt_token_count),
+            "engine_step_tokens": int(engine_step_tokens),
+            "generated_tokens": int(generated_tokens),
+            "completed_sequences": int(completed_sequences),
+            "engine_step_count": int(step_count),
+            "max_active_seq": max_active_seq,
+            "elapsed_ms": round(elapsed_s * 1000.0, 4),
+            "engine_step_tok_s": round(float(engine_step_tokens) / elapsed_s, 4),
+            "output_tok_s": round(float(generated_tokens) / elapsed_s, 4),
+            "scheduler_snapshot": _scheduler_snapshot(self.scheduler),
+        }
 
     def _to_sampling_params(self, sampling: SamplingConfig) -> object:
         top_k = int(sampling.top_k)
@@ -243,7 +283,21 @@ class NanoVLLMInferenceBackend:
         decode = getattr(tokenizer, "decode", None)
         if not callable(decode):
             raise RuntimeError("nano-vLLM engine tokenizer does not expose decode()")
-        return str(decode(list(token_ids)))
+        tokens = [int(token_id) for token_id in token_ids]
+        try:
+            return str(decode(tokens, utf8_errors="replace"))
+        except TypeError:
+            pass
+        try:
+            return str(decode(tokens))
+        except UnicodeDecodeError:
+            decode_bytes = getattr(tokenizer, "decodeBytes", None)
+            if callable(decode_bytes):
+                return bytes(decode_bytes(tokens)).decode("utf-8", errors="replace")
+            decode_bytes = getattr(tokenizer, "decode_bytes", None)
+            if callable(decode_bytes):
+                return bytes(decode_bytes(tokens)).decode("utf-8", errors="replace")
+            raise
 
     def score_choice_tokens(
         self,
@@ -322,6 +376,85 @@ def _contains_eos_token(engine: object, stop_tokens: Sequence[int]) -> bool:
     except (TypeError, ValueError):
         return bool(stop_tokens)
     return any(int(token_id) == eos_token_id for token_id in stop_tokens)
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return max(0, int(value))  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def _safe_len(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return len(value)  # type: ignore[arg-type]
+    except Exception:
+        return None
+
+
+def _active_sequence_count(engine: object, scheduler: object) -> int | None:
+    for owner in (scheduler, engine):
+        for name in (
+            "running",
+            "running_seqs",
+            "active_seqs",
+            "seqs",
+            "waiting",
+            "waiting_queue",
+            "requests",
+        ):
+            size = _safe_len(getattr(owner, name, None))
+            if size is not None:
+                return int(size)
+    return None
+
+
+def _scheduler_snapshot(scheduler: object) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    for name in (
+        "running",
+        "running_seqs",
+        "active_seqs",
+        "waiting",
+        "waiting_queue",
+        "swapped",
+        "seqs",
+        "requests",
+    ):
+        if hasattr(scheduler, name):
+            value = getattr(scheduler, name)
+            size = _safe_len(value)
+            snapshot[name] = size if size is not None else str(type(value).__name__)
+    return snapshot
+
+
+def _prompt_token_count(engine: object, prompt: str) -> int:
+    tokenizer = getattr(engine, "tokenizer", None)
+    encode = getattr(tokenizer, "encode", None)
+    if callable(encode):
+        try:
+            return len(encode(prompt))
+        except Exception:
+            pass
+    return max(1, len(prompt))
+
+
+def _fallback_seq_record(
+    seq_records: dict[int, tuple[int, str, object, Sequence[str] | None]],
+    *,
+    raw_seq_id: int,
+    batch_start: int,
+) -> tuple[int, str, object, Sequence[str] | None] | None:
+    if len(seq_records) == 1:
+        return next(iter(seq_records.values()))
+    local_index = int(raw_seq_id) - int(batch_start)
+    if 0 <= local_index < len(seq_records):
+        return list(seq_records.values())[local_index]
+    if 0 <= int(raw_seq_id) < len(seq_records):
+        return list(seq_records.values())[int(raw_seq_id)]
+    return None
 
 
 def _dedupe_token_seqs(token_seqs: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:

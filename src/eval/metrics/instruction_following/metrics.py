@@ -56,11 +56,12 @@ def evaluate_instruction_following(
     completions: Iterable[dict] | str | Path,
     *,
     dataset_path: str | Path,
+    dataset_slug: str | None = None,
     strict: bool = True,
     avg_k: tuple[NumericK, ...] = (),
 ) -> InstructionFollowingMetrics:
     dataset = list(JsonlInstructionFollowingLoader(str(dataset_path)).load())
-    registry = instructions_registry.INSTRUCTION_DICT
+    registry = _registry_for_dataset(dataset_path, dataset_slug=dataset_slug)
 
     prompt_total = 0
     prompt_correct = 0
@@ -92,7 +93,11 @@ def evaluate_instruction_following(
             for idx, instruction_id in enumerate(record.instruction_ids):
                 instruction_cls = registry[instruction_id]
                 instruction = instruction_cls(instruction_id)
-                kwargs = record.kwargs_list[idx]
+                kwargs = {
+                    key: value
+                    for key, value in record.kwargs_list[idx].items()
+                    if value is not None
+                }
                 description = instruction.build_description(**kwargs)
                 args = instruction.get_instruction_args()
                 if args and "prompt" in args:
@@ -159,6 +164,16 @@ def evaluate_instruction_following(
     if avg_k:
         metrics.avg_at_k = compute_avg_at_k(rows_for_avg, avg_k)
     return metrics
+
+
+def _registry_for_dataset(dataset_path: str | Path, *, dataset_slug: str | None) -> dict:
+    slug = str(dataset_slug or "").lower()
+    path_parts = {part.lower() for part in Path(dataset_path).parts}
+    if slug.startswith("ifbench") or "ifbench" in path_parts:
+        from .ifbench_official import instructions_registry as ifbench_registry
+
+        return ifbench_registry.INSTRUCTION_DICT
+    return instructions_registry.INSTRUCTION_DICT
 
 
 def _build_loose_variants(response: str) -> list[str]:

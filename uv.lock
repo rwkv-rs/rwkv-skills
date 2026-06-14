@@ -1175,6 +1175,15 @@ wheels = [
 ]
 
 [[package]]
+name = "emoji"
+version = "2.15.0"
+source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
+sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/a2/78/0d2db9382c92a163d7095fc08efff7800880f830a152cfced40161e7638d/emoji-2.15.0.tar.gz", hash = "sha256:eae4ab7d86456a70a00a985125a03263a5eac54cd55e51d7e184b1ed3b6757e4", size = 615483, upload-time = "2025-09-21T12:13:02.755Z" }
+wheels = [
+    { url = "https://mirrors.ustc.edu.cn/pypi/packages/e1/5e/4b5aaaabddfacfe36ba7768817bd1f71a7a810a43705e531f3ae4c690767/emoji-2.15.0-py3-none-any.whl", hash = "sha256:205296793d66a89d88af4688fa57fd6496732eb48917a87175a023c8138995eb", size = 608433, upload-time = "2025-09-21T12:13:01.197Z" },
+]
+
+[[package]]
 name = "evalplus"
 version = "0.3.0.dev27"
 source = { git = "https://github.com/evalplus/evalplus?rev=c91370f#c91370f8beebafbb166effcc9eedee624c946ca3" }
@@ -5842,6 +5851,7 @@ dependencies = [
     { name = "docstring-parser" },
     { name = "dotenv" },
     { name = "einops" },
+    { name = "emoji" },
     { name = "evalplus" },
     { name = "fastapi" },
     { name = "filelock" },
@@ -5907,6 +5917,7 @@ dependencies = [
     { name = "rwkv-fla" },
     { name = "scikit-build-core" },
     { name = "socksio" },
+    { name = "syllapy" },
     { name = "toml" },
     { name = "transformers" },
     { name = "triton" },
@@ -5962,6 +5973,7 @@ requires-dist = [
     { name = "docstring-parser", specifier = ">=0.17.0" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "einops", specifier = ">=0.8.1" },
+    { name = "emoji", specifier = ">=2.15.0" },
     { name = "evalplus", git = "https://github.com/evalplus/evalplus?rev=c91370f" },
     { name = "fastapi", specifier = ">=0.115.0,<1.0.0" },
     { name = "filelock", specifier = ">=3.16.1" },
@@ -6011,6 +6023,7 @@ requires-dist = [
     { name = "rwkv-fla", specifier = ">=0.7.202506181413" },
     { name = "scikit-build-core", specifier = ">=0.11.6" },
     { name = "socksio", specifier = ">=1.0.0" },
+    { name = "syllapy", specifier = ">=0.7.2" },
     { name = "toml", specifier = ">=0.10.2" },
     { name = "torch", marker = "extra == 'torch-cpu'", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "rwkv-skills", extra = "torch-cpu" } },
     { name = "torch", marker = "extra == 'torch-cu126'", specifier = ">=2.8.0", index = "https://download.pytorch.org/whl/cu126", conflict = { package = "rwkv-skills", extra = "torch-cu126" } },
@@ -6435,6 +6448,15 @@ source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
 sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/a9/b5/37e7a3706de436a8a2d75334711dad1afb4ddffab09f25e31d89e467542f/supervisor-4.3.0.tar.gz", hash = "sha256:4a2bf149adf42997e1bb44b70c43b613275ec9852c3edacca86a9166b27e945e", size = 468912, upload-time = "2025-08-23T18:25:02.418Z" }
 wheels = [
     { url = "https://mirrors.ustc.edu.cn/pypi/packages/0e/65/5e726c372da8a5e35022a94388b12252710aad0c2351699c3d76ae8dba78/supervisor-4.3.0-py2.py3-none-any.whl", hash = "sha256:0bcb763fddafba410f35cbde226aa7f8514b9fb82eb05a0c85f6588d1c13f8db", size = 320736, upload-time = "2025-08-23T18:25:00.767Z" },
+]
+
+[[package]]
+name = "syllapy"
+version = "0.7.2"
+source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
+sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/29/a1/7bc1ce4852e14ab5f3153262639742ae63fbfa626507dac4ab919a1e5232/syllapy-0.7.2.tar.gz", hash = "sha256:e55a7ad97d8b232e174b83f91b8f9be0c355d2a8e1208c7f6229055189605564", size = 25561, upload-time = "2022-08-29T01:55:03.366Z" }
+wheels = [
+    { url = "https://mirrors.ustc.edu.cn/pypi/packages/0e/cc/ffc9bddc146f14e8792a9b05b2bd1bc5f23f3b752a06e96b244780ce55b9/syllapy-0.7.2-py3-none-any.whl", hash = "sha256:198a7413033c32d7b31e21962efb3f284bcea80d3346e954b938ca1ebe6bee20", size = 24882, upload-time = "2022-08-29T01:55:01.1Z" },
 ]
 
 [[package]]

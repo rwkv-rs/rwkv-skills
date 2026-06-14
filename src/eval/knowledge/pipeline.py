@@ -99,6 +99,7 @@ class MultipleChoicePipeline:
         *,
         prompt_template: str | None = None,
         cot_mode: CoTMode = CoTMode.NO_COT,
+        batch_size: int = 64,
         dataset_name: str | None = None,
         sample_limit: int | None = None,
         record_indices: Sequence[int] | None = None,
@@ -119,6 +120,7 @@ class MultipleChoicePipeline:
         if prompt_template is None:
             prompt_template = templates.direct
         skip_keys = skip_keys or set()
+        batch_size = max(1, int(batch_size))
         if resume_start_index < 0:
             resume_start_index = 0
         record_map = {int(idx): record for idx, record in records}
@@ -141,26 +143,29 @@ class MultipleChoicePipeline:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
         payloads: list[dict] = []
-        for key, record in expanded:
+        for entry_index, (key, record) in enumerate(expanded):
             prompt = self._format_prompt(record, prompt_template)
-            _, pred_letter = self._score_prompt(record, prompt)
-            token_text = self.target_token_format.replace("<LETTER>", pred_letter)
-            stages = [
-                StageRecord(
-                    prompt=prompt,
-                    completion=token_text,
-                    stop_reason="logits_only",
+            try:
+                _, pred_letter = self._score_prompt_choice_only(record, prompt)
+            except NotImplementedError:
+                payloads.extend(
+                    self._run_direct_generation_batches(
+                        expanded[entry_index:],
+                        prompt_template=prompt_template,
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        batch_size=batch_size,
+                        on_record=on_record,
+                    )
                 )
-            ]
-            payload = SampleRecord(
+                break
+            payload = self._build_direct_payload(
                 benchmark_name=benchmark_name,
                 dataset_split=dataset_split,
-                sample_index=key.sample_index,
-                repeat_index=key.repeat_index,
-                pass_index=key.pass_index,
-                sampling_config={},
-                stages=stages,
-            ).as_payload()
+                key=key,
+                prompt=prompt,
+                pred_letter=pred_letter,
+            )
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
@@ -376,15 +381,43 @@ class MultipleChoicePipeline:
             for letter in ALPHABET[:num_choices]
         ]
 
-    def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
-        choice_texts = self._choice_tokens(len(record.choices))
-        try:
-            score_map, best_text = self.backend.score_choice_tokens(
+    def _build_direct_payload(
+        self,
+        *,
+        benchmark_name: str,
+        dataset_split: str,
+        key: AttemptKey,
+        prompt: str,
+        pred_letter: str,
+    ) -> dict:
+        token_text = self.target_token_format.replace("<LETTER>", pred_letter)
+        stages = [
+            StageRecord(
                 prompt=prompt,
-                choice_token_texts=choice_texts,
+                completion=token_text,
+                stop_reason="logits_only",
             )
-        except NotImplementedError:
-            return self._score_prompt_via_generation(record, prompt)
+        ]
+        return SampleRecord(
+            benchmark_name=benchmark_name,
+            dataset_split=dataset_split,
+            sample_index=key.sample_index,
+            repeat_index=key.repeat_index,
+            pass_index=key.pass_index,
+            sampling_config={},
+            stages=stages,
+        ).as_payload()
+
+    def _score_prompt_choice_only(
+        self,
+        record: MultipleChoiceRecord,
+        prompt: str,
+    ) -> tuple[dict[str, float], str]:
+        choice_texts = self._choice_tokens(len(record.choices))
+        score_map, best_text = self.backend.score_choice_tokens(
+            prompt=prompt,
+            choice_token_texts=choice_texts,
+        )
         logits_map = {
             ALPHABET[index]: float(score_map.get(choice_texts[index], float("-inf")))
             for index in range(len(choice_texts))
@@ -394,6 +427,12 @@ class MultipleChoicePipeline:
         except ValueError as exc:
             raise RuntimeError(f"backend returned unexpected choice token text: {best_text!r}") from exc
         return logits_map, ALPHABET[pred_idx]
+
+    def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
+        try:
+            return self._score_prompt_choice_only(record, prompt)
+        except NotImplementedError:
+            return self._score_prompt_via_generation(record, prompt)
 
     def _score_prompt_via_generation(
         self,
@@ -426,6 +465,57 @@ class MultipleChoicePipeline:
         }
         return score_map, pred_letter
 
+    def _run_direct_generation_batches(
+        self,
+        entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
+        *,
+        prompt_template: str,
+        benchmark_name: str,
+        dataset_split: str,
+        batch_size: int,
+        on_record: Callable[[dict], None] | None,
+    ) -> list[dict]:
+        payloads: list[dict] = []
+        sampling = SamplingConfig(
+            max_generate_tokens=8,
+            temperature=0.0,
+            top_k=1,
+            top_p=1.0,
+            alpha_presence=0.0,
+            alpha_frequency=0.0,
+            alpha_decay=1.0,
+            stop_tokens=(),
+            no_penalty_token_ids=(),
+        )
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, len(entries), chunk_size):
+            chunk = list(entries[start : start + chunk_size])
+            prompts = [self._format_prompt(record, prompt_template) for _key, record in chunk]
+            outputs = self.backend.generate(
+                prompts,
+                sampling=sampling,
+                batch_size=chunk_size,
+                progress_desc="Generating MC answer",
+                show_progress=False,
+            )
+            by_index = {int(output.prompt_index): output for output in outputs}
+            for local_index, ((key, record), prompt) in enumerate(zip(chunk, prompts, strict=True)):
+                output = by_index.get(local_index)
+                if output is None:
+                    raise RuntimeError("backend returned incomplete multiple-choice fallback batch")
+                pred_letter = self._extract_generated_choice_letter(output.text, len(record.choices))
+                payload = self._build_direct_payload(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    key=key,
+                    prompt=prompt,
+                    pred_letter=pred_letter,
+                )
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
+        return payloads
+
     def _extract_generated_choice_letter(self, text: str, num_choices: int) -> str:
         valid_letters = ALPHABET[:num_choices]
         normalized = (text or "").strip().upper()
@@ -435,7 +525,7 @@ class MultipleChoicePipeline:
         for char in normalized:
             if char in valid_letters:
                 return char
-        raise RuntimeError(f"could not extract a valid choice letter from generated text: {text!r}")
+        return ""
 
 
 __all__ = ["MultipleChoicePipeline", "MultipleChoicePipelineResult"]

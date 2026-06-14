@@ -56,6 +56,28 @@ def test_plan_deployments_skips_assigned_gpus_and_increments_ports(tmp_path: Pat
     assert specs[0].state_db_path == tmp_path / "state" / "model-a.sqlite3"
 
 
+def test_plan_deployments_spreads_replicas_across_distinct_gpus(tmp_path: Path) -> None:
+    specs = plan_deployments(
+        model_paths=(Path("/models/a.pth"), Path("/models/b.pth")),
+        model_names=("model-a", "model-b"),
+        max_batch_sizes=(64, 128),
+        idle_gpus=("0", "1", "2"),
+        assigned_gpus=set(),
+        base_port=18081,
+        log_dir=tmp_path / "logs",
+        state_db_dir=tmp_path / "state",
+        launched_count=0,
+        replicas_per_model=2,
+    )
+
+    assert [(spec.model_name, spec.gpu, spec.port, spec.replica_index) for spec in specs] == [
+        ("model-a", "0", 18081, 0),
+        ("model-a", "1", 18082, 1),
+    ]
+    assert specs[0].state_db_path == tmp_path / "state" / "model-a.r1.sqlite3"
+    assert specs[1].state_db_path == tmp_path / "state" / "model-a.r2.sqlite3"
+
+
 def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
     spec = InferServiceSpec(
         model_path=tmp_path / "rwkv.pth",
@@ -71,6 +93,7 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
         host="127.0.0.1",
         api_key="secret",
         engine_mode="classic",
+        infer_auto_config="off",
         batch_collect_ms=10,
         log_level="warning",
     )
@@ -80,6 +103,7 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
     assert command[command.index("--device") + 1] == "cuda:0"
     assert command[command.index("--port") + 1] == "18081"
     assert command[command.index("--max-batch-size") + 1] == "4"
+    assert command[command.index("--infer-auto-config") + 1] == "off"
     assert command[command.index("--api-key") + 1] == "secret"
 
 

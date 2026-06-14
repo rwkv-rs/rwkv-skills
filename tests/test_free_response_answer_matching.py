@@ -88,6 +88,64 @@ def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch,
     assert task_details == {}
 
 
+def test_strategy_b_c_inherit_a_passes_and_only_rescore_a_failures(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text(
+        '{"question":"q1","answer":"7"}\n{"question":"q2","answer":"9"}\n',
+        encoding="utf-8",
+    )
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User: q1\n\nAssistant: <think",
+                "completion1": "</think>\nlegacy answer \\boxed{7}",
+                "stop_reason1": "stop_token",
+                "prompt2": "\nTherefore, the answer is \\(\\boxed{",
+                "completion2": "0",
+                "stop_reason2": "stop_token",
+            },
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 1,
+                "repeat_index": 0,
+                "prompt1": "User: q2\n\nAssistant: <think",
+                "completion1": "</think>\nlegacy answer \\boxed{8}",
+                "stop_reason1": "stop_token",
+                "prompt2": "\nTherefore, the answer is \\(\\boxed{",
+                "completion2": "9",
+                "stop_reason2": "stop_token",
+            },
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert evaluation.primary_group == "strategy_a"
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.5
+    assert evaluation.metrics_by_group["strategy_b"]["exact_accuracy"] == 0.5
+    assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
+    assert evaluation.rows_by_group["strategy_b"] == [(0, 0, True), (1, 0, False)]
+    assert evaluation.rows_by_group["strategy_c"] == [(0, 0, True), (1, 0, True)]
+    assert evaluation.payloads[0]["answer"].endswith("7")
+
+    metrics_payload, _task_details = build_grouped_metrics_payload(
+        evaluation,
+        pass_k=(1,),
+        avg_k=(1,),
+        report_pass_k=(1,),
+        report_avg_k=(1,),
+    )
+    assert metrics_payload["avg@1"] == 0.5
+    assert metrics_payload["strategy_metrics"]["strategy_c"]["avg@1"] == 1.0
+
+
 def test_strategy_c_repairs_unclosed_think_for_scoring_only(monkeypatch, tmp_path) -> None:
     _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"
@@ -167,11 +225,13 @@ def test_two_stage_payload_uses_legacy_completion1_scoring(monkeypatch, tmp_path
     )
 
     assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
     assert evaluation.rows_by_group["strategy_a"] == [(0, 0, False)]
+    assert evaluation.primary_group == "strategy_a"
     assert evaluation.payloads[0]["answer"].endswith("8")
 
 
-def test_math_verify_pass_skips_judge_per_strategy_group(monkeypatch, tmp_path) -> None:
+def test_a_judge_pass_skips_strategy_judge_and_inherits_correctness(monkeypatch, tmp_path) -> None:
     _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"
     dataset.write_text(
@@ -216,8 +276,12 @@ def test_math_verify_pass_skips_judge_per_strategy_group(monkeypatch, tmp_path) 
 
     assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.5
     assert evaluation.metrics_by_group["strategy_a"]["judge_accuracy"] == 1.0
+    assert evaluation.metrics_by_group["strategy_b"]["judge_accuracy"] == 1.0
+    assert evaluation.metrics_by_group["strategy_c"]["judge_accuracy"] == 1.0
     assert [row[2] for row in evaluation.rows_by_group["strategy_a"]] == [True, True]
-    assert len(judge.client.prompts) == 3
+    assert [row[2] for row in evaluation.rows_by_group["strategy_b"]] == [True, True]
+    assert [row[2] for row in evaluation.rows_by_group["strategy_c"]] == [True, True]
+    assert len(judge.client.prompts) == 1
     assert all("Question: q2" in prompt for prompt in judge.client.prompts)
     assert all("Student's Answer:" in prompt for prompt in judge.client.prompts)
 

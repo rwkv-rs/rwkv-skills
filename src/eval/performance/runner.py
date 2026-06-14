@@ -235,7 +235,7 @@ def _run_point(
                     phase="measure",
                 )
             )
-    except BaseException as exc:
+    except Exception as exc:
         point.status = "failed"
         point.failure_reason = str(exc)
     point.summary = _summarize_point(point)

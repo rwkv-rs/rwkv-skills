@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import http.client
 import json
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 
 from src.infer.api import (
@@ -183,6 +184,64 @@ class _Utf8StreamingBackend(_FakeBackend):
         return [output]
 
 
+class _EarlyCompleteBackend(_FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_completed = threading.Event()
+        self.release = threading.Event()
+
+    def generate(
+        self,
+        prompts,
+        *,
+        sampling,
+        batch_size,
+        progress_desc="Generating",
+        probe_only=False,
+        on_complete=None,
+        on_token=None,
+        prompt_stop_suffixes=None,
+        constraints=None,
+        constraint_mode="off",
+        prompt_seeds=None,
+        top_logprobs=0,
+        prefill_chunk_size=16,
+        show_progress=True,
+    ):
+        del (
+            sampling,
+            batch_size,
+            progress_desc,
+            probe_only,
+            on_token,
+            prompt_stop_suffixes,
+            constraints,
+            constraint_mode,
+            prompt_seeds,
+            top_logprobs,
+            prefill_chunk_size,
+            show_progress,
+        )
+        outputs = [
+            GenerationOutput(
+                prompt_index=index,
+                prompt=prompt,
+                token_ids=[index + 1],
+                text=f"early:{prompt}",
+                finish_reason="stop_token",
+            )
+            for index, prompt in enumerate(prompts)
+        ]
+        if on_complete is not None:
+            on_complete(outputs[0])
+        self.first_completed.set()
+        if len(outputs) > 1:
+            self.release.wait(timeout=2.0)
+            if on_complete is not None:
+                on_complete(outputs[1])
+        return outputs
+
+
 def test_completion_request_to_sampling_config_preserves_custom_fields() -> None:
     request = CompletionRequest(
         model="demo-model",
@@ -284,6 +343,41 @@ def test_inference_service_batches_generation_and_handles_choice_scoring() -> No
     assert top_logprobs is not None
     assert top_logprobs[0][" B"] > top_logprobs[0][" A"]
     assert backend.shutdown_calls == 1
+
+
+def test_inference_service_completes_items_before_full_batch_returns() -> None:
+    backend = _EarlyCompleteBackend()
+    service = InferenceService(backend, max_batch_size=2, batch_collect_ms=10)
+    try:
+        future_one = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="prompt-one",
+                max_tokens=8,
+                temperature=0.3,
+            )
+        )
+        future_two = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="prompt-two",
+                max_tokens=8,
+                temperature=0.3,
+            )
+        )
+
+        assert backend.first_completed.wait(timeout=2.0)
+        response_one = future_one.result(timeout=1.0)
+        assert response_one.choices[0].text == "early:prompt-one"
+        assert not future_two.done()
+
+        backend.release.set()
+        response_two = future_two.result(timeout=2.0)
+    finally:
+        backend.release.set()
+        service.shutdown()
+
+    assert response_two.choices[0].text == "early:prompt-two"
 
 
 def test_inference_service_streams_local_token_events_and_builds_logprobs() -> None:
@@ -858,9 +952,117 @@ def test_remote_backend_vllm_protocol_uses_standard_chat_without_completion_fall
         "top_p": 0.8,
         "presence_penalty": 0.1,
         "frequency_penalty": 0.2,
-        "seed": 123,
         "stop": [" END"],
     }
+
+
+def test_remote_backend_openai_omit_seed_policy_drops_prompt_seed(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            protocol="openai",
+            seed_policy="omit-for-contents",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "seedless answer"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["prompt"],
+        sampling=SamplingConfig(max_generate_tokens=4, temperature=0.0, top_p=0.8),
+        batch_size=1,
+        prompt_seeds=[123],
+        show_progress=False,
+    )
+
+    assert outputs[0].text == "seedless answer"
+    assert len(calls) == 1
+    payload = calls[0][1]
+    assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/chat/completions"
+    assert payload["messages"] == [{"role": "user", "content": "prompt"}]
+    assert "seed" not in payload
+
+
+def test_remote_backend_completions_protocol_preserves_raw_prompt_private_fields_and_omits_seed(
+    monkeypatch,
+) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            prefer_chat_completions=True,
+            protocol="completions",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/completions"):
+            return {
+                "choices": [
+                    {
+                        "text": "raw answer",
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["User: solve\n\nAssistant: <think>"],
+        sampling=SamplingConfig(
+            max_generate_tokens=4,
+            temperature=0.0,
+            top_k=42,
+            top_p=0.8,
+            alpha_presence=0.1,
+            alpha_frequency=0.2,
+            alpha_decay=0.95,
+            stop_tokens=(0,),
+            ban_tokens=(123,),
+            pad_zero=False,
+            no_penalty_token_ids=(33, 10),
+        ),
+        batch_size=1,
+        prompt_stop_suffixes=[(" END",)],
+        prompt_seeds=[123],
+        prefill_chunk_size=64,
+        show_progress=False,
+    )
+
+    assert outputs[0].text == "raw answer"
+    assert outputs[0].finish_reason == "stop_token"
+    assert len(calls) == 1
+    assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/completions"
+    payload = calls[0][1]
+    assert payload["prompt"] == "User: solve\n\nAssistant: <think>"
+    assert "messages" not in payload
+    assert "seed" not in payload
+    assert payload["top_k"] == 42
+    assert payload["stop"] == [" END"]
+    assert payload["stop_tokens"] == [0]
+    assert payload["ban_tokens"] == [123]
+    assert payload["pad_zero"] is False
+    assert payload["no_penalty_token_ids"] == [33, 10]
+    assert payload["prefill_chunk_size"] == 64
 
 
 def test_remote_backend_vllm_protocol_rejects_private_choice_scoring(monkeypatch) -> None:
@@ -869,6 +1071,50 @@ def test_remote_backend_vllm_protocol_rejects_private_choice_scoring(monkeypatch
             base_url="http://127.0.0.1:19081/openai",
             model="remote-demo",
             protocol="vllm",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(
+        RemoteInferenceBackend,
+        "_post_json",
+        lambda self, url, payload: calls.append((url, payload)) or {},
+    )
+
+    with pytest.raises(NotImplementedError, match="candidate choice scoring"):
+        backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
+
+    assert calls == []
+
+
+def test_remote_backend_choice_scoring_unsupported_500_falls_back(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        raise RemoteHTTPError(500, '{"detail":"nano-vLLM backend does not support candidate choice scoring"}')
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    with pytest.raises(NotImplementedError, match="candidate choice scoring"):
+        backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
+
+    assert backend._legacy_choice_scoring_supported is False
+    assert len(calls) == 1
+
+
+def test_remote_backend_completions_protocol_rejects_private_choice_scoring(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            protocol="completions",
         )
     )
     calls: list[tuple[str, dict[str, object]]] = []
@@ -1004,6 +1250,52 @@ def test_remote_backend_rejects_prompt_constraints_in_strict_mode() -> None:
         )
 
 
+def test_remote_backend_reuses_pooled_http_client(monkeypatch) -> None:
+    created_clients = []
+
+    class _FakeResponse:
+        status_code = 200
+        content = b'{"choices":[{"text":"ok","finish_reason":"stop"}]}'
+        text = content.decode("utf-8")
+
+    class _FakeHTTPClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.posts = []
+            self.closed = False
+            created_clients.append(self)
+
+        def post(self, url, *, content, headers, timeout):
+            self.posts.append((url, content, headers, timeout))
+            return _FakeResponse()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("src.infer.backend.httpx.Client", _FakeHTTPClient)
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+            max_workers=8,
+        )
+    )
+
+    first = backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
+    second = backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
+
+    assert first["choices"][0]["text"] == "ok"
+    assert second["choices"][0]["text"] == "ok"
+    assert len(created_clients) == 1
+    assert len(created_clients[0].posts) == 2
+    assert created_clients[0].kwargs["follow_redirects"] is True
+
+    backend.shutdown()
+
+    assert created_clients[0].closed is True
+    assert backend._http_client is None
+
+
 def test_remote_backend_retries_transient_disconnect(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(
@@ -1016,28 +1308,102 @@ def test_remote_backend_retries_transient_disconnect(monkeypatch) -> None:
     calls = 0
 
     class _FakeResponse:
-        def __enter__(self):
-            return self
+        status_code = 200
+        content = b'{"choices":[{"text":"ok","finish_reason":"stop"}]}'
+        text = content.decode("utf-8")
 
-        def __exit__(self, exc_type, exc, tb):
-            return False
+    class _FakeHTTPClient:
+        def post(self, url, *, content, headers, timeout):
+            nonlocal calls
+            del url, content, headers, timeout
+            calls += 1
+            if calls == 1:
+                raise httpx.TransportError("closed")
+            return _FakeResponse()
 
-        def read(self) -> bytes:
-            return b'{"choices":[{"text":"ok","finish_reason":"stop"}]}'
+        def close(self):
+            return None
 
-    def _fake_urlopen(_req, timeout):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise http.client.RemoteDisconnected("closed")
-        return _FakeResponse()
-
-    monkeypatch.setattr("src.infer.backend.urllib_request.urlopen", _fake_urlopen)
+    monkeypatch.setattr("src.infer.backend.httpx.Client", lambda **_kwargs: _FakeHTTPClient())
 
     response = backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
 
     assert calls == 2
     assert response["choices"][0]["text"] == "ok"
+
+
+def test_remote_backend_retries_retryable_http_status(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+            max_retries=2,
+            retry_initial_delay_s=0.0,
+        )
+    )
+    calls = 0
+
+    class _FakeResponse:
+        def __init__(self, status_code: int, content: bytes) -> None:
+            self.status_code = status_code
+            self.content = content
+            self.text = content.decode("utf-8")
+
+    class _FakeHTTPClient:
+        def post(self, url, *, content, headers, timeout):
+            nonlocal calls
+            del url, content, headers, timeout
+            calls += 1
+            if calls == 1:
+                return _FakeResponse(
+                    502,
+                    b'{"detail":"backend request failed: Server disconnected without sending a response."}',
+                )
+            return _FakeResponse(200, b'{"choices":[{"text":"ok","finish_reason":"stop"}]}')
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("src.infer.backend.httpx.Client", lambda **_kwargs: _FakeHTTPClient())
+
+    response = backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
+
+    assert calls == 2
+    assert response["choices"][0]["text"] == "ok"
+
+
+def test_remote_backend_does_not_retry_non_retryable_http_status(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:8081",
+            model="remote-demo",
+            max_retries=2,
+            retry_initial_delay_s=0.0,
+        )
+    )
+    calls = 0
+
+    class _FakeResponse:
+        status_code = 404
+        content = b'{"detail":"missing"}'
+        text = content.decode("utf-8")
+
+    class _FakeHTTPClient:
+        def post(self, url, *, content, headers, timeout):
+            nonlocal calls
+            del url, content, headers, timeout
+            calls += 1
+            return _FakeResponse()
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("src.infer.backend.httpx.Client", lambda **_kwargs: _FakeHTTPClient())
+
+    with pytest.raises(RemoteHTTPError, match="HTTP 404"):
+        backend._post_json("http://127.0.0.1:8081/v1/completions", {"model": "remote-demo"})
+
+    assert calls == 1
 
 
 def test_local_inference_backend_can_select_lightning_engine(monkeypatch, tmp_path) -> None:

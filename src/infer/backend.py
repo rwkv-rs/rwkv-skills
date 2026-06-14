@@ -4,16 +4,14 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import http.client
 import json
-import socket
+import threading
 import time
 from dataclasses import dataclass, field, is_dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
-from urllib import error as urllib_error
-from urllib import request as urllib_request
 
+import httpx
 import torch
 from tqdm import tqdm
 
@@ -33,17 +31,12 @@ class RemoteHTTPError(RuntimeError):
         self.detail = str(detail)
 
 
-_REMOTE_TRANSIENT_ERRORS = (
-    urllib_error.URLError,
-    http.client.HTTPException,
-    TimeoutError,
-    ConnectionError,
-    socket.timeout,
-)
+_REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
+_RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 
-RemoteInferenceProtocol = Literal["openai", "vllm", "nano-vllm-contents"]
+RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "nano-vllm-contents"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
-REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "vllm")
+REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "vllm", "completions")
 REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("nano-vllm-contents",)
 REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
     *REMOTE_INFERENCE_PROTOCOL_CHOICES,
@@ -87,6 +80,10 @@ def _safe_tqdm_close(progress: tqdm) -> None:
         return
 
 
+def _is_retryable_remote_http_error(exc: RemoteHTTPError) -> bool:
+    return int(exc.status_code) in _RETRYABLE_REMOTE_HTTP_STATUS_CODES
+
+
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path", help="Path to RWKV weights (.pth)")
     parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
@@ -114,7 +111,7 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         "--infer-protocol",
         choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
         default="openai",
-        help="Remote request protocol: generic OpenAI compatibility, or vLLM-tuned OpenAI chat requests",
+        help="Remote request protocol: generic OpenAI compatibility, vLLM chat requests, or raw completions",
     )
     parser.add_argument(
         "--infer-seed-policy",
@@ -122,7 +119,9 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         default="preserve",
         help=(
             "Remote seed handling. preserve keeps per-prompt seeds, falling back to OpenAI requests when needed; "
-            "omit-for-contents drops seeds only for nano-vLLM contents batching."
+            "vllm, completions, and omit-for-contents omit per-prompt seeds for standard concurrent requests; "
+            "completions preserves raw prompts and private RWKV sampling fields; "
+            "omit-for-contents also drops seeds for nano-vLLM contents batching."
         ),
     )
 
@@ -314,6 +313,8 @@ class RemoteInferenceConfig:
 class RemoteInferenceBackend:
     config: RemoteInferenceConfig
     _legacy_choice_scoring_supported: bool | None = field(default=None, init=False, repr=False)
+    _http_client: httpx.Client | None = field(default=None, init=False, repr=False)
+    _http_client_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def model_name(self) -> str:
@@ -342,7 +343,7 @@ class RemoteInferenceBackend:
             constraint_mode=constraint_mode,
         )
         if effective_constraints is not None and any(constraint is not None for constraint in effective_constraints):
-            raise NotImplementedError("remote infer backend does not support prompt constraints")
+            raise RuntimeError("remote infer backend does not support prompt constraints; use a local backend")
         if not prompts:
             return []
         if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
@@ -352,9 +353,16 @@ class RemoteInferenceBackend:
         effective_sampling = sampling.clamp(1) if probe_only else sampling
         force_openai_single_requests = False
         use_contents_protocol = self.config.protocol == "nano-vllm-contents"
+        omit_prompt_seeds = (
+            self.config.protocol in {"vllm", "completions"}
+            or self.config.seed_policy == "omit-for-contents"
+        )
         if prompt_seeds is not None:
             has_prompt_seeds = any(seed is not None for seed in prompt_seeds)
-            if use_contents_protocol and has_prompt_seeds and self.config.seed_policy == "omit-for-contents":
+            if (
+                has_prompt_seeds
+                and (omit_prompt_seeds or (use_contents_protocol and self.config.seed_policy == "omit-for-contents"))
+            ):
                 prompt_seeds = None
             elif has_prompt_seeds:
                 force_openai_single_requests = True
@@ -504,11 +512,13 @@ class RemoteInferenceBackend:
     ) -> tuple[dict[str, float], str]:
         if not choice_token_texts:
             raise ValueError("choice_token_texts cannot be empty")
-        if self.config.protocol == "vllm":
+        if self.config.protocol in {"vllm", "completions"}:
             self._legacy_choice_scoring_supported = False
-            raise NotImplementedError("vllm remote protocol does not support candidate choice scoring")
+            raise RuntimeError(
+                f"{self.config.protocol} remote protocol does not support candidate choice scoring"
+            )
         if self._legacy_choice_scoring_supported is False:
-            raise NotImplementedError("remote infer service does not support candidate choice scoring")
+            raise RuntimeError("remote infer service does not support candidate choice scoring")
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -519,9 +529,16 @@ class RemoteInferenceBackend:
         try:
             response = self._post_json(self.config.completions_url(), payload)
         except RemoteHTTPError as exc:
-            if exc.status_code in {400, 404, 405, 422, 501}:
+            unsupported_choice_scoring = (
+                exc.status_code in {400, 404, 405, 422, 501}
+                or (
+                    exc.status_code == 500
+                    and "does not support candidate choice scoring" in exc.detail
+                )
+            )
+            if unsupported_choice_scoring:
                 self._legacy_choice_scoring_supported = False
-                raise NotImplementedError(
+                raise RuntimeError(
                     "remote infer service does not support candidate choice scoring"
                 ) from exc
             raise
@@ -534,15 +551,22 @@ class RemoteInferenceBackend:
         logprobs = choice0.get("logprobs")
         if not isinstance(logprobs, dict):
             self._legacy_choice_scoring_supported = False
-            raise NotImplementedError("remote infer response missing choice-scoring logprobs")
+            raise RuntimeError("remote infer response missing choice-scoring logprobs")
         top_logprobs = logprobs.get("top_logprobs")
         if not isinstance(top_logprobs, list) or not top_logprobs or not isinstance(top_logprobs[0], dict):
             self._legacy_choice_scoring_supported = False
-            raise NotImplementedError("remote infer response missing choice-scoring top_logprobs")
+            raise RuntimeError("remote infer response missing choice-scoring top_logprobs")
         self._legacy_choice_scoring_supported = True
         scores = {str(key): float(value) for key, value in top_logprobs[0].items()}
         best_text = max(choice_token_texts, key=lambda item: scores.get(item, float("-inf")))
         return scores, best_text
+
+    def shutdown(self) -> None:
+        with self._http_client_lock:
+            client = self._http_client
+            self._http_client = None
+        if client is not None:
+            client.close()
 
     def _generate_one(
         self,
@@ -553,7 +577,7 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol == "nano-vllm-contents"
+        include_private_fields = self.config.protocol in {"completions", "nano-vllm-contents"}
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -571,6 +595,9 @@ class RemoteInferenceBackend:
         if self.config.protocol == "vllm":
             response = self._post_json(self.config.chat_completions_url(), chat_payload)
             is_chat_response = True
+        elif self.config.protocol == "completions":
+            response = self._post_json(self.config.completions_url(), payload)
+            is_chat_response = False
         elif self.config.prefer_chat_completions:
             try:
                 response = self._post_json(self.config.chat_completions_url(), chat_payload)
@@ -608,18 +635,13 @@ class RemoteInferenceBackend:
         started = time.perf_counter()
         ok = False
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib_request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self.config.api_key or 'rwkv-skills'}",
-            },
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.config.api_key or 'rwkv-skills'}",
+        }
         try:
-            raw = self._urlopen_with_retries(req)
+            raw = self._post_bytes_with_retries(str(url), body, headers)
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise RuntimeError("remote infer response must be a JSON object")
@@ -630,7 +652,33 @@ class RemoteInferenceBackend:
             if callback is not None:
                 callback(str(url), max(0.0, time.perf_counter() - started), ok)
 
-    def _urlopen_with_retries(self, req: urllib_request.Request) -> str:
+    def _http_client_for_requests(self) -> httpx.Client:
+        client = self._http_client
+        if client is not None:
+            return client
+        with self._http_client_lock:
+            client = self._http_client
+            if client is None:
+                timeout_s = max(float(self.config.timeout_s), 1.0)
+                max_connections = max(1, int(self.config.max_workers))
+                client = httpx.Client(
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=max_connections,
+                        max_keepalive_connections=max_connections,
+                        keepalive_expiry=60.0,
+                    ),
+                    timeout=httpx.Timeout(timeout_s),
+                )
+                self._http_client = client
+            return client
+
+    def _post_bytes_with_retries(
+        self,
+        url: str,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> str:
         attempts = max(1, int(self.config.max_retries) + 1)
         timeout_s = max(float(self.config.timeout_s), 1.0)
         delay_s = max(float(self.config.retry_initial_delay_s), 0.0)
@@ -638,11 +686,22 @@ class RemoteInferenceBackend:
         last_exc: BaseException | None = None
         for attempt in range(1, attempts + 1):
             try:
-                with urllib_request.urlopen(req, timeout=timeout_s) as resp:
-                    return resp.read().decode("utf-8")
-            except urllib_error.HTTPError as exc:  # pragma: no cover - exercised through integration
-                detail = exc.read().decode("utf-8", errors="replace")
-                raise RemoteHTTPError(exc.code, detail) from exc
+                response = self._http_client_for_requests().post(
+                    url,
+                    content=body,
+                    headers=headers,
+                    timeout=timeout_s,
+                )
+                if int(response.status_code) >= 400:
+                    raise RemoteHTTPError(int(response.status_code), response.text)
+                return response.content.decode("utf-8")
+            except RemoteHTTPError as exc:
+                last_exc = exc
+                if not _is_retryable_remote_http_error(exc) or attempt >= attempts:
+                    raise
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                    delay_s = min(delay_s * 2, max_delay_s)
             except _REMOTE_TRANSIENT_ERRORS as exc:  # pragma: no cover - exercised through integration
                 last_exc = exc
                 if attempt >= attempts:
@@ -650,8 +709,6 @@ class RemoteInferenceBackend:
                 if delay_s > 0:
                     time.sleep(delay_s)
                     delay_s = min(delay_s * 2, max_delay_s)
-        if isinstance(last_exc, urllib_error.URLError):
-            raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc.reason}") from last_exc
         raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc}") from last_exc
 
 
@@ -827,6 +884,8 @@ def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
     value = str(protocol or "openai").strip().lower().replace("_", "-")
     if value in {"vllm-openai", "vllm-chat", "vllm-compatible"}:
         value = "vllm"
+    if value in {"completion", "raw-completion", "raw-completions", "text-completion", "text-completions"}:
+        value = "completions"
     if value in {"nano-vllm", "nanovllm", "contents", "lightning"}:
         value = "nano-vllm-contents"
     if value not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:

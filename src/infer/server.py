@@ -137,6 +137,10 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
             "batch_collect_ms": service.batch_collect_ms,
         }
 
+    @app.get("/v1/batch-metrics")
+    async def batch_metrics() -> dict[str, object]:
+        return service.batch_metrics()
+
     @app.get("/v1/models", dependencies=[Depends(_authorize)])
     async def list_models() -> dict[str, object]:
         return {

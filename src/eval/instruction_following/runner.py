@@ -160,15 +160,17 @@ def main(
             skip_keys=skip_keys,
             on_record=writer.enqueue,
         )
-    except BaseException:
+    except Exception:
         runtime.handle_attempt_stage_failure(writer)
         raise
     completions_payloads = runtime.complete_attempt_stage(writer)
     try:
+        is_ifbench = canonical_slug(str(slug)).startswith("ifbench")
         metrics = evaluate_instruction_following(
             completions_payloads,
             dataset_path=str(dataset_path),
-            strict=True,
+            dataset_slug=str(slug),
+            strict=not is_ifbench,
             avg_k=avg_k_final,
         )
         avg_payload = filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
@@ -188,13 +190,14 @@ def main(
             task_details={
                 "tier0_accuracy": metrics.tier0_accuracy,
                 "tier1_accuracy": metrics.tier1_accuracy,
+                "scoring_mode": "loose" if is_ifbench else "strict",
                 **build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
                 **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
             },
             extra={"cot_mode": CoTMode.NO_COT.value},
         )
         runtime.record_score(score_payload)
-    except BaseException as exc:
+    except Exception as exc:
         runtime.fail_task(error=str(exc))
         raise
     print(f"✅ instruction-following done: {result.sample_count} samples")

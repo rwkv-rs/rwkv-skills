@@ -85,6 +85,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="classic",
         help="Local inference engine implementation to use",
     )
+    parser.add_argument(
+        "--infer-auto-config",
+        choices=("off", "balanced", "throughput"),
+        help="Startup auto-config mode passed to each infer service; omit to use run_infer_server default",
+    )
     parser.add_argument("--state-db-dir", help="Directory for per-model lightning sqlite state caches")
     parser.add_argument("--max-batch-size", type=int, default=8, help="Max queued requests per infer batch")
     parser.add_argument(
@@ -173,11 +178,16 @@ def plan_deployments(
     available_gpus = [gpu for gpu in idle_gpus if gpu not in assigned_gpus]
     specs: list[InferServiceSpec] = []
     replica_count = max(1, int(replicas_per_model))
-    for model_index, (model_path, model_name, max_batch_size, gpu) in enumerate(
-        zip(model_paths, model_names, max_batch_sizes, available_gpus, strict=False)
+    gpu_cursor = 0
+    for model_index, (model_path, model_name, max_batch_size) in enumerate(
+        zip(model_paths, model_names, max_batch_sizes, strict=False)
     ):
+        if len(available_gpus) - gpu_cursor < replica_count:
+            break
         safe_name = _safe_name(model_name)
         for replica_index in range(replica_count):
+            gpu = available_gpus[gpu_cursor]
+            gpu_cursor += 1
             port = int(base_port) + int(launched_count) + len(specs)
             replica_suffix = "" if replica_count == 1 else f".r{replica_index + 1}"
             state_db_path = None
@@ -206,6 +216,7 @@ def build_command(
     host: str,
     api_key: str,
     engine_mode: str,
+    infer_auto_config: str | None,
     batch_collect_ms: int,
     log_level: str,
 ) -> list[str]:
@@ -232,6 +243,8 @@ def build_command(
         "--log-level",
         log_level,
     ]
+    if infer_auto_config:
+        command.extend(["--infer-auto-config", str(infer_auto_config)])
     if api_key:
         command.extend(["--api-key", api_key])
     if spec.state_db_path is not None:
@@ -266,6 +279,7 @@ def launch_service(
     host: str,
     api_key: str,
     engine_mode: str,
+    infer_auto_config: str | None,
     batch_collect_ms: int,
     log_level: str,
     detach: bool,
@@ -275,6 +289,7 @@ def launch_service(
         host=host,
         api_key=api_key,
         engine_mode=engine_mode,
+        infer_auto_config=infer_auto_config,
         batch_collect_ms=batch_collect_ms,
         log_level=log_level,
     )
@@ -467,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     host=str(args.host),
                     api_key=str(args.api_key or ""),
                     engine_mode=str(args.engine_mode),
+                    infer_auto_config=args.infer_auto_config,
                     batch_collect_ms=int(args.batch_collect_ms),
                     log_level=str(args.log_level),
                     detach=bool(args.detach),

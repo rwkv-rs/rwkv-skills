@@ -238,13 +238,14 @@ def main(
                 dataset_path=str(dataset_path),
                 prompt_template=direct_prompt_template,
                 cot_mode=cot_mode,
+                batch_size=max(1, args.batch_size),
                 record_indices=plan.sample_indices,
                 samples_per_task=plan.repeat_count,
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
             )
-    except BaseException:
+    except Exception:
         runtime.handle_attempt_stage_failure(writer)
         raise
 
@@ -288,7 +289,7 @@ def main(
             extra={"cot_mode": cot_mode.value},
         )
         runtime.record_score(score_payload)
-    except BaseException as exc:
+    except Exception as exc:
         runtime.fail_task(error=str(exc))
         raise
     _print_done_message(cot_mode, result.sample_count)
