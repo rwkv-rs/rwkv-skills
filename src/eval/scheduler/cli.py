@@ -227,6 +227,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         help="远端 seed 策略：默认保留 seed；omit-for-contents 在 nano contents 批量时丢弃 seed",
     )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
+    parser.add_argument("--sample-workers", type=int, help="runner 侧 episode 并发数；当前透传给 function-calling runner")
     parser.add_argument(
         "--disable-infer-backpressure",
         action="store_true",
@@ -439,6 +440,11 @@ def _dispatch_options_from_args(
         remote_batch_size=(
             int(getattr(args, "remote_batch_size"))
             if getattr(args, "remote_batch_size", None) is not None
+            else None
+        ),
+        sample_workers=(
+            int(getattr(args, "sample_workers"))
+            if getattr(args, "sample_workers", None) is not None
             else None
         ),
         infer_backpressure=not bool(getattr(args, "disable_infer_backpressure", False)),

@@ -52,6 +52,8 @@ from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.evaluating import RunMode
 from src.eval.runner_registry import RunnerGroup
 
+_SAMPLE_WORKER_JOB_NAMES = frozenset({"function_bfcl_v3"})
+
 
 @dataclass(slots=True)
 class QueueOptions:
@@ -76,6 +78,7 @@ class QueueOptions:
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
+    sample_workers: int | None = None
     infer_backpressure: bool = True
     infer_backpressure_timeout_s: float = 2.0
     infer_backpressure_pending_high_watermark: int = 0
@@ -644,6 +647,7 @@ def _launch_queue_items(
             job_name=item.job_name,
             job_id=item.job_id,
             batch_size=batch_size,
+            sample_workers=opts.sample_workers,
             infer_max_workers=(
                 item_budget.infer_max_workers
                 if item_budget is not None
@@ -671,6 +675,8 @@ def _launch_queue_items(
         if item.is_remote:
             meta["infer_base_url"] = str(item.infer_base_url)
             meta["infer_model"] = str(item.infer_model or item.model_name)
+            if opts.sample_workers is not None:
+                meta["sample_workers"] = max(1, int(opts.sample_workers))
             if item_budget is not None:
                 meta["infer_max_workers"] = item_budget.infer_max_workers
                 meta["remote_budget_reason"] = item_budget.reason
@@ -1062,6 +1068,8 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
             args.extend([flag, str(value)])
 
     _append_str("--prompt-style", opts.function_prompt_style)
+    if job.name in _SAMPLE_WORKER_JOB_NAMES:
+        _append("--sample-workers", opts.sample_workers)
     _append_str("--tool-catalog-format", opts.function_tool_catalog_format)
     _append("--cot-max-tokens", opts.function_cot_max_tokens)
     _append("--decision-max-tokens", opts.function_decision_max_tokens)
@@ -1248,6 +1256,7 @@ def _backup_run_config(
     job_name: str,
     job_id: str,
     batch_size: int | None,
+    sample_workers: int | None,
     infer_max_workers: int | None,
     budget_reason: str | None,
     gpu: str | None,
@@ -1278,6 +1287,7 @@ def _backup_run_config(
         job_name=job_name,
         job_id=job_id,
         batch_size=batch_size,
+        sample_workers=sample_workers,
         infer_max_workers=infer_max_workers,
         budget_reason=budget_reason,
         gpu=gpu,
@@ -1303,6 +1313,7 @@ def _render_run_block(
     job_name: str,
     job_id: str,
     batch_size: int | None,
+    sample_workers: int | None,
     infer_max_workers: int | None,
     budget_reason: str | None,
     gpu: str | None,
@@ -1336,6 +1347,8 @@ def _render_run_block(
         lines.append(f"gpu = {_toml_quote(gpu)}")
     if batch_size is not None:
         lines.append(f"batch_size = {int(batch_size)}")
+    if sample_workers is not None:
+        lines.append(f"sample_workers = {max(1, int(sample_workers))}")
     if infer_max_workers is not None:
         lines.append(f"infer_max_workers = {int(infer_max_workers)}")
     if budget_reason:

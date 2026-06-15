@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from src.eval.evaluating import RunContext, RunMode
 from src.eval.function_calling import (
     BfclTaskRecord,
@@ -57,6 +59,8 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "2",
             "--candidate-router-batch-size",
             "4",
+            "--sample-workers",
+            "8",
             "--candidate-router-prompt-max-chars",
             "8192",
             "--model-path",
@@ -81,7 +85,74 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.candidate_router_mode == "parallel"
     assert args.candidate_router_chunk_tools == 2
     assert args.candidate_router_batch_size == 4
+    assert args.sample_workers == 8
     assert args.candidate_router_prompt_max_chars == 8192
+
+
+def test_function_calling_runner_rejects_local_sample_workers() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "bfcl_v3_test.jsonl",
+            "--model-path",
+            "model.pth",
+            "--sample-workers",
+            "2",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires remote inference"):
+        function_calling_runner._normalize_sample_worker_args(args)
+
+
+def test_function_calling_runner_binds_remote_workers_to_connection_pool() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "bfcl_v3_test.jsonl",
+            "--infer-base-url",
+            "http://127.0.0.1:8081",
+            "--infer-model",
+            "demo",
+            "--infer-max-workers",
+            "4",
+            "--sample-workers",
+            "8",
+        ]
+    )
+
+    function_calling_runner._normalize_sample_worker_args(args)
+
+    assert args.sample_workers == 8
+    assert args.infer_max_workers == 8
+
+
+def test_function_calling_runner_rejects_unwired_sample_worker_benchmark() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "browsecomp_test.jsonl",
+            "--infer-base-url",
+            "http://127.0.0.1:8081",
+            "--infer-model",
+            "demo",
+            "--sample-workers",
+            "2",
+        ]
+    )
+    run = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.BROWSECOMP,
+        dataset_path=Path("/tmp/browsecomp_test.jsonl"),
+        dataset_slug="browsecomp_test",
+        benchmark_name="browsecomp",
+        dataset_split="test",
+        model_name="demo",
+        engine=object(),  # type: ignore[arg-type]
+    )
+
+    function_calling_runner._normalize_sample_worker_args(args)
+    with pytest.raises(ValueError, match="implemented only for: bfcl_v3"):
+        function_calling_runner._validate_sample_worker_benchmark(args, run)
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:

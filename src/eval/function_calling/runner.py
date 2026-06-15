@@ -67,6 +67,9 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
+_SAMPLE_WORKER_ENABLED_KINDS = frozenset({FunctionCallingBenchmarkKind.BFCL_V3})
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV unified function-calling benchmark runner")
     parser.add_argument("--dataset", required=True, help="Prepared function-calling JSONL dataset path")
@@ -105,6 +108,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, help="Generation batch size for batched runners")
+    parser.add_argument(
+        "--sample-workers",
+        type=int,
+        default=1,
+        help="Concurrent episode workers for remote-safe function-calling runners",
+    )
     parser.add_argument("--max-samples", type=int, help="Limit source task count before avg@k planning")
     parser.add_argument(
         "--avg-k",
@@ -405,7 +414,9 @@ def main(
     args = parse_args(argv)
     _apply_runner_env_overrides(args)
     validate_inference_backend_args(args)
+    _normalize_sample_worker_args(args)
     run = _resolve_run(args)
+    _validate_sample_worker_benchmark(args, run)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP_PLUS:
         return _run_browsecomp_plus(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP:
@@ -445,6 +456,31 @@ def _apply_runner_env_overrides(args: argparse.Namespace) -> None:
         os.environ["RWKV_TAU_LLM_TIMEOUT_S"] = str(float(timeout_s))
     if bool(getattr(args, "disable_checker", False)):
         os.environ["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
+
+
+def _normalize_sample_worker_args(args: argparse.Namespace) -> None:
+    workers = int(getattr(args, "sample_workers", 1) or 1)
+    if workers < 1:
+        raise ValueError("--sample-workers must be >= 1")
+    args.sample_workers = workers
+    if workers == 1:
+        return
+    infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip()
+    if not infer_base_url:
+        raise ValueError(
+            "--sample-workers > 1 currently requires remote inference "
+            "(--infer-base-url/--infer-model); local in-process batching is not enabled yet."
+        )
+    args.infer_max_workers = max(workers, int(getattr(args, "infer_max_workers", 1) or 1))
+
+
+def _validate_sample_worker_benchmark(args: argparse.Namespace, run: ResolvedFunctionCallingRun) -> None:
+    if int(getattr(args, "sample_workers", 1) or 1) <= 1:
+        return
+    if run.benchmark_kind in _SAMPLE_WORKER_ENABLED_KINDS:
+        return
+    enabled = ", ".join(sorted(kind.value for kind in _SAMPLE_WORKER_ENABLED_KINDS))
+    raise ValueError(f"--sample-workers > 1 is currently implemented only for: {enabled}")
 
 
 __all__ = [
