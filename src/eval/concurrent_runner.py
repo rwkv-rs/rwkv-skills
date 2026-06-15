@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Small fail-fast helpers for runner-side episode concurrency."""
+
+from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -19,6 +19,7 @@ def run_episodes(
     *,
     max_workers: int = 1,
     on_result: Callable[[R], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
     label: str = "episode",
     collect_results: bool = True,
 ) -> list[R]:
@@ -38,12 +39,20 @@ def run_episodes(
         return []
     workers = max(1, int(max_workers))
     if workers == 1:
-        return _run_serial(rows, worker, on_result=on_result, label=label, collect_results=collect_results)
+        return _run_serial(
+            rows,
+            worker,
+            on_result=on_result,
+            on_progress=on_progress,
+            label=label,
+            collect_results=collect_results,
+        )
     return _run_threaded(
         rows,
         worker,
         max_workers=workers,
         on_result=on_result,
+        on_progress=on_progress,
         label=label,
         collect_results=collect_results,
     )
@@ -54,10 +63,12 @@ def _run_serial(
     worker: Callable[[T], R],
     *,
     on_result: Callable[[R], None] | None,
+    on_progress: Callable[[int, int], None] | None,
     label: str,
     collect_results: bool,
 ) -> list[R]:
     results: list[R] = []
+    total = len(rows)
     for index, item in enumerate(rows):
         try:
             result = worker(item)
@@ -68,6 +79,8 @@ def _run_serial(
             results.append(result)
         if on_result is not None:
             on_result(result)
+        if on_progress is not None:
+            on_progress(index + 1, total)
     return results
 
 
@@ -77,16 +90,19 @@ def _run_threaded(
     *,
     max_workers: int,
     on_result: Callable[[R], None] | None,
+    on_progress: Callable[[int, int], None] | None,
     label: str,
     collect_results: bool,
 ) -> list[R]:
     results_by_index: dict[int, R] = {}
+    total = len(rows)
     executor = ThreadPoolExecutor(max_workers=min(max_workers, len(rows)))
     futures: dict[Future[R], int] = {
         executor.submit(worker, item): index
         for index, item in enumerate(rows)
     }
     failed = False
+    done = 0
     try:
         for future in as_completed(futures):
             index = futures[future]
@@ -109,6 +125,9 @@ def _run_threaded(
                     results_by_index[index] = result
                 if on_result is not None:
                     on_result(result)
+                done += 1
+                if on_progress is not None:
+                    on_progress(done, total)
             except Exception:
                 failed = True
                 _LOG.exception(

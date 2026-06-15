@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import sys
 import uuid
 from dataclasses import dataclass, field
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
@@ -16,6 +19,7 @@ from src.eval.field_common import build_plan_task_details
 from src.eval.function_calling.bfcl_v3 import (
     BFCL_ADDITIONAL_FUNCTION_PROMPT,
     BFCL_DECISION_STOP_SUFFIXES,
+    BfclEvaluation,
     BfclTaskRecord,
     apply_bfcl_tool_call,
     build_bfcl_ref_answer,
@@ -77,6 +81,8 @@ from src.infer.backend import RemoteInferenceBackend
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
+
+_LOG = logging.getLogger(__name__)
 
 BFCL_V3_DEFAULT_PROMPT_MAX_CHARS = 28000
 _BFCL_CANDIDATE_ROUTER_POLICY = (
@@ -700,17 +706,37 @@ def _run_bfcl_v3_official_episode(
 
         while step_in_turn < max_steps:
             progress_suffix = f"sample {state.sample_index} turn {turn_index + 1} step {step_in_turn + 1}"
-            outcome = _run_bfcl_generation_step(
-                state=state,
-                run=run,
-                tool_sampling=tool_sampling,
-                progress_suffix=progress_suffix,
-                prompt_style=prompt_style,
-                history_max_chars=history_max_chars,
-                prompt_max_chars=prompt_max_chars,
-                tool_routing_config=tool_routing_config,
-                candidate_router_config=candidate_router_config,
-            )
+            try:
+                outcome = _run_bfcl_generation_step(
+                    state=state,
+                    run=run,
+                    tool_sampling=tool_sampling,
+                    progress_suffix=progress_suffix,
+                    prompt_style=prompt_style,
+                    history_max_chars=history_max_chars,
+                    prompt_max_chars=prompt_max_chars,
+                    tool_routing_config=tool_routing_config,
+                    candidate_router_config=candidate_router_config,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                _LOG.warning(
+                    "bfcl_v3 sample %s turn %s step %s parse failed: %s",
+                    state.sample_index,
+                    turn_index + 1,
+                    step_in_turn + 1,
+                    exc,
+                )
+                state.termination_reason = "parse_error"
+                state.error = f"decode_failed:{exc}"
+                trace.append(
+                    {
+                        "turn_index": turn_index,
+                        "step_index": step_in_turn,
+                        "error": state.error,
+                        "termination_reason": "parse_error",
+                    }
+                )
+                return trace
             trace_entry = {
                 "turn_index": turn_index,
                 "step_index": step_in_turn,
@@ -848,6 +874,21 @@ def _run_bfcl_v3_official_episode(
     return trace
 
 
+def _checker_failure_evaluation(
+    *,
+    reason: str,
+    details: Mapping[str, Any] | None = None,
+) -> BfclEvaluation:
+    """Build a standard failed evaluation after checker-local failures."""
+
+    return BfclEvaluation(
+        reward=0.0,
+        is_passed=False,
+        fail_reason=reason,
+        details=dict(details or {}),
+    )
+
+
 def _run_one_bfcl_v3_attempt(
     *,
     key: AttemptKey,
@@ -886,17 +927,35 @@ def _run_one_bfcl_v3_attempt(
     else:
         for _ in range(max_steps):
             progress_suffix = f"sample {state.sample_index} step {state.turn_count + 1}"
-            outcome = _run_bfcl_generation_step(
-                state=state,
-                run=run,
-                tool_sampling=tool_sampling,
-                progress_suffix=progress_suffix,
-                prompt_style=prompt_style,
-                history_max_chars=history_max_chars,
-                prompt_max_chars=prompt_max_chars,
-                tool_routing_config=tool_routing_config,
-                candidate_router_config=candidate_router_config,
-            )
+            try:
+                outcome = _run_bfcl_generation_step(
+                    state=state,
+                    run=run,
+                    tool_sampling=tool_sampling,
+                    progress_suffix=progress_suffix,
+                    prompt_style=prompt_style,
+                    history_max_chars=history_max_chars,
+                    prompt_max_chars=prompt_max_chars,
+                    tool_routing_config=tool_routing_config,
+                    candidate_router_config=candidate_router_config,
+                )
+            except (json.JSONDecodeError, ValueError) as exc:
+                _LOG.warning(
+                    "bfcl_v3 sample %s step %s parse failed: %s",
+                    state.sample_index,
+                    state.turn_count + 1,
+                    exc,
+                )
+                state.termination_reason = "parse_error"
+                state.error = f"decode_failed:{exc}"
+                trace.append(
+                    {
+                        "round_num": state.turn_count + 1,
+                        "error": state.error,
+                        "termination_reason": "parse_error",
+                    }
+                )
+                break
             state.turn_count += 1
             trace_entry = {
                 "round_num": state.turn_count,
@@ -987,13 +1046,23 @@ def _run_one_bfcl_v3_attempt(
         if state.termination_reason is None:
             state.termination_reason = "max_steps"
 
-    evaluation = evaluate_bfcl_v3_episode(
-        record,
-        state.runtime_state,
-        state.final_answer,
-        termination_reason=state.termination_reason,
-        error=state.error,
-    )
+    try:
+        evaluation = evaluate_bfcl_v3_episode(
+            record,
+            state.runtime_state,
+            state.final_answer,
+            termination_reason=state.termination_reason,
+            error=state.error,
+        )
+    except ValueError as exc:
+        _LOG.warning("bfcl_v3 sample %s checker failed: %s", state.sample_index, exc)
+        evaluation = _checker_failure_evaluation(
+            reason=f"checker_error:{exc}",
+            details={"checker_exception": str(exc)},
+        )
+        if state.termination_reason is None or state.termination_reason == "agent_stop":
+            state.termination_reason = "checker_error"
+        state.error = state.error or f"checker_error:{exc}"
     payload = SampleRecord(
         benchmark_name=run.benchmark_name,
         dataset_split=run.dataset_split,
@@ -1216,6 +1285,17 @@ def _run_bfcl_v3(
             try:
                 pending = build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
                 sample_workers = max(1, int(getattr(args, "sample_workers", 1) or 1))
+                progress_last = [0.0]
+                progress_bucket = [-1]
+
+                def _progress(done: int, total: int) -> None:
+                    now = monotonic()
+                    bucket = int((done * 20) / max(1, total))
+                    if done == total or bucket > progress_bucket[0] or now - progress_last[0] >= 2.0:
+                        progress_last[0] = now
+                        progress_bucket[0] = bucket
+                        print(f"[bfcl_v3] {done}/{total} episodes done", file=sys.stderr, flush=True)
+
                 run_episodes(
                     pending,
                     lambda item: _run_one_bfcl_v3_attempt(
@@ -1234,6 +1314,7 @@ def _run_bfcl_v3(
                     ),
                     max_workers=sample_workers,
                     on_result=writer.enqueue,
+                    on_progress=_progress,
                     label="bfcl_v3 episode",
                     collect_results=False,
                 )

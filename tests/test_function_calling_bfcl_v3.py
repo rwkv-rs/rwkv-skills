@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import src.eval.function_calling.bfcl_v3 as bfcl_v3_mod
+from src.eval.concurrent_runner import run_episodes
+from src.eval.execution_plan import AttemptKey
+from src.eval.function_calling import bfcl_v3_runner
 from src.eval.function_calling.bfcl_v3 import (
     BfclTaskRecord,
     BfclTurn,
@@ -998,3 +1003,87 @@ def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
     assert "Conversation transcript JSON:" in context
     assert '{"role":"assistant","content":"{\\"name\\":\\"lookup\\",\\"arguments\\":{\\"id\\":\\"A1\\"}}"}' in context
     assert context.endswith("Assistant: ```json\n{")
+
+
+def _run_bfcl_v3_attempt_for_test(
+    record: BfclTaskRecord,
+    *,
+    key: AttemptKey = AttemptKey(sample_index=0, repeat_index=0, pass_index=0),
+) -> dict[str, object]:
+    return bfcl_v3_runner._run_one_bfcl_v3_attempt(
+        key=key,
+        record=record,
+        run=SimpleNamespace(benchmark_name="bfcl_v3", dataset_split="test"),
+        tool_sampling=object(),
+        sampling_payload={},
+        max_steps=3,
+        max_tool_errors=2,
+        history_max_chars=4000,
+        prompt_max_chars=bfcl_v3_runner.BFCL_V3_DEFAULT_PROMPT_MAX_CHARS,
+        prompt_style=bfcl_v3_runner.RWKV_OFFICIAL_JSON_PROMPT_STYLE,
+        tool_routing_config=bfcl_v3_runner.ToolRoutingConfig(),
+        candidate_router_config=None,
+    )
+
+
+def test_bfcl_v3_episode_parse_error_yields_failed_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = BfclTaskRecord(task_id="parse-error-demo", instruction="Return a valid call")
+
+    def _raise_parse_error(**_kwargs: object) -> object:
+        raise ValueError("bad json")
+
+    monkeypatch.setattr(bfcl_v3_runner, "_run_bfcl_generation_step", _raise_parse_error)
+
+    payload = _run_bfcl_v3_attempt_for_test(record)
+
+    assert payload["agent_result"]["is_passed"] is False
+    assert payload["agent_info"]["termination_reason"] == "parse_error"
+    assert str(payload["agent_result"]["error"]).startswith("decode_failed:bad json")
+
+
+def test_bfcl_v3_episode_checker_error_yields_failed_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = BfclTaskRecord(task_id="checker-error-demo", instruction="Return the final answer")
+
+    def _final_answer_step(**_kwargs: object) -> object:
+        return bfcl_v3_runner._BfclGenerationStepOutcome(
+            ok=True,
+            trace_entry={"decision_text": "done"},
+            final_answer="done",
+        )
+
+    def _raise_checker_error(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("checker rejected payload")
+
+    monkeypatch.setattr(bfcl_v3_runner, "_run_bfcl_generation_step", _final_answer_step)
+    monkeypatch.setattr(bfcl_v3_runner, "evaluate_bfcl_v3_episode", _raise_checker_error)
+
+    payload = _run_bfcl_v3_attempt_for_test(record)
+
+    assert payload["agent_result"]["is_passed"] is False
+    assert str(payload["agent_info"]["fail_reason"]).startswith("checker_error:checker rejected payload")
+
+
+def test_bfcl_v3_unknown_runtime_error_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = BfclTaskRecord(task_id="runtime-error-demo", instruction="Return a valid call")
+    keys = [
+        AttemptKey(sample_index=0, repeat_index=0, pass_index=0),
+        AttemptKey(sample_index=1, repeat_index=0, pass_index=0),
+    ]
+    emitted: list[dict[str, object]] = []
+
+    def _raise_runtime_error(**_kwargs: object) -> object:
+        raise RuntimeError("oom")
+
+    monkeypatch.setattr(bfcl_v3_runner, "_run_bfcl_generation_step", _raise_runtime_error)
+
+    with pytest.raises(RuntimeError, match="oom"):
+        run_episodes(
+            keys,
+            lambda key: _run_bfcl_v3_attempt_for_test(record, key=key),
+            max_workers=1,
+            on_result=emitted.append,
+            label="bfcl_v3 episode",
+            collect_results=False,
+        )
+
+    assert len(emitted) < len(keys)

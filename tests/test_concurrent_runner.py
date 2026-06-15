@@ -52,6 +52,19 @@ def test_run_episodes_can_emit_without_collecting_results() -> None:
     assert result == []
 
 
+def test_run_episodes_emits_progress_in_order() -> None:
+    progress: list[tuple[int, int]] = []
+
+    result = run_episodes(
+        [1, 2, 3],
+        lambda value: value,
+        on_progress=lambda done, total: progress.append((done, total)),
+    )
+
+    assert result == [1, 2, 3]
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+
+
 def test_run_episodes_logs_traceback_and_reraises(caplog: pytest.LogCaptureFixture) -> None:
     def worker(value: int) -> int:
         if value == 2:
