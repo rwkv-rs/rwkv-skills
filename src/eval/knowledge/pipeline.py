@@ -89,9 +89,16 @@ class MultipleChoicePipelineResult:
 class MultipleChoicePipeline:
     """Wrap direct and CoT multiple-choice execution into canonical payloads."""
 
-    def __init__(self, backend: InferenceBackend, target_token_format: str = TARGET_TOKEN_FORMAT) -> None:
+    def __init__(
+        self,
+        backend: InferenceBackend,
+        target_token_format: str = TARGET_TOKEN_FORMAT,
+        *,
+        allow_generation_fallback: bool = False,
+    ) -> None:
         self.backend = backend
         self.target_token_format = target_token_format
+        self.allow_generation_fallback = bool(allow_generation_fallback)
 
     def run_direct(
         self,
@@ -147,7 +154,9 @@ class MultipleChoicePipeline:
             prompt = self._format_prompt(record, prompt_template)
             try:
                 _, pred_letter = self._score_prompt_choice_only(record, prompt)
-            except NotImplementedError:
+            except NotImplementedError as exc:
+                if not self.allow_generation_fallback:
+                    self._raise_choice_scoring_required("direct multiple-choice", exc)
                 payloads.extend(
                     self._run_direct_generation_batches(
                         expanded[entry_index:],
@@ -431,8 +440,18 @@ class MultipleChoicePipeline:
     def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
         try:
             return self._score_prompt_choice_only(record, prompt)
-        except NotImplementedError:
+        except NotImplementedError as exc:
+            if not self.allow_generation_fallback:
+                self._raise_choice_scoring_required("multiple-choice final answer", exc)
             return self._score_prompt_via_generation(record, prompt)
+
+    def _raise_choice_scoring_required(self, stage: str, exc: NotImplementedError) -> None:
+        raise RuntimeError(
+            f"{stage} requires backend candidate choice scoring; "
+            "refusing generative fallback because it is not comparable with logits-only scoring. "
+            "Use a backend that supports score_choice_tokens, or pass "
+            "--allow-generative-mc-fallback for a non-comparable diagnostic run."
+        ) from exc
 
     def _score_prompt_via_generation(
         self,

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+from collections import deque
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
 from src.infer.nano_vllm_backend import NanoVLLMBackendConfig, NanoVLLMInferenceBackend
 from src.infer.sampling import SamplingConfig
@@ -117,16 +119,110 @@ def test_nano_vllm_backend_submit_rejects_prompt_seed(monkeypatch, tmp_path: Pat
         backend.shutdown()
 
 
+def test_nano_vllm_backend_scores_candidate_tokens(monkeypatch, tmp_path: Path) -> None:
+    root, fake = _install_fake_nanovllm(monkeypatch, tmp_path)
+    backend = NanoVLLMInferenceBackend.from_config(
+        NanoVLLMBackendConfig(
+            model_path="/models/rwkv-demo.pth",
+            nano_vllm_path=root,
+            rwkv_state_cache_enable=True,
+        )
+    )
+    try:
+        scores, best_text = backend.score_choice_tokens(
+            prompt="question",
+            choice_token_texts=["A", "B"],
+        )
+    finally:
+        backend.shutdown()
+
+    assert best_text == "B"
+    assert scores["B"] > scores["A"]
+    assert fake.calls["run_logits"][0]["is_prefill"] is True
+    assert fake.calls["run_logits"][0]["prompt_token_ids"] == [ord(char) for char in "question"]
+    assert fake.calls["aborted"] == [0]
+
+
+def test_nano_vllm_backend_strips_hidden_stop_tokens_from_outputs(monkeypatch, tmp_path: Path) -> None:
+    root, _fake = _install_fake_nanovllm(monkeypatch, tmp_path)
+    backend = NanoVLLMInferenceBackend.from_config(
+        NanoVLLMBackendConfig(model_path="/models/rwkv-demo.pth", nano_vllm_path=root)
+    )
+    try:
+        outputs = backend.generate(
+            ["hidden-stop"],
+            sampling=SamplingConfig(max_generate_tokens=8),
+            batch_size=1,
+            show_progress=False,
+        )
+    finally:
+        backend.shutdown()
+
+    assert outputs[0].text == "visible"
+    assert outputs[0].token_ids == [ord(char) for char in "visible"]
+
+
 def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
     root = tmp_path / "nano-vllm-rwkv-315cf53"
     (root / "nanovllm" / "engine").mkdir(parents=True)
-    calls: dict[str, object] = {"sampling_params": [], "seqs": []}
+    calls: dict[str, object] = {"sampling_params": [], "seqs": [], "run_logits": [], "aborted": []}
 
     class Scheduler:
-        pass
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(rwkv_prefill_chunk_size=-1)
+            self.waiting = deque()
+            self.running = deque()
+
+        def add(self, seq) -> None:
+            self.waiting.append(seq)
+
+        def schedule(self):
+            if self.waiting:
+                seq = self.waiting.popleft()
+                self.running.append(seq)
+                return [seq], True
+            if self.running:
+                return list(self.running), False
+            raise AssertionError("schedule called with no active fake sequences")
+
+        def postprocess(self, seqs, token_ids) -> None:
+            for seq, token_id in zip(seqs, token_ids, strict=True):
+                if token_id is not None:
+                    seq.append_token(int(token_id))
+                    seq.is_finished = True
+                    if seq in self.running:
+                        self.running.remove(seq)
+
+        def abort(self, seq_id: int) -> bool:
+            calls["aborted"].append(int(seq_id))
+            for queue in (self.waiting, self.running):
+                for seq in list(queue):
+                    if seq.seq_id == seq_id:
+                        queue.remove(seq)
+                        seq.is_finished = True
+                        return True
+            return False
 
     class ModelRunner:
-        pass
+        def call(self, method_name: str, seqs, is_prefill: bool):
+            if method_name == "prepare_postprocess":
+                for seq in seqs:
+                    seq.num_cached_tokens = seq.num_prompt_tokens
+                return None
+            assert method_name == "run_logits"
+            calls["run_logits"].append(
+                {
+                    "is_prefill": is_prefill,
+                    "prompt_token_ids": list(seqs[0].token_ids),
+                }
+            )
+            logits = torch.zeros((len(seqs), 256), dtype=torch.float32)
+            logits[:, ord("A")] = 1.0
+            logits[:, ord("B")] = 3.0
+            return logits
+
+        def sampler(self, logits, seqs):
+            return torch.full((len(seqs),), ord("x"), dtype=torch.long)
 
     class SamplingParams:
         def __init__(
@@ -160,6 +256,41 @@ def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
         def decode(self, token_ids: list[int]) -> str:
             return "".join(chr(token_id) for token_id in token_ids)
 
+    class Sequence:
+        def __init__(self, token_ids: list[int], sampling_params: SamplingParams | None = None) -> None:
+            self.seq_id = -1
+            self.token_ids = list(token_ids)
+            self.sampling_params = sampling_params
+            self.allow_sparse_penalty_state = False
+            self.num_prompt_tokens = len(token_ids)
+            self.num_cached_tokens = 0
+            self.max_tokens = 1 if sampling_params is None else sampling_params.max_tokens
+            self.num_raw_completion_tokens = 0
+            self.hidden_completion_token_count = 0
+            self.pending_hidden_finalize = False
+            self.is_finished = False
+
+        @property
+        def raw_completion_token_ids(self):
+            return self.token_ids[self.num_prompt_tokens:]
+
+        @property
+        def completion_token_ids(self):
+            if self.hidden_completion_token_count <= 0:
+                return self.raw_completion_token_ids
+            end = max(self.num_prompt_tokens, len(self.token_ids) - self.hidden_completion_token_count)
+            return self.token_ids[self.num_prompt_tokens:end]
+
+        def append_token(self, token_id: int) -> None:
+            self.token_ids.append(int(token_id))
+            self.num_raw_completion_tokens += 1
+
+        def prefill_step_tokens(self, chunk_size: int) -> int:
+            remaining = max(0, self.num_prompt_tokens - self.num_cached_tokens)
+            if chunk_size == -1:
+                return remaining
+            return min(remaining, max(0, int(chunk_size)))
+
     class LLMEngine:
         def __init__(self, model: str, **kwargs) -> None:
             calls["model"] = model
@@ -172,13 +303,11 @@ def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
             self.exit_calls = 0
 
         def add_request(self, prompt: str, sampling_params: SamplingParams):
-            seq = SimpleNamespace(
-                seq_id=self._next_seq_id,
-                max_tokens=sampling_params.max_tokens,
-                num_raw_completion_tokens=0,
-            )
+            seq = Sequence(self.tokenizer.encode(prompt), sampling_params)
+            seq.seq_id = self._next_seq_id
             self._next_seq_id += 1
             self._pending.append((seq, prompt))
+            self.scheduler.add(seq)
             calls["seqs"].append(seq)
             return seq
 
@@ -188,7 +317,15 @@ def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
         def step(self):
             outputs = []
             for seq, prompt in self._pending:
+                if prompt == "hidden-stop":
+                    token_ids = [ord(char) for char in "visible!"]
+                    seq.token_ids.extend(token_ids)
+                    seq.num_raw_completion_tokens = len(token_ids)
+                    seq.hidden_completion_token_count = 1
+                    outputs.append((seq.seq_id, token_ids, [-0.1]))
+                    continue
                 token_ids = [ord(char) for char in f"{prompt}-done STOP tail"]
+                seq.token_ids.extend(token_ids)
                 seq.num_raw_completion_tokens = len(token_ids)
                 outputs.append((seq.seq_id, token_ids))
             self._pending = []
@@ -210,6 +347,7 @@ def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
         "nanovllm.engine.llm_engine": ModuleType("nanovllm.engine.llm_engine"),
         "nanovllm.engine.scheduler": ModuleType("nanovllm.engine.scheduler"),
         "nanovllm.engine.model_runner": ModuleType("nanovllm.engine.model_runner"),
+        "nanovllm.engine.sequence": ModuleType("nanovllm.engine.sequence"),
         "nanovllm.sampling_params": ModuleType("nanovllm.sampling_params"),
     }
     modules["nanovllm"].__path__ = []  # type: ignore[attr-defined]
@@ -217,6 +355,7 @@ def _install_fake_nanovllm(monkeypatch, tmp_path: Path):
     modules["nanovllm.engine.llm_engine"].LLMEngine = LLMEngine
     modules["nanovllm.engine.scheduler"].Scheduler = Scheduler
     modules["nanovllm.engine.model_runner"].ModelRunner = ModelRunner
+    modules["nanovllm.engine.sequence"].Sequence = Sequence
     modules["nanovllm.sampling_params"].SamplingParams = SamplingParams
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)

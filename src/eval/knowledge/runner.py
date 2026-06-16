@@ -18,6 +18,7 @@ from src.eval.k_values import filter_metrics_by_k
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
+    require_completion_style_remote_protocol,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
@@ -44,6 +45,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--probe-only",
         action="store_true",
         help="Run a single-batch CoT probe and skip scoring",
+    )
+    parser.add_argument(
+        "--allow-generative-mc-fallback",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pass-k",
@@ -127,6 +133,10 @@ def main(
     cot_mode = CoTMode(args.cot_mode)
     if args.probe_only and cot_mode is not CoTMode.COT:
         raise ValueError("--probe-only is only supported with --cot-mode cot")
+    completion_style_remote = require_completion_style_remote_protocol(
+        args,
+        benchmark_name="multiple-choice knowledge benchmarks",
+    )
 
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
@@ -141,7 +151,11 @@ def main(
     plan = k_plan.plan
     attempt_keys = build_attempt_keys(plan, max_pass_k=1)
     backend = build_inference_backend_from_args(args)
-    pipeline = MultipleChoicePipeline(backend, target_token_format=args.target_token_format)
+    pipeline = MultipleChoicePipeline(
+        backend,
+        target_token_format=args.target_token_format,
+        allow_generation_fallback=bool(args.allow_generative_mc_fallback),
+    )
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
@@ -286,7 +300,16 @@ def main(
             samples=metrics.samples,
             task=job_name,
             task_details=task_details,
-            extra={"cot_mode": cot_mode.value},
+            extra={
+                "cot_mode": cot_mode.value,
+                "infer_protocol": getattr(args, "infer_protocol", "local"),
+                "completion_style_remote": completion_style_remote,
+                "choice_scoring": (
+                    "logits_only_required"
+                    if not args.allow_generative_mc_fallback
+                    else "generative_fallback_allowed"
+                ),
+            },
         )
         runtime.record_score(score_payload)
     except Exception as exc:

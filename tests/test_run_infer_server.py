@@ -4,7 +4,7 @@ from pathlib import Path
 
 from src.bin import run_infer_server
 from src.infer.auto_config import GpuProfile
-from src.infer.nano_vllm_backend import NanoVLLMBackendConfig
+from src.infer.nano_vllm_backend import DEFAULT_NANO_VLLM_PATH, NanoVLLMBackendConfig
 
 
 def test_run_infer_server_no_longer_imports_local_backend() -> None:
@@ -12,6 +12,12 @@ def test_run_infer_server_no_longer_imports_local_backend() -> None:
 
     assert "LocalInferenceBackend" not in source
     assert "ModelLoadConfig" not in source
+
+
+def test_default_nano_vllm_path_points_to_repo_vendor() -> None:
+    assert DEFAULT_NANO_VLLM_PATH.name == "nano-vllm-rwkv"
+    assert DEFAULT_NANO_VLLM_PATH.parent.name == "vendor"
+    assert (DEFAULT_NANO_VLLM_PATH / "nanovllm" / "engine" / "llm_engine.py").is_file()
 
 
 def test_build_backend_uses_nano_vllm_config(monkeypatch, tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ from queue import Empty, Queue
 from types import ModuleType
 from typing import Any, Callable, Literal, Sequence
 
+import torch
 from tqdm import tqdm
 
 from .constraints import DecodeConstraint
@@ -20,7 +21,8 @@ from .engine import DEFAULT_PREFILL_CHUNK_SIZE
 from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
 
 
-DEFAULT_NANO_VLLM_PATH = Path("/tmp/nano-vllm-rwkv-315cf53")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_NANO_VLLM_PATH = _REPO_ROOT / "vendor" / "nano-vllm-rwkv"
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,6 +90,14 @@ class _NanoSubmitRequest:
 
 
 @dataclass(slots=True)
+class _NanoScoreRequest:
+    prompt: str
+    choice_token_texts: tuple[str, ...]
+    future: Future[tuple[dict[str, float], str]]
+    enqueued_at: int
+
+
+@dataclass(slots=True)
 class _NanoActiveRecord:
     prompt_index: int
     prompt: str
@@ -103,17 +113,31 @@ class _NanoActiveRecord:
 
 
 @dataclass(slots=True)
+class _NanoActiveScoreRecord:
+    prompt: str
+    seq: object
+    future: Future[tuple[dict[str, float], str]]
+    choice_token_texts: tuple[str, ...]
+    choice_token_ids: tuple[int, ...]
+    enqueued_at: int
+    admitted_at: int
+    prompt_token_count: int
+    cache_admission_observed: bool = False
+
+
+@dataclass(slots=True)
 class NanoVLLMInferenceBackend:
     config: NanoVLLMBackendConfig
     runtime: _NanoVLLMRuntime
     engine: object
     scheduler: object
     model_runner: object
-    _inbox: Queue[_NanoSubmitRequest | None]
+    _inbox: Queue[_NanoSubmitRequest | _NanoScoreRequest | None]
     _stop: threading.Event
     _owner: threading.Thread
     _active_lock: threading.Lock
     _active_records: dict[int, _NanoActiveRecord]
+    _active_score_records: dict[int, _NanoActiveScoreRecord]
     _metrics_lock: threading.Lock
     _last_batch_metrics: dict[str, object]
     _metrics_totals: dict[str, int]
@@ -139,6 +163,7 @@ class NanoVLLMInferenceBackend:
             _owner=threading.Thread(),
             _active_lock=threading.Lock(),
             _active_records={},
+            _active_score_records={},
             _metrics_lock=threading.Lock(),
             _last_batch_metrics={},
             _metrics_totals={
@@ -332,7 +357,7 @@ class NanoVLLMInferenceBackend:
                 try:
                     self._observe_cache_admissions()
                     step_started = time.perf_counter()
-                    raw_outputs, num_tokens = self.engine.step()
+                    raw_outputs, num_tokens = self._step_engine()
                     elapsed_s = max(time.perf_counter() - step_started, 1e-9)
                     self._observe_cache_admissions()
                     self._record_owner_step(num_tokens=num_tokens, elapsed_s=elapsed_s)
@@ -363,7 +388,10 @@ class NanoVLLMInferenceBackend:
                 self._record_error_request()
                 continue
             try:
-                self._admit_request(item)
+                if isinstance(item, _NanoScoreRequest):
+                    self._admit_score_request(item)
+                else:
+                    self._admit_request(item)
                 admitted = True
             except BaseException as exc:
                 self._set_future_exception(item.future, exc)
@@ -397,15 +425,115 @@ class NanoVLLMInferenceBackend:
         with self._metrics_lock:
             self._metrics_totals["prompt_prefill_tokens"] += int(record.prompt_token_count)
 
+    def _admit_score_request(self, request: _NanoScoreRequest) -> None:
+        prompt_token_ids = self._encode_text(request.prompt)
+        if not prompt_token_ids:
+            raise ValueError("choice scoring prompt must tokenize to at least one token")
+        choice_token_ids = tuple(self._single_token_id(text) for text in request.choice_token_texts)
+        sampling_params = self._to_sampling_params(
+            SamplingConfig(
+                max_generate_tokens=1,
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                alpha_presence=0.0,
+                alpha_frequency=0.0,
+                alpha_decay=1.0,
+                stop_tokens=(),
+                no_penalty_token_ids=(),
+            )
+        )
+        seq = self.engine.add_request(request.prompt, sampling_params)
+        setattr(seq, "allow_sparse_penalty_state", True)
+        record = _NanoActiveScoreRecord(
+            prompt=request.prompt,
+            seq=seq,
+            future=request.future,
+            choice_token_texts=request.choice_token_texts,
+            choice_token_ids=choice_token_ids,
+            enqueued_at=request.enqueued_at,
+            admitted_at=time.monotonic_ns(),
+            prompt_token_count=len(prompt_token_ids),
+        )
+        seq_id = int(getattr(seq, "seq_id"))
+        with self._active_lock:
+            self._active_score_records[seq_id] = record
+        with self._metrics_lock:
+            self._metrics_totals["prompt_prefill_tokens"] += int(record.prompt_token_count)
+
+    def _step_engine(self) -> tuple[object, object]:
+        if self._active_score_count() > 0:
+            return self._step_engine_with_scoring()
+        return self.engine.step()
+
+    def _step_engine_with_scoring(self) -> tuple[list[tuple[int, object]], int]:
+        seqs, is_prefill = self.scheduler.schedule()
+        num_tokens = (
+            sum(_seq_prefill_step_tokens(seq, _scheduler_prefill_chunk_size(self.scheduler)) for seq in seqs)
+            if is_prefill
+            else -len(seqs)
+        )
+        logits = self.model_runner.call("run_logits", seqs, is_prefill)
+        if not isinstance(logits, torch.Tensor):
+            logits = torch.as_tensor(logits)
+        if logits.ndim == 1:
+            logits = logits.unsqueeze(0)
+        if logits.ndim != 2:
+            raise RuntimeError(f"nano-vLLM run_logits returned unexpected shape {tuple(logits.shape)}")
+
+        token_ids: list[int | None] = [None] * len(seqs)
+        sample_indices: list[int] = []
+        sample_seqs: list[object] = []
+        score_results: list[tuple[int, dict[str, float]]] = []
+
+        for index, seq in enumerate(seqs):
+            seq_id = int(getattr(seq, "seq_id"))
+            score_record = self._get_active_score_record(seq_id)
+            if score_record is not None:
+                if _can_emit_sequence_token(self.scheduler, seq, is_prefill):
+                    score_results.append((seq_id, _score_choices_from_logits(logits[index], score_record)))
+                continue
+            if not _can_emit_sequence_token(self.scheduler, seq, is_prefill):
+                continue
+            if getattr(seq, "pending_hidden_finalize", False):
+                continue
+            sample_indices.append(index)
+            sample_seqs.append(seq)
+
+        if sample_indices:
+            index_tensor = torch.tensor(sample_indices, dtype=torch.int64, device=logits.device)
+            sample_logits = logits.index_select(0, index_tensor) if len(sample_indices) != len(seqs) else logits
+            sampled_tokens = self.model_runner.sampler(sample_logits, sample_seqs).tolist()
+            for index, token_id in zip(sample_indices, sampled_tokens, strict=True):
+                token_ids[index] = int(token_id)
+
+        self.model_runner.call("prepare_postprocess", seqs, token_ids)
+        self.scheduler.postprocess(seqs, token_ids)
+
+        for seq_id, scores in score_results:
+            self._complete_score_record(seq_id, scores)
+
+        outputs: list[tuple[int, object]] = []
+        for seq in seqs:
+            seq_id = int(getattr(seq, "seq_id"))
+            if self._get_active_record(seq_id) is None or not bool(getattr(seq, "is_finished", False)):
+                continue
+            outputs.append((seq_id, getattr(seq, "raw_completion_token_ids", [])))
+        return outputs, int(num_tokens)
+
     def _complete_raw_outputs(self, raw_outputs: object) -> None:
-        for raw_seq_id, token_ids in raw_outputs or ():
+        for item in raw_outputs or ():
+            raw_seq_id = item[0]
+            token_ids = item[1] if len(item) > 1 else []
             seq_id = int(raw_seq_id)
             with self._active_lock:
                 record = self._active_records.pop(seq_id, None)
             if record is None:
                 continue
             try:
-                tokens = [int(token_id) for token_id in token_ids]
+                visible_token_ids = getattr(record.seq, "completion_token_ids", None)
+                tokens_source = visible_token_ids if visible_token_ids is not None else token_ids
+                tokens = [int(token_id) for token_id in tokens_source]
                 text = self._decode_token_ids(tokens)
                 text, trimmed = _trim_at_stop_suffix(text, record.prompt_stop_suffixes)
                 output = GenerationOutput(
@@ -434,13 +562,14 @@ class NanoVLLMInferenceBackend:
         waiting_ids = _scheduler_seq_ids(self.scheduler, "waiting")
         observations: list[tuple[int, bool, bool]] = []
         with self._active_lock:
-            for seq_id, record in self._active_records.items():
-                if record.cache_admission_observed or seq_id in waiting_ids:
-                    continue
-                cache_hit = getattr(record.seq, "cache_hit_slot", None) is not None
-                exact_hit = bool(getattr(record.seq, "exact_cache_hit", False))
-                record.cache_admission_observed = True
-                observations.append((seq_id, cache_hit or exact_hit, exact_hit))
+            for records in (self._active_records, self._active_score_records):
+                for seq_id, record in records.items():
+                    if record.cache_admission_observed or seq_id in waiting_ids:
+                        continue
+                    cache_hit = getattr(record.seq, "cache_hit_slot", None) is not None
+                    exact_hit = bool(getattr(record.seq, "exact_cache_hit", False))
+                    record.cache_admission_observed = True
+                    observations.append((seq_id, cache_hit or exact_hit, exact_hit))
         if not observations:
             return
         with self._metrics_lock:
@@ -483,13 +612,30 @@ class NanoVLLMInferenceBackend:
 
     def _active_count(self) -> int:
         with self._active_lock:
-            return len(self._active_records)
+            return len(self._active_records) + len(self._active_score_records)
+
+    def _active_score_count(self) -> int:
+        with self._active_lock:
+            return len(self._active_score_records)
+
+    def _get_active_record(self, seq_id: int) -> _NanoActiveRecord | None:
+        with self._active_lock:
+            return self._active_records.get(int(seq_id))
+
+    def _get_active_score_record(self, seq_id: int) -> _NanoActiveScoreRecord | None:
+        with self._active_lock:
+            return self._active_score_records.get(int(seq_id))
 
     def _fail_all_active(self, exc: BaseException) -> None:
         with self._active_lock:
             records = list(self._active_records.values())
+            score_records = list(self._active_score_records.values())
             self._active_records.clear()
+            self._active_score_records.clear()
         for record in records:
+            self._set_future_exception(record.future, exc)
+            self._record_error_request()
+        for record in score_records:
             self._set_future_exception(record.future, exc)
             self._record_error_request()
 
@@ -505,9 +651,22 @@ class NanoVLLMInferenceBackend:
             self._record_cancelled_request()
 
     @staticmethod
-    def _set_future_exception(future: Future[GenerationOutput], exc: BaseException) -> None:
+    def _set_future_exception(future: Future[Any], exc: BaseException) -> None:
         if not future.done():
             future.set_exception(exc)
+
+    def _encode_text(self, text: str) -> list[int]:
+        tokenizer = getattr(self.engine, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            raise RuntimeError("nano-vLLM engine tokenizer does not expose encode()")
+        return [int(token_id) for token_id in encode(str(text))]
+
+    def _single_token_id(self, text: str) -> int:
+        token_ids = self._encode_text(str(text))
+        if len(token_ids) != 1:
+            raise ValueError(f"choice token text {text!r} must encode to exactly one token, got {token_ids}")
+        return int(token_ids[0])
 
     def _to_sampling_params(self, sampling: SamplingConfig) -> object:
         top_k = int(sampling.top_k)
@@ -569,9 +728,48 @@ class NanoVLLMInferenceBackend:
         prompt: str,
         choice_token_texts: Sequence[str],
     ) -> tuple[dict[str, float], str]:
-        _ = prompt
-        _ = choice_token_texts
-        raise NotImplementedError("nano-vLLM backend does not support candidate choice scoring")
+        if self._stop.is_set():
+            raise RuntimeError("nano-vLLM backend is shut down")
+        choices = tuple(str(item) for item in choice_token_texts)
+        if not choices:
+            raise ValueError("choice_token_texts cannot be empty")
+        future: Future[tuple[dict[str, float], str]] = Future()
+        request = _NanoScoreRequest(
+            prompt=str(prompt),
+            choice_token_texts=choices,
+            future=future,
+            enqueued_at=time.monotonic_ns(),
+        )
+        with self._metrics_lock:
+            self._metrics_totals["submitted_requests"] += 1
+        if threading.current_thread() is self._owner:
+            self._admit_score_request(request)
+            while not future.done():
+                step_started = time.perf_counter()
+                raw_outputs, num_tokens = self._step_engine()
+                elapsed_s = max(time.perf_counter() - step_started, 1e-9)
+                self._record_owner_step(num_tokens=num_tokens, elapsed_s=elapsed_s)
+                self._complete_raw_outputs(raw_outputs)
+        else:
+            self._inbox.put(request)
+        return future.result()
+
+    def _complete_score_record(self, seq_id: int, scores: dict[str, float]) -> None:
+        with self._active_lock:
+            record = self._active_score_records.pop(int(seq_id), None)
+        if record is None:
+            return
+        try:
+            abort = getattr(self.scheduler, "abort", None)
+            if callable(abort):
+                abort(int(seq_id))
+            best_text = max(record.choice_token_texts, key=lambda item: scores[item])
+            if not record.future.done():
+                record.future.set_result((scores, best_text))
+            self._record_completed_request(generated_tokens=0)
+        except BaseException as exc:
+            self._set_future_exception(record.future, exc)
+            self._record_error_request()
 
     def shutdown(self) -> None:
         if self._stop.is_set():
@@ -688,23 +886,6 @@ def _scheduler_seq_ids(scheduler: object, name: str) -> set[int]:
         return set()
 
 
-def _active_sequence_count(engine: object, scheduler: object) -> int | None:
-    for owner in (scheduler, engine):
-        for name in (
-            "running",
-            "running_seqs",
-            "active_seqs",
-            "seqs",
-            "waiting",
-            "waiting_queue",
-            "requests",
-        ):
-            size = _safe_len(getattr(owner, name, None))
-            if size is not None:
-                return int(size)
-    return None
-
-
 def _scheduler_snapshot(scheduler: object) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for name in (
@@ -735,20 +916,47 @@ def _prompt_token_count(engine: object, prompt: str) -> int:
     return max(1, len(prompt))
 
 
-def _fallback_seq_record(
-    seq_records: dict[int, tuple[int, str, object, Sequence[str] | None]],
-    *,
-    raw_seq_id: int,
-    batch_start: int,
-) -> tuple[int, str, object, Sequence[str] | None] | None:
-    if len(seq_records) == 1:
-        return next(iter(seq_records.values()))
-    local_index = int(raw_seq_id) - int(batch_start)
-    if 0 <= local_index < len(seq_records):
-        return list(seq_records.values())[local_index]
-    if 0 <= int(raw_seq_id) < len(seq_records):
-        return list(seq_records.values())[int(raw_seq_id)]
-    return None
+def _scheduler_prefill_chunk_size(scheduler: object) -> int:
+    config = getattr(scheduler, "config", None)
+    try:
+        return int(getattr(config, "rwkv_prefill_chunk_size"))
+    except (AttributeError, TypeError, ValueError):
+        return -1
+
+
+def _seq_prefill_step_tokens(seq: object, chunk_size: int) -> int:
+    method = getattr(seq, "prefill_step_tokens", None)
+    if callable(method):
+        return max(0, int(method(chunk_size)))
+    try:
+        remaining = int(getattr(seq, "num_prompt_tokens")) - int(getattr(seq, "num_cached_tokens", 0))
+    except (TypeError, ValueError):
+        return 0
+    remaining = max(0, remaining)
+    if int(chunk_size) == -1:
+        return remaining
+    return min(remaining, max(0, int(chunk_size)))
+
+
+def _can_emit_sequence_token(scheduler: object, seq: object, is_prefill: bool) -> bool:
+    if not is_prefill:
+        return True
+    chunk_size = _scheduler_prefill_chunk_size(scheduler)
+    try:
+        cached = int(getattr(seq, "num_cached_tokens", 0))
+        prompt_tokens = int(getattr(seq, "num_prompt_tokens"))
+    except (TypeError, ValueError):
+        return True
+    return cached + _seq_prefill_step_tokens(seq, chunk_size) >= prompt_tokens
+
+
+def _score_choices_from_logits(logits_row: torch.Tensor, record: _NanoActiveScoreRecord) -> dict[str, float]:
+    if logits_row.ndim != 1:
+        logits_row = logits_row.reshape(-1)
+    return {
+        text: float(logits_row[int(token_id)].detach().to("cpu").item())
+        for text, token_id in zip(record.choice_token_texts, record.choice_token_ids, strict=True)
+    }
 
 
 def _dedupe_token_seqs(token_seqs: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:

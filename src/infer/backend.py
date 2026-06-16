@@ -151,6 +151,34 @@ def resolve_backend_model_name(args: argparse.Namespace) -> str:
     return Path(model_path).stem
 
 
+def require_completion_style_remote_protocol(
+    args: argparse.Namespace,
+    *,
+    benchmark_name: str,
+) -> bool:
+    """Force legacy prefilled prompts onto raw completions when using remote infer."""
+
+    validate_inference_backend_args(args)
+    infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip()
+    if not infer_base_url:
+        return False
+    protocol = _normalize_remote_protocol(getattr(args, "infer_protocol", "openai"))
+    if protocol == "vllm":
+        raise ValueError(
+            f"{benchmark_name} requires completion-style remote generation; "
+            "use --infer-protocol completions instead of vllm/chat."
+        )
+    if protocol == "openai":
+        setattr(args, "infer_protocol", "completions")
+        return True
+    if protocol == "completions":
+        return True
+    raise ValueError(
+        f"{benchmark_name} requires completion-style remote generation; "
+        f"unsupported infer protocol: {protocol}"
+    )
+
+
 class InferenceBackend(Protocol):
     model_name: str
 
@@ -512,7 +540,7 @@ class RemoteInferenceBackend:
     ) -> tuple[dict[str, float], str]:
         if not choice_token_texts:
             raise ValueError("choice_token_texts cannot be empty")
-        if self.config.protocol in {"vllm", "completions"}:
+        if self.config.protocol == "vllm":
             self._legacy_choice_scoring_supported = False
             raise NotImplementedError(
                 f"{self.config.protocol} remote protocol does not support candidate choice scoring"
@@ -972,6 +1000,7 @@ __all__ = [
     "build_inference_backend_from_args",
     "normalize_api_base",
     "normalize_local_device",
+    "require_completion_style_remote_protocol",
     "resolve_backend_model_name",
     "validate_inference_backend_args",
 ]

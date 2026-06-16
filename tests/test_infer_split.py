@@ -33,6 +33,7 @@ from src.infer.backend import (
     RemoteInferenceConfig,
     normalize_api_base,
     normalize_local_device,
+    require_completion_style_remote_protocol,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
@@ -347,6 +348,30 @@ def test_inference_backend_arg_validation_and_model_name_resolution() -> None:
     validate_inference_backend_args(remote_args)
     assert resolve_backend_model_name(remote_args) == "remote-demo"
     assert normalize_api_base("127.0.0.1:8081") == "http://127.0.0.1:8081/v1"
+
+
+def test_completion_style_remote_protocol_normalizes_openai_to_completions() -> None:
+    args = argparse.Namespace(
+        model_path="",
+        infer_base_url="127.0.0.1:8081",
+        infer_model="remote-demo",
+        infer_protocol="openai",
+    )
+
+    assert require_completion_style_remote_protocol(args, benchmark_name="legacy code") is True
+    assert args.infer_protocol == "completions"
+
+
+def test_completion_style_remote_protocol_rejects_vllm() -> None:
+    args = argparse.Namespace(
+        model_path="",
+        infer_base_url="127.0.0.1:8081",
+        infer_model="remote-demo",
+        infer_protocol="vllm",
+    )
+
+    with pytest.raises(ValueError, match="requires completion-style"):
+        require_completion_style_remote_protocol(args, benchmark_name="legacy code")
 
 
 def test_inference_service_batches_generation_and_handles_choice_scoring() -> None:
@@ -1231,7 +1256,7 @@ def test_remote_backend_choice_scoring_unsupported_500_falls_back(monkeypatch) -
     assert len(calls) == 1
 
 
-def test_remote_backend_completions_protocol_rejects_private_choice_scoring(monkeypatch) -> None:
+def test_remote_backend_completions_protocol_supports_choice_scoring(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(
             base_url="http://127.0.0.1:19081/openai",
@@ -1244,13 +1269,28 @@ def test_remote_backend_completions_protocol_rejects_private_choice_scoring(monk
     monkeypatch.setattr(
         RemoteInferenceBackend,
         "_post_json",
-        lambda self, url, payload: calls.append((url, payload)) or {},
+        lambda self, url, payload: calls.append((url, payload))
+        or {
+            "choices": [
+                {
+                    "text": " B",
+                    "logprobs": {
+                        "tokens": [" B"],
+                        "token_logprobs": [-0.1],
+                        "top_logprobs": [{" A": -2.0, " B": -0.1}],
+                    },
+                }
+            ]
+        },
     )
 
-    with pytest.raises(NotImplementedError, match="candidate choice scoring"):
-        backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
+    scores, best_text = backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
 
-    assert calls == []
+    assert best_text == " B"
+    assert scores[" B"] > scores[" A"]
+    assert len(calls) == 1
+    assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/completions"
+    assert calls[0][1]["candidate_token_texts"] == [" A", " B"]
 
 
 def test_remote_backend_legacy_nano_single_requests_keep_private_fields(monkeypatch) -> None:

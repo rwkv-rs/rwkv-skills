@@ -16,6 +16,7 @@ answer, ref_answer, is_passed, fail_reason
 import json
 import orjson
 from pathlib import Path
+import re
 import tempfile
 from typing import Iterable
 
@@ -26,6 +27,13 @@ from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import build_context_from_completions, strict_nonneg_int
 from src.eval.metrics.code_generation.human_eval import evaluate_functional_correctness
 from src.eval.metrics.code_generation.mbpp import evaluate_mbpp
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_FENCED_CODE_RE = re.compile(
+    r"```[ \t]*(?:python|py)?[^\S\r\n]*\r?\n(?P<code>.*?)```",
+    re.IGNORECASE | re.DOTALL,
+)
+_LEADING_END_THINK_RE = re.compile(r"^[\s\r\n]*</think>[ \t]*\r?\n?", re.IGNORECASE)
 
 
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
@@ -41,6 +49,20 @@ def _max_stage_index(payload: dict) -> int:
         if key.startswith("completion") and key.removeprefix("completion").isdigit():
             stage = max(stage, int(key.removeprefix("completion")))
     return stage
+
+
+def extract_code_completion(text: str) -> str:
+    """Recover executable code from chatty code-benchmark completions."""
+
+    if not text:
+        return ""
+    body = str(text)
+    body = _THINK_BLOCK_RE.sub("", body)
+    body = _LEADING_END_THINK_RE.sub("", body, count=1)
+    matches = list(_FENCED_CODE_RE.finditer(body))
+    if matches:
+        return matches[-1].group("code").strip("\r\n").rstrip()
+    return body.rstrip()
 
 
 def _write_temp_samples(
@@ -62,6 +84,7 @@ def _write_temp_samples(
             last_stage = _max_stage_index(payload)
             completion = str(payload.get(f"completion{last_stage}", "") or "")
             context = build_context_from_completions(payload)
+            executable_completion = extract_code_completion(completion)
             sample = {
                 "benchmark_name": payload.get("benchmark_name", ""),
                 "dataset_split": payload.get("dataset_split", ""),
@@ -70,7 +93,7 @@ def _write_temp_samples(
                 "context": context,
                 "task_id": task_id,
                 # Keep evaluator behaviour consistent with prior runs: strip trailing whitespace.
-                "completion": completion.rstrip(),
+                "completion": executable_completion,
             }
             out_f.write(orjson.dumps(sample, option=orjson.OPT_APPEND_NEWLINE))
             count += 1
@@ -202,4 +225,9 @@ def evaluate_mbpp_dataset(
         return metrics or {}, eval_payloads
 
 
-__all__ = ["eval_rows_from_payloads", "evaluate_human_eval", "evaluate_mbpp_dataset"]
+__all__ = [
+    "eval_rows_from_payloads",
+    "evaluate_human_eval",
+    "evaluate_mbpp_dataset",
+    "extract_code_completion",
+]

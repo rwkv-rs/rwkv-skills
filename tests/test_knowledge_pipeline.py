@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src.eval.knowledge.pipeline import MultipleChoicePipeline
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.infer.sampling import GenerationOutput
+from src.infer.sampling import SamplingConfig
 
 
 class _FallbackOnlyBackend:
@@ -29,7 +32,7 @@ class _FallbackOnlyBackend:
     ):
         self.generate_calls.append(list(prompts))
         self.generate_batch_sizes.append(int(batch_size))
-        return [
+        outputs = [
             GenerationOutput(
                 prompt_index=index,
                 prompt=str(prompt),
@@ -39,12 +42,16 @@ class _FallbackOnlyBackend:
             )
             for index, prompt in enumerate(prompts)
         ]
+        if on_complete is not None and not probe_only:
+            for output in outputs:
+                on_complete(output)
+        return outputs
 
     def score_choice_tokens(self, *, prompt: str, choice_token_texts):
         raise NotImplementedError("standard chat backend has no choice logits")
 
 
-def test_multiple_choice_pipeline_falls_back_to_generation_when_choice_scoring_is_unavailable(tmp_path) -> None:
+def test_multiple_choice_pipeline_requires_choice_scoring_by_default(tmp_path) -> None:
     dataset_path = tmp_path / "mmlu_demo_test.jsonl"
     dataset_path.write_text(
         json.dumps(
@@ -65,13 +72,10 @@ def test_multiple_choice_pipeline_falls_back_to_generation_when_choice_scoring_i
     backend = _FallbackOnlyBackend()
     pipeline = MultipleChoicePipeline(backend)
 
-    result = pipeline.run_direct(str(dataset_path))
+    with pytest.raises(RuntimeError, match="requires backend candidate choice scoring"):
+        pipeline.run_direct(str(dataset_path))
 
-    assert result.sample_count == 1
-    assert len(result.payloads) == 1
-    assert result.payloads[0]["completion1"] == " B"
-    assert result.payloads[0]["stop_reason1"] == "logits_only"
-    assert backend.generate_calls and "Assistant: The answer is" in backend.generate_calls[0][0]
+    assert backend.generate_calls == []
 
 
 def test_multiple_choice_pipeline_batches_fallback_generation(tmp_path) -> None:
@@ -93,7 +97,7 @@ def test_multiple_choice_pipeline_batches_fallback_generation(tmp_path) -> None:
         encoding="utf-8",
     )
     backend = _FallbackOnlyBackend()
-    pipeline = MultipleChoicePipeline(backend)
+    pipeline = MultipleChoicePipeline(backend, allow_generation_fallback=True)
 
     result = pipeline.run_direct(str(dataset_path), batch_size=3)
 
@@ -122,7 +126,7 @@ def test_multiple_choice_pipeline_marks_invalid_fallback_generation_wrong(tmp_pa
         encoding="utf-8",
     )
     backend = _FallbackOnlyBackend(text=" (1)(2)(3).\n")
-    pipeline = MultipleChoicePipeline(backend)
+    pipeline = MultipleChoicePipeline(backend, allow_generation_fallback=True)
 
     result = pipeline.run_direct(str(dataset_path))
     metrics = evaluate_multiple_choice(result.payloads, dataset_path=dataset_path)
@@ -130,3 +134,74 @@ def test_multiple_choice_pipeline_marks_invalid_fallback_generation_wrong(tmp_pa
     assert result.sample_count == 1
     assert result.payloads[0]["completion1"] == " "
     assert metrics.accuracy == 0.0
+
+
+def test_multiple_choice_cot_requires_choice_scoring_by_default(tmp_path) -> None:
+    dataset_path = tmp_path / "mmlu_pro_demo_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "2+2=?",
+                "A": "3",
+                "B": "4",
+                "C": "5",
+                "D": "6",
+                "answer": "B",
+                "subject": "math",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend()
+    pipeline = MultipleChoicePipeline(backend)
+
+    with pytest.raises(RuntimeError, match="requires backend candidate choice scoring"):
+        pipeline.run_chain_of_thought(
+            str(dataset_path),
+            cot_sampling=SamplingConfig(max_generate_tokens=32),
+            batch_size=1,
+        )
+
+    assert len(backend.generate_calls) == 1
+
+
+def test_multiple_choice_cot_can_explicitly_use_generated_final_answer(tmp_path) -> None:
+    dataset_path = tmp_path / "mmlu_pro_demo_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "2+2=?",
+                "A": "3",
+                "B": "4",
+                "C": "5",
+                "D": "6",
+                "answer": "B",
+                "subject": "math",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend()
+    pipeline = MultipleChoicePipeline(backend, allow_generation_fallback=True)
+    streamed_payloads: list[dict] = []
+
+    result = pipeline.run_chain_of_thought(
+        str(dataset_path),
+        cot_sampling=SamplingConfig(max_generate_tokens=32),
+        batch_size=1,
+        on_record=streamed_payloads.append,
+    )
+    metrics = evaluate_multiple_choice(result.payloads, dataset_path=dataset_path)
+
+    assert result.sample_count == 1
+    assert len(streamed_payloads) == 2
+    assert streamed_payloads[0]["_stage"] == "cot"
+    assert streamed_payloads[1]["_stage"] == "answer"
+    assert len(result.payloads) == 1
+    assert result.payloads[0]["completion2"] == " B"
+    assert len(backend.generate_calls) == 2
+    assert metrics.accuracy == 1.0

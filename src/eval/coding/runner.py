@@ -18,6 +18,7 @@ from src.eval.long_doc_evidence import LONG_DOC_MODE_CHOICES, LongDocEvidenceCon
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
+    require_completion_style_remote_protocol,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
@@ -302,6 +303,12 @@ def main(
     slug = infer_dataset_slug_from_path(str(dataset_path))
     benchmark_kind = _resolve_benchmark_kind(slug, CodingBenchmarkKind(args.benchmark_kind))
     cot_mode = _resolve_cot_mode(benchmark_kind, args.cot_mode)
+    completion_style_remote = False
+    if benchmark_kind in {CodingBenchmarkKind.HUMAN_EVAL, CodingBenchmarkKind.MBPP}:
+        completion_style_remote = require_completion_style_remote_protocol(
+            args,
+            benchmark_name=f"{benchmark_kind.value} coding benchmark",
+        )
 
     dataset_records = JsonlCodeGenerationLoader(str(dataset_path)).load()
     model_name = resolve_backend_model_name(args)
@@ -587,6 +594,16 @@ def main(
             task_details=task_details,
             extra={
                 "cot_mode": cot_mode.value,
+                "infer_protocol": getattr(args, "infer_protocol", "local"),
+                "completion_style_remote": completion_style_remote,
+                **(
+                    {
+                        "code_extraction": "think_and_python_fence_v1",
+                        "generation_contract": "legacy_completion_style_code",
+                    }
+                    if benchmark_kind in {CodingBenchmarkKind.HUMAN_EVAL, CodingBenchmarkKind.MBPP}
+                    else {}
+                ),
                 **(
                     {
                         "swebench_predictions_path": str(predictions_path),
