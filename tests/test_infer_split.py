@@ -4,6 +4,8 @@ import argparse
 import json
 import sys
 import threading
+import time
+from concurrent.futures import Future
 from types import ModuleType, SimpleNamespace
 
 import httpx
@@ -242,6 +244,60 @@ class _EarlyCompleteBackend(_FakeBackend):
         return outputs
 
 
+class _SubmitCapableBackend(_FakeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submit_calls: list[dict[str, object]] = []
+        self.slow_started = threading.Event()
+        self.release_slow = threading.Event()
+        self.completed_order: list[str] = []
+
+    def submit(
+        self,
+        prompt,
+        *,
+        sampling,
+        prompt_index=0,
+        prompt_stop_suffixes=None,
+        prompt_seed=None,
+        top_logprobs=0,
+        prefill_chunk_size=16,
+        on_token=None,
+    ):
+        self.submit_calls.append(
+            {
+                "prompt": prompt,
+                "max_tokens": sampling.max_generate_tokens,
+                "prompt_seed": prompt_seed,
+                "prompt_stop_suffixes": prompt_stop_suffixes,
+                "top_logprobs": top_logprobs,
+                "prefill_chunk_size": prefill_chunk_size,
+            }
+        )
+        future: Future[GenerationOutput] = Future()
+
+        def _run() -> None:
+            if int(sampling.max_generate_tokens) > 10:
+                self.slow_started.set()
+                self.release_slow.wait(timeout=2.0)
+            else:
+                time.sleep(0.01)
+            output = GenerationOutput(
+                prompt_index=int(prompt_index),
+                prompt=str(prompt),
+                token_ids=[int(sampling.max_generate_tokens)],
+                text=f"submit:{prompt}",
+                finish_reason="stop_token",
+            )
+            if on_token is not None:
+                on_token(int(prompt_index), GeneratedTextDelta(text=output.text))
+            self.completed_order.append(str(prompt))
+            future.set_result(output)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return future
+
+
 def test_completion_request_to_sampling_config_preserves_custom_fields() -> None:
     request = CompletionRequest(
         model="demo-model",
@@ -378,6 +434,72 @@ def test_inference_service_completes_items_before_full_batch_returns() -> None:
         service.shutdown()
 
     assert response_two.choices[0].text == "early:prompt-two"
+
+
+def test_inference_service_submit_backend_allows_fast_request_to_finish_before_slow_request() -> None:
+    backend = _SubmitCapableBackend()
+    service = InferenceService(backend, max_batch_size=4, batch_collect_ms=10)
+    try:
+        slow_future = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="slow",
+                max_tokens=64,
+                temperature=0.3,
+            )
+        )
+        fast_future = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="fast",
+                max_tokens=1,
+                temperature=0.9,
+            )
+        )
+
+        assert backend.slow_started.wait(timeout=2.0)
+        fast_response = fast_future.result(timeout=2.0)
+        assert fast_response.choices[0].text == "submit:fast"
+        assert not slow_future.done()
+
+        backend.release_slow.set()
+        slow_response = slow_future.result(timeout=2.0)
+    finally:
+        backend.release_slow.set()
+        service.shutdown()
+
+    assert slow_response.choices[0].text == "submit:slow"
+    assert backend.generate_calls == []
+    assert [call["prompt"] for call in backend.submit_calls] == ["slow", "fast"]
+    assert backend.completed_order[0] == "fast"
+
+
+def test_inference_service_non_submit_backend_keeps_different_sampling_in_separate_batches() -> None:
+    backend = _FakeBackend()
+    service = InferenceService(backend, max_batch_size=4, batch_collect_ms=10)
+    try:
+        first = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="first",
+                max_tokens=1,
+                temperature=0.3,
+            )
+        )
+        second = service.submit_completion(
+            CompletionRequest(
+                model="demo-model",
+                prompt="second",
+                max_tokens=2,
+                temperature=0.3,
+            )
+        )
+        assert first.result(timeout=2.0).choices[0].text == "gen:first"
+        assert second.result(timeout=2.0).choices[0].text == "gen:second"
+    finally:
+        service.shutdown()
+
+    assert [call["prompts"] for call in backend.generate_calls] == [["first"], ["second"]]
 
 
 def test_inference_service_streams_local_token_events_and_builds_logprobs() -> None:

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from src.bin.run_infer_router import _build_backpressure_payload, create_app, parse_args, parse_routes
+from src.bin.run_infer_router import (
+    _build_backpressure_payload,
+    _build_batch_metrics_payload,
+    create_app,
+    parse_args,
+    parse_routes,
+)
 
 
 def _close_router_app(app) -> None:
@@ -41,6 +47,7 @@ def test_create_app_registers_openai_routes() -> None:
         assert "/healthz" in paths
         assert "/v1/models" in paths
         assert "/v1/backpressure" in paths
+        assert "/v1/batch-metrics" in paths
         assert "/v1/chat/completions" in paths
         assert "/v1/completions" in paths
     finally:
@@ -106,10 +113,19 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
                         "model_name": "model-a",
                         "max_batch_size": 16,
                         "batch_collect_ms": 5,
-                        "pending": {"pending_queue": 2},
+                        "pending": {
+                            "pending_queue": 5,
+                            "service_queue": 2,
+                            "engine_inbox": 1,
+                            "active_records": 2,
+                            "scheduler_waiting": 1,
+                            "scheduler_running": 1,
+                        },
                         "totals": {
                             "total_batches": 3,
                             "total_requests": 12,
+                            "completed_requests": 11,
+                            "error_requests": 1,
                             "failed_batches": 0,
                             "last_total_tok_s": 40.0,
                         },
@@ -121,10 +137,19 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
                     {
                         "model_name": "model-a",
                         "max_batch_size": 8,
-                        "pending": {"pending_queue": 1},
+                        "pending": {
+                            "pending_queue": 3,
+                            "service_queue": 1,
+                            "engine_inbox": 1,
+                            "active_records": 1,
+                            "scheduler_waiting": 1,
+                            "scheduler_running": 0,
+                        },
                         "totals": {
                             "total_batches": 2,
                             "total_requests": 8,
+                            "completed_requests": 7,
+                            "error_requests": 1,
                             "failed_batches": 1,
                             "last_total_tok_s": 20.0,
                         },
@@ -137,7 +162,59 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
     aggregate = payload["models"]["model-a"]["aggregate"]
     assert aggregate["status"] == "ok"
     assert aggregate["ok_route_count"] == 2
-    assert aggregate["pending_queue"] == 3
+    assert aggregate["pending_queue"] == 8
+    assert aggregate["service_queue"] == 3
+    assert aggregate["engine_inbox"] == 2
+    assert aggregate["active_records"] == 3
+    assert aggregate["scheduler_waiting"] == 2
+    assert aggregate["scheduler_running"] == 1
     assert aggregate["max_batch_size"] == 24
     assert aggregate["failed_batches"] == 1
+    assert aggregate["completed_requests"] == 18
+    assert aggregate["error_requests"] == 2
     assert aggregate["last_total_tok_s"] == 60.0
+
+
+def test_build_batch_metrics_payload_preserves_backend_live_metrics() -> None:
+    routes = {"model-a": ("http://127.0.0.1:18081/v1",)}
+    payload = _build_batch_metrics_payload(
+        routes,
+        {
+            "model-a": [
+                (
+                    "http://127.0.0.1:18081/v1",
+                    200,
+                    {
+                        "model_name": "model-a",
+                        "max_batch_size": 16,
+                        "pending": {
+                            "pending_queue": 4,
+                            "service_queue": 0,
+                            "engine_inbox": 1,
+                            "active_records": 3,
+                            "scheduler_waiting": 2,
+                            "scheduler_running": 1,
+                        },
+                        "totals": {
+                            "total_batches": 5,
+                            "total_requests": 10,
+                            "completed_requests": 9,
+                            "error_requests": 1,
+                            "failed_batches": 1,
+                        },
+                        "backend_live": {
+                            "engine_inbox": 1,
+                            "active_records": 3,
+                            "state_cache": {"hits": 2, "misses": 1},
+                        },
+                    },
+                )
+            ],
+        },
+    )
+
+    model = payload["models"]["model-a"]
+    assert model["status"] == "ok"
+    assert model["aggregate"]["pending_queue"] == 4
+    assert model["aggregate"]["completed_requests"] == 9
+    assert model["backends"][0]["backend_live"]["state_cache"]["hits"] == 2

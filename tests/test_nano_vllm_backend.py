@@ -97,6 +97,24 @@ def test_nano_vllm_backend_rejects_prompt_seeds(monkeypatch, tmp_path: Path) -> 
             prompt_seeds=[123],
             show_progress=False,
         )
+    backend.shutdown()
+
+
+def test_nano_vllm_backend_submit_rejects_prompt_seed(monkeypatch, tmp_path: Path) -> None:
+    root, _fake = _install_fake_nanovllm(monkeypatch, tmp_path)
+    backend = NanoVLLMInferenceBackend.from_config(
+        NanoVLLMBackendConfig(model_path="/models/rwkv-demo.pth", nano_vllm_path=root)
+    )
+
+    try:
+        with pytest.raises(NotImplementedError, match="per-prompt seeds"):
+            backend.submit(
+                "prompt",
+                sampling=SamplingConfig(max_generate_tokens=1),
+                prompt_seed=123,
+            )
+    finally:
+        backend.shutdown()
 
 
 def _install_fake_nanovllm(monkeypatch, tmp_path: Path):

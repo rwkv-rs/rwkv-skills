@@ -72,11 +72,15 @@ class InferenceService:
         self.backend = backend
         self.max_batch_size = max(1, int(max_batch_size))
         self.batch_collect_ms = max(0, int(batch_collect_ms))
+        submit = getattr(backend, "submit", None)
+        self._backend_submit = submit if callable(submit) else None
         self._metrics_lock = threading.Lock()
         self._batch_metrics: deque[_BatchMetricsSnapshot] = deque(maxlen=256)
         self._batch_totals = {
             "total_batches": 0,
             "total_requests": 0,
+            "completed_requests": 0,
+            "error_requests": 0,
             "total_prefill_tokens": 0,
             "total_generated_tokens": 0,
             "total_queue_wait_ms": 0.0,
@@ -131,6 +135,11 @@ class InferenceService:
         with self._metrics_lock:
             recent = list(self._batch_metrics)
             totals = dict(self._batch_totals)
+        backend_stats = _backend_batch_stats(self.backend)
+        pending = _pending_snapshot(
+            service_queue=self._queue.qsize(),
+            backend_stats=backend_stats,
+        )
         avg_batch_size = (
             totals["total_requests"] / totals["total_batches"] if totals["total_batches"] else 0.0
         )
@@ -150,6 +159,8 @@ class InferenceService:
             "totals": {
                 "total_batches": totals["total_batches"],
                 "total_requests": totals["total_requests"],
+                "completed_requests": totals["completed_requests"],
+                "error_requests": totals["error_requests"],
                 "total_prefill_tokens": totals["total_prefill_tokens"],
                 "total_generated_tokens": totals["total_generated_tokens"],
                 "total_queue_wait_ms": totals["total_queue_wait_ms"],
@@ -181,9 +192,8 @@ class InferenceService:
                 }
                 for snapshot in recent
             ],
-            "pending": {
-                "pending_queue": self._queue.qsize(),
-            },
+            "pending": pending,
+            "backend_live": backend_stats,
         }
 
     def shutdown(self) -> None:
@@ -192,6 +202,7 @@ class InferenceService:
         self._stop.set()
         self._queue.put(None)
         self._worker.join(timeout=5.0)
+        self._cancel_service_queue(RuntimeError("inference service shut down"))
         shutdown = getattr(self.backend, "shutdown", None)
         if callable(shutdown):
             shutdown()
@@ -230,6 +241,12 @@ class InferenceService:
                 self._execute_score(item)
                 continue
 
+            if self._backend_submit is not None:
+                batch = self._take_submit_generation_batch(pending)
+                for item in batch:
+                    self._execute_submit_generation(item)
+                continue
+
             batch = self._take_generation_batch(pending)
             self._execute_generation_batch(batch)
 
@@ -266,6 +283,103 @@ class InferenceService:
                 remainder.append(item)
         pending.extend(remainder)
         return batch
+
+    def _take_submit_generation_batch(self, pending: deque[_PendingRequest]) -> list[_PendingRequest]:
+        batch: list[_PendingRequest] = []
+        remainder: deque[_PendingRequest] = deque()
+        while pending:
+            item = pending.popleft()
+            if len(batch) < self.max_batch_size and not item.request.is_choice_scoring_request():
+                batch.append(item)
+            else:
+                remainder.append(item)
+        pending.extend(remainder)
+        return batch
+
+    def _execute_submit_generation(self, item: _PendingRequest) -> None:
+        submit = self._backend_submit
+        if submit is None:
+            self._execute_generation_batch([item])
+            return
+        request = item.request
+        sampling = request.to_sampling_config()
+        stop_suffixes = _request_stop_suffixes(request)
+        prefill_tokens = self._prompt_token_count(request.prompt)
+        queue_wait_ms = (time.monotonic_ns() - item.enqueued_at) / 1e6
+        start = time.perf_counter()
+
+        def _on_token(_prompt_index: int, delta: GeneratedTextDelta) -> None:
+            if item.stream_queue is not None:
+                item.stream_queue.put(delta)
+
+        def _finish_with_exception(exc: BaseException) -> None:
+            if item.stream_queue is not None:
+                item.stream_queue.put(None)
+            if not item.future.done():
+                item.future.set_exception(exc)
+
+        def _on_done(done_future: Future[GenerationOutput]) -> None:
+            generated_tokens = 0
+            success = True
+            error_text: str | None = None
+            try:
+                output = done_future.result()
+                generated_tokens = len(getattr(output, "token_ids", []))
+                if not item.future.done():
+                    item.future.set_result(self._build_generation_response(item, output))
+            except BaseException as exc:
+                success = False
+                error_text = str(exc)
+                _finish_with_exception(exc)
+            else:
+                if item.stream_queue is not None:
+                    item.stream_queue.put(None)
+            finally:
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                backend_stats = _backend_batch_stats(self.backend)
+                gpu_memory_used_mb, gpu_memory_total_mb = _gpu_memory_mb()
+                self._record_batch_metrics(
+                    batch_size=1,
+                    prefill_tokens=prefill_tokens,
+                    generated_tokens=generated_tokens,
+                    queue_wait_ms=queue_wait_ms,
+                    elapsed_ms=elapsed_ms,
+                    backend_stats=backend_stats,
+                    gpu_memory_used_mb=gpu_memory_used_mb,
+                    gpu_memory_total_mb=gpu_memory_total_mb,
+                    success=success,
+                    error=error_text,
+                )
+
+        try:
+            backend_future = submit(
+                request.prompt,
+                sampling=sampling,
+                prompt_index=0,
+                prompt_stop_suffixes=stop_suffixes,
+                prompt_seed=request.seed,
+                top_logprobs=max(int(request.logprobs or 0), 0),
+                prefill_chunk_size=request.effective_prefill_chunk_size(),
+                on_token=_on_token if item.stream_queue is not None else None,
+            )
+        except BaseException as exc:
+            _finish_with_exception(exc)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            self._record_batch_metrics(
+                batch_size=1,
+                prefill_tokens=prefill_tokens,
+                generated_tokens=0,
+                queue_wait_ms=queue_wait_ms,
+                elapsed_ms=elapsed_ms,
+                backend_stats=_backend_batch_stats(self.backend),
+                gpu_memory_used_mb=None,
+                gpu_memory_total_mb=None,
+                success=False,
+                error=str(exc),
+            )
+            return
+
+        backend_future.add_done_callback(_safe_submit_done_callback(_on_done))
 
     def _execute_generation_batch(self, batch: Sequence[_PendingRequest]) -> None:
         if not batch:
@@ -468,6 +582,10 @@ class InferenceService:
             self._batch_metrics.append(snapshot)
             self._batch_totals["total_batches"] += 1
             self._batch_totals["total_requests"] += max(0, int(batch_size))
+            if success:
+                self._batch_totals["completed_requests"] += max(0, int(batch_size))
+            else:
+                self._batch_totals["error_requests"] += max(0, int(batch_size))
             self._batch_totals["total_prefill_tokens"] += max(0, int(prefill_tokens))
             self._batch_totals["total_generated_tokens"] += max(0, int(generated_tokens))
             self._batch_totals["total_queue_wait_ms"] += float(queue_wait_ms)
@@ -503,6 +621,19 @@ class InferenceService:
             flush=True,
         )
 
+    def _cancel_service_queue(self, exc: BaseException) -> None:
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                return
+            if item is None:
+                continue
+            if item.stream_queue is not None:
+                item.stream_queue.put(None)
+            if not item.future.done():
+                item.future.set_exception(exc)
+
 
 def _backend_batch_stats(backend: InferenceBackend) -> dict[str, object]:
     getter = getattr(backend, "last_batch_metrics", None)
@@ -514,6 +645,41 @@ def _backend_batch_stats(backend: InferenceBackend) -> dict[str, object]:
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
     return {}
+
+
+def _pending_snapshot(*, service_queue: int, backend_stats: dict[str, object]) -> dict[str, object]:
+    engine_inbox = _optional_int(backend_stats.get("engine_inbox")) or 0
+    active_records = _optional_int(backend_stats.get("active_records")) or 0
+    scheduler_waiting = _optional_int(backend_stats.get("scheduler_waiting")) or 0
+    scheduler_running = _optional_int(backend_stats.get("scheduler_running")) or 0
+    service_queue = max(0, int(service_queue))
+    return {
+        "pending_queue": service_queue + engine_inbox + active_records,
+        "service_queue": service_queue,
+        "engine_inbox": engine_inbox,
+        "active_records": active_records,
+        "scheduler_waiting": scheduler_waiting,
+        "scheduler_running": scheduler_running,
+    }
+
+
+def _safe_submit_done_callback(callback):
+    def _wrapped(future: Future[GenerationOutput]) -> None:
+        try:
+            callback(future)
+        except Exception:
+            return
+
+    return _wrapped
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _gpu_memory_mb() -> tuple[int | None, int | None]:

@@ -146,6 +146,17 @@ def create_app(
             timeout_s=min(float(timeout_s), 5.0),
         )
 
+    @app.get("/v1/batch-metrics")
+    @app.get("/openai/v1/batch-metrics")
+    async def batch_metrics(request: Request) -> dict[str, object]:
+        return await _collect_batch_metrics(
+            route_map,
+            forward_executor=request.app.state.forward_executor,
+            http_client=request.app.state.forward_http_client,
+            authorization=request.headers.get("authorization"),
+            timeout_s=min(float(timeout_s), 5.0),
+        )
+
     @app.get("/v1/models")
     @app.get("/openai/v1/models")
     async def list_models() -> dict[str, object]:
@@ -341,6 +352,42 @@ async def _collect_backpressure(
     authorization: str | None,
     timeout_s: float,
 ) -> dict[str, object]:
+    results = await _collect_backend_batch_metrics(
+        routes,
+        forward_executor=forward_executor,
+        http_client=http_client,
+        authorization=authorization,
+        timeout_s=timeout_s,
+    )
+    return _build_backpressure_payload(routes, results)
+
+
+async def _collect_batch_metrics(
+    routes: RouteMap,
+    *,
+    forward_executor: concurrent.futures.Executor,
+    http_client: httpx.Client,
+    authorization: str | None,
+    timeout_s: float,
+) -> dict[str, object]:
+    results = await _collect_backend_batch_metrics(
+        routes,
+        forward_executor=forward_executor,
+        http_client=http_client,
+        authorization=authorization,
+        timeout_s=timeout_s,
+    )
+    return _build_batch_metrics_payload(routes, results)
+
+
+async def _collect_backend_batch_metrics(
+    routes: RouteMap,
+    *,
+    forward_executor: concurrent.futures.Executor,
+    http_client: httpx.Client,
+    authorization: str | None,
+    timeout_s: float,
+) -> dict[str, list[tuple[str, int, object]]]:
     loop = asyncio.get_running_loop()
     pending: list[tuple[str, str, asyncio.Future[tuple[int, object]]]] = []
     for model, urls in sorted(routes.items()):
@@ -358,7 +405,7 @@ async def _collect_backpressure(
     for model, base_url, future in pending:
         status_code, payload = await future
         results.setdefault(model, []).append((base_url, status_code, payload))
-    return _build_backpressure_payload(routes, results)
+    return results
 
 
 def _build_backpressure_payload(
@@ -395,6 +442,40 @@ def _build_backpressure_payload(
     return {"status": overall_status, "models": models}
 
 
+def _build_batch_metrics_payload(
+    routes: RouteMap,
+    backend_results: Mapping[str, Sequence[tuple[str, int, object]]],
+) -> dict[str, object]:
+    models: dict[str, object] = {}
+    for model, urls in sorted(routes.items()):
+        backend_entries = [
+            _backend_batch_metrics_entry(base_url, status_code, payload)
+            for base_url, status_code, payload in backend_results.get(model, ())
+        ]
+        known_urls = {str(entry.get("base_url")) for entry in backend_entries if isinstance(entry, dict)}
+        for base_url in urls:
+            if base_url not in known_urls:
+                backend_entries.append(
+                    {
+                        "base_url": base_url,
+                        "status": "error",
+                        "error": "missing backend metrics result",
+                    }
+                )
+        aggregate = _aggregate_live_metrics(backend_entries)
+        models[model] = {
+            "model": model,
+            "status": aggregate["status"],
+            "route_count": len(urls),
+            "aggregate": aggregate,
+            "backends": backend_entries,
+        }
+    overall_status = "ok"
+    if any(isinstance(entry, dict) and entry.get("status") != "ok" for entry in models.values()):
+        overall_status = "degraded"
+    return {"status": overall_status, "models": models}
+
+
 def _backend_backpressure_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         return {
@@ -414,8 +495,15 @@ def _backend_backpressure_entry(base_url: str, status_code: int, payload: object
         "max_batch_size": _optional_int(payload.get("max_batch_size")),
         "batch_collect_ms": _optional_int(payload.get("batch_collect_ms")),
         "pending_queue": _int_or_zero(pending.get("pending_queue")),
+        "service_queue": _int_or_zero(pending.get("service_queue")),
+        "engine_inbox": _int_or_zero(pending.get("engine_inbox")),
+        "active_records": _int_or_zero(pending.get("active_records")),
+        "scheduler_waiting": _int_or_zero(pending.get("scheduler_waiting")),
+        "scheduler_running": _int_or_zero(pending.get("scheduler_running")),
         "total_batches": _int_or_zero(totals.get("total_batches")),
         "total_requests": _int_or_zero(totals.get("total_requests")),
+        "completed_requests": _int_or_zero(totals.get("completed_requests")),
+        "error_requests": _int_or_zero(totals.get("error_requests")),
         "failed_batches": _int_or_zero(totals.get("failed_batches")),
         "last_total_tok_s": _optional_float(totals.get("last_total_tok_s")),
         "last_output_tok_s": _optional_float(totals.get("last_output_tok_s")),
@@ -426,7 +514,41 @@ def _backend_backpressure_entry(base_url: str, status_code: int, payload: object
     return entry
 
 
+def _backend_batch_metrics_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
+    entry = _backend_backpressure_entry(base_url, status_code, payload)
+    if isinstance(payload, dict):
+        backend_live = payload.get("backend_live")
+        recent_batches = payload.get("recent_batches")
+        entry["backend_live"] = backend_live if isinstance(backend_live, dict) else {}
+        entry["recent_batches"] = recent_batches if isinstance(recent_batches, list) else []
+        entry["totals"] = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+        entry["pending"] = payload.get("pending") if isinstance(payload.get("pending"), dict) else {}
+    return entry
+
+
 def _aggregate_backpressure(backends: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    aggregate = _aggregate_live_metrics(backends)
+    return {
+        "status": aggregate["status"],
+        "route_count": aggregate["route_count"],
+        "ok_route_count": aggregate["ok_route_count"],
+        "pending_queue": aggregate["pending_queue"],
+        "service_queue": aggregate["service_queue"],
+        "engine_inbox": aggregate["engine_inbox"],
+        "active_records": aggregate["active_records"],
+        "scheduler_waiting": aggregate["scheduler_waiting"],
+        "scheduler_running": aggregate["scheduler_running"],
+        "max_batch_size": aggregate["max_batch_size"],
+        "failed_batches": aggregate["failed_batches"],
+        "total_batches": aggregate["total_batches"],
+        "total_requests": aggregate["total_requests"],
+        "completed_requests": aggregate["completed_requests"],
+        "error_requests": aggregate["error_requests"],
+        "last_total_tok_s": aggregate["last_total_tok_s"],
+    }
+
+
+def _aggregate_live_metrics(backends: Sequence[Mapping[str, object]]) -> dict[str, object]:
     ok_backends = [entry for entry in backends if entry.get("status") == "ok"]
     route_count = len(backends)
     ok_count = len(ok_backends)
@@ -451,10 +573,17 @@ def _aggregate_backpressure(backends: Sequence[Mapping[str, object]]) -> dict[st
         "route_count": route_count,
         "ok_route_count": ok_count,
         "pending_queue": sum(_int_or_zero(entry.get("pending_queue")) for entry in ok_backends),
+        "service_queue": sum(_int_or_zero(entry.get("service_queue")) for entry in ok_backends),
+        "engine_inbox": sum(_int_or_zero(entry.get("engine_inbox")) for entry in ok_backends),
+        "active_records": sum(_int_or_zero(entry.get("active_records")) for entry in ok_backends),
+        "scheduler_waiting": sum(_int_or_zero(entry.get("scheduler_waiting")) for entry in ok_backends),
+        "scheduler_running": sum(_int_or_zero(entry.get("scheduler_running")) for entry in ok_backends),
         "max_batch_size": sum(max_batch_values) if max_batch_values else None,
         "failed_batches": sum(_int_or_zero(entry.get("failed_batches")) for entry in ok_backends),
         "total_batches": sum(_int_or_zero(entry.get("total_batches")) for entry in ok_backends),
         "total_requests": sum(_int_or_zero(entry.get("total_requests")) for entry in ok_backends),
+        "completed_requests": sum(_int_or_zero(entry.get("completed_requests")) for entry in ok_backends),
+        "error_requests": sum(_int_or_zero(entry.get("error_requests")) for entry in ok_backends),
         "last_total_tok_s": sum(last_total_tok_s_values) if last_total_tok_s_values else None,
     }
 

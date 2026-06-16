@@ -343,7 +343,7 @@ class RemoteInferenceBackend:
             constraint_mode=constraint_mode,
         )
         if effective_constraints is not None and any(constraint is not None for constraint in effective_constraints):
-            raise RuntimeError("remote infer backend does not support prompt constraints; use a local backend")
+            raise NotImplementedError("remote infer backend does not support prompt constraints; use a local backend")
         if not prompts:
             return []
         if prompt_seeds is not None and len(prompt_seeds) != len(prompts):
@@ -514,11 +514,11 @@ class RemoteInferenceBackend:
             raise ValueError("choice_token_texts cannot be empty")
         if self.config.protocol in {"vllm", "completions"}:
             self._legacy_choice_scoring_supported = False
-            raise RuntimeError(
+            raise NotImplementedError(
                 f"{self.config.protocol} remote protocol does not support candidate choice scoring"
             )
         if self._legacy_choice_scoring_supported is False:
-            raise RuntimeError("remote infer service does not support candidate choice scoring")
+            raise NotImplementedError("remote infer service does not support candidate choice scoring")
         payload = {
             "model": self.model_name,
             "prompt": prompt,
@@ -538,7 +538,7 @@ class RemoteInferenceBackend:
             )
             if unsupported_choice_scoring:
                 self._legacy_choice_scoring_supported = False
-                raise RuntimeError(
+                raise NotImplementedError(
                     "remote infer service does not support candidate choice scoring"
                 ) from exc
             raise
@@ -551,11 +551,11 @@ class RemoteInferenceBackend:
         logprobs = choice0.get("logprobs")
         if not isinstance(logprobs, dict):
             self._legacy_choice_scoring_supported = False
-            raise RuntimeError("remote infer response missing choice-scoring logprobs")
+            raise NotImplementedError("remote infer service does not support candidate choice scoring")
         top_logprobs = logprobs.get("top_logprobs")
         if not isinstance(top_logprobs, list) or not top_logprobs or not isinstance(top_logprobs[0], dict):
             self._legacy_choice_scoring_supported = False
-            raise RuntimeError("remote infer response missing choice-scoring top_logprobs")
+            raise NotImplementedError("remote infer service does not support candidate choice scoring")
         self._legacy_choice_scoring_supported = True
         scores = {str(key): float(value) for key, value in top_logprobs[0].items()}
         best_text = max(choice_token_texts, key=lambda item: scores.get(item, float("-inf")))

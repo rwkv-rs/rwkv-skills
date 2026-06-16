@@ -6,8 +6,10 @@ import importlib
 import sys
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from types import ModuleType
 from typing import Any, Callable, Literal, Sequence
 
@@ -74,14 +76,47 @@ class _NanoVLLMRuntime:
 
 
 @dataclass(slots=True)
+class _NanoSubmitRequest:
+    prompt_index: int
+    prompt: str
+    sampling: SamplingConfig
+    future: Future[GenerationOutput]
+    prompt_stop_suffixes: Sequence[str] | None
+    on_complete: Callable[[GenerationOutput], None] | None
+    on_token: Callable[[int, GeneratedTextDelta], None] | None
+    enqueued_at: int
+
+
+@dataclass(slots=True)
+class _NanoActiveRecord:
+    prompt_index: int
+    prompt: str
+    seq: object
+    future: Future[GenerationOutput]
+    prompt_stop_suffixes: Sequence[str] | None
+    on_complete: Callable[[GenerationOutput], None] | None
+    on_token: Callable[[int, GeneratedTextDelta], None] | None
+    enqueued_at: int
+    admitted_at: int
+    prompt_token_count: int
+    cache_admission_observed: bool = False
+
+
+@dataclass(slots=True)
 class NanoVLLMInferenceBackend:
     config: NanoVLLMBackendConfig
     runtime: _NanoVLLMRuntime
     engine: object
     scheduler: object
     model_runner: object
-    _lock: threading.Lock
+    _inbox: Queue[_NanoSubmitRequest | None]
+    _stop: threading.Event
+    _owner: threading.Thread
+    _active_lock: threading.Lock
+    _active_records: dict[int, _NanoActiveRecord]
+    _metrics_lock: threading.Lock
     _last_batch_metrics: dict[str, object]
+    _metrics_totals: dict[str, int]
 
     @classmethod
     def from_config(cls, config: NanoVLLMBackendConfig) -> "NanoVLLMInferenceBackend":
@@ -93,15 +128,41 @@ class NanoVLLMInferenceBackend:
             raise RuntimeError("nano-vLLM LLMEngine did not construct a Scheduler instance")
         if not isinstance(model_runner, runtime.model_runner_cls):
             raise RuntimeError("nano-vLLM LLMEngine did not construct a ModelRunner instance")
-        return cls(
+        backend = cls(
             config=config,
             runtime=runtime,
             engine=engine,
             scheduler=scheduler,
             model_runner=model_runner,
-            _lock=threading.Lock(),
+            _inbox=Queue(),
+            _stop=threading.Event(),
+            _owner=threading.Thread(),
+            _active_lock=threading.Lock(),
+            _active_records={},
+            _metrics_lock=threading.Lock(),
             _last_batch_metrics={},
+            _metrics_totals={
+                "submitted_requests": 0,
+                "completed_requests": 0,
+                "error_requests": 0,
+                "cancelled_requests": 0,
+                "prompt_prefill_tokens": 0,
+                "engine_step_tokens": 0,
+                "generated_tokens": 0,
+                "engine_step_count": 0,
+                "state_cache_admissions": 0,
+                "state_cache_hits": 0,
+                "state_cache_exact_hits": 0,
+                "state_cache_misses": 0,
+            },
         )
+        backend._owner = threading.Thread(
+            target=backend._run_owner,
+            name="rwkv-nano-vllm-owner",
+            daemon=True,
+        )
+        backend._owner.start()
+        return backend
 
     @property
     def model_name(self) -> str:
@@ -111,7 +172,43 @@ class NanoVLLMInferenceBackend:
         return Path(str(self.config.model_path)).stem
 
     def last_batch_metrics(self) -> dict[str, object]:
-        return dict(self._last_batch_metrics)
+        with self._metrics_lock:
+            last = dict(self._last_batch_metrics)
+            totals = dict(self._metrics_totals)
+        with self._active_lock:
+            active_records = len(self._active_records)
+        scheduler = _scheduler_snapshot(self.scheduler)
+        state_cache_admissions = int(totals.get("state_cache_admissions", 0))
+        state_cache_hits = int(totals.get("state_cache_hits", 0))
+        hit_rate = (
+            float(state_cache_hits) / float(state_cache_admissions)
+            if state_cache_admissions > 0
+            else 0.0
+        )
+        last.update(
+            {
+                "engine_inbox": self._inbox.qsize(),
+                "active_records": active_records,
+                "owner_alive": self._owner.is_alive(),
+                "scheduler_snapshot": scheduler,
+                "scheduler_waiting": _scheduler_count(self.scheduler, "waiting"),
+                "scheduler_running": _scheduler_count(self.scheduler, "running"),
+                "submitted_requests": int(totals.get("submitted_requests", 0)),
+                "completed_requests": int(totals.get("completed_requests", 0)),
+                "error_requests": int(totals.get("error_requests", 0)),
+                "cancelled_requests": int(totals.get("cancelled_requests", 0)),
+                "prompt_prefill_tokens": int(totals.get("prompt_prefill_tokens", 0)),
+                "generated_tokens": int(totals.get("generated_tokens", 0)),
+                "state_cache": {
+                    "admissions": state_cache_admissions,
+                    "hits": state_cache_hits,
+                    "exact_hits": int(totals.get("state_cache_exact_hits", 0)),
+                    "misses": int(totals.get("state_cache_misses", 0)),
+                    "hit_rate": round(hit_rate, 6),
+                },
+            }
+        )
+        return last
 
     def generate(
         self,
@@ -133,6 +230,7 @@ class NanoVLLMInferenceBackend:
     ) -> list[GenerationOutput]:
         _ = top_logprobs
         _ = prefill_chunk_size
+        _ = batch_size
         if not prompts:
             return []
         if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
@@ -146,104 +244,270 @@ class NanoVLLMInferenceBackend:
             raise NotImplementedError("nano-vLLM backend does not support prompt constraints")
 
         effective_sampling = sampling.clamp(1) if probe_only else sampling
-        outputs: list[GenerationOutput | None] = [None] * len(prompts)
-        max_batch = max(1, min(int(batch_size), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" prompt", disable=not show_progress)
+        futures: list[Future[GenerationOutput]] = []
+
+        def _on_submit_complete(output: GenerationOutput) -> None:
+            if on_complete is not None and not probe_only:
+                on_complete(output)
+            progress.update(1)
+
         try:
-            with self._lock:
-                for start in range(0, len(prompts), max_batch):
-                    stop = min(start + max_batch, len(prompts))
-                    self._generate_chunk(
-                        start=start,
-                        prompts=prompts[start:stop],
+            for prompt_index, prompt in enumerate(prompts):
+                futures.append(
+                    self.submit(
+                        str(prompt),
                         sampling=effective_sampling,
+                        prompt_index=prompt_index,
                         prompt_stop_suffixes=(
-                            None if prompt_stop_suffixes is None else prompt_stop_suffixes[start:stop]
+                            None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index]
                         ),
-                        outputs=outputs,
-                        on_complete=on_complete if not probe_only else None,
-                        on_token=on_token,
-                        progress=progress,
+                        prompt_seed=None if prompt_seeds is None else prompt_seeds[prompt_index],
+                        constraints=None,
+                        constraint_mode=constraint_mode,
+                        on_complete=_on_submit_complete,
+                        on_token=on_token if not probe_only else None,
                     )
+                )
+            outputs = [future.result() for future in futures]
         finally:
             progress.close()
-        return [output for output in outputs if output is not None]
+        return outputs
 
-    def _generate_chunk(
+    def submit(
         self,
+        prompt: str,
         *,
-        start: int,
-        prompts: Sequence[str],
         sampling: SamplingConfig,
-        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
-        outputs: list[GenerationOutput | None],
-        on_complete: Callable[[GenerationOutput], None] | None,
-        on_token: Callable[[int, GeneratedTextDelta], None] | None,
-        progress: tqdm,
-    ) -> None:
-        seq_records: dict[int, tuple[int, str, object, Sequence[str] | None]] = {}
-        sampling_params = self._to_sampling_params(sampling)
-        prompt_token_count = 0
-        for local_index, prompt in enumerate(prompts):
-            seq = self.engine.add_request(prompt, sampling_params)
-            prompt_token_count += _prompt_token_count(self.engine, prompt)
-            stop_suffixes = None if prompt_stop_suffixes is None else prompt_stop_suffixes[local_index]
-            stop_token_seqs = self._build_stop_token_seqs(sampling=sampling, stop_suffixes=stop_suffixes)
-            if stop_token_seqs:
-                setattr(seq, "stop_token_seqs", stop_token_seqs)
-            seq_records[int(getattr(seq, "seq_id"))] = (start + local_index, prompt, seq, stop_suffixes)
+        prompt_index: int = 0,
+        prompt_stop_suffixes: Sequence[str] | None = None,
+        prompt_seed: int | None = None,
+        constraints: Sequence[DecodeConstraint | None] | None = None,
+        constraint_mode: Literal["off", "soft", "strict"] = "off",
+        top_logprobs: int = 0,
+        prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
+        probe_only: bool = False,
+        on_complete: Callable[[GenerationOutput], None] | None = None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
+    ) -> Future[GenerationOutput]:
+        _ = top_logprobs
+        _ = prefill_chunk_size
+        if probe_only:
+            sampling = sampling.clamp(1)
+        if self._stop.is_set():
+            raise RuntimeError("nano-vLLM backend is shut down")
+        if prompt_seed is not None:
+            raise NotImplementedError("nano-vLLM backend does not support per-prompt seeds")
+        if _has_active_constraints(constraints=constraints, constraint_mode=constraint_mode):
+            raise NotImplementedError("nano-vLLM backend does not support prompt constraints")
+        future: Future[GenerationOutput] = Future()
+        request = _NanoSubmitRequest(
+            prompt_index=int(prompt_index),
+            prompt=str(prompt),
+            sampling=sampling,
+            future=future,
+            prompt_stop_suffixes=prompt_stop_suffixes,
+            on_complete=on_complete,
+            on_token=on_token,
+            enqueued_at=time.monotonic_ns(),
+        )
+        with self._metrics_lock:
+            self._metrics_totals["submitted_requests"] += 1
+        self._inbox.put(request)
+        return future
 
-        step_count = 0
-        engine_step_tokens = 0
-        generated_tokens = 0
-        completed_sequences = 0
-        max_active_seq = _active_sequence_count(self.engine, self.scheduler)
-        start_time = time.perf_counter()
-        while not self.engine.is_finished():
-            active_before = _active_sequence_count(self.engine, self.scheduler)
-            if active_before is not None:
-                max_active_seq = max(int(max_active_seq or 0), int(active_before))
-            raw_outputs, _num_tokens = self.engine.step()
-            step_count += 1
-            engine_step_tokens += _safe_int(_num_tokens)
-            for seq_id, token_ids in raw_outputs:
-                record = seq_records.get(int(seq_id))
-                if record is None:
-                    record = _fallback_seq_record(seq_records, raw_seq_id=int(seq_id), batch_start=start)
-                if record is None:
+    def _run_owner(self) -> None:
+        shutdown_error = RuntimeError("nano-vLLM backend shut down")
+        try:
+            while True:
+                admitted = self._drain_inbox(block=self._active_count() == 0)
+                if self._stop.is_set():
+                    self._cancel_pending_inbox(shutdown_error)
+                    self._fail_all_active(shutdown_error)
+                    return
+                if self._active_count() == 0:
+                    if not admitted:
+                        time.sleep(0.001)
                     continue
-                prompt_index, prompt, seq, stop_suffixes = record
-                completed_sequences += 1
-                generated_tokens += len(token_ids)
-                text = self._decode_token_ids(token_ids)
-                text, trimmed = _trim_at_stop_suffix(text, stop_suffixes)
+                try:
+                    self._observe_cache_admissions()
+                    step_started = time.perf_counter()
+                    raw_outputs, num_tokens = self.engine.step()
+                    elapsed_s = max(time.perf_counter() - step_started, 1e-9)
+                    self._observe_cache_admissions()
+                    self._record_owner_step(num_tokens=num_tokens, elapsed_s=elapsed_s)
+                except BaseException as exc:
+                    self._fail_all_active(exc)
+                    continue
+                self._complete_raw_outputs(raw_outputs)
+        finally:
+            self._cancel_pending_inbox(shutdown_error)
+            self._fail_all_active(shutdown_error)
+            exit_method = getattr(self.engine, "exit", None)
+            if callable(exit_method):
+                exit_method()
+
+    def _drain_inbox(self, *, block: bool) -> bool:
+        admitted = False
+        while True:
+            try:
+                item = self._inbox.get(timeout=0.05 if block and not admitted else 0.0)
+            except Empty:
+                return admitted
+            if item is None:
+                if self._stop.is_set():
+                    return admitted
+                continue
+            if self._stop.is_set():
+                self._set_future_exception(item.future, RuntimeError("nano-vLLM backend is shut down"))
+                self._record_error_request()
+                continue
+            try:
+                self._admit_request(item)
+                admitted = True
+            except BaseException as exc:
+                self._set_future_exception(item.future, exc)
+                self._record_error_request()
+                self._fail_all_active(exc)
+
+    def _admit_request(self, request: _NanoSubmitRequest) -> None:
+        sampling_params = self._to_sampling_params(request.sampling)
+        seq = self.engine.add_request(request.prompt, sampling_params)
+        stop_token_seqs = self._build_stop_token_seqs(
+            sampling=request.sampling,
+            stop_suffixes=request.prompt_stop_suffixes,
+        )
+        if stop_token_seqs:
+            setattr(seq, "stop_token_seqs", stop_token_seqs)
+        record = _NanoActiveRecord(
+            prompt_index=request.prompt_index,
+            prompt=request.prompt,
+            seq=seq,
+            future=request.future,
+            prompt_stop_suffixes=request.prompt_stop_suffixes,
+            on_complete=request.on_complete,
+            on_token=request.on_token,
+            enqueued_at=request.enqueued_at,
+            admitted_at=time.monotonic_ns(),
+            prompt_token_count=_prompt_token_count(self.engine, request.prompt),
+        )
+        seq_id = int(getattr(seq, "seq_id"))
+        with self._active_lock:
+            self._active_records[seq_id] = record
+        with self._metrics_lock:
+            self._metrics_totals["prompt_prefill_tokens"] += int(record.prompt_token_count)
+
+    def _complete_raw_outputs(self, raw_outputs: object) -> None:
+        for raw_seq_id, token_ids in raw_outputs or ():
+            seq_id = int(raw_seq_id)
+            with self._active_lock:
+                record = self._active_records.pop(seq_id, None)
+            if record is None:
+                continue
+            try:
+                tokens = [int(token_id) for token_id in token_ids]
+                text = self._decode_token_ids(tokens)
+                text, trimmed = _trim_at_stop_suffix(text, record.prompt_stop_suffixes)
                 output = GenerationOutput(
-                    prompt_index=prompt_index,
-                    prompt=prompt,
-                    token_ids=[int(token_id) for token_id in token_ids],
+                    prompt_index=record.prompt_index,
+                    prompt=record.prompt,
+                    token_ids=tokens,
                     text=text,
-                    finish_reason=_finish_reason(seq, trimmed=trimmed),
+                    finish_reason=_finish_reason(record.seq, trimmed=trimmed),
                 )
-                outputs[prompt_index] = output
-                if on_token is not None and output.text:
-                    on_token(prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
-                if on_complete is not None:
-                    on_complete(output)
-                progress.update(1)
-        elapsed_s = max(time.perf_counter() - start_time, 1e-9)
-        self._last_batch_metrics = {
-            "actual_batch_size": len(prompts),
-            "prompt_prefill_tokens": int(prompt_token_count),
-            "engine_step_tokens": int(engine_step_tokens),
-            "generated_tokens": int(generated_tokens),
-            "completed_sequences": int(completed_sequences),
-            "engine_step_count": int(step_count),
-            "max_active_seq": max_active_seq,
-            "elapsed_ms": round(elapsed_s * 1000.0, 4),
-            "engine_step_tok_s": round(float(engine_step_tokens) / elapsed_s, 4),
-            "output_tok_s": round(float(generated_tokens) / elapsed_s, 4),
-            "scheduler_snapshot": _scheduler_snapshot(self.scheduler),
-        }
+                if record.on_token is not None and output.text:
+                    _safe_callback(
+                        record.on_token,
+                        record.prompt_index,
+                        GeneratedTextDelta(text=output.text, tokens=list(output.tokens)),
+                    )
+                if record.on_complete is not None:
+                    _safe_callback(record.on_complete, output)
+                if not record.future.done():
+                    record.future.set_result(output)
+                self._record_completed_request(generated_tokens=len(tokens))
+            except BaseException as exc:
+                self._set_future_exception(record.future, exc)
+                self._record_error_request()
+
+    def _observe_cache_admissions(self) -> None:
+        waiting_ids = _scheduler_seq_ids(self.scheduler, "waiting")
+        observations: list[tuple[int, bool, bool]] = []
+        with self._active_lock:
+            for seq_id, record in self._active_records.items():
+                if record.cache_admission_observed or seq_id in waiting_ids:
+                    continue
+                cache_hit = getattr(record.seq, "cache_hit_slot", None) is not None
+                exact_hit = bool(getattr(record.seq, "exact_cache_hit", False))
+                record.cache_admission_observed = True
+                observations.append((seq_id, cache_hit or exact_hit, exact_hit))
+        if not observations:
+            return
+        with self._metrics_lock:
+            for _seq_id, cache_hit, exact_hit in observations:
+                self._metrics_totals["state_cache_admissions"] += 1
+                if cache_hit:
+                    self._metrics_totals["state_cache_hits"] += 1
+                else:
+                    self._metrics_totals["state_cache_misses"] += 1
+                if exact_hit:
+                    self._metrics_totals["state_cache_exact_hits"] += 1
+
+    def _record_owner_step(self, *, num_tokens: object, elapsed_s: float) -> None:
+        engine_step_tokens = _safe_int(num_tokens)
+        with self._metrics_lock:
+            self._metrics_totals["engine_step_count"] += 1
+            self._metrics_totals["engine_step_tokens"] += int(engine_step_tokens)
+            self._last_batch_metrics = {
+                "engine_step_tokens": int(engine_step_tokens),
+                "engine_step_count": int(self._metrics_totals["engine_step_count"]),
+                "active_records": self._active_count(),
+                "engine_inbox": self._inbox.qsize(),
+                "elapsed_ms": round(float(elapsed_s) * 1000.0, 4),
+                "engine_step_tok_s": round(float(engine_step_tokens) / max(float(elapsed_s), 1e-9), 4),
+                "scheduler_snapshot": _scheduler_snapshot(self.scheduler),
+            }
+
+    def _record_completed_request(self, *, generated_tokens: int) -> None:
+        with self._metrics_lock:
+            self._metrics_totals["completed_requests"] += 1
+            self._metrics_totals["generated_tokens"] += max(0, int(generated_tokens))
+
+    def _record_error_request(self) -> None:
+        with self._metrics_lock:
+            self._metrics_totals["error_requests"] += 1
+
+    def _record_cancelled_request(self) -> None:
+        with self._metrics_lock:
+            self._metrics_totals["cancelled_requests"] += 1
+
+    def _active_count(self) -> int:
+        with self._active_lock:
+            return len(self._active_records)
+
+    def _fail_all_active(self, exc: BaseException) -> None:
+        with self._active_lock:
+            records = list(self._active_records.values())
+            self._active_records.clear()
+        for record in records:
+            self._set_future_exception(record.future, exc)
+            self._record_error_request()
+
+    def _cancel_pending_inbox(self, exc: BaseException) -> None:
+        while True:
+            try:
+                item = self._inbox.get_nowait()
+            except Empty:
+                return
+            if item is None:
+                continue
+            self._set_future_exception(item.future, exc)
+            self._record_cancelled_request()
+
+    @staticmethod
+    def _set_future_exception(future: Future[GenerationOutput], exc: BaseException) -> None:
+        if not future.done():
+            future.set_exception(exc)
 
     def _to_sampling_params(self, sampling: SamplingConfig) -> object:
         top_k = int(sampling.top_k)
@@ -310,9 +574,18 @@ class NanoVLLMInferenceBackend:
         raise NotImplementedError("nano-vLLM backend does not support candidate choice scoring")
 
     def shutdown(self) -> None:
-        exit_method = getattr(self.engine, "exit", None)
-        if callable(exit_method):
-            exit_method()
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        self._inbox.put(None)
+        self._owner.join(timeout=10.0)
+        if self._owner.is_alive():
+            shutdown_error = RuntimeError("nano-vLLM backend shutdown timed out")
+            self._cancel_pending_inbox(shutdown_error)
+            self._fail_all_active(shutdown_error)
+            exit_method = getattr(self.engine, "exit", None)
+            if callable(exit_method):
+                exit_method()
 
 
 def load_nano_vllm_runtime(nano_vllm_path: str | Path = DEFAULT_NANO_VLLM_PATH) -> _NanoVLLMRuntime:
@@ -392,6 +665,27 @@ def _safe_len(value: object) -> int | None:
         return len(value)  # type: ignore[arg-type]
     except Exception:
         return None
+
+
+def _safe_callback(callback: Callable[..., object], *args: object) -> None:
+    try:
+        callback(*args)
+    except Exception:
+        return
+
+
+def _scheduler_count(scheduler: object, name: str) -> int:
+    return _safe_len(getattr(scheduler, name, None)) or 0
+
+
+def _scheduler_seq_ids(scheduler: object, name: str) -> set[int]:
+    values = getattr(scheduler, name, None)
+    if values is None:
+        return set()
+    try:
+        return {int(getattr(seq, "seq_id")) for seq in list(values)}
+    except Exception:
+        return set()
 
 
 def _active_sequence_count(engine: object, scheduler: object) -> int | None:
