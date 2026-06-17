@@ -4,71 +4,54 @@ from pathlib import Path
 
 from src.bin import run_infer_server
 from src.infer.auto_config import GpuProfile
-from src.infer.nano_vllm_backend import DEFAULT_NANO_VLLM_PATH, NanoVLLMBackendConfig
+from src.infer.backend import LocalInferenceBackend
+from src.infer.model import ModelLoadConfig
+from src.infer.rwkv_lightning_server import DEFAULT_RWKV_LIGHTNING_PATH, RWKVLightningServerConfig
 
 
-def test_run_infer_server_no_longer_imports_local_backend() -> None:
+def test_run_infer_server_defaults_to_rwkv_lightning_backend() -> None:
     source = Path(run_infer_server.__file__).read_text(encoding="utf-8")
 
-    assert "LocalInferenceBackend" not in source
-    assert "ModelLoadConfig" not in source
+    assert '_ENGINE_MODE_CHOICES = ("rwkv-lightning", "lightning", "classic")' in source
+    assert "default=_default_engine_mode()" in source
+    assert "build_rwkv_lightning_app" in source
+    assert "LocalInferenceBackend" in source
 
 
-def test_default_nano_vllm_path_points_to_repo_vendor() -> None:
-    assert DEFAULT_NANO_VLLM_PATH.name == "nano-vllm-rwkv"
-    assert DEFAULT_NANO_VLLM_PATH.parent.name == "vendor"
-    assert (DEFAULT_NANO_VLLM_PATH / "nanovllm" / "engine" / "llm_engine.py").is_file()
+def test_default_rwkv_lightning_path_points_to_repo_vendor() -> None:
+    assert DEFAULT_RWKV_LIGHTNING_PATH.name == "rwkv-lightning"
+    assert DEFAULT_RWKV_LIGHTNING_PATH.parent.name == "vendor"
+    assert (DEFAULT_RWKV_LIGHTNING_PATH / "API_servers" / "fastapi_service.py").is_file()
+    assert (DEFAULT_RWKV_LIGHTNING_PATH / "infer" / "inference.py").is_file()
 
 
-def test_build_backend_uses_nano_vllm_config(monkeypatch, tmp_path: Path) -> None:
+def test_build_backend_uses_local_lightning_when_requested(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
     fake_backend = object()
 
-    def _fake_from_config(config: NanoVLLMBackendConfig):
+    def _fake_from_model_config(config, *, engine_mode: str, state_db_path: str | None):  # noqa: ANN001
         captured["config"] = config
+        captured["engine_mode"] = engine_mode
+        captured["state_db_path"] = state_db_path
         return fake_backend
 
     monkeypatch.setattr(
-        run_infer_server.NanoVLLMInferenceBackend,
-        "from_config",
-        staticmethod(_fake_from_config),
+        LocalInferenceBackend,
+        "from_model_config",
+        staticmethod(_fake_from_model_config),
     )
     args = run_infer_server.parse_args(
         [
             "--model-path",
-            "/models/rwkv-demo.pth",
+            str(tmp_path / "rwkv-demo.pth"),
             "--model-name",
             "demo",
-            "--nano-vllm-path",
-            str(tmp_path / "nano"),
-            "--max-num-seqs",
-            "64",
-            "--max-num-batched-tokens",
-            "2048",
-            "--max-model-len",
-            "8192",
-            "--rwkv-prefill-token-budget",
-            "512",
-            "--rwkv-prefill-max-batch-size",
-            "16",
-            "--rwkv-prefill-chunk-size",
-            "32",
-            "--rwkv-state-cache-enable",
-            "--max-state-slots",
-            "128",
-            "--rwkv-state-cache-safety-reserve-slots",
-            "4",
-            "--sampling-bucket-temperature-resolution",
-            "0.05",
-            "--sampling-bucket-top-p-resolution",
-            "0.1",
-            "--rwkv-quant-int8",
-            "--rwkv-int8-fp16-lm-head",
-            "--gpu-memory-utilization",
-            "0.75",
-            "--tensor-parallel-size",
-            "2",
-            "--enforce-eager",
+            "--engine-mode",
+            "lightning",
+            "--device",
+            "cuda:1",
+            "--state-db-path",
+            str(tmp_path / "states.sqlite"),
         ]
     )
 
@@ -76,26 +59,82 @@ def test_build_backend_uses_nano_vllm_config(monkeypatch, tmp_path: Path) -> Non
 
     assert backend is fake_backend
     config = captured["config"]
-    assert isinstance(config, NanoVLLMBackendConfig)
-    assert config.model_path == "/models/rwkv-demo.pth"
+    assert isinstance(config, ModelLoadConfig)
+    assert config.weights_path == str(tmp_path / "rwkv-demo.pth")
+    assert config.device == "cuda:1"
+    assert config.tokenizer_path is None
+    assert captured["engine_mode"] == "lightning"
+    assert captured["state_db_path"] == str(tmp_path / "states.sqlite")
+
+
+def test_parse_args_ignores_removed_nano_engine_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RWKV_INFER_ENGINE_MODE", "nano-vllm")
+
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            str(tmp_path / "rwkv-demo.pth"),
+            "--infer-auto-config",
+            "off",
+        ]
+    )
+
+    assert args.engine_mode == "rwkv-lightning"
+
+
+def test_main_serves_rwkv_lightning_server_by_default(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeServer:
+        app = {"kind": "rwkv-lightning"}
+
+        @staticmethod
+        def cleanup() -> None:
+            captured["cleanup"] = True
+
+    def _fake_build(config: RWKVLightningServerConfig):
+        captured["config"] = config
+        return _FakeServer()
+
+    monkeypatch.setattr(run_infer_server, "build_rwkv_lightning_app", _fake_build)
+    monkeypatch.setattr(
+        run_infer_server.uvicorn,
+        "run",
+        lambda app, **kwargs: captured.update({"app": app, "uvicorn_kwargs": kwargs}),
+    )
+
+    result = run_infer_server.main(
+        [
+            "--model-path",
+            str(tmp_path / "rwkv-demo.pth"),
+            "--model-name",
+            "demo",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "18081",
+            "--api-key",
+            "secret",
+            "--log-level",
+            "warning",
+        ]
+    )
+
+    assert result == 0
+    config = captured["config"]
+    assert isinstance(config, RWKVLightningServerConfig)
+    assert config.model_path == str(tmp_path / "rwkv-demo.pth")
     assert config.model_name == "demo"
-    assert config.nano_vllm_path == str(tmp_path / "nano")
-    assert config.max_num_seqs == 64
-    assert config.max_num_batched_tokens == 2048
-    assert config.max_model_len == 8192
-    assert config.rwkv_prefill_token_budget == 512
-    assert config.rwkv_prefill_max_batch_size == 16
-    assert config.rwkv_prefill_chunk_size == 32
-    assert config.rwkv_state_cache_enable is True
-    assert config.max_state_slots == 128
-    assert config.rwkv_state_cache_safety_reserve_slots == 4
-    assert config.sampling_bucket_temperature_resolution == 0.05
-    assert config.sampling_bucket_top_p_resolution == 0.1
-    assert config.rwkv_quant_int8 is True
-    assert config.rwkv_int8_fp16_lm_head is True
-    assert config.gpu_memory_utilization == 0.75
-    assert config.tensor_parallel_size == 2
-    assert config.enforce_eager is True
+    assert config.password == "secret"
+    assert config.rwkv_lightning_path == str(DEFAULT_RWKV_LIGHTNING_PATH)
+    assert captured["app"] == {"kind": "rwkv-lightning"}
+    assert captured["cleanup"] is True
+    assert captured["uvicorn_kwargs"] == {
+        "host": "0.0.0.0",
+        "port": 18081,
+        "log_level": "warning",
+        "access_log": False,
+    }
 
 
 def test_parse_args_applies_throughput_auto_config_for_large_visible_gpu(monkeypatch) -> None:
@@ -180,7 +219,7 @@ def test_parse_args_auto_config_off_uses_legacy_defaults(monkeypatch) -> None:
     assert args.gpu_memory_utilization == 0.9
 
 
-def test_main_serves_nano_vllm_backend(monkeypatch, tmp_path: Path) -> None:
+def test_main_serves_local_backend(monkeypatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     class _FakeBackend:
@@ -213,6 +252,8 @@ def test_main_serves_nano_vllm_backend(monkeypatch, tmp_path: Path) -> None:
             str(tmp_path / "rwkv-demo.pth"),
             "--model-name",
             "demo",
+            "--engine-mode",
+            "classic",
             "--host",
             "0.0.0.0",
             "--port",

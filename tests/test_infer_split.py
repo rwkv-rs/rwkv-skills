@@ -21,6 +21,7 @@ from src.infer.api import (
     ChatToolFunction,
     ChatCompletionToolCall,
     ChatCompletionToolCallFunction,
+    ChoiceLogitsRequest,
     CompletionChoice,
     CompletionLogprobs,
     CompletionRequest,
@@ -45,6 +46,7 @@ from src.infer.openai_service import (
 )
 from src.infer.sampling import GeneratedTextDelta, GeneratedToken, GeneratedTokenCandidate
 from src.infer.sampling import GenerationOutput, SamplingConfig
+from src.infer.server import create_app as create_infer_app
 from src.infer.service import InferenceService
 from src.infer.sse import encode_sse_comment, iter_sse_payloads
 
@@ -348,6 +350,7 @@ def test_inference_backend_arg_validation_and_model_name_resolution() -> None:
     validate_inference_backend_args(remote_args)
     assert resolve_backend_model_name(remote_args) == "remote-demo"
     assert normalize_api_base("127.0.0.1:8081") == "http://127.0.0.1:8081/v1"
+    assert normalize_api_base("http://127.0.0.1:8081/v2") == "http://127.0.0.1:8081/v1"
 
 
 def test_completion_style_remote_protocol_normalizes_openai_to_completions() -> None:
@@ -372,6 +375,32 @@ def test_completion_style_remote_protocol_rejects_vllm() -> None:
 
     with pytest.raises(ValueError, match="requires completion-style"):
         require_completion_style_remote_protocol(args, benchmark_name="legacy code")
+
+
+def test_completion_style_remote_protocol_allows_lightning_contents() -> None:
+    args = argparse.Namespace(
+        model_path="",
+        infer_base_url="127.0.0.1:8081",
+        infer_model="remote-demo",
+        infer_protocol="lightning",
+    )
+
+    assert require_completion_style_remote_protocol(args, benchmark_name="legacy code") is True
+    assert args.infer_protocol == "lightning"
+
+
+def test_infer_server_registers_lightning_generation_and_choice_logits_routes() -> None:
+    service = InferenceService(_FakeBackend(), max_batch_size=4, batch_collect_ms=0)
+    try:
+        app = create_infer_app(service)
+        paths = {route.path for route in app.routes}
+    finally:
+        service.shutdown()
+
+    assert "/v2/chat/completions" in paths
+    assert "/openai/v2/chat/completions" in paths
+    assert "/v1/choice_logits" in paths
+    assert "/openai/v1/choice_logits" in paths
 
 
 def test_inference_service_batches_generation_and_handles_choice_scoring() -> None:
@@ -405,10 +434,18 @@ def test_inference_service_batches_generation_and_handles_choice_scoring() -> No
                 candidate_token_texts=[" A", " B"],
             )
         )
+        future_logits = service.submit_choice_logits(
+            ChoiceLogitsRequest(
+                model="demo-model",
+                prompt="question2",
+                choices={"C": " C", "D": " D"},
+            )
+        )
 
         response_one = future_one.result(timeout=2.0)
         response_two = future_two.result(timeout=2.0)
         response_score = future_score.result(timeout=2.0)
+        response_logits = future_logits.result(timeout=2.0)
     finally:
         service.shutdown()
 
@@ -419,10 +456,13 @@ def test_inference_service_batches_generation_and_handles_choice_scoring() -> No
     assert response_one.choices[0].text == "gen:prompt-one"
     assert response_two.choices[0].text == "gen:prompt-two"
 
-    assert backend.score_calls == [("question", [" A", " B"])]
+    assert backend.score_calls == [("question", [" A", " B"]), ("question2", [" C", " D"])]
     top_logprobs = response_score.choices[0].logprobs.top_logprobs
     assert top_logprobs is not None
     assert top_logprobs[0][" B"] > top_logprobs[0][" A"]
+    assert response_logits.best_choice == "D"
+    assert response_logits.choice_logits["D"] > response_logits.choice_logits["C"]
+    assert response_logits.choice_probabilities["D"] > response_logits.choice_probabilities["C"]
     assert backend.shutdown_calls == 1
 
 
@@ -1291,6 +1331,94 @@ def test_remote_backend_completions_protocol_supports_choice_scoring(monkeypatch
     assert len(calls) == 1
     assert calls[0][0] == "http://127.0.0.1:19081/openai/v1/completions"
     assert calls[0][1]["candidate_token_texts"] == [" A", " B"]
+
+
+def test_remote_backend_lightning_uses_v2_contents_and_choice_logits(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081/openai",
+            model="remote-demo",
+            api_key="pw",
+            protocol="lightning",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/v2/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "answer-a"},
+                        "finish_reason": "stop",
+                    },
+                    {
+                        "index": 1,
+                        "message": {"role": "assistant", "content": "answer-b"},
+                        "finish_reason": "stop",
+                    },
+                ]
+            }
+        if url.endswith("/v1/choice_logits"):
+            return {
+                "model": "remote-demo",
+                "choice_logits": {
+                    "choice_0": -2.0,
+                    "choice_1": 3.0,
+                },
+                "choice_probabilities": {
+                    "choice_0": 0.01,
+                    "choice_1": 0.99,
+                },
+                "best_choice": "choice_1",
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["raw prompt A", "raw prompt B"],
+        sampling=SamplingConfig(
+            max_generate_tokens=4,
+            temperature=0.0,
+            top_k=42,
+            top_p=0.8,
+            alpha_presence=0.1,
+            alpha_frequency=0.2,
+            alpha_decay=0.95,
+            stop_tokens=(0,),
+            ban_tokens=(123,),
+            pad_zero=False,
+            no_penalty_token_ids=(33, 10),
+        ),
+        batch_size=2,
+        prompt_seeds=[123, 456],
+        prefill_chunk_size=64,
+        show_progress=False,
+    )
+    scores, best_text = backend.score_choice_tokens(prompt="question", choice_token_texts=[" A", " B"])
+
+    assert [output.text for output in outputs] == ["answer-a", "answer-b"]
+    assert best_text == " B"
+    assert scores == {" A": -2.0, " B": 3.0}
+    assert calls[0][0] == "http://127.0.0.1:19081/v2/chat/completions"
+    assert calls[0][1]["contents"] == ["raw prompt A", "raw prompt B"]
+    assert calls[0][1]["top_k"] == 42
+    assert calls[0][1]["chunk_size"] == 64
+    assert calls[0][1]["password"] == "pw"
+    assert "messages" not in calls[0][1]
+    assert "seed" not in calls[0][1]
+    assert calls[1][0] == "http://127.0.0.1:19081/v1/choice_logits"
+    assert calls[1][1] == {
+        "model": "remote-demo",
+        "prompt": "question",
+        "choices": {"choice_0": " A", "choice_1": " B"},
+        "temperature": 1.0,
+        "use_prefix_cache": False,
+        "password": "pw",
+    }
 
 
 def test_remote_backend_legacy_nano_single_requests_keep_private_fields(monkeypatch) -> None:

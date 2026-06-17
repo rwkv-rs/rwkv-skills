@@ -11,16 +11,19 @@ from typing import Sequence, cast
 import uvicorn
 
 from src.infer.auto_config import AutoConfigMode, GpuProfile, choose_infer_auto_config, detect_visible_gpu_profile
-from src.infer.nano_vllm_backend import (
-    DEFAULT_NANO_VLLM_PATH,
-    NanoVLLMBackendConfig,
-    NanoVLLMInferenceBackend,
+from src.infer.backend import InferenceBackend, LocalInferenceBackend
+from src.infer.model import ModelLoadConfig
+from src.infer.rwkv_lightning_server import (
+    DEFAULT_RWKV_LIGHTNING_PATH,
+    RWKVLightningServerConfig,
+    build_rwkv_lightning_app,
 )
 from src.infer.server import create_app
 from src.infer.service import InferenceService
 
 
 _AUTO_CONFIG_MODES = ("off", "balanced", "throughput")
+_ENGINE_MODE_CHOICES = ("rwkv-lightning", "lightning", "classic")
 _AUTO_CONFIG_DEFAULTS = {
     "max_batch_size": 32,
     "batch_collect_ms": 5,
@@ -38,6 +41,13 @@ def _default_auto_config_mode() -> str:
     return os.environ.get("RWKV_INFER_AUTO_CONFIG", "throughput").strip().lower()
 
 
+def _default_engine_mode() -> str:
+    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "rwkv-lightning").strip().lower()
+    if value in _ENGINE_MODE_CHOICES:
+        return value
+    return "rwkv-lightning"
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the standalone RWKV infer service")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
@@ -48,18 +58,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--engine-mode",
-        choices=("classic", "lightning"),
-        default="classic",
-        help="Deprecated compatibility flag; run_infer_server always uses nano-vLLM",
+        choices=_ENGINE_MODE_CHOICES,
+        default=_default_engine_mode(),
+        help="Inference backend implementation; rwkv-lightning is the formal server backend",
     )
     parser.add_argument(
         "--state-db-path",
-        help="Deprecated compatibility flag retained for fleet launch commands",
+        help="Path to the local sqlite state cache database used by the lightning engine",
     )
     parser.add_argument(
-        "--nano-vllm-path",
-        default=os.environ.get("NANO_VLLM_RWKV_PATH", str(DEFAULT_NANO_VLLM_PATH)),
-        help="Path to the nano-vLLM RWKV checkout that provides nanovllm.LLMEngine",
+        "--rwkv-lightning-path",
+        default=os.environ.get("RWKV_LIGHTNING_PATH", str(DEFAULT_RWKV_LIGHTNING_PATH)),
+        help="Path to the vendored RWKV-Lightning server source",
     )
     parser.add_argument("--model-name", help="Public model name exposed by the infer API")
     parser.add_argument(
@@ -195,30 +205,20 @@ def apply_startup_auto_config(
     return args
 
 
-def build_backend(args: argparse.Namespace) -> NanoVLLMInferenceBackend:
-    return NanoVLLMInferenceBackend.from_config(
-        NanoVLLMBackendConfig(
-            model_path=str(args.model_path),
-            model_name=str(args.model_name) if args.model_name else Path(args.model_path).stem,
-            nano_vllm_path=str(args.nano_vllm_path),
-            max_num_batched_tokens=int(args.max_num_batched_tokens),
-            max_num_seqs=int(args.max_num_seqs),
-            max_model_len=int(args.max_model_len),
-            rwkv_prefill_token_budget=int(args.rwkv_prefill_token_budget),
-            rwkv_prefill_max_batch_size=int(args.rwkv_prefill_max_batch_size),
-            rwkv_prefill_chunk_size=int(args.rwkv_prefill_chunk_size),
-            rwkv_state_cache_enable=bool(args.rwkv_state_cache_enable),
-            max_state_slots=int(args.max_state_slots),
-            rwkv_state_cache_safety_reserve_slots=int(args.rwkv_state_cache_safety_reserve_slots),
-            sampling_bucket_temperature_resolution=float(args.sampling_bucket_temperature_resolution),
-            sampling_bucket_top_p_resolution=float(args.sampling_bucket_top_p_resolution),
-            rwkv_quant_int8=bool(args.rwkv_quant_int8),
-            rwkv_int8_fp16_lm_head=bool(args.rwkv_int8_fp16_lm_head),
-            gpu_memory_utilization=float(args.gpu_memory_utilization),
-            tensor_parallel_size=int(args.tensor_parallel_size),
-            enforce_eager=bool(args.enforce_eager),
+def build_backend(args: argparse.Namespace) -> InferenceBackend:
+    engine_mode = str(args.engine_mode or "lightning").strip().lower()
+    if engine_mode == "rwkv-lightning":
+        raise ValueError("rwkv-lightning is a standalone server mode; call main() to launch it")
+    if engine_mode in {"lightning", "classic"}:
+        return LocalInferenceBackend.from_model_config(
+            ModelLoadConfig(
+                weights_path=str(args.model_path),
+                device=str(args.device or "cuda"),
+            ),
+            engine_mode=engine_mode,
+            state_db_path=None if args.state_db_path in (None, "") else str(args.state_db_path),
         )
-    )
+    raise ValueError(f"unsupported engine mode: {args.engine_mode!r}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -226,6 +226,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if bool(getattr(args, "infer_auto_config_applied", False)):
         logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
         _LOG.info("applied infer auto config: %s", args.infer_auto_config_reason)
+    if str(args.engine_mode).strip().lower() == "rwkv-lightning":
+        server = build_rwkv_lightning_app(
+            RWKVLightningServerConfig(
+                model_path=str(args.model_path),
+                model_name=str(args.model_name) if args.model_name else None,
+                password=str(args.api_key) if args.api_key else None,
+                rwkv_lightning_path=str(args.rwkv_lightning_path),
+            )
+        )
+        try:
+            uvicorn.run(
+                server.app,
+                host=args.host,
+                port=int(args.port),
+                log_level=str(args.log_level),
+                access_log=False,
+            )
+        finally:
+            server.cleanup()
+        return 0
     backend = build_backend(args)
     service = InferenceService(
         backend,

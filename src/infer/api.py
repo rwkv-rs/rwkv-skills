@@ -555,6 +555,37 @@ class ChoiceScore:
     logprob: float
 
 
+class ChoiceLogitsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    model: str
+    prompt: str = ""
+    contents: list[str] = Field(default_factory=list)
+    choices: dict[str, str] = Field(min_length=1)
+    temperature: float = 1.0
+    password: str | None = None
+    use_prefix_cache: bool = True
+
+    def single_prompt(self) -> str:
+        if self.prompt:
+            return self.prompt
+        if len(self.contents) == 1 and self.contents[0]:
+            return self.contents[0]
+        raise ValueError("choice_logits requires prompt or exactly one content item")
+
+
+class ChoiceLogitsResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=lambda: f"choice_logits-{uuid4().hex}")
+    object: str = "choice.logits"
+    created: int = Field(default_factory=current_unix_seconds)
+    model: str
+    choice_logits: dict[str, float]
+    choice_probabilities: dict[str, float]
+    best_choice: str
+
+
 ChatCompletionMessage.model_rebuild()
 
 
@@ -581,6 +612,8 @@ __all__ = [
     "ChatToolFunction",
     "ChatTopLogprob",
     "ChoiceScore",
+    "ChoiceLogitsRequest",
+    "ChoiceLogitsResponse",
     "CompletionChoice",
     "CompletionChunkResponse",
     "CompletionLogprobs",

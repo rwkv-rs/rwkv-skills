@@ -34,9 +34,14 @@ class RemoteHTTPError(RuntimeError):
 _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 
-RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "nano-vllm-contents"]
+RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "lightning", "nano-vllm-contents"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
-REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("openai", "vllm", "completions")
+REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
+    "openai",
+    "vllm",
+    "completions",
+    "lightning",
+)
 REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("nano-vllm-contents",)
 REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
     *REMOTE_INFERENCE_PROTOCOL_CHOICES,
@@ -48,14 +53,24 @@ REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
 )
 
 
-def normalize_api_base(base_url: str) -> str:
+def normalize_api_root(base_url: str) -> str:
     base = str(base_url or "").strip()
     if not base:
         raise ValueError("infer base URL cannot be empty")
     if "://" not in base:
         base = f"http://{base}"
     base = base.rstrip("/")
-    return base if base.endswith("/v1") else f"{base}/v1"
+    if base.endswith("/v1") or base.endswith("/v2"):
+        return base.rsplit("/", 1)[0]
+    return base
+
+
+def normalize_api_base_for_version(base_url: str, version: Literal["v1", "v2"]) -> str:
+    return f"{normalize_api_root(base_url)}/{version}"
+
+
+def normalize_api_base(base_url: str) -> str:
+    return normalize_api_base_for_version(base_url, "v1")
 
 
 def normalize_local_device(device: str) -> str:
@@ -119,9 +134,9 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         default="preserve",
         help=(
             "Remote seed handling. preserve keeps per-prompt seeds, falling back to OpenAI requests when needed; "
-            "vllm, completions, and omit-for-contents omit per-prompt seeds for standard concurrent requests; "
+            "vllm, completions, lightning, and omit-for-contents omit per-prompt seeds for standard concurrent requests; "
             "completions preserves raw prompts and private RWKV sampling fields; "
-            "omit-for-contents also drops seeds for nano-vLLM contents batching."
+            "omit-for-contents also drops seeds for contents batching."
         ),
     )
 
@@ -166,12 +181,12 @@ def require_completion_style_remote_protocol(
     if protocol == "vllm":
         raise ValueError(
             f"{benchmark_name} requires completion-style remote generation; "
-            "use --infer-protocol completions instead of vllm/chat."
+            "use --infer-protocol completions or lightning instead of vllm/chat."
         )
     if protocol == "openai":
         setattr(args, "infer_protocol", "completions")
         return True
-    if protocol == "completions":
+    if protocol in {"completions", "lightning"}:
         return True
     raise ValueError(
         f"{benchmark_name} requires completion-style remote generation; "
@@ -331,10 +346,22 @@ class RemoteInferenceConfig:
     )
 
     def completions_url(self) -> str:
-        return f"{normalize_api_base(self.base_url)}/completions"
+        return f"{normalize_api_base_for_version(self.base_url, 'v1')}/completions"
 
     def chat_completions_url(self) -> str:
-        return f"{normalize_api_base(self.base_url)}/chat/completions"
+        return f"{normalize_api_base_for_version(self.base_url, 'v1')}/chat/completions"
+
+    def lightning_api_root(self) -> str:
+        root = normalize_api_root(self.base_url)
+        if root.endswith("/openai"):
+            return root.rsplit("/", 1)[0]
+        return root
+
+    def lightning_chat_completions_url(self) -> str:
+        return f"{self.lightning_api_root()}/v2/chat/completions"
+
+    def choice_logits_url(self) -> str:
+        return f"{self.lightning_api_root()}/v1/choice_logits"
 
 
 @dataclass(slots=True)
@@ -380,9 +407,9 @@ class RemoteInferenceBackend:
             raise ValueError("prompt_stop_suffixes length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
         force_openai_single_requests = False
-        use_contents_protocol = self.config.protocol == "nano-vllm-contents"
+        use_contents_protocol = self.config.protocol in {"nano-vllm-contents", "lightning"}
         omit_prompt_seeds = (
-            self.config.protocol in {"vllm", "completions"}
+            self.config.protocol in {"vllm", "completions", "lightning"}
             or self.config.seed_policy == "omit-for-contents"
         )
         if prompt_seeds is not None:
@@ -402,12 +429,13 @@ class RemoteInferenceBackend:
                 sampling=effective_sampling,
                 batch_size=batch_size,
                 progress_desc=progress_desc,
-                probe_only=probe_only,
-                on_complete=on_complete,
-                on_token=on_token,
-                prompt_stop_suffixes=prompt_stop_suffixes,
-                show_progress=show_progress,
-            )
+            probe_only=probe_only,
+            on_complete=on_complete,
+            on_token=on_token,
+            prompt_stop_suffixes=prompt_stop_suffixes,
+            prefill_chunk_size=prefill_chunk_size,
+            show_progress=show_progress,
+        )
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
@@ -448,6 +476,7 @@ class RemoteInferenceBackend:
         on_complete: Callable[[GenerationOutput], None] | None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+        prefill_chunk_size: int,
         show_progress: bool,
     ) -> list[GenerationOutput]:
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
@@ -464,6 +493,7 @@ class RemoteInferenceBackend:
                     prompts=[prompts[index] for index in indices],
                     sampling=sampling,
                     stop_suffixes=stop_suffixes,
+                    prefill_chunk_size=prefill_chunk_size,
                 )
                 for output in batch_outputs:
                     outputs[output.prompt_index] = output
@@ -483,6 +513,7 @@ class RemoteInferenceBackend:
         prompts: Sequence[str],
         sampling: SamplingConfig,
         stop_suffixes: tuple[str, ...],
+        prefill_chunk_size: int,
     ) -> list[GenerationOutput]:
         payload: dict[str, object] = {
             "model": self.model_name,
@@ -497,8 +528,17 @@ class RemoteInferenceBackend:
             "pad_zero": bool(sampling.pad_zero),
             "stream": False,
             "stop_tokens": list(stop_suffixes),
+            "chunk_size": max(1, int(prefill_chunk_size)),
+            "prefill_chunk_size": max(1, int(prefill_chunk_size)),
         }
-        response = self._post_json(self.config.chat_completions_url(), payload)
+        if self.config.protocol == "lightning" and self.config.api_key:
+            payload["password"] = str(self.config.api_key)
+        response = self._post_json(
+            self.config.lightning_chat_completions_url()
+            if self.config.protocol == "lightning"
+            else self.config.chat_completions_url(),
+            payload,
+        )
         choices = response.get("choices")
         if not isinstance(choices, list):
             raise RuntimeError("remote infer response missing choices")
@@ -545,6 +585,8 @@ class RemoteInferenceBackend:
             raise NotImplementedError(
                 f"{self.config.protocol} remote protocol does not support candidate choice scoring"
             )
+        if self.config.protocol == "lightning":
+            return self._score_choice_logits(prompt=prompt, choice_token_texts=choice_token_texts)
         if self._legacy_choice_scoring_supported is False:
             raise NotImplementedError("remote infer service does not support candidate choice scoring")
         payload = {
@@ -589,6 +631,64 @@ class RemoteInferenceBackend:
         best_text = max(choice_token_texts, key=lambda item: scores.get(item, float("-inf")))
         return scores, best_text
 
+    def _score_choice_logits(
+        self,
+        *,
+        prompt: str,
+        choice_token_texts: Sequence[str],
+    ) -> tuple[dict[str, float], str]:
+        labels = [f"choice_{index}" for index, _choice in enumerate(choice_token_texts)]
+        label_to_text = {
+            label: str(choice)
+            for label, choice in zip(labels, choice_token_texts, strict=True)
+        }
+        payload = {
+            "model": self.model_name,
+            "prompt": str(prompt),
+            "choices": label_to_text,
+            "temperature": 1.0,
+            "use_prefix_cache": False,
+        }
+        if self.config.api_key:
+            payload["password"] = str(self.config.api_key)
+        response = self._post_json(self.config.choice_logits_url(), payload)
+        label_logits = response.get("choice_logits")
+        if isinstance(label_logits, dict):
+            missing_labels = [label for label in labels if label not in label_logits]
+            if missing_labels:
+                raise RuntimeError(f"remote choice_logits response missing labels: {missing_labels!r}")
+            scores = {
+                label_to_text[label]: float(label_logits[label])
+                for label in labels
+            }
+            best_label = response.get("best_choice")
+            if not isinstance(best_label, str) or best_label not in label_to_text:
+                best_label = max(labels, key=lambda label: float(label_logits[label]))
+            return scores, label_to_text[best_label]
+
+        raw_scores = response.get("scores")
+        if isinstance(raw_scores, list):
+            scores: dict[str, float] = {}
+            for item in raw_scores:
+                if not isinstance(item, dict):
+                    raise RuntimeError("remote choice_logits score entry must be an object")
+                text = item.get("text")
+                if not isinstance(text, str):
+                    raise RuntimeError("remote choice_logits score entry missing text")
+                try:
+                    scores[text] = float(item["logit"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError("remote choice_logits score entry missing numeric logit") from exc
+            missing = [choice for choice in choice_token_texts if str(choice) not in scores]
+            if missing:
+                raise RuntimeError(f"remote choice_logits response missing choices: {missing!r}")
+            best_text = response.get("best_text")
+            if not isinstance(best_text, str) or best_text not in scores:
+                best_text = max((str(choice) for choice in choice_token_texts), key=lambda item: scores[item])
+            return scores, best_text
+
+        raise RuntimeError("remote choice_logits response missing choice_logits")
+
     def shutdown(self) -> None:
         with self._http_client_lock:
             client = self._http_client
@@ -605,7 +705,7 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol in {"completions", "nano-vllm-contents"}
+        include_private_fields = self.config.protocol in {"completions", "lightning", "nano-vllm-contents"}
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -622,6 +722,11 @@ class RemoteInferenceBackend:
         )
         if self.config.protocol == "vllm":
             response = self._post_json(self.config.chat_completions_url(), chat_payload)
+            is_chat_response = True
+        elif self.config.protocol == "lightning":
+            if self.config.api_key:
+                chat_payload["password"] = str(self.config.api_key)
+            response = self._post_json(self.config.lightning_chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
             response = self._post_json(self.config.completions_url(), payload)
@@ -914,7 +1019,9 @@ def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
         value = "vllm"
     if value in {"completion", "raw-completion", "raw-completions", "text-completion", "text-completions"}:
         value = "completions"
-    if value in {"nano-vllm", "nanovllm", "contents", "lightning"}:
+    if value in {"rwkv-lightning", "lightning-v2"}:
+        value = "lightning"
+    if value in {"nano-vllm", "nanovllm", "contents"}:
         value = "nano-vllm-contents"
     if value not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:
         choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)

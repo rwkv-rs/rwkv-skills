@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Verified launch helper for the nano-vLLM inference-swap formal eval path."""
+"""Verified launch helper for the Lightning inference-swap formal eval path."""
 
 import argparse
 import json
@@ -16,7 +16,7 @@ from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES, REMOTE_INFERENC
 
 DEFAULT_INFER_BASE_URL = "http://127.0.0.1:29082"
 DEFAULT_INFER_MODEL = "rwkv7-g1g-2.9b-20260526-ctx8192"
-DEFAULT_INFER_PROTOCOL = "vllm"
+DEFAULT_INFER_PROTOCOL = "lightning"
 DEFAULT_INFER_SEED_POLICY = "preserve"
 DEFAULT_DB_HOST = "127.0.0.1"
 DEFAULT_DB_PORT = 5432

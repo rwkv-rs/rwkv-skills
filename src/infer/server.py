@@ -16,6 +16,8 @@ from .api import (
     ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChoiceLogitsRequest,
+    ChoiceLogitsResponse,
     CompletionRequest,
     CompletionResponse,
     ContentsChatCompletionRequest,
@@ -148,6 +150,22 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
             "data": [{"id": service.model_name, "object": "model"}],
         }
 
+    @app.post("/openai/v1/choice_logits", dependencies=[Depends(_authorize)], response_model=ChoiceLogitsResponse)
+    @app.post("/v1/choice_logits", dependencies=[Depends(_authorize)], response_model=ChoiceLogitsResponse)
+    async def choice_logits(request: ChoiceLogitsRequest) -> ChoiceLogitsResponse:
+        if request.model != service.model_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"unknown model {request.model!r}; available model is {service.model_name!r}",
+            )
+        future = service.submit_choice_logits(request)
+        try:
+            return await asyncio.wrap_future(future)
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - exercised through integration
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
     @app.post("/openai/v1/completions", dependencies=[Depends(_authorize)], response_model=CompletionResponse)
     @app.post("/v1/completions", dependencies=[Depends(_authorize)], response_model=CompletionResponse)
     async def completions(request: CompletionRequest) -> CompletionResponse | StreamingResponse:
@@ -204,6 +222,16 @@ def create_app(service: InferenceService, *, api_key: str | None = None) -> Fast
     )
     @app.post(
         "/v1/chat/completions",
+        dependencies=[Depends(_authorize)],
+        response_model=ChatCompletionResponse,
+    )
+    @app.post(
+        "/openai/v2/chat/completions",
+        dependencies=[Depends(_authorize)],
+        response_model=ChatCompletionResponse,
+    )
+    @app.post(
+        "/v2/chat/completions",
         dependencies=[Depends(_authorize)],
         response_model=ChatCompletionResponse,
     )

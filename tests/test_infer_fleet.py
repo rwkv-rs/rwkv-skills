@@ -7,6 +7,7 @@ from src.bin.run_infer_fleet import (
     InferServiceSpec,
     RunningInferService,
     build_command,
+    parse_args,
     plan_deployments,
     resolve_max_batch_sizes,
     resolve_model_names,
@@ -105,6 +106,19 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
     assert command[command.index("--max-batch-size") + 1] == "4"
     assert command[command.index("--infer-auto-config") + 1] == "off"
     assert command[command.index("--api-key") + 1] == "secret"
+
+
+def test_parse_args_ignores_removed_nano_engine_default(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RWKV_INFER_ENGINE_MODE", "nano-vllm")
+
+    args = parse_args(
+        [
+            "--model-paths",
+            str(tmp_path / "rwkv-demo.pth"),
+        ]
+    )
+
+    assert args.engine_mode == "rwkv-lightning"
 
 
 def test_write_manifest_serializes_service_urls(tmp_path: Path) -> None:

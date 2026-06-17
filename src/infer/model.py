@@ -6,9 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import types
 
-from .rwkv7.rwkv7 import RWKV_x070
-from .rwkv7.utils import TRIE_TOKENIZER
-
 
 @dataclass(slots=True)
 class ModelLoadConfig:
@@ -19,6 +16,9 @@ class ModelLoadConfig:
 
 def load_rwkv_model(config: ModelLoadConfig):
     """Load RWKV 模型 + tokenizer。"""
+
+    from .rwkv7.rwkv7 import RWKV_x070
+    from .rwkv7.utils import TRIE_TOKENIZER
 
     weights_path = Path(config.weights_path).expanduser().resolve()
     if weights_path.suffix == ".pth":

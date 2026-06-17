@@ -14,6 +14,8 @@ from typing import Sequence
 import torch
 
 from .api import (
+    ChoiceLogitsRequest,
+    ChoiceLogitsResponse,
     ChoiceScore,
     CompletionChoice,
     CompletionLogprobs,
@@ -34,6 +36,13 @@ class _PendingRequest:
     future: Future[CompletionResponse]
     enqueued_at: int
     stream_queue: Queue[GeneratedTextDelta | None] | None = None
+
+
+@dataclass(slots=True)
+class _PendingChoiceLogitsRequest:
+    request: ChoiceLogitsRequest
+    future: Future[ChoiceLogitsResponse]
+    enqueued_at: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -91,7 +100,7 @@ class InferenceService:
             "last_gpu_memory_used_mb": None,
             "last_gpu_memory_total_mb": None,
         }
-        self._queue: Queue[_PendingRequest | None] = Queue()
+        self._queue: Queue[_PendingRequest | _PendingChoiceLogitsRequest | None] = Queue()
         self._stop = threading.Event()
         self._worker = threading.Thread(target=self._run_worker, name="rwkv-infer-worker", daemon=True)
         self._worker.start()
@@ -102,6 +111,16 @@ class InferenceService:
 
     def submit_completion(self, request: CompletionRequest) -> Future[CompletionResponse]:
         return self._submit_pending(request).future
+
+    def submit_choice_logits(self, request: ChoiceLogitsRequest) -> Future[ChoiceLogitsResponse]:
+        future: Future[ChoiceLogitsResponse] = Future()
+        pending = _PendingChoiceLogitsRequest(
+            request=request,
+            future=future,
+            enqueued_at=time.monotonic_ns(),
+        )
+        self._queue.put(pending)
+        return future
 
     def submit_streaming_completion(self, request: CompletionRequest) -> CompletionStreamHandle:
         token_queue: Queue[GeneratedTextDelta | None] = Queue()
@@ -208,7 +227,7 @@ class InferenceService:
             shutdown()
 
     def _run_worker(self) -> None:
-        pending: deque[_PendingRequest] = deque()
+        pending: deque[_PendingRequest | _PendingChoiceLogitsRequest] = deque()
         while True:
             if not pending:
                 try:
@@ -232,13 +251,21 @@ class InferenceService:
                 continue
 
             score_index = next(
-                (index for index, item in enumerate(pending) if item.request.is_choice_scoring_request()),
+                (
+                    index
+                    for index, item in enumerate(pending)
+                    if isinstance(item, _PendingChoiceLogitsRequest)
+                    or item.request.is_choice_scoring_request()
+                ),
                 None,
             )
             if score_index is not None:
                 item = pending[score_index]
                 del pending[score_index]
-                self._execute_score(item)
+                if isinstance(item, _PendingChoiceLogitsRequest):
+                    self._execute_choice_logits(item)
+                else:
+                    self._execute_score(item)
                 continue
 
             if self._backend_submit is not None:
@@ -250,7 +277,12 @@ class InferenceService:
             batch = self._take_generation_batch(pending)
             self._execute_generation_batch(batch)
 
-    def _collect_pending(self, pending: deque[_PendingRequest], *, block: bool = True) -> None:
+    def _collect_pending(
+        self,
+        pending: deque[_PendingRequest | _PendingChoiceLogitsRequest],
+        *,
+        block: bool = True,
+    ) -> None:
         timeout_s = self.batch_collect_ms / 1000.0
         deadline = time.monotonic() + timeout_s
         while True:
@@ -270,26 +302,42 @@ class InferenceService:
             if len(pending) >= self.max_batch_size * 4:
                 break
 
-    def _take_generation_batch(self, pending: deque[_PendingRequest]) -> list[_PendingRequest]:
+    def _take_generation_batch(
+        self,
+        pending: deque[_PendingRequest | _PendingChoiceLogitsRequest],
+    ) -> list[_PendingRequest]:
         first = pending.popleft()
+        if isinstance(first, _PendingChoiceLogitsRequest):
+            raise RuntimeError("choice logits request reached generation batch")
         key = first.request.generation_batch_key()
         batch = [first]
-        remainder: deque[_PendingRequest] = deque()
+        remainder: deque[_PendingRequest | _PendingChoiceLogitsRequest] = deque()
         while pending:
             item = pending.popleft()
-            if len(batch) < self.max_batch_size and item.request.generation_batch_key() == key:
+            if (
+                isinstance(item, _PendingRequest)
+                and len(batch) < self.max_batch_size
+                and item.request.generation_batch_key() == key
+            ):
                 batch.append(item)
             else:
                 remainder.append(item)
         pending.extend(remainder)
         return batch
 
-    def _take_submit_generation_batch(self, pending: deque[_PendingRequest]) -> list[_PendingRequest]:
+    def _take_submit_generation_batch(
+        self,
+        pending: deque[_PendingRequest | _PendingChoiceLogitsRequest],
+    ) -> list[_PendingRequest]:
         batch: list[_PendingRequest] = []
-        remainder: deque[_PendingRequest] = deque()
+        remainder: deque[_PendingRequest | _PendingChoiceLogitsRequest] = deque()
         while pending:
             item = pending.popleft()
-            if len(batch) < self.max_batch_size and not item.request.is_choice_scoring_request():
+            if (
+                isinstance(item, _PendingRequest)
+                and len(batch) < self.max_batch_size
+                and not item.request.is_choice_scoring_request()
+            ):
                 batch.append(item)
             else:
                 remainder.append(item)
@@ -506,6 +554,39 @@ class InferenceService:
                             ),
                         )
                     ],
+                )
+            )
+        except BaseException as exc:
+            item.future.set_exception(exc)
+
+    def _execute_choice_logits(self, item: _PendingChoiceLogitsRequest) -> None:
+        request = item.request
+        try:
+            prompt = request.single_prompt()
+            labels = [str(label) for label in request.choices]
+            choices = [str(request.choices[label]) for label in labels]
+            raw_scores, best_text = self.backend.score_choice_tokens(
+                prompt=prompt,
+                choice_token_texts=choices,
+            )
+            if float(request.temperature) <= 0:
+                raise ValueError("temperature must be positive")
+            choice_logits = {
+                label: float(raw_scores[text])
+                for label, text in zip(labels, choices, strict=True)
+            }
+            logits_tensor = torch.tensor([choice_logits[label] for label in labels], dtype=torch.float32)
+            probabilities = torch.softmax(logits_tensor / max(float(request.temperature), 1e-12), dim=0)
+            best_label = labels[choices.index(best_text)] if best_text in choices else max(labels, key=choice_logits.__getitem__)
+            item.future.set_result(
+                ChoiceLogitsResponse(
+                    model=self.model_name,
+                    choice_logits=choice_logits,
+                    choice_probabilities={
+                        label: float(probability)
+                        for label, probability in zip(labels, probabilities.tolist(), strict=True)
+                    },
+                    best_choice=str(best_label),
                 )
             )
         except BaseException as exc:

@@ -16,6 +16,16 @@ from typing import Sequence
 from src.eval.scheduler.process import list_idle_gpus
 
 
+_ENGINE_MODE_CHOICES = ("rwkv-lightning", "lightning", "classic")
+
+
+def _default_engine_mode() -> str:
+    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "rwkv-lightning").strip().lower()
+    if value in _ENGINE_MODE_CHOICES:
+        return value
+    return "rwkv-lightning"
+
+
 @dataclass(frozen=True, slots=True)
 class InferServiceSpec:
     model_path: Path
@@ -81,9 +91,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default="", help="Bearer token required by each infer service")
     parser.add_argument(
         "--engine-mode",
-        choices=("classic", "lightning"),
-        default="classic",
-        help="Local inference engine implementation to use",
+        choices=_ENGINE_MODE_CHOICES,
+        default=_default_engine_mode(),
+        help="Inference backend implementation; rwkv-lightning is the formal server backend",
     )
     parser.add_argument(
         "--infer-auto-config",

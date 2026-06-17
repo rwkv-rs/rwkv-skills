@@ -40,14 +40,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 RouteMap = dict[str, tuple[str, ...]]
 
 
-def normalize_api_base(base_url: str) -> str:
+def normalize_api_root(base_url: str) -> str:
     base = str(base_url or "").strip()
     if not base:
         raise ValueError("infer base URL cannot be empty")
     if "://" not in base:
         base = f"http://{base}"
     base = base.rstrip("/")
-    return base if base.endswith("/v1") else f"{base}/v1"
+    if base.endswith("/v1") or base.endswith("/v2"):
+        return base.rsplit("/", 1)[0]
+    return base
+
+
+def normalize_api_base(base_url: str) -> str:
+    return f"{normalize_api_root(base_url)}/v1"
+
+
+def _backend_url_for_path(base_url: str, backend_path: str) -> str:
+    if backend_path.startswith("v1/") or backend_path.startswith("v2/"):
+        return f"{normalize_api_root(base_url)}/{backend_path}"
+    return f"{base_url}/{backend_path}"
 
 
 def parse_routes(raw_routes: Sequence[str]) -> RouteMap:
@@ -176,6 +188,28 @@ def create_app(
             timeout_s=timeout_s,
         )
 
+    @app.post("/v2/chat/completions")
+    @app.post("/openai/v2/chat/completions")
+    async def chat_completions_v2(request: Request) -> Response:
+        return await _forward_json_request(
+            request,
+            routes=route_map,
+            route_offsets=route_offsets,
+            backend_path="v2/chat/completions",
+            timeout_s=timeout_s,
+        )
+
+    @app.post("/v1/choice_logits")
+    @app.post("/openai/v1/choice_logits")
+    async def choice_logits(request: Request) -> Response:
+        return await _forward_json_request(
+            request,
+            routes=route_map,
+            route_offsets=route_offsets,
+            backend_path="choice_logits",
+            timeout_s=timeout_s,
+        )
+
     @app.post("/v1/completions")
     @app.post("/openai/v1/completions")
     async def completions(request: Request) -> Response:
@@ -206,12 +240,17 @@ async def _forward_json_request(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="request body must be a JSON object")
     model = str(payload.get("model") or "").strip()
-    if backend_path == "chat/completions" and isinstance(payload.get("contents"), list):
+    should_split_contents_batch = (
+        isinstance(payload.get("contents"), list)
+        and (backend_path.endswith("chat/completions") or backend_path == "choice_logits")
+    )
+    if should_split_contents_batch:
         urls = _backend_urls_for_model(model, routes)
         if len(urls) > 1:
             return await _forward_contents_batch_request(
                 payload,
                 urls=urls,
+                backend_path=backend_path,
                 route_offsets=route_offsets,
                 forward_executor=request.app.state.forward_executor,
                 http_client=request.app.state.forward_http_client,
@@ -220,7 +259,7 @@ async def _forward_json_request(
                 timeout_s=timeout_s,
             )
     base_url = _next_backend_url(model, routes, route_offsets)
-    target_url = f"{base_url}/{backend_path}"
+    target_url = _backend_url_for_path(base_url, backend_path)
     authorization = request.headers.get("authorization")
     content_type = request.headers.get("content-type") or "application/json"
     loop = asyncio.get_running_loop()
@@ -240,6 +279,7 @@ async def _forward_contents_batch_request(
     payload: dict[str, Any],
     *,
     urls: Sequence[str],
+    backend_path: str,
     route_offsets: dict[str, int],
     forward_executor: concurrent.futures.Executor,
     http_client: httpx.Client,
@@ -256,7 +296,7 @@ async def _forward_contents_batch_request(
             loop.run_in_executor(
                 forward_executor,
                 _post_raw,
-                f"{base_url}/chat/completions",
+                _backend_url_for_path(base_url, backend_path),
                 json.dumps(subpayload, ensure_ascii=False).encode("utf-8"),
                 authorization,
                 content_type,
@@ -269,7 +309,10 @@ async def _forward_contents_batch_request(
     for status_code, raw, media_type in results:
         if int(status_code) >= 400:
             return Response(content=raw, status_code=int(status_code), media_type=media_type)
-    merged = _merge_contents_batch_responses(payload, subrequests=subrequests, results=results)
+    if backend_path == "choice_logits":
+        merged = _merge_choice_logits_batch_responses(payload, subrequests=subrequests, results=results)
+    else:
+        merged = _merge_contents_batch_responses(payload, subrequests=subrequests, results=results)
     return Response(
         content=json.dumps(merged, ensure_ascii=False).encode("utf-8"),
         status_code=200,
@@ -342,6 +385,61 @@ def _merge_contents_batch_responses(
     template["choices"] = sorted(merged_choices, key=lambda choice: int(choice.get("index", 0)))
     template["model"] = str(payload.get("model") or template.get("model") or "")
     return template
+
+
+def _merge_choice_logits_batch_responses(
+    payload: dict[str, Any],
+    *,
+    subrequests: Sequence[tuple[str, tuple[int, ...], dict[str, Any]]],
+    results: Sequence[tuple[int, bytes, str]],
+) -> dict[str, Any]:
+    merged_results: list[dict[str, Any]] = []
+    template: dict[str, Any] | None = None
+    for (_base_url, indices, _subpayload), (_status_code, raw, _media_type) in zip(subrequests, results, strict=True):
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=502, detail="backend response must be JSON") from exc
+        if not isinstance(response, dict):
+            raise HTTPException(status_code=502, detail="backend response must be a JSON object")
+        if template is None:
+            template = dict(response)
+        response_results = response.get("results")
+        if isinstance(response_results, list):
+            local_results = response_results
+        elif "choice_logits" in response:
+            local_results = [_single_choice_logits_response_to_result(response)]
+        else:
+            raise HTTPException(status_code=502, detail="backend choice_logits response missing results")
+        for fallback_index, result in enumerate(local_results):
+            if not isinstance(result, dict):
+                raise HTTPException(status_code=502, detail="backend choice_logits result must be an object")
+            local_index = int(result.get("index", fallback_index))
+            if local_index < 0 or local_index >= len(indices):
+                raise HTTPException(status_code=502, detail="backend choice_logits result index out of range")
+            rewritten = dict(result)
+            rewritten["index"] = indices[local_index]
+            merged_results.append(rewritten)
+    response_model = str(payload.get("model") or (template or {}).get("model") or "")
+    merged: dict[str, Any] = {
+        "id": str((template or {}).get("id") or "router-choice-logits"),
+        "object": "choice.logits.batch",
+        "model": response_model,
+        "results": sorted(merged_results, key=lambda result: int(result.get("index", 0))),
+    }
+    if template is not None and template.get("created") is not None:
+        merged["created"] = template["created"]
+    return merged
+
+
+def _single_choice_logits_response_to_result(response: Mapping[str, Any]) -> dict[str, Any]:
+    result = {
+        key: value
+        for key, value in response.items()
+        if key not in {"id", "object", "created", "model"}
+    }
+    result.setdefault("index", 0)
+    return result
 
 
 async def _collect_backpressure(
