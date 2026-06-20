@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
-from src.eval.env_config import resolve_judge_max_workers, resolve_judge_model_config
+from src.eval.env_config import resolve_judge_max_workers, resolve_judge_model_config, resolve_judge_timeout_s
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
@@ -65,6 +65,7 @@ class BrowseCompJudgeConfig:
     max_workers: int = 4
     max_retries: int = 3
     backoff_base_s: float = 0.5
+    timeout_s: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +267,12 @@ def judge_browsecomp_answers(
 ) -> list[BrowseCompJudgeOutcome]:
     from openai import OpenAI
 
-    client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+    client = OpenAI(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout=max(1.0, float(config.timeout_s)),
+        max_retries=0,
+    )
 
     def worker(entry: tuple[BrowseCompRecord, str]) -> BrowseCompJudgeOutcome:
         record, response_text = entry
@@ -546,6 +552,7 @@ def _run_browsecomp(
         model=judge_cfg.model_name,
         base_url=judge_cfg.base_url,
         max_workers=resolve_judge_max_workers(getattr(args, "judge_max_workers", None), default=4),
+        timeout_s=resolve_judge_timeout_s(default=60.0),
     )
 
     job_name = _resolve_job_name("function_browsecomp", run_context=run_context)

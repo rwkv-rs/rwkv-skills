@@ -133,6 +133,7 @@ async def chat_completions(request: Request):
             alpha_frequency=req.alpha_frequency,
             alpha_decay=req.alpha_decay,
             stop_tokens=req.stop_tokens,
+            ban_tokens=req.ban_tokens,
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
@@ -152,6 +153,7 @@ async def chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                ban_tokens=req.ban_tokens,
             )
     except InferenceCancelled:
         return client_closed_response()
@@ -256,6 +258,7 @@ async def fim_completions(request: Request):
             alpha_frequency=req.alpha_frequency,
             alpha_decay=req.alpha_decay,
             stop_tokens=[],
+            ban_tokens=req.ban_tokens,
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
@@ -275,6 +278,7 @@ async def fim_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=[],
+                ban_tokens=req.ban_tokens,
             )
     except InferenceCancelled:
         return client_closed_response()

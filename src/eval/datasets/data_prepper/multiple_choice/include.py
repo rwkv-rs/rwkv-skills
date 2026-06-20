@@ -12,11 +12,17 @@ _DATASET_ID = "CohereForAI/include-base-44"
 _REQUIRED_FIELDS = ("question", "answer", "A", "B", "C", "D")
 
 
-def _include_config_names() -> list[str]:
+def _include_config_names(split: str) -> list[str]:
     configure_hf_home()
     from datasets import get_dataset_config_names  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
+    from huggingface_hub import list_repo_files  # pyright: ignore[reportMissingImports]
 
-    return sorted(name for name in get_dataset_config_names(_DATASET_ID) if name and name != "default")
+    files = set(list_repo_files(_DATASET_ID, repo_type="dataset"))
+    return sorted(
+        name
+        for name in get_dataset_config_names(_DATASET_ID)
+        if name and name != "default" and f"{name}/{split}-00000-of-00001.parquet" in files
+    )
 
 
 def _load_include_rows(config: str, split: str) -> Iterable[Mapping[str, Any]]:
@@ -42,9 +48,13 @@ def _iter_records(split: str) -> Iterable[dict[str, Any]]:
     if split not in {"validation", "test"}:
         raise ValueError("include 仅支持 validation 或 test split")
 
-    for config in _include_config_names():
+    for config in _include_config_names(split):
         for row in _load_include_rows(config, split):
             choices = row.get("options") or row.get("choices") or row.get("answers")
+            if choices is None:
+                option_keys = ("option_a", "option_b", "option_c", "option_d")
+                if all(row.get(key) is not None for key in option_keys):
+                    choices = [row[key] for key in option_keys]
             if not isinstance(choices, (list, tuple)) or len(choices) != 4:
                 raise ValueError(f"include:{config}:{split} 缺少四个候选项: {row}")
 

@@ -9,6 +9,7 @@ from infer.batch_inference import BatchInferenceMixin
 from infer.big_batch import BigBatchMixin
 from infer.cancellation import InferenceCancelled, PrefillBszLimitExceeded
 from infer.inference_utils import InferenceUtilsMixin
+from infer.metrics import MetricsCollector
 
 
 class InferenceEngine(
@@ -29,6 +30,8 @@ class InferenceEngine(
         self._prefill_reserved_bsz = 0
         self._prefill_next_ticket = 0
         self._prefill_condition = None
+        # Live observability; gpu_sampler is wired in by create_app once started.
+        self.metrics = MetricsCollector()
 
     def _encode_single_token_choices(self, choices):
         if not isinstance(choices, dict) or not choices:
@@ -293,6 +296,9 @@ class InferenceEngine(
                 f"max_prefill_bsz={current_limit}"
             )
             condition.notify_all()
+        # A released permit marks a finished request (decode failures are tracked
+        # separately via failed_batches).
+        self.metrics.record_request(success=True)
 
     def shutdown(self):
         self.executor.shutdown(wait=False)

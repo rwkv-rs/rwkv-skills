@@ -178,6 +178,24 @@ class EvalDbService:
     def _is_completed_task_status(value: object) -> bool:
         return EvalDbService._normalize_task_status(value) == "completed"
 
+    @classmethod
+    def _effective_resumable_task_ids(cls, matches: Sequence[TaskLookup]) -> tuple[int, ...]:
+        resumable_ids = tuple(
+            int(task.task_id)
+            for task in matches
+            if cls._is_resumable_task_status(task.status)
+        )
+        if len(resumable_ids) <= 1:
+            return resumable_ids
+        running_ids = tuple(
+            int(task.task_id)
+            for task in matches
+            if cls._normalize_task_status(task.status) == "running"
+        )
+        if len(running_ids) == 1:
+            return running_ids
+        return resumable_ids
+
     @staticmethod
     def _resolve_task_config_path(benchmark_name: str, model: str) -> str | None:
         config_path = config_path_for_benchmark(benchmark_name, model)
@@ -291,7 +309,6 @@ class EvalDbService:
 
         matches: list[TaskLookup] = []
         completed_ids: list[int] = []
-        resumable_ids: list[int] = []
         for row in raw_matches:
             task_id = int(row["task_id"])
             status = str(row.get("status") or "")
@@ -301,15 +318,13 @@ class EvalDbService:
             matches.append(lookup)
             if self._is_completed_task_status(status):
                 completed_ids.append(task_id)
-            elif self._is_resumable_task_status(status):
-                resumable_ids.append(task_id)
 
         ctx.matching_tasks = tuple(matches)
         ctx.completed_task_ids = tuple(completed_ids)
-        ctx.resumable_task_ids = tuple(resumable_ids)
+        ctx.resumable_task_ids = self._effective_resumable_task_ids(ctx.matching_tasks)
 
-        if not completed_ids and len(resumable_ids) == 1:
-            ctx.task_id = resumable_ids[0]
+        if not completed_ids and len(ctx.resumable_task_ids) == 1:
+            ctx.task_id = ctx.resumable_task_ids[0]
             ctx.can_resume = True
             answer_rows = self._repo.fetch_completion_keys(
                 task_id=ctx.task_id,
@@ -318,8 +333,8 @@ class EvalDbService:
             ctx.completed_keys = set(answer_rows)
         elif completed_ids:
             ctx.task_id = completed_ids[-1]
-        elif resumable_ids:
-            ctx.task_id = resumable_ids[-1]
+        elif ctx.resumable_task_ids:
+            ctx.task_id = ctx.resumable_task_ids[-1]
 
         return ctx
 

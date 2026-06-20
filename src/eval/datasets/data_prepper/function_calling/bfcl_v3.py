@@ -13,13 +13,17 @@ from .common import LocalRowsDatasetSpec
 _REQUIRED_FIELDS = ("task_id", "instruction", "tools")
 
 
-def bfcl_v3_source_root() -> Path:
-    override = (
+def _bfcl_v3_source_override() -> str | None:
+    return (
         os.environ.get("RWKV_BFCL_V3_SOURCE")
         or os.environ.get("RWKV_BFCL_V3_ROOT")
         or os.environ.get("BFCL_V3_SOURCE")
         or os.environ.get("BFCL_V3_ROOT")
     )
+
+
+def bfcl_v3_source_root() -> Path:
+    override = _bfcl_v3_source_override()
     if override:
         return Path(override).expanduser().resolve()
     repo_raw_root = REPO_ROOT / "data" / "bfcl_v3_raw"
@@ -36,14 +40,32 @@ def bfcl_v3_source_paths(split: str) -> tuple[Path, ...]:
     if root.is_file():
         return (root,)
 
-    candidate_roots = [
-        root,
-        root / "data",
-        root / "bfcl_eval" / "data",
-        root / "berkeley-function-call-leaderboard",
-        root / "berkeley-function-call-leaderboard" / "data",
-        root / "berkeley-function-call-leaderboard" / "bfcl_eval" / "data",
-    ]
+    base_roots = [root]
+    if not _bfcl_v3_source_override():
+        cache_root = (
+            REPO_ROOT
+            / "data"
+            / "cache"
+            / "bfcl_exec_multiple_ast"
+            / "gorilla"
+            / "berkeley-function-call-leaderboard"
+        )
+        if cache_root.exists():
+            base_roots.append(cache_root.resolve())
+    candidate_roots = tuple(
+        dict.fromkeys(
+            candidate.resolve()
+            for base in base_roots
+            for candidate in (
+                base,
+                base / "data",
+                base / "bfcl_eval" / "data",
+                base / "berkeley-function-call-leaderboard",
+                base / "berkeley-function-call-leaderboard" / "data",
+                base / "berkeley-function-call-leaderboard" / "bfcl_eval" / "data",
+            )
+        )
+    )
     exact_names = (
         f"bfcl_v3_{split}.jsonl",
         f"bfcl_v3_{split}.json",
@@ -71,9 +93,11 @@ def bfcl_v3_source_paths(split: str) -> tuple[Path, ...]:
             path.resolve()
             for path in fuzzy
             if path.is_file()
-            and "bfcl" in path.name.lower()
-            and "v3" in path.name.lower()
-            and "possible_answer" not in {part.lower() for part in path.parts}
+            and (
+                ("bfcl" in path.name.lower() and "v3" in path.name.lower())
+                or path.name.lower().startswith("bfcl_v4_multi_turn_")
+            )
+            and not ({"possible_answer", "unused_datasets"} & {part.lower() for part in path.parts})
         )
     )
     if deduped:

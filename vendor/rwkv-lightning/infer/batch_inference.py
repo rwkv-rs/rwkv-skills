@@ -4,6 +4,33 @@ import json
 import random
 
 from infer import inference_deps
+from infer.metrics import get_metrics
+
+
+def _normalize_ban_tokens(ban_tokens):
+    if not ban_tokens:
+        return ()
+    normalized = []
+    seen = set()
+    for token_id in ban_tokens:
+        try:
+            value = int(token_id)
+        except (TypeError, ValueError):
+            continue
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    return tuple(normalized)
+
+
+def _mask_ban_token_logits(logits, ban_token_ids):
+    if not ban_token_ids:
+        return logits
+    vocab_size = logits.size(-1)
+    valid_ids = [token_id for token_id in ban_token_ids if 0 <= token_id < vocab_size]
+    if valid_ids:
+        logits[..., valid_ids] = -float("inf")
+    return logits
 
 
 class BatchInferenceMixin:
@@ -20,6 +47,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         cancel_token=None,
     ):
         state = None
@@ -37,45 +65,50 @@ class BatchInferenceMixin:
             sample_rand_states = inference_deps.get_sample().setup_rand(
                 random.randint(0, 2**63 - 1), batch_size
             )
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(
                 batch_size, out.size(-1), device=out.device
             )
 
-            for _ in range(max_length):
-                self._raise_if_cancelled(cancel_token)
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    out,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
-                new_tokens = [[token] for token in new_tokens]
-                out = self.model.forward_batch(new_tokens, state).float()
+            prefill_tokens = sum(len(p) for p in encoded_prompts)
+            with get_metrics(self).decode_session(batch_size, prefill_tokens) as _sess:
+                for _ in range(max_length):
+                    self._raise_if_cancelled(cancel_token)
+                    _mask_ban_token_logits(out, ban_token_ids)
+                    new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        out,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+                    new_tokens = [[token] for token in new_tokens]
+                    out = self.model.forward_batch(new_tokens, state).float()
+                    _sess.step(sum(1 for f in finished if not f))
 
-                for i in range(batch_size):
-                    tok = (
-                        new_tokens[i][0]
-                        if isinstance(new_tokens[i], list)
-                        else new_tokens[i]
-                    )
-                    if finished[i]:
-                        continue
+                    for i in range(batch_size):
+                        tok = (
+                            new_tokens[i][0]
+                            if isinstance(new_tokens[i], list)
+                            else new_tokens[i]
+                        )
+                        if finished[i]:
+                            continue
 
-                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
-                    if content:
-                        generated_text[i] += content
+                        content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                        if content:
+                            generated_text[i] += content
 
-                    if should_stop:
-                        finished[i] = True
-                        continue
+                        if should_stop:
+                            finished[i] = True
+                            continue
 
-                if all(finished):
-                    break
+                    if all(finished):
+                        break
 
             decoded = []
             for i in range(batch_size):
@@ -99,6 +132,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         chunk_size=32,
         cancel_token=None,
     ):
@@ -119,72 +153,85 @@ class BatchInferenceMixin:
             sample_rand_states = inference_deps.get_sample().setup_rand(
                 random.randint(0, 2**63 - 1), batch_size
             )
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(
                 batch_size, out.size(-1), device=out.device
             )
 
-            while not all(finished) and max_length > 0:
-                self._raise_if_cancelled(cancel_token)
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    out,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
-                new_tokens = [[token] for token in new_tokens]
-                out = self.model.forward_batch(new_tokens, state).float()
-                max_length -= 1
+            prefill_tokens = sum(len(p) for p in encoded_prompts)
+            _sess = get_metrics(self).decode_session(batch_size, prefill_tokens)
+            _sess.__enter__()
+            _sess_exc = None
+            try:
+                while not all(finished) and max_length > 0:
+                    self._raise_if_cancelled(cancel_token)
+                    _mask_ban_token_logits(out, ban_token_ids)
+                    new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        out,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+                    new_tokens = [[token] for token in new_tokens]
+                    out = self.model.forward_batch(new_tokens, state).float()
+                    max_length -= 1
+                    _sess.step(sum(1 for f in finished if not f))
 
-                contents_to_send = [""] * batch_size
+                    contents_to_send = [""] * batch_size
 
-                for i in range(batch_size):
-                    if finished[i]:
-                        continue
+                    for i in range(batch_size):
+                        if finished[i]:
+                            continue
 
-                    tok = (
-                        new_tokens[i][0]
-                        if isinstance(new_tokens[i], list)
-                        else new_tokens[i]
-                    )
+                        tok = (
+                            new_tokens[i][0]
+                            if isinstance(new_tokens[i], list)
+                            else new_tokens[i]
+                        )
 
-                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
-                    if content:
-                        text_buffers[i] += content
+                        content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                        if content:
+                            text_buffers[i] += content
 
-                    if should_stop:
-                        finished[i] = True
-                        flushed = self._flush_stop_state(stop_states[i], final=True)
-                        if flushed:
-                            text_buffers[i] += flushed
-                        if text_buffers[i]:
+                        if should_stop:
+                            finished[i] = True
+                            flushed = self._flush_stop_state(stop_states[i], final=True)
+                            if flushed:
+                                text_buffers[i] += flushed
+                            if text_buffers[i]:
+                                contents_to_send[i] += text_buffers[i]
+                                text_buffers[i] = ""
+                            continue
+
+                        chunk_token_counts[i] += 1
+                        if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
                             contents_to_send[i] += text_buffers[i]
                             text_buffers[i] = ""
-                        continue
+                            chunk_token_counts[i] = 0
 
-                    chunk_token_counts[i] += 1
-                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
-                        contents_to_send[i] += text_buffers[i]
-                        text_buffers[i] = ""
-                        chunk_token_counts[i] = 0
+                    if any(contents_to_send):
+                        chunk = {
+                            "object": "chat.completion.chunk",
+                            "choices": [
+                                {"index": i, "delta": {"content": contents_to_send[i]}}
+                                for i in range(batch_size)
+                                if contents_to_send[i]
+                            ],
+                        }
+                        if chunk["choices"]:
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-                if any(contents_to_send):
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [
-                            {"index": i, "delta": {"content": contents_to_send[i]}}
-                            for i in range(batch_size)
-                            if contents_to_send[i]
-                        ],
-                    }
-                    if chunk["choices"]:
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-                await asyncio.sleep(0)
+                    await asyncio.sleep(0)
+            except BaseException as exc:
+                _sess_exc = exc
+                raise
+            finally:
+                _sess.__exit__(type(_sess_exc), _sess_exc, None)
 
             remaining_contents = [""] * batch_size
             for i in range(batch_size):
@@ -226,6 +273,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         cancel_token=None,
     ):
         try:
@@ -234,6 +282,7 @@ class BatchInferenceMixin:
             tokens = encoded_prompts[0]
             out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
             stop_state = self._create_stop_state(stop_tokens)
@@ -243,6 +292,7 @@ class BatchInferenceMixin:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
+                _mask_ban_token_logits(out, ban_token_ids)
                 new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
@@ -283,6 +333,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         chunk_size=32,
         session_id=None,
         state_manager=None,
@@ -296,6 +347,7 @@ class BatchInferenceMixin:
             tokens = encoded_prompts[0]
             out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
             stop_state = self._create_stop_state(stop_tokens)
@@ -308,6 +360,7 @@ class BatchInferenceMixin:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
+                _mask_ban_token_logits(out, ban_token_ids)
                 new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
@@ -390,6 +443,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         prefix_cache_manager=None,
         cancel_token=None,
     ):
@@ -405,35 +459,40 @@ class BatchInferenceMixin:
                 cancel_token=cancel_token,
             )
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
-            while max_length > 0:
-                self._raise_if_cancelled(cancel_token)
-                max_length -= 1
-                logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    logits_reshaped,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+            with get_metrics(self).decode_session(1) as _sess:
+                while max_length > 0:
+                    self._raise_if_cancelled(cancel_token)
+                    max_length -= 1
+                    logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
+                    _mask_ban_token_logits(logits_reshaped, ban_token_ids)
+                    new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        logits_reshaped,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
 
-                tok = new_tokens[0]
-                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
-                if content:
-                    generated_text += content
+                    tok = new_tokens[0]
+                    content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                    if content:
+                        generated_text += content
 
-                if should_stop:
-                    finish_reason = "stop"
-                    break
+                    if should_stop:
+                        finish_reason = "stop"
+                        _sess.step(0)
+                        break
 
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
-                await asyncio.sleep(0)
+                    _sess.step(1)
+                    out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                    await asyncio.sleep(0)
 
             generated_text += self._flush_stop_state(stop_state, final=True)
             return generated_text, finish_reason
@@ -454,6 +513,7 @@ class BatchInferenceMixin:
         alpha_frequency=0.1,
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
+        ban_tokens=(),
         chunk_size=32,
         prefix_cache_manager=None,
         cancel_token=None,
@@ -471,55 +531,68 @@ class BatchInferenceMixin:
             buffered_tokens = 0
             text_buffer = ""
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
+            ban_token_ids = _normalize_ban_tokens(ban_tokens)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
-            while max_length > 0:
-                self._raise_if_cancelled(cancel_token)
-                max_length -= 1
-                logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    logits_reshaped,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+            _sess = get_metrics(self).decode_session(1)
+            _sess.__enter__()
+            _sess_exc = None
+            try:
+                while max_length > 0:
+                    self._raise_if_cancelled(cancel_token)
+                    max_length -= 1
+                    logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
+                    _mask_ban_token_logits(logits_reshaped, ban_token_ids)
+                    new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        logits_reshaped,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
 
-                tok = new_tokens[0]
-                content, should_stop = self._ingest_token_with_stop(stop_state, tok)
-                if content:
-                    text_buffer += content
+                    tok = new_tokens[0]
+                    content, should_stop = self._ingest_token_with_stop(stop_state, tok)
+                    if content:
+                        text_buffer += content
 
-                if should_stop:
-                    finish_reason = "stop"
-                    flushed = self._flush_stop_state(stop_state, final=True)
-                    if flushed:
-                        text_buffer += flushed
-                    if text_buffer:
+                    if should_stop:
+                        finish_reason = "stop"
+                        _sess.step(0)
+                        flushed = self._flush_stop_state(stop_state, final=True)
+                        if flushed:
+                            text_buffer += flushed
+                        if text_buffer:
+                            chunk = {
+                                "object": "chat.completion.chunk",
+                                "choices": [{"index": 0, "delta": {"content": text_buffer}}],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            text_buffer = ""
+                        break
+
+                    _sess.step(1)
+                    buffered_tokens += 1
+                    if buffered_tokens >= chunk_size and text_buffer:
                         chunk = {
                             "object": "chat.completion.chunk",
                             "choices": [{"index": 0, "delta": {"content": text_buffer}}],
                         }
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                         text_buffer = ""
-                    break
+                        buffered_tokens = 0
 
-                buffered_tokens += 1
-                if buffered_tokens >= chunk_size and text_buffer:
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [{"index": 0, "delta": {"content": text_buffer}}],
-                    }
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    text_buffer = ""
-                    buffered_tokens = 0
-
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
-                await asyncio.sleep(0)
+                    out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                    await asyncio.sleep(0)
+            except BaseException as exc:
+                _sess_exc = exc
+                raise
+            finally:
+                _sess.__exit__(type(_sess_exc), _sess_exc, None)
 
             flushed = self._flush_stop_state(stop_state, final=True)
             if flushed:

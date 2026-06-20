@@ -65,6 +65,7 @@ async def state_chat_completions(request: Request):
             alpha_frequency=req.alpha_frequency,
             alpha_decay=req.alpha_decay,
             stop_tokens=req.stop_tokens,
+            ban_tokens=req.ban_tokens,
             chunk_size=req.chunk_size,
             session_id=session_id,
             state_manager=state_manager,
@@ -87,6 +88,7 @@ async def state_chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                ban_tokens=req.ban_tokens,
             )
     except InferenceCancelled:
         del state
@@ -171,6 +173,7 @@ async def multi_state_chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                ban_tokens=req.ban_tokens,
                 chunk_size=req.chunk_size,
                 session_id=None,
                 state_manager=None,
@@ -224,6 +227,7 @@ async def multi_state_chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                ban_tokens=req.ban_tokens,
             )
     except InferenceCancelled:
         del state

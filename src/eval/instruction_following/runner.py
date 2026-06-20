@@ -23,7 +23,7 @@ from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
 from src.eval.scheduler.job_env import ensure_job_id
-from src.eval.evaluating import prepare_task_execution, run_checker_for_task
+from src.eval.evaluating import prepare_task_execution
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
 from src.infer.backend import (
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 DEFAULT_AVG_K: tuple[NumericK, ...] = ()
-IFEVAL_AVG_K: tuple[NumericK, ...] = (4,)
+IFEVAL_AVG_K: tuple[NumericK, ...] = ()
 _RULE_BASED_JOB_NAME = "instruction_following"
 
 
@@ -55,7 +55,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--avg-k",
         type=float,
         action="append",
-        help="avg@k values to compute from generated samples (IFEval 默认 4)",
+        help="avg@k values to compute from generated samples (defaults come from configs/<benchmark>.toml)",
     )
     return parser.parse_args(argv)
 
@@ -68,6 +68,11 @@ def _ensure_rule_based_dataset(slug: str) -> None:
         f"dataset {slug!r} is registered as instruction-following data, "
         "but it does not have a rule-based instruction-following scorer"
     )
+
+
+def _should_run_checker(slug: str) -> bool:
+    canonical = canonical_slug(str(slug))
+    return not (canonical.startswith("ifeval") or canonical.startswith("ifbench"))
 
 
 def main(
@@ -175,7 +180,8 @@ def main(
         )
         avg_payload = filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
         runtime.ingest_eval_payloads(metrics.payloads or [])
-        runtime.run_checker(model_name=model_name)
+        if _should_run_checker(str(slug)):
+            runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
             is_cot=False,

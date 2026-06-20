@@ -30,8 +30,37 @@ os.environ.setdefault("NLTK_DATA", str(_nltk_data_dir))
 import nltk
 
 nltk.data.path.insert(0, str(_nltk_data_dir))
-import emoji
-import syllapy
+try:
+	import emoji
+except ModuleNotFoundError:
+	class _EmojiFallback:
+		@staticmethod
+		def is_emoji(value):
+			return bool(value) and any(
+				0x1F000 <= ord(ch) <= 0x1FAFF
+				or 0x2600 <= ord(ch) <= 0x27BF
+				or 0x2300 <= ord(ch) <= 0x23FF
+				or 0x2B00 <= ord(ch) <= 0x2BFF
+				for ch in value
+			)
+
+	emoji = _EmojiFallback()
+try:
+	import syllapy
+except ModuleNotFoundError:
+	class _SyllapyFallback:
+		@staticmethod
+		def count(word):
+			word = re.sub(r"[^a-z]", "", word.lower())
+			if not word:
+				return 0
+			groups = re.findall(r"[aeiouy]+", word)
+			count = len(groups)
+			if word.endswith("e") and count > 1:
+				count -= 1
+			return max(1, count)
+
+	syllapy = _SyllapyFallback()
 import unicodedata
 from collections import Counter
 import csv
@@ -43,7 +72,7 @@ from . import instructions_util
 def _word_tokens_without_punctuation(text):
 	"""Tokenize text while excluding standalone punctuation tokens."""
 	return [
-		token for token in instructions_util.nltk.word_tokenize(text)
+		token for token in instructions_util.word_tokenize(text)
 		if any(ch.isalnum() for ch in token)
 	]
 
@@ -1013,8 +1042,7 @@ class StartWithVerbChecker(Instruction):
 
 	def check_following(self, value):
 		"""Checks if the response starts with a verb."""
-		text = nltk.word_tokenize(value)
-		return len(text) > 0 and len(nltk.pos_tag(text)) > 0 and 'VB' in nltk.pos_tag(text)[0][1]
+		return instructions_util.starts_with_verb(value)
 
 
 class LimitedWordRepeatChecker(Instruction):
@@ -1151,8 +1179,8 @@ class PronounCountChecker(Instruction):
 			'each', 'either', 'neither', 'both', 'all', 'some', 'any', 'none'])
 		value = value.replace('/',
 							  ' ')  # to correctly count pronoun sets like she/her/hers, a common use case of pronouns
-		# Use NLTK word_tokenize for better tokenization
-		words = nltk.word_tokenize(value.lower())
+		# Use NLTK tokenization when available, with a regex fallback.
+		words = instructions_util.word_tokenize(value.lower())
 		pronoun_count = sum(1 for word in words if word in pronouns)
 		return pronoun_count >= self._num_pronouns
 
@@ -2058,7 +2086,7 @@ class WordsPositionChecker(Instruction):
 		  True if the second word and the second to last word are the same;
 		  otherwise, False.
 		"""
-		words = instructions_util.nltk.word_tokenize(value)
+		words = instructions_util.word_tokenize(value)
 		if len(words) < 2:
 			return False
 		if words[-1] in string.punctuation:
@@ -2224,7 +2252,7 @@ class TitleCaseChecker(Instruction):
 		  True if the response is in title case;
 		  otherwise, False.
 		"""
-		words = instructions_util.nltk.word_tokenize(value)
+		words = instructions_util.word_tokenize(value)
 		for word in words:
 			if not word or not word[0].isalpha():
 				continue

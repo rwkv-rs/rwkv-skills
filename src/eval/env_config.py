@@ -23,6 +23,7 @@ JUDGE_MODEL_ENV = "JUDGE_MODEL"
 JUDGE_BASE_URL_ENV = "JUDGE_BASE_URL"
 JUDGE_MAX_WORKERS_ENV = "JUDGE_MAX_WORKERS"
 JUDGE_MAX_TOKENS_ENV = "JUDGE_MAX_TOKENS"
+JUDGE_TIMEOUT_S_ENV = "JUDGE_TIMEOUT_S"
 
 
 def load_env_file(path: Path | str = ".env") -> None:
@@ -100,6 +101,13 @@ def resolve_judge_max_tokens(value: int | None = None) -> int | None:
     )
 
 
+def resolve_judge_timeout_s(value: float | None = None, *, default: float = 60.0) -> float:
+    return _positive_float_value(value, field_name="judge timeout") or _positive_float_env(
+        JUDGE_TIMEOUT_S_ENV,
+        default=default,
+    )
+
+
 def apply_openai_env(config: OpenAIModelConfig) -> None:
     os.environ["OPENAI_API_KEY"] = config.api_key
     os.environ["API_KEY"] = config.api_key
@@ -164,17 +172,41 @@ def _positive_int_value(value: int | str | None, *, field_name: str) -> int | No
     return parsed
 
 
+def _positive_float_env(name: str, *, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = _positive_float_value(raw, field_name=name)
+    if value is None:
+        return default
+    return value
+
+
+def _positive_float_value(value: float | str | None, *, field_name: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a positive number: {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive number: {value!r}")
+    return parsed
+
+
 __all__ = [
     "OpenAIModelConfig",
     "JUDGE_API_KEY_ENV",
     "JUDGE_BASE_URL_ENV",
     "JUDGE_MAX_TOKENS_ENV",
+    "JUDGE_TIMEOUT_S_ENV",
     "JUDGE_MAX_WORKERS_ENV",
     "JUDGE_MODEL_ENV",
     "load_env_file",
     "resolve_required_user_model_config",
     "resolve_judge_model_config",
     "resolve_judge_max_tokens",
+    "resolve_judge_timeout_s",
     "resolve_judge_max_workers",
     "apply_openai_env",
     "normalize_openai_base_url",

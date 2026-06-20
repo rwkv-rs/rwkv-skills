@@ -67,7 +67,9 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext, TaskSpec
 
 
-_SAMPLE_WORKER_ENABLED_KINDS = frozenset({FunctionCallingBenchmarkKind.BFCL_V3})
+_SAMPLE_WORKER_ENABLED_KINDS = frozenset(
+    {FunctionCallingBenchmarkKind.BFCL_V3, FunctionCallingBenchmarkKind.BROWSECOMP_PLUS}
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -95,6 +97,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-api-key", help="API key for official tau NL assertion judge")
     parser.add_argument("--judge-base-url", help="OpenAI-compatible base URL for official tau NL assertion judge")
     parser.add_argument("--judge-max-workers", type=int, help="Max concurrent workers for BrowseComp judge clients")
+    parser.add_argument(
+        "--browsecomp-plus-judge-mode",
+        choices=("inline", "defer", "judge"),
+        help=(
+            "BrowseComp-Plus judge mode: inline scores during the run, defer stores judge_pending "
+            "completions without a score, judge scores a previously deferred task."
+        ),
+    )
+    parser.add_argument(
+        "--browsecomp-plus-judge-task-id",
+        help="Existing BrowseComp-Plus task_id to score when --browsecomp-plus-judge-mode=judge.",
+    )
     parser.add_argument(
         "--disable-checker",
         action="store_true",

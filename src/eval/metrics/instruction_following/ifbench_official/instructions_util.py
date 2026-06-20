@@ -15,8 +15,10 @@
 """Utility library of instructions."""
 
 import functools
+import os
 import random
 import re
+import zipfile
 
 import nltk
 
@@ -1548,27 +1550,40 @@ WORD_LIST = [
     "apartment",
 ]  # pylint: disable=line-too-long
 
+_NLTK_RESOURCE_ERRORS = (LookupError, zipfile.BadZipFile, OSError)
+
+
+@functools.lru_cache(maxsize=None)
+def _ensure_nltk_resource(resource_path, package_name):
+    try:
+        nltk.data.find(resource_path)
+        return True
+    except _NLTK_RESOURCE_ERRORS:
+        pass
+    if os.environ.get("RWKV_IFBENCH_ALLOW_NLTK_DOWNLOAD") != "1":
+        return False
+    try:
+        nltk.download(package_name, quiet=True)
+        nltk.data.find(resource_path)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def download_nltk_resources():
     """Download 'punkt' and 'stopwords' if not already installed"""
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt", quiet=True)
-    try:
-        nltk.data.find("tokenizers/punkt_tab")
-    except LookupError:
-        nltk.download("punkt_tab", quiet=True)
-    try:
-        nltk.data.find("corpora/stopwords")
-    except LookupError:
-        nltk.download("stopwords", quiet=True)
-    try:
-        nltk.data.find("taggers/averaged_perceptron_tagger_eng")
-    except LookupError:
-        nltk.download("averaged_perceptron_tagger_eng", quiet=True)
-
-
-download_nltk_resources()
+    return all(
+        [
+            _ensure_nltk_resource("tokenizers/punkt", "punkt"),
+            _ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab"),
+            _ensure_nltk_resource("corpora/stopwords", "stopwords"),
+            _ensure_nltk_resource(
+                "taggers/averaged_perceptron_tagger_eng",
+                "averaged_perceptron_tagger_eng",
+            ),
+        ]
+    )
 
 
 def split_into_sentences(text):
@@ -1580,7 +1595,15 @@ def split_into_sentences(text):
     Returns:
       A list of strings where each string is a sentence.
     """
-    return nltk.sent_tokenize(text)
+    if _ensure_nltk_resource("tokenizers/punkt", "punkt") and _ensure_nltk_resource(
+        "tokenizers/punkt_tab",
+        "punkt_tab",
+    ):
+        try:
+            return nltk.sent_tokenize(text)
+        except _NLTK_RESOURCE_ERRORS:
+            pass
+    return [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", text) if sentence.strip()]
 
 
 def count_words(text):
@@ -1591,15 +1614,83 @@ def count_words(text):
     return num_words
 
 
+def word_tokenize(text):
+    """Tokenize text without letting optional NLTK data failures abort scoring."""
+    if _ensure_nltk_resource("tokenizers/punkt", "punkt") and _ensure_nltk_resource(
+        "tokenizers/punkt_tab",
+        "punkt_tab",
+    ):
+        try:
+            return nltk.word_tokenize(text)
+        except _NLTK_RESOURCE_ERRORS:
+            pass
+    return re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+
+
+def starts_with_verb(text):
+    """Return whether text starts with a verb when the POS tagger is available."""
+    words = word_tokenize(text)
+    if not words:
+        return False
+    if not _ensure_nltk_resource(
+        "taggers/averaged_perceptron_tagger_eng",
+        "averaged_perceptron_tagger_eng",
+    ):
+        return False
+    try:
+        tagged = nltk.pos_tag(words)
+    except _NLTK_RESOURCE_ERRORS:
+        return False
+    return bool(tagged and tagged[0][1].startswith("VB"))
+
+
 @functools.lru_cache(maxsize=None)
 def _get_sentence_tokenizer():
+    _ensure_nltk_resource("tokenizers/punkt", "punkt")
     return nltk.data.load("nltk:tokenizers/punkt/english.pickle")
+
+
+_BASIC_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "but",
+        "by",
+        "for",
+        "from",
+        "has",
+        "he",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "to",
+        "was",
+        "were",
+        "will",
+        "with",
+    }
+)
 
 
 def count_stopwords(text):
     """Counts the number of stopwords."""
-    """Counts the number of stopwords."""
-    stopwords = nltk.corpus.stopwords.words('english')
+    stopwords = _BASIC_STOPWORDS
+    if _ensure_nltk_resource("corpora/stopwords", "stopwords"):
+        try:
+            stopwords = frozenset(nltk.corpus.stopwords.words("english"))
+        except _NLTK_RESOURCE_ERRORS:
+            pass
     tokenizer = nltk.tokenize.RegexpTokenizer(r"\w+")
     tokens = tokenizer.tokenize(text)
     num_stopwords = len([t for t in tokens if t.lower() in stopwords])

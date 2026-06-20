@@ -35,4 +35,4 @@ candidate_router_tool_schema_mode = "compact"
 max_steps = 20
 max_tool_errors = 20
 cot_max_tokens = 2048
-decision_max_tokens = 1024
+decision_max_tokens = 512

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Iterable
 
 
@@ -14,6 +15,9 @@ from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 from . import instructions_registry
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
+_LEADING_THINK_RE = re.compile(r"^\s*<think\b[^>]*>", re.IGNORECASE | re.DOTALL)
 
 
 @dataclass(slots=True)
@@ -45,11 +49,15 @@ def _max_stage_index(payload: dict) -> int:
 def _response_from_completion(payload: dict) -> str:
     last_stage = _max_stage_index(payload)
     completion = str(payload.get(f"completion{last_stage}", "") or "")
-    prompt1 = str(payload.get("prompt1", "") or "")
-    # Mirror pipeline behaviour: if we prompted with `<think`, drop thought content.
-    if "<think" in prompt1:
-        return completion.split("</think>")[-1].strip()
-    return completion.strip()
+    return _strip_reasoning_block(completion)
+
+
+def _strip_reasoning_block(text: str) -> str:
+    body = str(text or "")
+    body = _THINK_BLOCK_RE.sub("", body).strip()
+    if _LEADING_THINK_RE.match(body):
+        return ""
+    return body
 
 
 def evaluate_instruction_following(

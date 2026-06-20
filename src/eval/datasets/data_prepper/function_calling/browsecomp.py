@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from src.eval.datasets.runtime import UrlDownloadFile, download_git_repo, download_url_files
+from src.eval.datasets.runtime import UrlDownloadFile, download_url_files
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 from src.eval.function_calling import (
     BrowseCompRecord,
@@ -16,6 +16,9 @@ from .common import OfficialRowsDatasetSpec, first_complete_source_root, rwkv_rs
 _REQUIRED_FIELDS = ("task_id", "question", "answer", "locale")
 _BROWSECOMP_CSV_URL = "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv"
 _BROWSECOMP_ZH_REPO_URL = "https://github.com/PALIN2018/BrowseComp-ZH.git"
+_BROWSECOMP_ZH_XLSX_URL = (
+    "https://raw.githubusercontent.com/PALIN2018/BrowseComp-ZH/main/data/browsecomp-zh-encrypted.xlsx"
+)
 _BROWSECOMP_ZH_REPO_REVISION = "main"
 _BROWSECOMP_ZH_REPO_ROOT_NAME = "BrowseComp-ZH"
 
@@ -116,11 +119,11 @@ def _resolve_browsecomp_zh_source_root(spec: OfficialRowsDatasetSpec) -> Path:
 
 
 def _download_browsecomp_zh_source(spec: OfficialRowsDatasetSpec) -> None:
-    download_git_repo(
+    download_url_files(
         spec.cache_dir,
-        _BROWSECOMP_ZH_REPO_URL,
-        revision=_BROWSECOMP_ZH_REPO_REVISION,
-        root_name=_BROWSECOMP_ZH_REPO_ROOT_NAME,
+        f"{_BROWSECOMP_ZH_REPO_ROOT_NAME}/data",
+        [UrlDownloadFile(Path("browsecomp-zh-encrypted.xlsx"), _BROWSECOMP_ZH_XLSX_URL)],
+        tasks=1,
     )
 
 
@@ -152,7 +155,11 @@ def prepare_browsecomp_zh_spec(output_root: Path, split: str = "test") -> Offici
         load_records=load_browsecomp_zh_rows_from_xlsx,
         download_source=_download_browsecomp_zh_source,
         official_source="PALIN2018/BrowseComp-ZH",
-        extra={"source_repo_url": _BROWSECOMP_ZH_REPO_URL, "source_revision": _BROWSECOMP_ZH_REPO_REVISION},
+        extra={
+            "source_repo_url": _BROWSECOMP_ZH_REPO_URL,
+            "source_file_url": _BROWSECOMP_ZH_XLSX_URL,
+            "source_revision": _BROWSECOMP_ZH_REPO_REVISION,
+        },
     )
 
 

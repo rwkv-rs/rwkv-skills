@@ -13,7 +13,7 @@ from src.eval.datasets.data_struct.instruction_following import (
 )
 from src.eval.execution_plan import AttemptKey
 from src.eval.prompt_builders import build_instruction_following_prompt
-from src.infer.backend import InferenceBackend
+from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
 from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -110,7 +110,7 @@ class InstructionFollowingPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling_cfg)])
 
         payloads: list[dict] = []
-        chunk_size = max(1, int(batch_size))
+        chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
         for start in range(0, len(remaining_records), chunk_size):
             chunk = remaining_records[start : start + chunk_size]
             prompts = [self._make_prompt(dataset_name, record.prompt, enable_think) for _key, record in chunk]

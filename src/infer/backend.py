@@ -51,6 +51,8 @@ REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
     "preserve",
     "omit-for-contents",
 )
+_CONTENTS_BATCH_PROTOCOLS = frozenset({"nano-vllm-contents", "lightning"})
+_DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES = 4
 
 
 def normalize_api_root(base_url: str) -> str:
@@ -364,6 +366,35 @@ class RemoteInferenceConfig:
         return f"{self.lightning_api_root()}/v1/choice_logits"
 
 
+def remote_contents_inflight_batches(
+    backend: object,
+    batch_size: int,
+    *,
+    max_inflight_batches: int = _DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES,
+) -> int:
+    config = getattr(backend, "config", None)
+    if getattr(config, "protocol", None) not in _CONTENTS_BATCH_PROTOCOLS:
+        return 1
+    request_batch = max(1, int(batch_size))
+    worker_budget = max(1, int(getattr(config, "max_workers", request_batch) or request_batch))
+    cap = max(1, int(max_inflight_batches))
+    return max(1, min(cap, worker_budget // request_batch))
+
+
+def resolve_generation_prompt_batch_size(
+    backend: object,
+    batch_size: int,
+    *,
+    max_inflight_batches: int = _DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES,
+) -> int:
+    request_batch = max(1, int(batch_size))
+    return request_batch * remote_contents_inflight_batches(
+        backend,
+        request_batch,
+        max_inflight_batches=max_inflight_batches,
+    )
+
+
 @dataclass(slots=True)
 class RemoteInferenceBackend:
     config: RemoteInferenceConfig
@@ -429,13 +460,13 @@ class RemoteInferenceBackend:
                 sampling=effective_sampling,
                 batch_size=batch_size,
                 progress_desc=progress_desc,
-            probe_only=probe_only,
-            on_complete=on_complete,
-            on_token=on_token,
-            prompt_stop_suffixes=prompt_stop_suffixes,
-            prefill_chunk_size=prefill_chunk_size,
-            show_progress=show_progress,
-        )
+                probe_only=probe_only,
+                on_complete=on_complete,
+                on_token=on_token,
+                prompt_stop_suffixes=prompt_stop_suffixes,
+                prefill_chunk_size=prefill_chunk_size,
+                show_progress=show_progress,
+            )
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
@@ -481,27 +512,36 @@ class RemoteInferenceBackend:
     ) -> list[GenerationOutput]:
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_batch = max(1, min(int(batch_size), len(prompts)))
+        max_inflight = remote_contents_inflight_batches(self, max_batch)
+        batches = _iter_contents_batches(
+            prompt_count=len(prompts),
+            max_batch=max_batch,
+            prompt_stop_suffixes=prompt_stop_suffixes,
+        )
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
         try:
-            for indices, stop_suffixes in _iter_contents_batches(
-                prompt_count=len(prompts),
-                max_batch=max_batch,
-                prompt_stop_suffixes=prompt_stop_suffixes,
-            ):
-                batch_outputs = self._generate_contents_batch(
-                    indices=indices,
-                    prompts=[prompts[index] for index in indices],
-                    sampling=sampling,
-                    stop_suffixes=stop_suffixes,
-                    prefill_chunk_size=prefill_chunk_size,
-                )
-                for output in batch_outputs:
-                    outputs[output.prompt_index] = output
-                    if on_token is not None and output.text:
-                        on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
-                    if on_complete is not None and not probe_only:
-                        on_complete(output)
-                _safe_tqdm_update(progress, len(indices))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_inflight) as executor:
+                future_map = {
+                    executor.submit(
+                        self._generate_contents_batch,
+                        indices=indices,
+                        prompts=[prompts[index] for index in indices],
+                        sampling=sampling,
+                        stop_suffixes=stop_suffixes,
+                        prefill_chunk_size=prefill_chunk_size,
+                    ): indices
+                    for indices, stop_suffixes in batches
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    indices = future_map[future]
+                    batch_outputs = future.result()
+                    for output in batch_outputs:
+                        outputs[output.prompt_index] = output
+                        if on_token is not None and output.text:
+                            on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
+                        if on_complete is not None and not probe_only:
+                            on_complete(output)
+                    _safe_tqdm_update(progress, len(indices))
         finally:
             _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
@@ -528,6 +568,7 @@ class RemoteInferenceBackend:
             "pad_zero": bool(sampling.pad_zero),
             "stream": False,
             "stop_tokens": list(stop_suffixes),
+            "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
             "chunk_size": max(1, int(prefill_chunk_size)),
             "prefill_chunk_size": max(1, int(prefill_chunk_size)),
         }
@@ -1108,6 +1149,8 @@ __all__ = [
     "normalize_api_base",
     "normalize_local_device",
     "require_completion_style_remote_protocol",
+    "remote_contents_inflight_batches",
     "resolve_backend_model_name",
+    "resolve_generation_prompt_batch_size",
     "validate_inference_backend_args",
 ]

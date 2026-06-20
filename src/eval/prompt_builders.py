@@ -114,21 +114,24 @@ def build_human_eval_expected_context(
     cot_mode: CoTMode,
 ) -> str:
     user_part = (
-        "You are a top-level code master.\n"
-        f"{prompt}\n"
-        "Complete the code without any additional text or explanation:\n"
+        "You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        f"{prompt}"
     )
     prefix = assistant_code_prefix or ""
     assistant_part = {
-        CoTMode.NO_COT: f"```python\n{prefix}{CODE_COMPLETION_PLACEHOLDER}",
+        CoTMode.NO_COT: (
+            "<think>\n"
+            "</think>\n"
+            f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
+        ),
         CoTMode.FAKE_COT: (
             "<think>\n"
             "</think>\n"
-            f"```python\n{prefix}{CODE_COMPLETION_PLACEHOLDER}"
+            f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
         ),
         CoTMode.COT: (
             f"<think>{COT_PLACEHOLDER}</think>\n"
-            f"```python\n{prefix}{CODE_COMPLETION_PLACEHOLDER}"
+            f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
         ),
     }[cot_mode]
     return apply_user_assistant_template(user_part, assistant_part)
@@ -162,20 +165,19 @@ def build_mbpp_expected_context(
     )
     prompt_body = trim_empty_lines(prompt_body)
     user_part = (
-        "You are a top-level code master.\n"
-        f"{prompt_body}\n"
-        "Output only the full Python function definition without any additional text or explanation."
+        "You are a top-level code master. Complete the following code without any additional text or explanation:\n"
+        f"{prompt_body}"
     )
     assistant_part = {
-        CoTMode.NO_COT: f"```python\n{CODE_COMPLETION_PLACEHOLDER}",
+        CoTMode.NO_COT: f"<think></think>\n```python{CODE_COMPLETION_PLACEHOLDER}",
         CoTMode.FAKE_COT: (
             "<think>\n"
             "</think>\n"
-            f"```python\n{CODE_COMPLETION_PLACEHOLDER}"
+            f"```python{CODE_COMPLETION_PLACEHOLDER}"
         ),
         CoTMode.COT: (
             f"<think>{COT_PLACEHOLDER}</think>\n"
-            f"```python\n{CODE_COMPLETION_PLACEHOLDER}"
+            f"```python{CODE_COMPLETION_PLACEHOLDER}"
         ),
     }[cot_mode]
     return apply_user_assistant_template(user_part, assistant_part)
@@ -189,34 +191,29 @@ def build_livecodebench_expected_context(
 ) -> str:
     if cot_mode is not CoTMode.COT:
         raise ValueError(f"livecodebench only supports CoT mode, got {cot_mode!r}")
-    clean_prompt = prompt.strip()
-    clean_starter = (starter_code or "").rstrip()
-    has_starter_code = bool(clean_starter.strip())
-    if has_starter_code:
-        user_part = (
-            "You are an expert Python programmer.\n"
-            "Solve the following programming problem and output only the final code.\n"
-            "Problem:\n"
-            f"{clean_prompt}\n"
-            "Use the following starter code and complete it into a full solution:\n"
-            f"```python\n{clean_starter}\n```"
+    clean = (prompt or "").strip()
+    body = f"### Question:\n{clean}\n\n"
+    if starter_code and starter_code.strip():
+        body += (
+            "### Format: You will use the following starter code to write the solution to the problem "
+            "and enclose your code within delimiters.\n"
         )
-        code_prefix = f"{clean_starter}\n"
+        body += f"```python\n{starter_code}\n```\n\n"
     else:
-        user_part = (
-            "You are an expert Python programmer.\n"
-            "Solve the following programming problem and output only the final code.\n"
-            "Problem:\n"
-            f"{clean_prompt}\n"
-            "Read the inputs from stdin, solve the problem, and write the answer to stdout.\n"
-            "Do not hardcode sample inputs or outputs."
+        body += (
+            "### Format: Read the inputs from stdin solve the problem and write the answer to STDOUT "
+            "(do not directly test on the sample inputs). Enclose your code within delimiters as follows. "
+            "Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT.\n"
         )
-        code_prefix = ""
-    assistant_part = (
-        f"<think>{COT_PLACEHOLDER}</think>\n"
-        f"```python\n{code_prefix}{CODE_COMPLETION_PLACEHOLDER}"
+        body += "```python\n# YOUR CODE HERE\n```\n\n"
+    body += "### Answer: (use the provided format with backticks)\n\n"
+    return (
+        "User: You are an expert Python programmer. You will be given a question "
+        "(problem specification) and will generate a correct Python program "
+        "that matches the specification and passes all tests.\n"
+        f"{body}"
+        f"Assistant: <think{COT_PLACEHOLDER}\n</think>\n```python\n{CODE_COMPLETION_PLACEHOLDER}"
     )
-    return apply_user_assistant_template(user_part, assistant_part)
 
 
 __all__ = [

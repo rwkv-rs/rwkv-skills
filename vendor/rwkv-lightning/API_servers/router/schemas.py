@@ -21,6 +21,7 @@ class ChatRequest(BaseModel):
     alpha_presence: float = 2
     alpha_frequency: float = 0.2
     alpha_decay: float = 0.996
+    ban_tokens: list[int] = []
     enable_think: bool = False
     chunk_size: int = 4
     password: Optional[str] = None

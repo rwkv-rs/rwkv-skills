@@ -27,7 +27,12 @@ def _load_mbpp_problems(*, plus: bool) -> Mapping[str, dict[str, Any]]:
         from evalplus.data.mbpp import get_mbpp, get_mbpp_plus  # pyright: ignore[reportMissingImports]
     except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
         raise ModuleNotFoundError("需要安装 `evalplus` 才能准备 MBPP 数据集，请运行 `pip install evalplus`") from exc
-    return get_mbpp_plus() if plus else get_mbpp()
+    del get_mbpp
+    # Legacy RWKV MBPP used the EvalPlus MBPP problem set for both base and
+    # plus scoring.  The base benchmark still drops plus-only inputs below, but
+    # keeping the same 378 problems avoids mixing the larger 427-problem
+    # evalplus.get_mbpp() set with old formal scores.
+    return get_mbpp_plus()
 
 
 def _iter_mbpp_records(problems: Mapping[str, dict[str, Any]], *, keep_plus_inputs: bool) -> Iterable[dict[str, Any]]:
@@ -75,7 +80,11 @@ class MbppDatasetSpec(MaterializingDatasetSpec):
         return list(_iter_mbpp_records(problems, keep_plus_inputs=self._keep_plus_inputs))
 
     def manifest_extra(self) -> dict[str, Any]:
-        return {"source_split": self.split, "keep_plus_inputs": self._keep_plus_inputs}
+        return {
+            "source_split": self.split,
+            "source_problem_set": "evalplus.get_mbpp_plus",
+            "keep_plus_inputs": self._keep_plus_inputs,
+        }
 
 
 @CODE_GENERATION_REGISTRY.register_spec("mbpp")

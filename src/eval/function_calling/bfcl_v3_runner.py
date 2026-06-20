@@ -85,6 +85,12 @@ if TYPE_CHECKING:
 _LOG = logging.getLogger(__name__)
 
 BFCL_V3_DEFAULT_PROMPT_MAX_CHARS = 28000
+DEFAULT_BFCL_V3_MAX_STEPS = 20
+DEFAULT_BFCL_V3_MAX_TOOL_ERRORS = 20
+# The unified function-calling CLI inherits Tau defaults. Treat those inherited
+# values as "not explicitly set" so BFCL V3 keeps its benchmark-specific budget.
+_INHERITED_TAU_DEFAULT_MAX_STEPS = 200
+_INHERITED_TAU_DEFAULT_MAX_TOOL_ERRORS = 10
 _BFCL_CANDIDATE_ROUTER_POLICY = (
     "BFCL v3 tool-call policy: return exactly one JSON function call for the next official sandbox action. "
     "Use only listed tool names. Use ask_user only when required information is missing. "
@@ -299,6 +305,24 @@ def _positive_int(raw: object, default: int) -> int:
         value = int(raw) if raw is not None else int(default)
     except (TypeError, ValueError):
         value = int(default)
+    return max(1, value)
+
+
+def _resolve_bfcl_v3_max_steps(raw: object) -> int:
+    if raw is None:
+        return DEFAULT_BFCL_V3_MAX_STEPS
+    value = int(raw)
+    if value == _INHERITED_TAU_DEFAULT_MAX_STEPS:
+        return DEFAULT_BFCL_V3_MAX_STEPS
+    return max(1, value)
+
+
+def _resolve_bfcl_v3_max_tool_errors(raw: object) -> int:
+    if raw is None:
+        return DEFAULT_BFCL_V3_MAX_TOOL_ERRORS
+    value = int(raw)
+    if value == _INHERITED_TAU_DEFAULT_MAX_TOOL_ERRORS:
+        return DEFAULT_BFCL_V3_MAX_TOOL_ERRORS
     return max(1, value)
 
 
@@ -1139,8 +1163,8 @@ def _run_bfcl_v3(
             + preview
         )
     batch_size = max(1, int(args.batch_size or 16))
-    max_steps = max(1, int(args.max_steps))
-    max_tool_errors = max(1, int(args.max_tool_errors))
+    max_steps = _resolve_bfcl_v3_max_steps(getattr(args, "max_steps", None))
+    max_tool_errors = _resolve_bfcl_v3_max_tool_errors(getattr(args, "max_tool_errors", None))
     history_max_chars = max(0, int(args.history_max_chars))
     prompt_max_chars = max(0, int(getattr(args, "prompt_max_chars", None) or BFCL_V3_DEFAULT_PROMPT_MAX_CHARS))
     tool_routing_config = tool_routing_config_from_args(args)

@@ -34,6 +34,7 @@ _FENCED_CODE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _LEADING_END_THINK_RE = re.compile(r"^[\s\r\n]*</think>[ \t]*\r?\n?", re.IGNORECASE)
+_STANDALONE_CODE_FENCE_RE = re.compile(r"^[ \t]*```[ \t]*(?:python|py)?[ \t]*$", re.IGNORECASE)
 
 
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
@@ -62,7 +63,16 @@ def extract_code_completion(text: str) -> str:
     matches = list(_FENCED_CODE_RE.finditer(body))
     if matches:
         return matches[-1].group("code").strip("\r\n").rstrip()
-    return body.rstrip()
+    return _strip_standalone_code_fence_edges(body)
+
+
+def _strip_standalone_code_fence_edges(text: str) -> str:
+    lines = str(text or "").rstrip().splitlines()
+    while lines and _STANDALONE_CODE_FENCE_RE.match(lines[0]):
+        lines.pop(0)
+    while lines and _STANDALONE_CODE_FENCE_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).rstrip()
 
 
 def _write_temp_samples(

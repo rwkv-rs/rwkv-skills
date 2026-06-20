@@ -22,7 +22,7 @@ from src.eval.coding.swe_bench import build_swebench_prompt_with_trace
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
-from src.infer.backend import InferenceBackend
+from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
 from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 
@@ -233,7 +233,7 @@ class CodingPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict] = []
         if entries:
-            chunk_size = max(1, int(batch_size))
+            chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
                 prompts = [entry[0] for entry in chunk]
@@ -423,7 +423,7 @@ class CodingPipeline:
         )
         payloads: list[dict] = []
         if entries:
-            chunk_size = max(1, int(batch_size))
+            chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
                 prompts = [entry[1] for entry in chunk]
@@ -684,7 +684,7 @@ class CodingPipeline:
         )
         payloads: list[dict] = []
         if entries:
-            chunk_size = max(1, int(batch_size))
+            chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
                 prompts = [entry[1] for entry in chunk]
@@ -896,7 +896,7 @@ class CodingPipeline:
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict] = []
         if entries:
-            chunk_size = max(1, int(batch_size))
+            chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
             for start in range(0, len(entries), chunk_size):
                 chunk = entries[start : start + chunk_size]
                 prompts = [entry[0] for entry in chunk]

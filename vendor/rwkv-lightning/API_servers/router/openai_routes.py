@@ -152,6 +152,7 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "alpha_presence": body.get("alpha_presence", 1),
         "alpha_frequency": body.get("alpha_frequency", 0.1),
         "alpha_decay": body.get("alpha_decay", 0.996),
+        "ban_tokens": body.get("ban_tokens", []),
         "enable_think": body.get("enable_think", False),
         "chunk_size": chunk_size,
         "password": body.get("password"),
@@ -213,6 +214,7 @@ async def stream_openai_chunks(
         alpha_frequency=req.alpha_frequency,
         alpha_decay=req.alpha_decay,
         stop_tokens=req.stop_tokens,
+        ban_tokens=req.ban_tokens,
         chunk_size=req.chunk_size,
         prefix_cache_manager=prefix_cache_manager,
         cancel_token=cancel_token,
@@ -334,6 +336,7 @@ async def openai_chat_completions(request: Request):
                     alpha_frequency=req.alpha_frequency,
                     alpha_decay=req.alpha_decay,
                     stop_tokens=req.stop_tokens,
+                    ban_tokens=req.ban_tokens,
                     prefix_cache_manager=prefix_cache_manager,
                     cancel_token=cancel_token,
                 )

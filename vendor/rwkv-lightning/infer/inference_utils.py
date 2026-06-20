@@ -1,8 +1,10 @@
 import gc
+import time
 from collections import deque
 
 from infer import inference_deps
 from infer.cancellation import InferenceCancelled
+from infer.metrics import get_metrics
 
 
 class InferenceUtilsMixin:
@@ -167,6 +169,7 @@ class InferenceUtilsMixin:
         bsz = len(tokens)
         pos = [0] * bsz
         out = None if not full_output else [None] * bsz
+        _prefill_t0 = time.monotonic()
 
         while True:
             self._raise_if_cancelled(cancel_token)
@@ -209,6 +212,7 @@ class InferenceUtilsMixin:
                 pos[i] += step
 
         self._raise_if_cancelled(cancel_token)
+        get_metrics(self).record_prefill(sum(lengths), time.monotonic() - _prefill_t0)
         return out
 
     def _prefill_prompt_with_prefix_cache(self, prompt, prefix_cache_manager=None, cancel_token=None):
@@ -216,6 +220,7 @@ class InferenceUtilsMixin:
         if not encoded_prompt:
             raise ValueError("Empty prompt")
 
+        _prefill_t0 = time.monotonic()
         state = None
         out = None
         matched_tokens = 0
@@ -265,4 +270,9 @@ class InferenceUtilsMixin:
             matched_tokens = 0
             cache_source = None
 
+        # Only count tokens actually forwarded (prefix-cache hits skip the GPU).
+        get_metrics(self).record_prefill(
+            max(0, len(encoded_prompt) - int(matched_tokens)),
+            time.monotonic() - _prefill_t0,
+        )
         return encoded_prompt, state, out, matched_tokens, cache_source

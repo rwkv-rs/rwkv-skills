@@ -11,7 +11,7 @@ from src.eval.execution_plan import AttemptKey
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
-from src.infer.backend import InferenceBackend
+from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 USER_SENTINEL = "\nUser:"
@@ -219,7 +219,7 @@ class FreeResponsePipeline:
             return FreeResponsePipelineResult(dataset_name, len(expanded), problem_count, [])
 
         payloads: list[dict] = []
-        chunk_size = max(1, int(batch_size))
+        chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
             prompts = [_render_prompt(prompt_template, record.question) for _key, record in chunk]

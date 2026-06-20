@@ -3,6 +3,7 @@ from __future__ import annotations
 """Shared helper structures for evaluator pipelines (调试工具)."""
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,7 @@ def sample_repeat_seed(
 ) -> int:
     """Build a stable per-attempt seed from (sample_index, repeat_index, pass_index, stage).
 
-    Layout (63-bit, non-negative):
+    Historical layout for stage < 256 (63-bit, non-negative):
       [sample_index:31][repeat_index:24][stage:8]
     """
 
@@ -83,7 +84,12 @@ def sample_repeat_seed(
     if passed >= (1 << 16):
         raise ValueError(f"pass_index 超出可编码范围: {passed}")
     if stage_id >= (1 << 8):
-        raise ValueError(f"stage 超出可编码范围: {stage_id}")
+        return _extended_sample_repeat_seed(
+            sample_index=sample,
+            repeat_index=repeat,
+            pass_index=passed,
+            stage=stage_id,
+        )
     base_seed = (sample << 32) | (repeat << 8) | stage_id
     if passed == 0:
         return base_seed
@@ -93,6 +99,20 @@ def sample_repeat_seed(
         base_seed
         ^ (((passed + 1) * 0x9E3779B97F4A7C15) & 0x7FFFFFFFFFFFFFFF)
     ) & 0x7FFFFFFFFFFFFFFF
+
+
+def _extended_sample_repeat_seed(
+    *,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    stage: int,
+) -> int:
+    payload = (
+        f"{sample_index}:{repeat_index}:{pass_index}:{stage}"
+    ).encode("ascii")
+    digest = hashlib.blake2b(payload, digest_size=8, person=b"rwkvseed").digest()
+    return int.from_bytes(digest, "big") & 0x7FFFFFFFFFFFFFFF
 
 
 @dataclass(slots=True)

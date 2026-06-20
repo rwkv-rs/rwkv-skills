@@ -52,7 +52,7 @@ from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.evaluating import RunMode
 from src.eval.runner_registry import RunnerGroup
 
-_SAMPLE_WORKER_JOB_NAMES = frozenset({"function_bfcl_v3"})
+_SAMPLE_WORKER_JOB_NAMES = frozenset({"function_bfcl_v3", "function_browsecomp_plus"})
 
 
 @dataclass(slots=True)
@@ -508,9 +508,9 @@ def _launch_queue_items(
         dataset_slug = item.dataset_slug
         try:
             dataset_path = locate_dataset(dataset_slug, search=DATASET_ROOTS, output_root=DATA_OUTPUT_ROOT)
-        except (FileNotFoundError, ValueError) as exc:
+        except Exception as exc:
             if opts.skip_missing_dataset:
-                print(f"⚠️  {item.job_id} 缺少数据集：{exc}. 已跳过。")
+                print(f"⚠️  {item.job_id} 数据集不可用：{exc}. 已跳过。")
                 skipped_missing_keys.add(
                     CompletedKey(
                         job=item.job_name,
@@ -528,6 +528,7 @@ def _launch_queue_items(
                     item.job_id,
                     reason="unavailable_dataset",
                     dataset_slug=dataset_slug,
+                    error=type(exc).__name__,
                 )
                 continue
             log_job_event(
@@ -535,6 +536,7 @@ def _launch_queue_items(
                 item.job_id,
                 reason="missing_dataset",
                 dataset_slug=dataset_slug,
+                error=type(exc).__name__,
             )
             if lease_manager is not None:
                 lease_manager.release((item.job_id,))
