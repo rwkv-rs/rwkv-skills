@@ -72,6 +72,17 @@ class _DecodeSession:
         )
         return False  # never suppress exceptions
 
+    def finish(self, exc=None):
+        """Close the session from a manual try/finally (async generators).
+
+        Encapsulates the with-protocol so call sites never pass ``type(None)``
+        for the success case -- ``exc is None`` is the only "succeeded" signal.
+        """
+        if exc is None:
+            self.__exit__(None, None, None)
+        else:
+            self.__exit__(type(exc), exc, exc.__traceback__)
+
 
 class MetricsCollector:
     def __init__(self, window_seconds=10.0, recent_capacity=64):
@@ -104,7 +115,7 @@ class MetricsCollector:
 
         # Rolling windows for the "is it busy right now" view.
         self._decode_window = deque()   # (ts, slots, output)
-        self._prefill_window = deque()  # (ts, tokens)
+        self._prefill_window = deque()  # (ts, tokens, elapsed_s)
 
         self._recent = deque(maxlen=int(recent_capacity))
 
@@ -164,10 +175,14 @@ class MetricsCollector:
         if tokens <= 0:
             return
         ts = _now()
+        elapsed_s = max(0.0, float(elapsed_s))
         with self._lock:
             self.prefill_tokens_total += tokens
-            self.prefill_busy_s += max(0.0, float(elapsed_s))
-            self._prefill_window.append((ts, tokens))
+            self.prefill_busy_s += elapsed_s
+            # Keep the real duration: windowed tok/s divides by sum(elapsed),
+            # not by the timestamp span (which collapses to ~0 right after a
+            # multi-second prefill and spikes the rate).
+            self._prefill_window.append((ts, tokens, elapsed_s))
             self._trim_prefill(ts)
 
     def record_request(self, success):
@@ -202,12 +217,12 @@ class MetricsCollector:
             d_slots = sum(s for _, s, _ in self._decode_window)
             d_out = sum(o for _, _, o in self._decode_window)
             d_span = max(now - self._decode_window[0][0], 1e-6) if self._decode_window else 0.0
-            p_tokens = sum(t for _, t in self._prefill_window)
-            p_span = max(now - self._prefill_window[0][0], 1e-6) if self._prefill_window else 0.0
+            p_tokens = sum(t for _, t, _ in self._prefill_window)
+            p_elapsed = sum(e for _, _, e in self._prefill_window)
 
             decode_slots_s = d_slots / d_span if d_span > 0 else 0.0
             output_tok_s = d_out / d_span if d_span > 0 else 0.0
-            prefill_tok_s = p_tokens / p_span if p_span > 0 else 0.0
+            prefill_tok_s = p_tokens / p_elapsed if p_elapsed > 0 else 0.0
 
             slots_s_avg = (self.decode_token_slots_total / self.decode_busy_s
                            if self.decode_busy_s > 0 else 0.0)
@@ -251,6 +266,9 @@ class _NullSession:
         pass
 
     def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def finish(self, exc=None):
         return False
 
 

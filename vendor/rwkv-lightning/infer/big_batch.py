@@ -122,7 +122,7 @@ class BigBatchMixin:
                     _sess_exc = exc
                     raise
                 finally:
-                    _sess.__exit__(type(_sess_exc), _sess_exc, None)
+                    _sess.finish(_sess_exc)
 
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
