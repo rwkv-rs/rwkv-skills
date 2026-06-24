@@ -9,6 +9,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from .dataset_utils import safe_slug
+from .remote_slots import infer_workers_for_model, parse_remote_model_slots
 
 
 class RemoteBackpressureError(RuntimeError):
@@ -84,6 +85,8 @@ def fetch_remote_backpressure(
         raise RemoteBackpressureError(str(exc.reason)) from exc
     except TimeoutError as exc:
         raise RemoteBackpressureError("request timed out") from exc
+    except OSError as exc:
+        raise RemoteBackpressureError(str(exc)) from exc
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -131,22 +134,27 @@ def compute_remote_concurrency_budgets(
     default_remote_batch_size: int | None,
     pending_high_watermark: int = 0,
     min_infer_max_workers: int = 1,
+    infer_worker_profile: str = "fixed",
 ) -> dict[str, RemoteConcurrencyBudget]:
     budgets: dict[str, RemoteConcurrencyBudget] = {}
     default_workers = max(1, int(default_infer_max_workers))
     min_workers = max(1, int(min_infer_max_workers))
     high_watermark = max(0, int(pending_high_watermark))
-    for model in infer_models:
-        model_name = str(model).strip()
-        if not model_name:
-            continue
-        model_slug = safe_slug(model_name)
-        signal = backpressure.get(model_slug)
+    for slot in parse_remote_model_slots(infer_models):
+        model_name = slot.model
+        slot_slug = slot.slot_slug
+        source_model_slug = slot.model_slug
+        slot_workers = infer_workers_for_model(
+            model_name,
+            default_workers=default_workers,
+            profile=infer_worker_profile,
+        )
+        signal = backpressure.get(source_model_slug)
         if signal is None:
-            budgets[model_slug] = RemoteConcurrencyBudget(
+            budgets[slot_slug] = RemoteConcurrencyBudget(
                 model=model_name,
-                model_slug=model_slug,
-                infer_max_workers=default_workers,
+                model_slug=slot_slug,
+                infer_max_workers=max(min_workers, slot_workers),
                 remote_batch_size=_positive_or_none(default_remote_batch_size),
                 reason="static_no_backpressure",
             )
@@ -163,18 +171,15 @@ def compute_remote_concurrency_budgets(
             reason = "backend_queue_pending"
 
         worker_cap = _positive_or_none(signal.max_batch_size)
-        if worker_cap is None:
-            infer_max_workers = default_workers
-        else:
-            infer_max_workers = max(min_workers, min(default_workers, worker_cap))
+        infer_max_workers = max(min_workers, slot_workers)
 
         remote_batch_size = _positive_or_none(default_remote_batch_size)
         if remote_batch_size is not None and worker_cap is not None:
             remote_batch_size = max(1, min(remote_batch_size, worker_cap))
 
-        budgets[model_slug] = RemoteConcurrencyBudget(
+        budgets[slot_slug] = RemoteConcurrencyBudget(
             model=model_name,
-            model_slug=model_slug,
+            model_slug=slot_slug,
             infer_max_workers=infer_max_workers,
             remote_batch_size=remote_batch_size,
             launch_allowed=launch_allowed,
@@ -193,17 +198,20 @@ def static_remote_concurrency_budgets(
     default_infer_max_workers: int,
     default_remote_batch_size: int | None,
     reason: str = "static",
+    infer_worker_profile: str = "fixed",
 ) -> dict[str, RemoteConcurrencyBudget]:
     budgets: dict[str, RemoteConcurrencyBudget] = {}
-    for model in infer_models:
-        model_name = str(model).strip()
-        if not model_name:
-            continue
-        model_slug = safe_slug(model_name)
+    for slot in parse_remote_model_slots(infer_models):
+        model_name = slot.model
+        model_slug = slot.slot_slug
         budgets[model_slug] = RemoteConcurrencyBudget(
             model=model_name,
             model_slug=model_slug,
-            infer_max_workers=max(1, int(default_infer_max_workers)),
+            infer_max_workers=infer_workers_for_model(
+                model_name,
+                default_workers=max(1, int(default_infer_max_workers)),
+                profile=infer_worker_profile,
+            ),
             remote_batch_size=_positive_or_none(default_remote_batch_size),
             reason=reason,
         )

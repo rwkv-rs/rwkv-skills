@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from .config import (
+    DEFAULT_DB_CONFIG,
     DEFAULT_DISPATCH_POLL_SECONDS,
     DEFAULT_GPU_IDLE_MAX_MEM,
     DEFAULT_MODEL_GLOBS,
@@ -29,6 +30,7 @@ from .process import FAILURE_MONITOR, JobFailure, handle_job_failure, launch_job
 from .profiler import BatchProfiler
 from .queue import QueueItem, build_queue, sort_queue_items
 from .question_counts import derive_question_counts
+from .remote_slots import parse_remote_model_slots, remote_slot_map
 from .backpressure import (
     RemoteBackpressureError,
     RemoteConcurrencyBudget,
@@ -53,6 +55,14 @@ from src.eval.evaluating import RunMode
 from src.eval.runner_registry import RunnerGroup
 
 _SAMPLE_WORKER_JOB_NAMES = frozenset({"function_bfcl_v3", "function_browsecomp_plus"})
+_NO_GENERATION_SLOT_RELEASE_JOBS = frozenset(
+    {
+        "code_human_eval_naive",
+        "code_mbpp_naive",
+        "code_livecodebench_naive",
+        "code_swe_bench",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -75,6 +85,7 @@ class QueueOptions:
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
+    infer_worker_profile: str = "fixed"
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
@@ -83,6 +94,8 @@ class QueueOptions:
     infer_backpressure_timeout_s: float = 2.0
     infer_backpressure_pending_high_watermark: int = 0
     infer_budget_min_workers: int = 1
+    coding_eval_workers: int | None = None
+    max_active_coding_runners: int | None = None
     function_prompt_style: str | None = None
     function_tool_catalog_format: str | None = None
     function_cot_max_tokens: int | None = None
@@ -317,6 +330,7 @@ def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteC
             default_infer_max_workers=opts.infer_max_workers,
             default_remote_batch_size=opts.remote_batch_size,
             reason="static_backpressure_disabled",
+            infer_worker_profile=opts.infer_worker_profile,
         )
         _log_remote_budgets(budgets)
         return budgets
@@ -332,6 +346,7 @@ def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteC
             default_infer_max_workers=opts.infer_max_workers,
             default_remote_batch_size=opts.remote_batch_size,
             reason="static_backpressure_unavailable",
+            infer_worker_profile=opts.infer_worker_profile,
         )
         for budget in budgets.values():
             budget.error = str(exc)
@@ -345,6 +360,7 @@ def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteC
         default_remote_batch_size=opts.remote_batch_size,
         pending_high_watermark=opts.infer_backpressure_pending_high_watermark,
         min_infer_max_workers=opts.infer_budget_min_workers,
+        infer_worker_profile=opts.infer_worker_profile,
     )
     _log_remote_budgets(budgets)
     return budgets
@@ -373,16 +389,21 @@ def _lease_meta_for_item(item: QueueItem) -> dict[str, object]:
 def _resolve_available_dispatch_resources(
     opts: DispatchOptions,
     running_entries: Mapping[str, RunningEntry],
+    generated_job_ids: Sequence[str] | set[str] = (),
     remote_budgets: Mapping[str, RemoteConcurrencyBudget] | None = None,
 ) -> list[str]:
     if _dispatch_uses_remote_inference(opts):
-        occupied_model_slugs = _running_remote_model_slugs(running_entries, opts.infer_models)
+        occupied_slot_slugs = _running_remote_slot_slugs(
+            running_entries,
+            opts.infer_models,
+            generated_job_ids=generated_job_ids,
+        )
         budgets = remote_budgets or {}
         return [
-            f"model:{model_slug}"
-            for model in opts.infer_models
-            if (model_slug := safe_slug(model)) not in occupied_model_slugs
-            and (model_slug not in budgets or budgets[model_slug].launch_allowed)
+            f"model:{slot.slot_slug}"
+            for slot in parse_remote_model_slots(opts.infer_models)
+            if slot.slot_slug not in occupied_slot_slugs
+            and (slot.slot_slug not in budgets or budgets[slot.slot_slug].launch_allowed)
         ]
 
     idle_gpus = list_idle_gpus(opts.gpu_idle_max_mem)
@@ -390,20 +411,133 @@ def _resolve_available_dispatch_resources(
     return [gpu for gpu in idle_gpus if gpu not in running_gpus]
 
 
-def _running_remote_model_slugs(
+def _running_remote_slot_slugs(
     running_entries: Mapping[str, RunningEntry],
     infer_models: Sequence[str],
+    generated_job_ids: Sequence[str] | set[str] = (),
 ) -> set[str]:
-    model_slugs = {safe_slug(model) for model in infer_models if str(model).strip()}
-    if not model_slugs:
+    slots = parse_remote_model_slots(infer_models)
+    slot_slugs = {slot.slot_slug for slot in slots}
+    model_to_slots: dict[str, list[str]] = {}
+    for slot in slots:
+        model_to_slots.setdefault(slot.model_slug, []).append(slot.slot_slug)
+    if not slot_slugs:
         return set()
+    generated = set(generated_job_ids)
     occupied: set[str] = set()
-    for job_id in running_entries:
-        for model_slug in model_slugs:
+    for job_id, entry in running_entries.items():
+        if job_id in generated:
+            continue
+        resource_slot = _remote_resource_model_slug(entry.gpu or "")
+        if resource_slot in slot_slugs:
+            occupied.add(resource_slot)
+            continue
+        if resource_slot is not None:
+            continue
+        for model_slug, matching_slots in model_to_slots.items():
             if job_id.endswith(f"_{model_slug}"):
-                occupied.add(model_slug)
+                for slot_slug in matching_slots:
+                    if slot_slug not in occupied:
+                        occupied.add(slot_slug)
+                        break
                 break
     return occupied
+
+
+def _generated_running_job_ids(
+    *,
+    running_entries: Mapping[str, RunningEntry],
+    job_metadata: Mapping[str, Mapping[str, object]],
+) -> set[str]:
+    generated: set[str] = set()
+    for job_id in running_entries:
+        meta = job_metadata.get(job_id)
+        if not meta:
+            continue
+        if bool(meta.get("generation_slot_released")):
+            generated.add(job_id)
+            continue
+        job_name = str(meta.get("job") or "").strip()
+        model_name = str(meta.get("model_name") or "").strip()
+        dataset_slug = str(meta.get("dataset_slug") or "").strip()
+        if not job_name or not model_name or not dataset_slug:
+            continue
+        if job_name in _NO_GENERATION_SLOT_RELEASE_JOBS:
+            continue
+        try:
+            if _job_generation_is_complete(
+                job_name=job_name,
+                model_name=model_name,
+                dataset_slug=dataset_slug,
+            ):
+                generated.add(job_id)
+                if isinstance(meta, dict):
+                    meta["generation_slot_released"] = True
+        except Exception as exc:
+            log_job_event(
+                "generation_progress_probe_failed",
+                job_id,
+                job=job_name,
+                dataset_slug=dataset_slug,
+                model_name=model_name,
+                error=type(exc).__name__,
+                message=str(exc),
+            )
+    return generated
+
+
+def _expected_completion_count_from_sampling(sampling_config: object) -> int | None:
+    if not isinstance(sampling_config, Mapping):
+        return None
+    raw = sampling_config.get("effective_sample_count")
+    if raw is None:
+        return None
+    try:
+        expected = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return expected if expected > 0 else None
+
+
+def _job_generation_is_complete(
+    *,
+    job_name: str,
+    model_name: str,
+    dataset_slug: str,
+) -> bool:
+    from src.db.database import init_db
+    from src.db.eval_db_service import EvalDbService
+
+    benchmark_name, benchmark_split = split_benchmark_and_split(dataset_slug)
+    init_db(DEFAULT_DB_CONFIG)
+    progress = EvalDbService().get_latest_task_generation_progress(
+        evaluator=job_name,
+        model_name=model_name,
+        benchmark_name=benchmark_name,
+        benchmark_split=benchmark_split,
+    )
+    if not progress or bool(progress.get("has_score")):
+        return False
+    expected = _expected_completion_count_from_sampling(progress.get("sampling_config"))
+    if expected is None:
+        return False
+    try:
+        completed = int(progress.get("completed_completions") or 0)
+    except (TypeError, ValueError):
+        return False
+    if completed < expected:
+        return False
+    log_job_event(
+        "generation_complete_release_slot",
+        f"{job_name}__{dataset_slug}",
+        task_id=str(progress.get("task_id") or ""),
+        job=job_name,
+        dataset_slug=dataset_slug,
+        model_name=model_name,
+        completed_completions=completed,
+        expected_completions=expected,
+    )
+    return True
 
 
 def _remote_resource_model_slug(resource: str) -> str | None:
@@ -432,6 +566,7 @@ def _launch_queue_items(
     lease_manager: SchedulerLeaseManager | None,
     claimed_job_ids: set[str],
     skipped_missing_keys: set[CompletedKey] | None = None,
+    generated_job_ids: Sequence[str] | set[str] = (),
     remote_budgets: Mapping[str, RemoteConcurrencyBudget] | None = None,
 ) -> None:
     if skipped_missing_keys is None:
@@ -439,26 +574,52 @@ def _launch_queue_items(
     remote_mode = _dispatch_uses_remote_inference(opts)
     resource_label = "Free slots" if remote_mode else "Idle GPUs"
     print(f"🧮 Pending={len(queue)} | {resource_label}={', '.join(available_resources)}")
-    occupied_remote_models = (
-        _running_remote_model_slugs(load_running(opts.pid_dir), opts.infer_models)
+    running_now = load_running(opts.pid_dir)
+    remote_slots = remote_slot_map(opts.infer_models) if remote_mode else {}
+    occupied_remote_slots = (
+        _running_remote_slot_slugs(
+            running_now,
+            opts.infer_models,
+            generated_job_ids=generated_job_ids,
+        )
         if remote_mode
         else set()
     )
     budgets = remote_budgets or {}
+    active_coding_runners = _running_job_group_count(running_now, RunnerGroup.CODING)
 
     queue_index = 0
     skipped_remote_job_ids: set[str] = set()
     for resource in available_resources:
         item: QueueItem | None = None
+        resource_slot_slug = _remote_resource_model_slug(resource) if remote_mode else None
+        resource_model_slug = None
+        if remote_mode and resource_slot_slug is not None:
+            slot_spec = remote_slots.get(resource_slot_slug)
+            resource_model_slug = slot_spec.model_slug if slot_spec is not None else resource_slot_slug
         while queue_index < len(queue):
             if remote_mode:
-                resource_model_slug = _remote_resource_model_slug(resource)
                 candidate = None
                 for maybe in queue:
                     if maybe.job_id in skipped_remote_job_ids:
                         continue
                     candidate_model_slug = safe_slug(maybe.infer_model or maybe.model_name or maybe.model_slug)
                     if resource_model_slug is not None and candidate_model_slug != resource_model_slug:
+                        continue
+                    if _candidate_exceeds_coding_limit(
+                        opts=opts,
+                        candidate=maybe,
+                        active_coding_runners=active_coding_runners,
+                    ):
+                        log_job_event(
+                            "job_defer",
+                            maybe.job_id,
+                            reason="max_active_coding_runners",
+                            active_coding_runners=active_coding_runners,
+                            max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                            worker_slot=resource,
+                        )
+                        skipped_remote_job_ids.add(maybe.job_id)
                         continue
                     candidate = maybe
                     skipped_remote_job_ids.add(candidate.job_id)
@@ -468,9 +629,23 @@ def _launch_queue_items(
             else:
                 candidate = queue[queue_index]
                 queue_index += 1
+                if _candidate_exceeds_coding_limit(
+                    opts=opts,
+                    candidate=candidate,
+                    active_coding_runners=active_coding_runners,
+                ):
+                    log_job_event(
+                        "job_defer",
+                        candidate.job_id,
+                        reason="max_active_coding_runners",
+                        active_coding_runners=active_coding_runners,
+                        max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                        worker_slot=resource,
+                    )
+                    continue
             if remote_mode:
                 candidate_model_slug = safe_slug(candidate.infer_model or candidate.model_name or candidate.model_slug)
-                budget = budgets.get(candidate_model_slug)
+                budget = budgets.get(resource_slot_slug or candidate_model_slug)
                 if budget is not None and not budget.launch_allowed:
                     log_job_event(
                         "job_defer",
@@ -482,11 +657,11 @@ def _launch_queue_items(
                         source_status=budget.source_status,
                     )
                     continue
-                if candidate_model_slug in occupied_remote_models:
+                if resource_slot_slug is not None and resource_slot_slug in occupied_remote_slots:
                     log_job_event(
                         "job_defer",
                         candidate.job_id,
-                        reason="remote_model_busy",
+                        reason="remote_slot_busy",
                         infer_model=str(candidate.infer_model or candidate.model_name or ""),
                         worker_slot=resource,
                     )
@@ -598,7 +773,7 @@ def _launch_queue_items(
         questions = question_counts.get(dataset_slug)
 
         batch_size = None
-        item_budget = budgets.get(safe_slug(item.infer_model or item.model_name or item.model_slug)) if item.is_remote else None
+        item_budget = budgets.get(resource_slot_slug or "") if item.is_remote else None
         if item.is_remote and job.batch_flag:
             if item_budget is not None and item_budget.remote_batch_size is not None:
                 batch_size = max(1, int(item_budget.remote_batch_size))
@@ -616,7 +791,7 @@ def _launch_queue_items(
                 dataset_questions=questions,
             )
 
-        extra_args = item.extra_args + _function_calling_extra_args(opts, job)
+        extra_args = item.extra_args + _coding_extra_args(opts, job) + _function_calling_extra_args(opts, job)
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
 
@@ -677,6 +852,7 @@ def _launch_queue_items(
         if item.is_remote:
             meta["infer_base_url"] = str(item.infer_base_url)
             meta["infer_model"] = str(item.infer_model or item.model_name)
+            meta["remote_slot"] = resource
             if opts.sample_workers is not None:
                 meta["sample_workers"] = max(1, int(opts.sample_workers))
             if item_budget is not None:
@@ -704,7 +880,7 @@ def _launch_queue_items(
             log_reference = str(console_log_path.relative_to(opts.run_log_dir))
         except ValueError:
             log_reference = str(console_log_path)
-        write_pid_file(opts.pid_dir, item.job_id, process.pid, (None if item.is_remote else resource), log_reference)
+        write_pid_file(opts.pid_dir, item.job_id, process.pid, resource, log_reference)
         launch_times[item.job_id] = time.time()
         pending_start = pending_since.pop(item.job_id, None)
         wait_s = time.time() - pending_start if pending_start else None
@@ -730,7 +906,10 @@ def _launch_queue_items(
                     payload["remote_batch_size"] = item_budget.remote_batch_size
         log_job_event("job_launch", item.job_id, **payload)
         if remote_mode:
-            occupied_remote_models.add(safe_slug(item.infer_model or item.model_name or item.model_slug))
+            if resource_slot_slug is not None:
+                occupied_remote_slots.add(resource_slot_slug)
+        if job.runner_group is RunnerGroup.CODING:
+            active_coding_runners += 1
 
 
 def action_queue(opts: QueueOptions) -> list[QueueItem]:
@@ -865,9 +1044,18 @@ def action_dispatch(
             now=now,
         )
         remote_budgets = _resolve_remote_concurrency_budgets(opts) if _dispatch_uses_remote_inference(opts) else {}
+        generated_job_ids = (
+            _generated_running_job_ids(
+                running_entries=running_entries,
+                job_metadata=job_metadata,
+            )
+            if _dispatch_uses_remote_inference(opts)
+            else set()
+        )
         available_resources = _resolve_available_dispatch_resources(
             opts,
             running_entries,
+            generated_job_ids=generated_job_ids,
             remote_budgets=remote_budgets,
         )
         progress = _build_progress_snapshot(
@@ -985,6 +1173,7 @@ def action_dispatch(
             lease_manager=lease_manager,
             claimed_job_ids=claimed_job_ids,
             skipped_missing_keys=skipped_missing_keys,
+            generated_job_ids=generated_job_ids,
             remote_budgets=remote_budgets,
         )
 
@@ -1055,8 +1244,33 @@ def build_command(
     return base + args
 
 
+def _running_job_group_count(running_entries: Mapping[str, RunningEntry], group: RunnerGroup) -> int:
+    count = 0
+    for job_id in running_entries:
+        for spec in JOB_CATALOGUE.values():
+            if spec.runner_group is group and job_id.startswith(spec.id_prefix):
+                count += 1
+                break
+    return count
+
+
+def _candidate_exceeds_coding_limit(
+    *,
+    opts: QueueOptions,
+    candidate: QueueItem,
+    active_coding_runners: int,
+) -> bool:
+    if opts.max_active_coding_runners is None:
+        return False
+    limit = max(1, int(opts.max_active_coding_runners))
+    job = JOB_CATALOGUE.get(candidate.job_name)
+    return bool(job is not None and job.runner_group is RunnerGroup.CODING and active_coding_runners >= limit)
+
+
 def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
     if job.runner_group is not RunnerGroup.FUNCTION_CALLING:
+        return ()
+    if job.module != "src.eval.function_calling.runner":
         return ()
 
     args: list[str] = []
@@ -1100,6 +1314,14 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
     _append("--max-steps", opts.function_max_steps)
     _append("--max-tool-errors", opts.function_max_tool_errors)
     return tuple(args)
+
+
+def _coding_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.CODING:
+        return ()
+    if opts.coding_eval_workers is None:
+        return ()
+    return ("--eval-workers", str(max(1, int(opts.coding_eval_workers))))
 
 
 def action_status(opts: StatusOptions) -> dict[str, RunningEntry]:

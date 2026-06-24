@@ -37,6 +37,7 @@ from .control import (
 from .dataset_utils import canonical_slug, canonicalize_benchmark_list
 from .jobs import JOB_CATALOGUE, JOB_ORDER
 from .models import MODEL_SELECT_CHOICES
+from .remote_slots import INFER_WORKER_PROFILE_CHOICES
 from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
 
@@ -66,6 +67,7 @@ class SchedulerStartRequest:
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
     infer_max_workers: int = 32
+    infer_worker_profile: str = "fixed"
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
@@ -134,6 +136,9 @@ class SchedulerStartRequest:
         infer_seed_policy = str(self.infer_seed_policy or "preserve")
         if infer_seed_policy not in {"preserve", "omit-for-contents"}:
             raise ValueError(f"unknown infer_seed_policy={infer_seed_policy!r}")
+        infer_worker_profile = str(self.infer_worker_profile or "fixed")
+        if infer_worker_profile not in INFER_WORKER_PROFILE_CHOICES:
+            raise ValueError(f"unknown infer_worker_profile={infer_worker_profile!r}")
 
         job_list = _resolve_job_list(self.only_jobs, self.skip_jobs, self.domains)
         if not job_list:
@@ -191,6 +196,7 @@ class SchedulerStartRequest:
             infer_api_key=str(self.infer_api_key or ""),
             infer_timeout_s=float(self.infer_timeout_s),
             infer_max_workers=int(self.infer_max_workers),
+            infer_worker_profile=infer_worker_profile,
             infer_protocol=infer_protocol,
             infer_seed_policy=infer_seed_policy,
             remote_batch_size=(

@@ -32,6 +32,8 @@ _CANONICALIZE_SPLIT_NAMES = {
     "devtest",
     "base",
     "main",
+    "extended",
+    "diamond",
     "science",
     "verified",
     "all",

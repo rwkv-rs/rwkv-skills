@@ -14,6 +14,7 @@ from .dataset_utils import canonical_slug, make_dataset_slug, safe_slug
 from .jobs import JOB_CATALOGUE
 from .models import expand_model_paths, filter_model_names, filter_model_paths
 from .naming import build_run_slug
+from .remote_slots import parse_remote_model_slots, unique_remote_models
 from .state import CompletedKey
 
 
@@ -188,17 +189,23 @@ def build_queue(
     infer_models: Sequence[str] = (),
 ) -> list[QueueItem]:
     remote_base_url = str(infer_base_url or "").strip() or None
-    remote_models = tuple(str(name).strip() for name in infer_models if str(name).strip())
-    remote_mode = bool(remote_base_url or remote_models)
+    remote_slots = parse_remote_model_slots(infer_models)
+    remote_models = unique_remote_models(remote_slots)
+    remote_mode = bool(remote_base_url or remote_slots)
 
     resolved_models: list[tuple[str, Path | None]] = []
     latest_2_9b_models: set[str] = set()
     if remote_mode:
-        if not remote_base_url or not remote_models:
+        if not remote_base_url or not remote_slots:
             raise ValueError("远端调度必须同时提供 infer_base_url 和 infer_models。")
         filtered_model_names = filter_model_names(remote_models, model_select, min_param_b, max_param_b)
         latest_2_9b_models = set(filter_model_names(remote_models, "latest-data", 2.9, 2.9))
-        resolved_models = [(model_name, None) for model_name in filtered_model_names]
+        filtered_model_slugs = {safe_slug(model_name) for model_name in filtered_model_names}
+        resolved_models = [
+            (model_name, None)
+            for model_name in remote_models
+            if safe_slug(model_name) in filtered_model_slugs
+        ]
     else:
         model_paths = expand_model_paths(model_globs)
         if not model_paths:

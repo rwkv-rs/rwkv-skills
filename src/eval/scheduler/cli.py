@@ -47,6 +47,7 @@ from .config import (
 from .dataset_utils import canonical_slug, canonicalize_benchmark_list
 from .jobs import JOB_CATALOGUE, JOB_ORDER
 from .models import MODEL_SELECT_CHOICES
+from .remote_slots import INFER_WORKER_PROFILE_CHOICES
 from .remote_profiler import DEFAULT_REMOTE_PROBE_PROMPT, probe_remote_inference, write_remote_probe_result
 
 
@@ -215,6 +216,12 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
     parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
     parser.add_argument(
+        "--infer-worker-profile",
+        choices=INFER_WORKER_PROFILE_CHOICES,
+        default="fixed",
+        help="远端 worker 档位：fixed 使用 --infer-max-workers；param-size 按模型大小分配",
+    )
+    parser.add_argument(
         "--infer-protocol",
         choices=REMOTE_INFERENCE_PROTOCOL_CHOICES,
         default="openai",
@@ -228,6 +235,8 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
     parser.add_argument("--sample-workers", type=int, help="runner 侧 episode 并发数；当前透传给 function-calling runner")
+    parser.add_argument("--coding-eval-workers", type=int, help="coding runner 本地评测并发数；透传为 --eval-workers")
+    parser.add_argument("--max-active-coding-runners", type=int, help="最多同时运行的 coding runner 数；空出的远端槽可调度非 coding 任务")
     parser.add_argument(
         "--disable-infer-backpressure",
         action="store_true",
@@ -435,6 +444,7 @@ def _dispatch_options_from_args(
         infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
         infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
         infer_max_workers=int(getattr(args, "infer_max_workers", 32)),
+        infer_worker_profile=str(getattr(args, "infer_worker_profile", "fixed") or "fixed"),
         infer_protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),
         infer_seed_policy=str(getattr(args, "infer_seed_policy", "preserve") or "preserve"),
         remote_batch_size=(
@@ -445,6 +455,16 @@ def _dispatch_options_from_args(
         sample_workers=(
             int(getattr(args, "sample_workers"))
             if getattr(args, "sample_workers", None) is not None
+            else None
+        ),
+        coding_eval_workers=(
+            int(getattr(args, "coding_eval_workers"))
+            if getattr(args, "coding_eval_workers", None) is not None
+            else None
+        ),
+        max_active_coding_runners=(
+            int(getattr(args, "max_active_coding_runners"))
+            if getattr(args, "max_active_coding_runners", None) is not None
             else None
         ),
         infer_backpressure=not bool(getattr(args, "disable_infer_backpressure", False)),
