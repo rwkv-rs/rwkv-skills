@@ -7,7 +7,12 @@ from typing import Iterable
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
-from src.eval.env_config import resolve_judge_max_tokens, resolve_judge_max_workers, resolve_judge_model_config
+from src.eval.env_config import (
+    resolve_judge_max_tokens,
+    resolve_judge_max_workers,
+    resolve_judge_model_config,
+    resolve_judge_timeout_s,
+)
 from src.eval.k_values import NumericK, filter_metrics_by_k
 
 
@@ -130,12 +135,14 @@ def build_llm_judge(
         return None
     resolved_max_workers = resolve_judge_max_workers(judge_max_workers, default=16)
     resolved_max_tokens = resolve_judge_max_tokens(judge_max_tokens)
+    resolved_timeout_s = resolve_judge_timeout_s(default=60.0)
 
     return LLMJudge(
         LLMJudgeConfig(
             api_key=config.api_key,
             model=config.model_name,
             base_url=config.base_url,
+            timeout_s=resolved_timeout_s,
             max_workers=resolved_max_workers,
             max_completion_tokens=resolved_max_tokens,
         )

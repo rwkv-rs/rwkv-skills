@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS eval (
     is_passed BOOLEAN NOT NULL,
     fail_reason TEXT NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
+    CONSTRAINT chk_eval_answer_size CHECK (char_length(answer) <= 65536),
+    CONSTRAINT chk_eval_ref_answer_size CHECK (char_length(ref_answer) <= 4096),
+    CONSTRAINT chk_eval_fail_reason_size CHECK (char_length(fail_reason) <= 2048),
     CONSTRAINT uq_eval_completion UNIQUE (completions_id)
 );
 
@@ -83,7 +86,7 @@ CREATE TABLE IF NOT EXISTS scores (
     cot_mode VARCHAR(32) NOT NULL,
     metrics JSONB NOT NULL,
     created_at TIMESTAMP(6) NOT NULL,
-    CONSTRAINT chk_scores_cot_mode CHECK (cot_mode IN ('NoCoT', 'FakeCoT', 'CoT')),
+    CONSTRAINT chk_scores_cot_mode CHECK (cot_mode IN ('NoCoT', 'CoT')),
     CONSTRAINT uq_score_task UNIQUE (task_id)
 );
 

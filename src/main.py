@@ -586,18 +586,27 @@ def _default_job_name(config: RunConfig, benchmark: BenchmarkMetadata) -> str:
         cot_mode = _resolve_cot_mode(config.runner.cot_mode, benchmark=benchmark, default=CoTMode.NO_COT)
         return {
             CoTMode.NO_COT: "multi_choice_plain",
-            CoTMode.FAKE_COT: "multi_choice_fake_cot",
             CoTMode.COT: "multi_choice_cot",
         }[cot_mode]
     if benchmark.field is BenchmarkField.MATHS:
         judge_mode = config.runner.judge_mode or "exact"
         return "free_response_judge" if judge_mode == "llm" else "free_response"
     if benchmark.field is BenchmarkField.CODING:
-        cot_mode = _resolve_cot_mode(config.runner.cot_mode, benchmark=benchmark, default=CoTMode.NO_COT)
-        if cot_mode is not CoTMode.NO_COT:
-            raise ValueError("legacy-aligned coding benchmarks only support cot_mode='no_cot' by default")
-        return "code_mbpp"
+        default_mode = benchmark.cot_modes[0] if benchmark.cot_modes else CoTMode.NO_COT
+        _resolve_cot_mode(config.runner.cot_mode, benchmark=benchmark, default=default_mode)
+        return _first_normal_scheduler_job(jobs)
+    if benchmark.field is BenchmarkField.FUNCTION_CALLING:
+        return _first_normal_scheduler_job(jobs)
     raise ValueError(f"benchmark {benchmark.name!r} requires an explicit run.job")
+
+
+def _first_normal_scheduler_job(jobs: Sequence[str]) -> str:
+    for job in jobs:
+        if not job.endswith("_naive"):
+            return job
+    if jobs:
+        return jobs[0]
+    raise ValueError("benchmark does not define any scheduler jobs")
 
 
 def _resolve_cot_mode(raw_mode: str | None, *, benchmark: BenchmarkMetadata, default: CoTMode) -> CoTMode:
@@ -718,7 +727,7 @@ def _build_runner_argv(
         _append_flag(argv, "--judge-api-key", runner_cfg.judge_api_key)
         _append_flag(argv, "--judge-base-url", runner_cfg.judge_base_url)
         _append_flag(argv, "--judge-max-workers", runner_cfg.judge_max_workers)
-    elif group is RunnerGroup.CODING:
+    elif group is RunnerGroup.CODING or runner.module == "src.eval.coding.runner":
         _append_flag(argv, "--benchmark-kind", runner_cfg.benchmark_kind or _coding_benchmark_kind(runner.name))
         _append_flag(argv, "--max-tokens", runner_cfg.max_tokens)
         _append_flag(argv, "--temperature", runner_cfg.temperature)

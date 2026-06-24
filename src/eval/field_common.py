@@ -114,14 +114,22 @@ def _primary_avg_k(avg_k: tuple[NumericK, ...], fallback: int) -> NumericK:
     return max(1, int(fallback))
 
 
-def build_plan_task_details(plan: AvgKExecutionPlan, *, cot_mode: str) -> dict[str, object]:
-    return {
+def build_plan_task_details(
+    plan: AvgKExecutionPlan,
+    *,
+    cot_mode: str,
+    prompt_profile: str = "normal",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "cot_mode": cot_mode,
         "avg_k": plan.avg_k,
         "sample_size": plan.sample_size,
         "avg_repeat_count": plan.repeat_count,
         "effective_sample_count": plan.effective_sample_count,
     }
+    if prompt_profile != "normal":
+        payload["prompt_profile"] = prompt_profile
+    return payload
 
 
 def rwkv_rs_cot_mode_name(cot_mode: CoTMode | str) -> str:
@@ -131,8 +139,6 @@ def rwkv_rs_cot_mode_name(cot_mode: CoTMode | str) -> str:
         resolved = CoTMode(str(cot_mode))
     if resolved is CoTMode.NO_COT:
         return "NoCoT"
-    if resolved is CoTMode.FAKE_COT:
-        return "FakeCoT"
     return "CoT"
 
 
@@ -147,6 +153,7 @@ def build_task_sampling_config(
     effective_sample_count: int,
     judger_model_name: str | None = None,
     checker_model_name: str | None = None,
+    prompt_profile: str = "normal",
 ) -> dict[str, object]:
     normalized_pass_ks = sorted(
         {
@@ -155,7 +162,7 @@ def build_task_sampling_config(
             if int(item) > 0
         }
     )
-    return {
+    payload: dict[str, object] = {
         "cot_mode": rwkv_rs_cot_mode_name(cot_mode),
         "n_shot": int(n_shot),
         "avg_k": float(avg_k),
@@ -166,6 +173,9 @@ def build_task_sampling_config(
         "judger_model_name": judger_model_name,
         "checker_model_name": checker_model_name,
     }
+    if prompt_profile != "normal":
+        payload["prompt_profile"] = str(prompt_profile or "normal")
+    return payload
 
 
 __all__ = [

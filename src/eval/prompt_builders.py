@@ -71,11 +71,6 @@ def build_multiple_choice_expected_context(
     )
     assistant_part = {
         CoTMode.NO_COT: f"Therefore, the answer is{LOGPROBS_PLACEHOLDER}",
-        CoTMode.FAKE_COT: (
-            "<think>\n"
-            "</think>\n"
-            f"Therefore, the answer is{LOGPROBS_PLACEHOLDER}"
-        ),
         CoTMode.COT: (
             f"<think>{COT_PLACEHOLDER}</think>\n"
             f"Therefore, the answer is{LOGPROBS_PLACEHOLDER}"
@@ -124,11 +119,6 @@ def build_human_eval_expected_context(
             "</think>\n"
             f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
         ),
-        CoTMode.FAKE_COT: (
-            "<think>\n"
-            "</think>\n"
-            f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
-        ),
         CoTMode.COT: (
             f"<think>{COT_PLACEHOLDER}</think>\n"
             f"```python{prefix}{CODE_COMPLETION_PLACEHOLDER}"
@@ -170,11 +160,6 @@ def build_mbpp_expected_context(
     )
     assistant_part = {
         CoTMode.NO_COT: f"<think></think>\n```python{CODE_COMPLETION_PLACEHOLDER}",
-        CoTMode.FAKE_COT: (
-            "<think>\n"
-            "</think>\n"
-            f"```python{CODE_COMPLETION_PLACEHOLDER}"
-        ),
         CoTMode.COT: (
             f"<think>{COT_PLACEHOLDER}</think>\n"
             f"```python{CODE_COMPLETION_PLACEHOLDER}"

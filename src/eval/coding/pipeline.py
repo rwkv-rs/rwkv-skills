@@ -11,6 +11,7 @@ from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.execution_plan import AttemptKey
 from src.eval.prompt_builders import (
     CODE_COMPLETION_PLACEHOLDER,
+    COT_PLACEHOLDER,
     build_human_eval_expected_context,
     build_livecodebench_expected_context,
     build_mbpp_expected_context,
@@ -52,9 +53,19 @@ def _format_prompt_no_echo(prompt: str) -> str:
     )
 
 
+def _format_naive_code_prompt(prompt: str) -> str:
+    clean = _compress_newlines(prompt).strip()
+    return f"User: {clean}\n\nAssistant: <think>\n</think>\n```python"
+
+
 def _format_signature_prompt(prompt: str, signature: str) -> str:
     prompt = f"{prompt}\nFunction signature: {signature}\nWrite the full function definition."
     return _format_prompt_no_echo(prompt)
+
+
+def _format_naive_signature_prompt(prompt: str, signature: str) -> str:
+    prompt = f"{prompt}\nFunction signature: {signature}"
+    return _format_naive_code_prompt(prompt)
 
 
 _LCB_SYSTEM_MESSAGE = (
@@ -89,6 +100,13 @@ def _format_lcb_body(question: str, starter_code: str | None) -> str:
 def _format_lcb_cot_prompt(question: str, starter_code: str | None) -> str:
     body = _format_lcb_body(question, starter_code)
     return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think"
+
+
+def _format_lcb_naive_cot_prompt(question: str, starter_code: str | None) -> str:
+    clean = (question or "").strip()
+    if starter_code and starter_code.strip():
+        clean = f"{clean}\n```python\n{starter_code.strip()}\n```"
+    return f"User: {clean}\n\nAssistant: <think"
 
 
 def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
@@ -135,11 +153,25 @@ def _build_human_eval_prompt(prompt: str, *, echo_prompt: bool) -> str:
     return _format_prompt(prompt)
 
 
+def _build_human_eval_naive_prompt(prompt: str) -> str:
+    return _format_naive_code_prompt(prompt)
+
+
 def _build_mbpp_context(prompt: str, signature: str | None, cot_mode: CoTMode) -> str:
     return build_mbpp_expected_context(prompt, signature=signature, cot_mode=cot_mode)
 
 
-def _build_livecodebench_context(prompt: str, starter_code: str | None) -> str:
+def _build_livecodebench_context(
+    prompt: str,
+    starter_code: str | None,
+    *,
+    prompt_profile: str = "normal",
+) -> str:
+    if prompt_profile == "naive":
+        return (
+            f"{_format_lcb_naive_cot_prompt(prompt, starter_code)}"
+            f"{COT_PLACEHOLDER}\n</think>\n```python\n{CODE_COMPLETION_PLACEHOLDER}"
+        )
     return build_livecodebench_expected_context(
         prompt,
         starter_code=starter_code,
@@ -168,6 +200,7 @@ class CodingPipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        prompt_profile: str = "normal",
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
@@ -189,7 +222,11 @@ class CodingPipeline:
             probe_seeds: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
-                prompt_text = _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix)
+                prompt_text = (
+                    _build_human_eval_naive_prompt(record.prompt)
+                    if prompt_profile == "naive"
+                    else _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix)
+                )
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
             _ = self.backend.generate(
@@ -220,7 +257,11 @@ class CodingPipeline:
             )
         entries = [
             (
-                _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix),
+                (
+                    _build_human_eval_naive_prompt(record.prompt)
+                    if prompt_profile == "naive"
+                    else _build_human_eval_prompt(record.prompt, echo_prompt=not is_human_eval_fix)
+                ),
                 record,
                 key,
             )
@@ -303,6 +344,7 @@ class CodingPipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        prompt_profile: str = "normal",
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
@@ -331,9 +373,15 @@ class CodingPipeline:
                 else:
                     expected_context = ""
                     prompt_text = (
-                        _format_signature_prompt(record.prompt, signature)
+                        _format_naive_signature_prompt(record.prompt, signature)
+                        if prompt_profile == "naive" and signature
+                        else _format_signature_prompt(record.prompt, signature)
                         if signature
-                        else _format_prompt_no_echo(record.prompt)
+                        else (
+                            _format_naive_code_prompt(record.prompt)
+                            if prompt_profile == "naive"
+                            else _format_prompt_no_echo(record.prompt)
+                        )
                     )
                 expected_contexts.append(expected_context)
                 prompts.append(prompt_text)
@@ -409,9 +457,15 @@ class CodingPipeline:
             else:
                 expected_context = ""
                 prompt_text = (
-                    _format_signature_prompt(record.prompt, signature)
+                    _format_naive_signature_prompt(record.prompt, signature)
+                    if prompt_profile == "naive" and signature
+                    else _format_signature_prompt(record.prompt, signature)
                     if signature
-                    else _format_prompt_no_echo(record.prompt)
+                    else (
+                        _format_naive_code_prompt(record.prompt)
+                        if prompt_profile == "naive"
+                        else _format_prompt_no_echo(record.prompt)
+                    )
                 )
             entries.append((expected_context, prompt_text, record, key))
         skipped = total_expected - len(entries)
@@ -604,6 +658,7 @@ class CodingPipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        prompt_profile: str = "normal",
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
@@ -623,7 +678,11 @@ class CodingPipeline:
             probe_seeds_stage1: list[int] = []
             for idx in range(batch_size):
                 _record_idx, record = records[idx % len(records)]
-                prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
+                prompt_text = (
+                    _format_lcb_naive_cot_prompt(record.prompt, record.starter_code)
+                    if prompt_profile == "naive"
+                    else _format_lcb_cot_prompt(record.prompt, record.starter_code)
+                )
                 prompts.append(prompt_text)
                 probe_seeds_stage1.append(sample_repeat_seed(records[idx % len(records)][0], idx // len(records), stage=1))
             cot_outputs = self.backend.generate(
@@ -673,7 +732,11 @@ class CodingPipeline:
             )
         entries = []
         for key, record in expanded:
-            prompt_text = _format_lcb_cot_prompt(record.prompt, record.starter_code)
+            prompt_text = (
+                _format_lcb_naive_cot_prompt(record.prompt, record.starter_code)
+                if prompt_profile == "naive"
+                else _format_lcb_cot_prompt(record.prompt, record.starter_code)
+            )
             entries.append((prompt_text, prompt_text, record, key))
         skipped = total_expected - len(entries)
         if skipped > 0:

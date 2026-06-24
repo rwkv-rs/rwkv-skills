@@ -107,6 +107,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Prompt mode for MBPP benchmarks; human_eval/livecodebench use fixed modes",
     )
     parser.add_argument(
+        "--prompt-profile",
+        choices=("normal", "naive"),
+        help="Prompt profile: normal uses benchmark prompts; naive uses only the problem plus code/final prefill.",
+    )
+    parser.add_argument(
         "--pass-k",
         type=int,
         action="append",
@@ -192,6 +197,14 @@ def _resolve_cot_mode(kind: CodingBenchmarkKind, requested_mode: str | None) -> 
     return CoTMode(requested_mode)
 
 
+def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
+    if raw:
+        return raw
+    if job_name.endswith("_naive"):
+        return "naive"
+    return "normal"
+
+
 def _default_job_name(kind: CodingBenchmarkKind, cot_mode: CoTMode) -> str:
     if kind is CodingBenchmarkKind.HUMAN_EVAL:
         return "code_human_eval"
@@ -214,9 +227,6 @@ def _print_done_message(kind: CodingBenchmarkKind, cot_mode: CoTMode, sample_cou
         return
     if cot_mode is CoTMode.NO_COT:
         print(f"✅ MBPP done: {sample_count} samples")
-        return
-    if cot_mode is CoTMode.FAKE_COT:
-        print(f"✅ fake-CoT MBPP done: {sample_count} samples")
         return
     print(f"✅ CoT MBPP done: {sample_count} samples")
 
@@ -303,6 +313,13 @@ def main(
     slug = infer_dataset_slug_from_path(str(dataset_path))
     benchmark_kind = _resolve_benchmark_kind(slug, CodingBenchmarkKind(args.benchmark_kind))
     cot_mode = _resolve_cot_mode(benchmark_kind, args.cot_mode)
+    job_name = run_context.job_name if run_context is not None else os.environ.get(
+        "RWKV_SKILLS_JOB_NAME",
+        _default_job_name(benchmark_kind, cot_mode),
+    )
+    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
+    if prompt_profile == "naive" and benchmark_kind is CodingBenchmarkKind.SWE_BENCH:
+        raise ValueError("swe_bench does not support prompt_profile=naive")
     completion_style_remote = False
     if benchmark_kind in {CodingBenchmarkKind.HUMAN_EVAL, CodingBenchmarkKind.MBPP}:
         completion_style_remote = require_completion_style_remote_protocol(
@@ -356,6 +373,7 @@ def main(
                 sample_limit=sample_limit,
                 probe_only=True,
                 samples_per_task=1,
+                prompt_profile=prompt_profile,
             )
         elif benchmark_kind is CodingBenchmarkKind.MBPP:
             result = pipeline.run_mbpp(
@@ -366,6 +384,7 @@ def main(
                 sample_limit=sample_limit,
                 probe_only=True,
                 samples_per_task=1,
+                prompt_profile=prompt_profile,
             )
         elif benchmark_kind is CodingBenchmarkKind.LIVECODEBENCH:
             result = pipeline.run_livecodebench(
@@ -376,6 +395,7 @@ def main(
                 sample_limit=sample_limit,
                 probe_only=True,
                 samples_per_task=1,
+                prompt_profile=prompt_profile,
             )
         else:
             result = pipeline.run_swe_bench(
@@ -396,10 +416,6 @@ def main(
 
     init_eval_store(DEFAULT_DB_CONFIG)
     service = create_eval_service()
-    job_name = run_context.job_name if run_context is not None else os.environ.get(
-        "RWKV_SKILLS_JOB_NAME",
-        _default_job_name(benchmark_kind, cot_mode),
-    )
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
@@ -419,6 +435,7 @@ def main(
             ),
             pass_ks=k_plan.pass_k,
             effective_sample_count=plan.effective_sample_count,
+            prompt_profile=prompt_profile,
         ),
     )
     expected_count = plan_attempt_count(plan, max_pass_k=1)
@@ -449,6 +466,7 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                prompt_profile=prompt_profile,
             )
         elif benchmark_kind is CodingBenchmarkKind.MBPP:
             result = pipeline.run_mbpp(
@@ -466,6 +484,7 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                prompt_profile=prompt_profile,
             )
         elif benchmark_kind is CodingBenchmarkKind.LIVECODEBENCH:
             result = pipeline.run_livecodebench(
@@ -483,6 +502,7 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                prompt_profile=prompt_profile,
             )
         else:
             result = pipeline.run_swe_bench(
@@ -574,7 +594,11 @@ def main(
                 avg_payload = avg_metrics_all or {}
             if avg_payload:
                 metrics_payload.update(avg_payload)
-        task_details: dict[str, object] = build_plan_task_details(plan, cot_mode=cot_mode.value)
+        task_details: dict[str, object] = build_plan_task_details(
+            plan,
+            cot_mode=cot_mode.value,
+            prompt_profile=prompt_profile,
+        )
         if eval_metrics and pass_payload != eval_metrics:
             task_details["pass_curve"] = eval_metrics
         if avg_metrics_all and avg_payload != avg_metrics_all:
@@ -594,6 +618,7 @@ def main(
             task_details=task_details,
             extra={
                 "cot_mode": cot_mode.value,
+                "prompt_profile": prompt_profile,
                 "infer_protocol": getattr(args, "infer_protocol", "local"),
                 "completion_style_remote": completion_style_remote,
                 **(

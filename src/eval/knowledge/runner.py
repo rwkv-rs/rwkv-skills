@@ -42,6 +42,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Prompt mode for knowledge benchmarks",
     )
     parser.add_argument(
+        "--prompt-profile",
+        choices=("normal", "naive"),
+        help="Prompt profile: normal uses benchmark configs/defaults; naive uses only question/options plus answer prefill.",
+    )
+    parser.add_argument(
         "--probe-only",
         action="store_true",
         help="Run a single-batch CoT probe and skip scoring",
@@ -69,17 +74,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _default_job_name(cot_mode: CoTMode) -> str:
     if cot_mode is CoTMode.NO_COT:
         return "multi_choice_plain"
-    if cot_mode is CoTMode.FAKE_COT:
-        return "multi_choice_fake_cot"
     return "multi_choice_cot"
+
+
+def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
+    if raw:
+        return raw
+    if job_name.endswith("_naive"):
+        return "naive"
+    return "normal"
+
+
+def _naive_direct_prompt_template() -> str:
+    return "User: <Q>\n<CHOICES>\n\nAssistant:"
+
+
+def _naive_cot_prompt_template() -> str:
+    return "User: <Q>\n<CHOICES>\n\nAssistant: <think"
+
+
+def _naive_final_answer_template() -> str:
+    return "<Q><COT>\nTherefore, the answer is"
 
 
 def _print_done_message(cot_mode: CoTMode, sample_count: int) -> None:
     if cot_mode is CoTMode.NO_COT:
         print(f"✅ direct multiple-choice done: {sample_count} samples")
-        return
-    if cot_mode is CoTMode.FAKE_COT:
-        print(f"✅ fake-CoT multiple-choice done: {sample_count} samples")
         return
     print(f"✅ CoT multiple-choice done: {sample_count} samples")
 
@@ -91,6 +111,7 @@ def _task_sampling_config(
     effective_sample_count: int,
     cot_sampling: object | None = None,
     pass_ks: Sequence[int] | None = None,
+    prompt_profile: str = "normal",
 ) -> dict[str, object]:
     from src.eval.results.schema import sampling_config_to_dict
 
@@ -103,6 +124,7 @@ def _task_sampling_config(
         sampling_config=sampling_payload,
         pass_ks=pass_ks,
         effective_sample_count=effective_sample_count,
+        prompt_profile=prompt_profile,
     )
 
 
@@ -131,6 +153,8 @@ def main(
     from src.db.eval_db_service import EvalDbService
 
     cot_mode = CoTMode(args.cot_mode)
+    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", _default_job_name(cot_mode))
+    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
     if args.probe_only and cot_mode is not CoTMode.COT:
         raise ValueError("--probe-only is only supported with --cot-mode cot")
     completion_style_remote = require_completion_style_remote_protocol(
@@ -159,21 +183,26 @@ def main(
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
-    direct_prompt_template = (
-        direct_config.direct_prompt_template
-        if direct_config is not None and direct_config.direct_prompt_template
-        else None
-    )
-    cot_prompt_template = (
-        cot_config.cot_prompt_template
-        if cot_config is not None and cot_config.cot_prompt_template
-        else None
-    )
-    final_answer_template = (
-        final_config.final_prompt_template
-        if final_config is not None and final_config.final_prompt_template
-        else None
-    )
+    if prompt_profile == "naive":
+        direct_prompt_template = _naive_direct_prompt_template()
+        cot_prompt_template = _naive_cot_prompt_template()
+        final_answer_template = _naive_final_answer_template()
+    else:
+        direct_prompt_template = (
+            direct_config.direct_prompt_template
+            if direct_config is not None and direct_config.direct_prompt_template
+            else None
+        )
+        cot_prompt_template = (
+            cot_config.cot_prompt_template
+            if cot_config is not None and cot_config.cot_prompt_template
+            else None
+        )
+        final_answer_template = (
+            final_config.final_prompt_template
+            if final_config is not None and final_config.final_prompt_template
+            else None
+        )
 
     cot_sampling = None
     if cot_mode is CoTMode.COT:
@@ -205,7 +234,6 @@ def main(
 
     init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
-    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", _default_job_name(cot_mode))
     expected_count = plan_attempt_count(plan, max_pass_k=1)
     task_state = prepare_task_execution(
         service=service,
@@ -220,6 +248,7 @@ def main(
             effective_sample_count=plan.effective_sample_count,
             cot_sampling=cot_sampling,
             pass_ks=k_plan.pass_k,
+            prompt_profile=prompt_profile,
         ),
     )
     task_run = TaskRunState.from_task_execution(
@@ -284,7 +313,7 @@ def main(
             metrics_payload.update(avg_payload)
         task_details = {
             "accuracy_by_subject": metrics.accuracy_by_subject,
-            **build_plan_task_details(plan, cot_mode=cot_mode.value),
+            **build_plan_task_details(plan, cot_mode=cot_mode.value, prompt_profile=prompt_profile),
         }
         if pass_metrics_all and pass_payload != pass_metrics_all:
             task_details["pass_curve"] = pass_metrics_all
@@ -302,6 +331,7 @@ def main(
             task_details=task_details,
             extra={
                 "cot_mode": cot_mode.value,
+                "prompt_profile": prompt_profile,
                 "infer_protocol": getattr(args, "infer_protocol", "local"),
                 "completion_style_remote": completion_style_remote,
                 "choice_scoring": (

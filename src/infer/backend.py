@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import threading
 import time
 from dataclasses import dataclass, field, is_dataclass, replace
@@ -33,6 +34,8 @@ class RemoteHTTPError(RuntimeError):
 
 _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
+_REMOTE_GENERATION_MIN_TEMPERATURE = 0.001
+_REMOTE_GENERATION_MAX_TEMPERATURE = 1000.0
 
 RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "lightning", "nano-vllm-contents"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
@@ -559,7 +562,7 @@ class RemoteInferenceBackend:
             "model": self.model_name,
             "contents": list(prompts),
             "max_tokens": int(sampling.max_generate_tokens),
-            "temperature": float(sampling.temperature),
+            "temperature": _remote_generation_temperature(sampling.temperature),
             "top_k": int(sampling.top_k),
             "top_p": float(sampling.top_p),
             "alpha_presence": float(sampling.alpha_presence),
@@ -767,6 +770,7 @@ class RemoteInferenceBackend:
         elif self.config.protocol == "lightning":
             if self.config.api_key:
                 chat_payload["password"] = str(self.config.api_key)
+            chat_payload["temperature"] = _remote_generation_temperature(chat_payload.get("temperature"))
             response = self._post_json(self.config.lightning_chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
@@ -854,11 +858,12 @@ class RemoteInferenceBackend:
         headers: dict[str, str],
     ) -> str:
         attempts = max(1, int(self.config.max_retries) + 1)
+        transient_attempts = max(attempts, 12)
         timeout_s = max(float(self.config.timeout_s), 1.0)
         delay_s = max(float(self.config.retry_initial_delay_s), 0.0)
         max_delay_s = max(float(self.config.retry_max_delay_s), delay_s)
         last_exc: BaseException | None = None
-        for attempt in range(1, attempts + 1):
+        for attempt in range(1, transient_attempts + 1):
             try:
                 response = self._http_client_for_requests().post(
                     url,
@@ -878,12 +883,12 @@ class RemoteInferenceBackend:
                     delay_s = min(delay_s * 2, max_delay_s)
             except _REMOTE_TRANSIENT_ERRORS as exc:  # pragma: no cover - exercised through integration
                 last_exc = exc
-                if attempt >= attempts:
+                if attempt >= transient_attempts:
                     break
                 if delay_s > 0:
                     time.sleep(delay_s)
                     delay_s = min(delay_s * 2, max_delay_s)
-        raise RuntimeError(f"remote infer request failed after {attempts} attempts: {last_exc}") from last_exc
+        raise RuntimeError(f"remote infer request failed after {transient_attempts} attempts: {last_exc}") from last_exc
 
 
 def _completion_payload_from_sampling(
@@ -923,6 +928,18 @@ def _completion_payload_from_sampling(
             }
         )
     return payload
+
+
+def _remote_generation_temperature(value: object) -> float:
+    try:
+        temperature = float(value)
+    except (TypeError, ValueError):
+        return _REMOTE_GENERATION_MIN_TEMPERATURE
+    if not math.isfinite(temperature):
+        return _REMOTE_GENERATION_MIN_TEMPERATURE
+    if temperature < _REMOTE_GENERATION_MIN_TEMPERATURE:
+        return _REMOTE_GENERATION_MIN_TEMPERATURE
+    return min(temperature, _REMOTE_GENERATION_MAX_TEMPERATURE)
 
 
 def _chat_payload_from_completion_payload(

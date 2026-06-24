@@ -367,7 +367,7 @@ def _build_metrics(task: str | None, data: dict[str, Any]) -> tuple[dict[str, An
     task_details: dict[str, Any] | None = None
     metrics: dict[str, Any] = {}
 
-    if task in {"multi_choice_plain", "multi_choice_fake_cot", "multi_choice_cot"}:
+    if task in {"multi_choice_plain", "multi_choice_cot"}:
         acc = data.get("accuracy")
         if isinstance(acc, (int, float)):
             metrics["accuracy"] = float(acc)

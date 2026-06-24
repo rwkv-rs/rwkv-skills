@@ -11,9 +11,6 @@ def _normalize_cot_mode(value, *, is_cot: bool):  # noqa: ANN001
         "no_cot": "no_cot",
         "nocot": "no_cot",
         "no-cot": "no_cot",
-        "fake_cot": "fake_cot",
-        "fakecot": "fake_cot",
-        "fake-cot": "fake_cot",
         "cot": "cot",
     }
     if raw in mapping:
@@ -55,11 +52,12 @@ def make_score_payload(
         explicit_cot_mode = extra.get("cot_mode")
     if explicit_cot_mode is None and isinstance(task_details, dict):
         explicit_cot_mode = task_details.get("cot_mode")
+    normalized_cot_mode = _normalize_cot_mode(explicit_cot_mode, is_cot=bool(is_cot))
     payload = {
         "dataset": dataset_slug,
         "model": model_name,
         "cot": bool(is_cot),
-        "cot_mode": _normalize_cot_mode(explicit_cot_mode, is_cot=bool(is_cot)),
+        "cot_mode": normalized_cot_mode,
         "metrics": _normalize_jsonable(metrics),
         "samples": int(samples),
         "created_at": created_at,
@@ -72,6 +70,7 @@ def make_score_payload(
         payload["task_details"] = task_details
     if extra:
         payload.update(extra)
+    payload["cot_mode"] = normalized_cot_mode
     return payload
 
 

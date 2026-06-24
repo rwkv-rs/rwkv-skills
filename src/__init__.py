@@ -4,5 +4,4 @@ __all__ = [
     "bin",
     "eval",
     "infer",
-    "space",
 ]

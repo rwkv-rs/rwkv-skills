@@ -34,6 +34,11 @@ STRATEGY_LABELS = {
 }
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_JUDGEMENT_LABEL_RE = re.compile(r"\bjudg(?:e)?ment\s*:\s*(yes|no)\b", re.IGNORECASE)
+_TRAILING_JUDGEMENT_LABEL_RE = re.compile(
+    r"(?:\bjudg(?:e)?ment\s*:\s*)?\b(yes|no)\b\s*[.!。]?\s*$",
+    re.IGNORECASE,
+)
 _PREFERRED_ANSWER_KEYS = (
     "expected_judgement",
     "expected_answer",
@@ -63,6 +68,23 @@ def _normalize_text(value: str) -> str:
 
 def _is_exact_match(prediction: str, reference: str) -> bool:
     return bool(reference) and _normalize_text(prediction) == _normalize_text(reference)
+
+
+def _extract_judgement_label(value: str) -> str | None:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return None
+    matches = _JUDGEMENT_LABEL_RE.findall(normalized)
+    if matches:
+        return f"Judgement: {matches[-1].capitalize()}"
+    trailing = _TRAILING_JUDGEMENT_LABEL_RE.search(normalized[-200:])
+    if trailing:
+        return f"Judgement: {trailing.group(1).capitalize()}"
+    return None
+
+
+def _is_judgement_reference(reference: str) -> bool:
+    return _extract_judgement_label(reference) is not None
 
 
 def _short_text(value: str, *, limit: int = 1200) -> str:
@@ -140,6 +162,7 @@ class LLMJudgeConfig:
     api_key: str
     model: str
     base_url: str | None = None
+    timeout_s: float = 60.0
     max_workers: int = 4
     max_completion_tokens: int | None = None
 
@@ -177,7 +200,12 @@ class LLMJudgeStats:
 class LLMJudge:
     def __init__(self, config: LLMJudgeConfig) -> None:
         self.config = config
-        self.client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        self.client = OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=max(1.0, float(config.timeout_s)),
+            max_retries=0,
+        )
         self.last_run_stats: LLMJudgeStats | None = None
 
     def judge(self, items: list[tuple[str, str, str]]) -> list[bool]:
@@ -340,6 +368,24 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
     )
 
 
+def _judgement_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
+    expected = _extract_judgement_label(reference)
+    actual = _extract_judgement_label(scoring_text)
+    display_answer = actual or _short_text(scoring_text)
+    passed = bool(expected and actual and expected == actual)
+    if passed:
+        fail_reason = ""
+    elif actual is None:
+        fail_reason = "judgement_label_missing"
+    else:
+        fail_reason = "judgement_label_mismatch"
+    return _MathVerifyResult(
+        passed=passed,
+        answer=display_answer,
+        fail_reason=fail_reason,
+    )
+
+
 def _parsed_answer_text(parsed: Any) -> str:
     if isinstance(parsed, (list, tuple)) and parsed:
         item = parsed[-1]
@@ -479,13 +525,16 @@ def evaluate_free_response(
 ) -> FreeResponseEvaluation:
     """Evaluate full-generation free-response completions."""
 
-    if _load_math_verify() is None:
-        raise RuntimeError("free-response evaluation requires math-verify; run `uv sync` after updating uv.lock.")
-
     dataset = list(JsonlFreeAnswerLoader(str(dataset_path)))
     completion_payloads = list(_iter_completions(completions))
+    references = [resolve_reference_answer(record) for record in dataset]
+    judgement_reference_count = sum(1 for reference in references if _is_judgement_reference(reference))
+    judgement_label_dataset = bool(dataset) and judgement_reference_count == len(dataset)
+    if not judgement_label_dataset and _load_math_verify() is None:
+        raise RuntimeError("free-response evaluation requires math-verify; run `uv sync` after updating uv.lock.")
+
     grouped: dict[str, list[_ScoredCompletion]] = {group: [] for group in STRATEGY_GROUPS}
-    primary_group = STRATEGY_A
+    primary_group = STRATEGY_C if judgement_label_dataset else STRATEGY_A
 
     def apply_judge(group: str) -> None:
         if judge is None:
@@ -524,7 +573,10 @@ def evaluate_free_response(
         reference: str,
     ) -> _ScoredCompletion:
         scoring_text = _strategy_scoring_text(group, payload)
-        verify_result = _math_verify(reference, scoring_text)
+        if _is_judgement_reference(reference):
+            verify_result = _judgement_verify(reference, scoring_text)
+        else:
+            verify_result = _math_verify(reference, scoring_text)
         return _ScoredCompletion(
             source_payload=payload,
             sample_index=sample_index,

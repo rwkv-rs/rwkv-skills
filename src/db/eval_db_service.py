@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -15,7 +16,7 @@ from zoneinfo import ZoneInfo
 from src.eval.benchmark_config import config_path_for_benchmark
 from src.eval.results.schema import iter_stage_indices, strict_nonneg_int
 from src.eval.scheduler.config import REPO_ROOT
-from src.eval.scheduler.dataset_utils import split_benchmark_and_split
+from src.eval.scheduler.dataset_utils import make_dataset_slug, split_benchmark_and_split
 from src.eval.scheduler.datasets import DATASET_ROOTS, find_dataset_file
 from src.eval.scheduler.models import _normalize_model_identifier, _parse_model_tags, normalize_model_name
 
@@ -41,7 +42,34 @@ def _positive_int_env(name: str, default: int) -> int:
 # each SQL statement bounded and prevents psycopg buffer allocation failures.
 _EVAL_INSERT_FLUSH_ROWS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_ROWS", 32)
 _EVAL_INSERT_FLUSH_CHARS = _positive_int_env("RWKV_EVAL_INSERT_FLUSH_CHARS", 2_000_000)
+_EVAL_ANSWER_MAX_CHARS = _positive_int_env("RWKV_EVAL_ANSWER_MAX_CHARS", 65_536)
+_EVAL_REF_ANSWER_MAX_CHARS = _positive_int_env("RWKV_EVAL_REF_ANSWER_MAX_CHARS", 4_096)
+_EVAL_FAIL_REASON_MAX_CHARS = _positive_int_env("RWKV_EVAL_FAIL_REASON_MAX_CHARS", 2_048)
 _CHECKER_INSERT_FLUSH_ROWS = _positive_int_env("RWKV_CHECKER_INSERT_FLUSH_ROWS", 64)
+_COMPLETION_EXTRA_TEXT_MAX_CHARS = _positive_int_env("RWKV_COMPLETION_EXTRA_TEXT_MAX_CHARS", 4_096)
+_COMPLETION_EXTRA_LIST_MAX_ITEMS = _positive_int_env("RWKV_COMPLETION_EXTRA_LIST_MAX_ITEMS", 32)
+_COMPLETION_EXTRA_DICT_MAX_ITEMS = _positive_int_env("RWKV_COMPLETION_EXTRA_DICT_MAX_ITEMS", 128)
+_COMPLETION_EXTRA_MAX_DEPTH = _positive_int_env("RWKV_COMPLETION_EXTRA_MAX_DEPTH", 6)
+_EVAL_REF_ANSWER_KEYS = (
+    "ref_answer",
+    "expected_answer",
+    "reference_answer",
+    "expected_judgement",
+    "reference_solution",
+    "canonical_solution",
+    "solution",
+    "output",
+    "target",
+    "final_answer",
+)
+_DATASET_REF_ANSWER_KEYS = (
+    *_EVAL_REF_ANSWER_KEYS[1:],
+    "answer",
+    "answers",
+    "gold",
+    "test_cases",
+)
+_DATASET_REFERENCE_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
 
 
 def _get_cached_git_sha() -> str:
@@ -123,6 +151,201 @@ class EvalDbService:
             + len(str(ref_answer or ""))
             + len(str(fail_reason or ""))
         )
+
+    @staticmethod
+    def _bounded_eval_text(value: Any, *, max_chars: int) -> str:
+        text = str(value or "").replace("\x00", "")
+        if len(text) <= max_chars:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        marker = f"\n...[truncated chars={len(text)} sha256={digest}]"
+        if max_chars <= len(marker):
+            return marker[-max_chars:]
+        return text[: max_chars - len(marker)].rstrip() + marker
+
+    @classmethod
+    def _compact_completion_extra(cls, value: Any, *, depth: int = 0) -> Any:
+        if depth > _COMPLETION_EXTRA_MAX_DEPTH:
+            return "[truncated depth]"
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return cls._bounded_eval_text(value, max_chars=_COMPLETION_EXTRA_TEXT_MAX_CHARS)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, bytes):
+            return cls._bounded_eval_text(
+                value.decode("utf-8", errors="replace"),
+                max_chars=_COMPLETION_EXTRA_TEXT_MAX_CHARS,
+            )
+        if is_dataclass(value) and not isinstance(value, type):
+            return cls._compact_completion_extra(asdict(value), depth=depth + 1)
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            try:
+                return cls._compact_completion_extra(value.model_dump(), depth=depth + 1)
+            except Exception:
+                return cls._bounded_eval_text(value, max_chars=_COMPLETION_EXTRA_TEXT_MAX_CHARS)
+        if isinstance(value, AbcMapping):
+            compact: dict[str, Any] = {}
+            items = list(value.items())
+            for key, item in items[:_COMPLETION_EXTRA_DICT_MAX_ITEMS]:
+                compact_key = cls._sanitize_json_text(key)
+                if not isinstance(compact_key, str):
+                    compact_key = str(compact_key)
+                compact[compact_key] = cls._compact_completion_extra(item, depth=depth + 1)
+            if len(items) > _COMPLETION_EXTRA_DICT_MAX_ITEMS:
+                compact["__truncated_items__"] = len(items) - _COMPLETION_EXTRA_DICT_MAX_ITEMS
+            return compact
+        if isinstance(value, (list, tuple)):
+            compact_list = [
+                cls._compact_completion_extra(item, depth=depth + 1)
+                for item in value[:_COMPLETION_EXTRA_LIST_MAX_ITEMS]
+            ]
+            if len(value) > _COMPLETION_EXTRA_LIST_MAX_ITEMS:
+                compact_list.append({"__truncated_items__": len(value) - _COMPLETION_EXTRA_LIST_MAX_ITEMS})
+            return compact_list
+        if isinstance(value, set):
+            items = sorted(value, key=str)
+            compact_list = [
+                cls._compact_completion_extra(item, depth=depth + 1)
+                for item in items[:_COMPLETION_EXTRA_LIST_MAX_ITEMS]
+            ]
+            if len(items) > _COMPLETION_EXTRA_LIST_MAX_ITEMS:
+                compact_list.append({"__truncated_items__": len(items) - _COMPLETION_EXTRA_LIST_MAX_ITEMS})
+            return compact_list
+        try:
+            json.dumps(value)
+            return value
+        except (TypeError, ValueError):
+            return cls._bounded_eval_text(value, max_chars=_COMPLETION_EXTRA_TEXT_MAX_CHARS)
+
+    @staticmethod
+    def _normalize_reference_value(value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            normalized = str(value).strip()
+            return normalized or None
+        try:
+            normalized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            normalized = str(value)
+        normalized = normalized.strip()
+        return normalized or None
+
+    @classmethod
+    def _extract_reference_from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        keys: Sequence[str] = _EVAL_REF_ANSWER_KEYS,
+    ) -> str | None:
+        for key in keys:
+            if key not in payload:
+                continue
+            normalized = cls._normalize_reference_value(payload.get(key))
+            if normalized:
+                return normalized
+        raw_record = payload.get("raw_record")
+        if isinstance(raw_record, Mapping):
+            return cls._extract_reference_from_mapping(raw_record, keys=_DATASET_REF_ANSWER_KEYS)
+        return None
+
+    @classmethod
+    def _dataset_references(cls, benchmark_name: str, dataset_split: str) -> tuple[str, ...]:
+        key = (benchmark_name, dataset_split)
+        cached = _DATASET_REFERENCE_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        dataset_path: Path | None = None
+        direct_candidates: list[Path] = []
+        for root in DATASET_ROOTS:
+            if dataset_split:
+                direct_candidates.append((root / benchmark_name / f"{dataset_split}.jsonl").resolve())
+            direct_candidates.append((root / f"{benchmark_name}.jsonl").resolve())
+        for candidate in direct_candidates:
+            if candidate.exists():
+                dataset_path = candidate
+                break
+        if dataset_path is None:
+            dataset_slug = make_dataset_slug(benchmark_name, dataset_split) if dataset_split else benchmark_name
+            dataset_path = find_dataset_file(dataset_slug, DATASET_ROOTS)
+        references: list[str] = []
+        if dataset_path is not None:
+            with dataset_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        references.append("")
+                        continue
+                    if isinstance(payload, Mapping):
+                        references.append(
+                            cls._extract_reference_from_mapping(
+                                payload,
+                                keys=_DATASET_REF_ANSWER_KEYS,
+                            )
+                            or ""
+                        )
+                    else:
+                        references.append("")
+        resolved = tuple(references)
+        _DATASET_REFERENCE_CACHE[key] = resolved
+        return resolved
+
+    @classmethod
+    def _resolve_eval_ref_answer(cls, payload: Mapping[str, Any]) -> str:
+        explicit = cls._extract_reference_from_mapping(payload)
+        if explicit:
+            return explicit
+
+        benchmark_name = str(payload.get("benchmark_name") or "").strip()
+        dataset_split = str(payload.get("dataset_split") or "").strip()
+        if not benchmark_name:
+            return ""
+        try:
+            sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        except Exception:
+            return ""
+
+        references = cls._dataset_references(benchmark_name, dataset_split)
+        if 0 <= sample_index < len(references):
+            return references[sample_index]
+        return ""
+
+    @classmethod
+    def _normalize_eval_payload_for_db(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep eval rows small; full prompts/completions live in completions.context."""
+        return {
+            "answer": cls._bounded_eval_text(
+                payload.get("answer"),
+                max_chars=_EVAL_ANSWER_MAX_CHARS,
+            ),
+            "ref_answer": cls._bounded_eval_text(
+                cls._resolve_eval_ref_answer(payload),
+                max_chars=_EVAL_REF_ANSWER_MAX_CHARS,
+            ),
+            "is_passed": bool(payload.get("is_passed", False)),
+            "fail_reason": cls._bounded_eval_text(
+                payload.get("fail_reason"),
+                max_chars=_EVAL_FAIL_REASON_MAX_CHARS,
+            ),
+        }
 
     @classmethod
     def _sanitize_json_text(cls, value: Any) -> Any:
@@ -542,10 +765,11 @@ class EvalDbService:
             if completions_id is None or completions_id in existing_eval_ids:
                 continue
 
-            pending_payloads.append((completions_id, payload))
+            db_payload = self._normalize_eval_payload_for_db(payload)
+            pending_payloads.append((completions_id, db_payload))
             existing_eval_ids.add(completions_id)
             pending_rows += 1
-            pending_chars += self._estimate_eval_payload_chars(payload)
+            pending_chars += self._estimate_eval_payload_chars(db_payload)
 
             if pending_rows >= _EVAL_INSERT_FLUSH_ROWS or pending_chars >= _EVAL_INSERT_FLUSH_CHARS:
                 inserted += self._insert_eval_payload_chunk(
@@ -654,12 +878,6 @@ class EvalDbService:
             payload=payload,
         )
         self._repo.update_task_status(task_id=int(task_id), status="completed")
-        try:
-            from src.space.score_index import append_score_index_entry
-
-            append_score_index_entry(payload, task_id=task_id)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[space] failed to append score index for task {task_id}: {exc}")
 
     def ingest_checker_payloads(
         self,
@@ -835,6 +1053,21 @@ class EvalDbService:
         benchmark = self._repo.fetch_benchmark(benchmark_id=int(benchmark_id)) if benchmark_id else None
         return {"task": task, "model": model, "benchmark": benchmark}
 
+    def get_latest_task_generation_progress(
+        self,
+        *,
+        evaluator: str,
+        model_name: str,
+        benchmark_name: str,
+        benchmark_split: str,
+    ) -> dict[str, Any] | None:
+        return self._repo.fetch_latest_task_generation_progress(
+            evaluator=evaluator,
+            model_name=model_name,
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+        )
+
     def list_completions_rows(self, *, task_id: str) -> list[dict[str, Any]]:
         return self._repo.fetch_completions_rows(task_id=int(task_id))
 
@@ -855,6 +1088,7 @@ class EvalDbService:
         limit: int | None = None,
         offset: int = 0,
         include_context: bool = True,
+        include_preview: bool = False,
     ) -> list[dict[str, Any]]:
         safe_limit = int(limit) if isinstance(limit, int) or (isinstance(limit, str) and limit.isdigit()) else None
         if safe_limit is not None and safe_limit <= 0:
@@ -871,6 +1105,7 @@ class EvalDbService:
             limit=safe_limit,
             offset=safe_offset,
             include_context=bool(include_context),
+            include_preview=bool(include_preview),
         )
         payloads: list[dict[str, Any]] = []
         for row in rows:
@@ -934,7 +1169,7 @@ class EvalDbService:
         for key in ("agent_result", "agent_info", "agent_trace", "task_id", "domain", "instruction"):
             value = payload.get(key)
             if value is not None:
-                context[key] = value
+                context[key] = EvalDbService._compact_completion_extra(value)
         sanitized = EvalDbService._sanitize_json_text(context)
         return sanitized if isinstance(sanitized, dict) else {}
 

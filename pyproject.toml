@@ -49,7 +49,6 @@ dependencies = [
     "basedpyright>=1.32.1",
     "filelock>=3.16.1",
     "evalplus @ git+https://github.com/evalplus/evalplus@c91370f",
-    "gradio>=5.50.0",
     "nvidia-cudnn-cu12>=9.10.2.21",
     "orjson>=3.10.7",
     "nvidia-cuda-cupti-cu12>=12.6.80",
@@ -83,8 +82,6 @@ packages = ["src", "lexical_chunk_router"]
 include = [
     "lexical_chunk_router/README.md",
     "lexical_chunk_router/py.typed",
-    "src/space/styles/*.css",
-    "src/space/assets/**/*",
     "src/infer/rwkv7/rwkv_vocab_v20230424.txt",
     "src/infer/rwkv7/cuda/*",
     "src/infer/rapid_sampling/*.cpp",
@@ -170,12 +167,12 @@ default = true
 [project.scripts]
 rwkv-skills = "src.main:main"
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"
+rwkv-skills-dashboard = "src.bin.run_dashboard:main"
 rwkv-skills-infer = "src.bin.run_infer_server:main"
 rwkv-skills-infer-fleet = "src.bin.run_infer_fleet:main"
 rwkv-skills-infer-router = "src.bin.run_infer_router:main"
 rwkv-benchmark-service-perf = "src.bin.run_perf_benchmark:main"
 rwkv-download-weights = "src.bin.download_weights:main"
-rwkv-skills-space = "src.space.app:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

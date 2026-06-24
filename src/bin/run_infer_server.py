@@ -5,8 +5,21 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Sequence, cast
+
+def _bootstrap_cuda_visible_devices(argv: Sequence[str]) -> None:
+    for index, arg in enumerate(argv):
+        if arg == "--cuda-visible-devices" and index + 1 < len(argv):
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(argv[index + 1])
+            return
+        if arg.startswith("--cuda-visible-devices="):
+            os.environ["CUDA_VISIBLE_DEVICES"] = arg.split("=", 1)[1]
+            return
+
+
+_bootstrap_cuda_visible_devices(sys.argv[1:])
 
 import uvicorn
 
@@ -54,7 +67,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default="cuda",
-        help="Compatibility flag; nano-vLLM selects CUDA devices from CUDA_VISIBLE_DEVICES",
+        help="Compatibility flag; rwkv-lightning selects cuda:0 after any --cuda-visible-devices remap",
+    )
+    parser.add_argument(
+        "--cuda-visible-devices",
+        help=(
+            "Process-local CUDA_VISIBLE_DEVICES value applied before infer modules load. "
+            "Use this to bind a server to one physical GPU without changing shell or .env configuration."
+        ),
     )
     parser.add_argument(
         "--engine-mode",

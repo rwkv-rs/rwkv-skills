@@ -13,6 +13,7 @@ from src.eval.datasets.data_loader.code_generation import JsonlCodeGenerationLoa
 from src.eval.datasets.data_struct.code_generation import CodeGenerationRecord
 from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
+from src.eval.metrics.code_generation.evaluate import extract_code_completion
 from .execution import check_correctness
 
 
@@ -32,18 +33,7 @@ def _max_stage_index(payload: dict) -> int:
 
 
 def _extract_code(text: str) -> str:
-    if not text:
-        return ""
-    if "```" not in text:
-        return text.strip()
-    parts = text.split("```")
-    if len(parts) < 3:
-        return text.strip()
-    block = parts[-2]
-    lines = block.splitlines()
-    if lines and lines[0].strip().lower() in {"python", "py"}:
-        block = "\n".join(lines[1:])
-    return block.strip()
+    return extract_code_completion(text)
 
 
 def _parse_json_maybe(value: object) -> object:
@@ -100,7 +90,21 @@ def _build_lcb_sample(record: CodeGenerationRecord) -> tuple[dict, str]:
             }
         )
     }
-    return sample, sample["input_output"]
+    ref_answer = (
+        f"LiveCodeBench official tests for task_id={record.task_id}; "
+        f"public_tests={len(public_tests)}, private_tests={len(private_tests)}."
+    )
+    return sample, ref_answer
+
+
+def _compact_fail_reason(reason: object, *, max_chars: int = 512) -> str:
+    text = str(reason or "").strip()
+    if len(text) <= max_chars:
+        return text
+    suffix = " ... [truncated]"
+    if max_chars <= len(suffix):
+        return suffix[:max_chars]
+    return text[: max_chars - len(suffix)].rstrip() + suffix
 
 
 def _normalize_difficulty(value: object) -> str | None:
@@ -233,7 +237,7 @@ def evaluate_livecodebench_dataset(
         passed = bool(result.get("passed")) if result else False
         fail_reason = ""
         if result and not passed:
-            fail_reason = str(result.get("result") or "")
+            fail_reason = _compact_fail_reason(result.get("result"))
         eval_payloads.append(
             make_eval_payload(
                 payload,

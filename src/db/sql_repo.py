@@ -40,9 +40,6 @@ def _parse_cot_mode(value: Any) -> str | None:
         "nocot": "NoCoT",
         "no_cot": "NoCoT",
         "no-cot": "NoCoT",
-        "fakecot": "FakeCoT",
-        "fake_cot": "FakeCoT",
-        "fake-cot": "FakeCoT",
         "cot": "CoT",
     }
     return mapping.get(raw)
@@ -913,6 +910,53 @@ class SqlEvalDbRepository:
                 row = cur.fetchone()
         return dict(row) if row else None
 
+    def fetch_latest_task_generation_progress(
+        self,
+        *,
+        evaluator: str,
+        model_name: str,
+        benchmark_name: str,
+        benchmark_split: str,
+    ) -> dict[str, Any] | None:
+        with self._connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        t.task_id,
+                        t.status,
+                        t.sampling_config,
+                        COUNT(c.completions_id) FILTER (WHERE c.status = 'Completed') AS completed_completions,
+                        COUNT(c.completions_id) AS total_completions,
+                        EXISTS (
+                            SELECT 1
+                            FROM scores s
+                            WHERE s.task_id = t.task_id
+                        ) AS has_score
+                    FROM task t
+                    JOIN model m ON m.model_id = t.model_id
+                    JOIN benchmark b ON b.benchmark_id = t.benchmark_id
+                    LEFT JOIN completions c ON c.task_id = t.task_id
+                    WHERE t.evaluator = %s
+                      AND m.model_name = %s
+                      AND b.benchmark_name = %s
+                      AND b.benchmark_split = %s
+                      AND t.is_param_search = FALSE
+                      AND t.is_tmp = FALSE
+                    GROUP BY t.task_id, t.status, t.sampling_config
+                    ORDER BY t.task_id DESC
+                    LIMIT 1
+                    """,
+                    (
+                        evaluator,
+                        model_name,
+                        benchmark_name,
+                        benchmark_split,
+                    ),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
     def fetch_model(self, *, model_id: int) -> dict[str, Any] | None:
         with self._connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -972,8 +1016,19 @@ class SqlEvalDbRepository:
         limit: int | None = None,
         offset: int | None = None,
         include_context: bool = True,
+        include_preview: bool = False,
     ) -> list[dict[str, Any]]:
+        # ``c.context`` is a large TOASTed JSONB column. Casting it to text for a
+        # preview (``LEFT(c.context::TEXT, 80)``) detoasts and serialises the
+        # *entire* value on every row, which dominates latency for paginated
+        # listings. Only pay that cost when the caller actually needs the
+        # preview/full context; the default fast path reads only small columns.
         select_context = ", c.context AS context" if include_context else ""
+        select_preview = (
+            ", LEFT(c.context::TEXT, 80) AS context_preview"
+            if (include_preview or include_context)
+            else ""
+        )
         query = f"""
             SELECT
                 c.sample_index AS sample_index,
@@ -982,8 +1037,7 @@ class SqlEvalDbRepository:
                 e.is_passed AS is_passed,
                 e.answer AS answer,
                 e.ref_answer AS ref_answer,
-                e.fail_reason AS fail_reason,
-                LEFT(c.context::TEXT, 80) AS context_preview
+                e.fail_reason AS fail_reason{select_preview}
                 {select_context}
             FROM completions c
             JOIN eval e ON e.completions_id = c.completions_id

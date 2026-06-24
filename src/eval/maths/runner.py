@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Mapping
 from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
@@ -43,6 +44,28 @@ class MathStageConfig:
     final_answer_template: str
     cot_sampling: Any
     final_sampling: Any
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _judge_error_summaries(judge_stats_by_group: Mapping[str, Mapping[str, object]]) -> list[str]:
+    summaries: list[str] = []
+    for group, stats in sorted(judge_stats_by_group.items()):
+        total = _safe_int(stats.get("total"))
+        invalid = _safe_int(stats.get("invalid_output_count"))
+        request = _safe_int(stats.get("request_error_count"))
+        errors = invalid + request
+        if errors:
+            summaries.append(
+                f"{group} {errors}/{total} "
+                f"(invalid_output={invalid}, request_error={request})"
+            )
+    return summaries
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -89,6 +112,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=JudgeMode.EXACT.value,
         help="Maths verdict mode",
     )
+    parser.add_argument(
+        "--prompt-profile",
+        choices=("normal", "naive"),
+        help="Prompt profile: normal uses benchmark configs; naive uses only the problem plus final-answer prefill.",
+    )
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY)")
     parser.add_argument(
@@ -102,6 +130,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
+    if raw:
+        return raw
+    if job_name.endswith("_naive"):
+        return "naive"
+    return "normal"
 
 
 def _close_writer_and_mark_failed(
@@ -151,6 +187,8 @@ def main(
 
     load_env_file(Path(".env"))
     judge_mode = JudgeMode(args.judge_mode)
+    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", default_job_name(judge_mode))
+    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = resolve_backend_model_name(args)
@@ -171,6 +209,7 @@ def main(
         model_name,
         cot_max_tokens=args.max_tokens or args.cot_max_tokens,
         final_max_tokens=args.final_max_tokens,
+        prompt_profile=prompt_profile,
     )
     batch_size = max(1, args.batch_size)
     judge = None
@@ -189,7 +228,6 @@ def main(
 
     init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
-    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", default_job_name(judge_mode))
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
@@ -207,6 +245,7 @@ def main(
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
             judger_model_name=(judge.config.model if judge is not None else None),
+            prompt_profile=prompt_profile,
         ),
     )
     expected_count = plan_attempt_count(plan, max_pass_k=1)
@@ -285,15 +324,14 @@ def main(
         if judge_mode is JudgeMode.LLM and evaluation.judge_accuracy is None:
             raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
         if judge is not None:
-            for group, group_stats in evaluation.judge_stats_by_group.items():
-                if int(group_stats.get("error_count", 0) or 0):
-                    print(
-                        "⚠️ LLM judge 存在异常样本："
-                        f"{group} "
-                        f"{group_stats.get('error_count')}/{group_stats.get('total')} "
-                        f"(invalid_output={group_stats.get('invalid_output_count')}, "
-                        f"request_error={group_stats.get('request_error_count')})"
-                    )
+            judge_errors = _judge_error_summaries(evaluation.judge_stats_by_group)
+            for summary in judge_errors:
+                print(f"⚠️ LLM judge 存在异常样本：{summary}")
+            if judge_mode is JudgeMode.LLM and judge_errors:
+                raise RuntimeError(
+                    "LLM judge 存在异常样本，拒绝写入正式分数: "
+                    + "; ".join(judge_errors)
+                )
 
         strategy_task_ids = service.ingest_eval_payload_groups(
             task_id=task_id,
@@ -310,7 +348,11 @@ def main(
         )
         attach_strategy_task_ids(metrics_payload, strategy_task_ids)
 
-        task_details: dict[str, object] = build_plan_task_details(plan, cot_mode=CoTMode.COT.value)
+        task_details: dict[str, object] = build_plan_task_details(
+            plan,
+            cot_mode=CoTMode.COT.value,
+            prompt_profile=prompt_profile,
+        )
         task_details.update(metric_details)
         runtime.state.task_results = {
             (int(payload["sample_index"]), int(payload["repeat_index"]), int(payload.get("pass_index", 0))): bool(
@@ -329,7 +371,7 @@ def main(
             problems=result.problem_count,
             task=job_name,
             task_details=task_details,
-            extra={"cot_mode": CoTMode.COT.value},
+            extra={"cot_mode": CoTMode.COT.value, "prompt_profile": prompt_profile},
         )
         runtime.record_score(score_payload)
     except Exception as exc:
@@ -364,8 +406,10 @@ def _resolve_math_stage_config(
     *,
     cot_max_tokens: int | None = None,
     final_max_tokens: int | None = None,
+    prompt_profile: str = "normal",
 ) -> MathStageConfig:
     from src.eval.benchmark_config import resolve_benchmark_model_config
+    from src.eval.maths.pipeline import DEFAULT_COT_PROMPT, DEFAULT_FINAL_PROMPT
 
     cot_sampling, final_sampling = resolve_sampling_pair(
         slug,
@@ -373,6 +417,13 @@ def _resolve_math_stage_config(
         cot_max_tokens=cot_max_tokens,
         final_max_tokens=final_max_tokens,
     )
+    if prompt_profile == "naive":
+        return MathStageConfig(
+            cot_prompt_template=DEFAULT_COT_PROMPT,
+            final_answer_template=DEFAULT_FINAL_PROMPT,
+            cot_sampling=cot_sampling,
+            final_sampling=final_sampling,
+        )
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
     return MathStageConfig(
