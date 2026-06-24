@@ -83,5 +83,15 @@ def test_evaluate_livecodebench_dataset_accepts_generator_completions(monkeypatc
     assert metrics["pass@1_hard"] == 0.0
     assert len(eval_payloads) == 2
     assert eval_payloads[0]["is_passed"] is True
+    assert eval_payloads[0]["ref_answer"] == (
+        "LiveCodeBench official tests for task_id=task-0; public_tests=1, private_tests=0."
+    )
     assert eval_payloads[1]["is_passed"] is False
     assert eval_payloads[1]["fail_reason"] == "incorrect output"
+
+
+def test_livecodebench_fail_reason_is_short() -> None:
+    reason = evaluation._compact_fail_reason("x" * 2000, max_chars=128)
+
+    assert len(reason) == 128
+    assert reason.endswith(" ... [truncated]")

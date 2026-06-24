@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.db.eval_db_service import ResumeContext, TaskLookup
+from src.db.eval_db_service import EvalDbService, ResumeContext, TaskLookup
 from src.eval.evaluating import RunMode, current_run_mode, prepare_task_execution
 
 
@@ -108,6 +108,16 @@ def test_prepare_task_execution_resume_requires_resumable_task() -> None:
         )
 
 
+def test_resume_context_prefers_single_running_task_over_failed_history() -> None:
+    assert EvalDbService._effective_resumable_task_ids(
+        (
+            TaskLookup(task_id=10, status="Failed"),
+            TaskLookup(task_id=11, status="Running"),
+            TaskLookup(task_id=12, status="Failed"),
+        )
+    ) == (11,)
+
+
 def test_prepare_task_execution_rerun_forces_new_task_lookup() -> None:
     service = _FakeService(ResumeContext(), task_id="42")
     state = prepare_task_execution(
@@ -140,7 +150,7 @@ def test_prepare_task_execution_resume_rejects_ambiguous_matches() -> None:
                 ResumeContext(
                     matching_tasks=(
                         TaskLookup(task_id=11, status="Running"),
-                        TaskLookup(task_id=12, status="Failed"),
+                        TaskLookup(task_id=12, status="Running"),
                     ),
                     resumable_task_ids=(11, 12),
                 )

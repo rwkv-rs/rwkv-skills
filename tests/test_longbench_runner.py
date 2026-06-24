@@ -72,10 +72,12 @@ def test_longbench_budgeted_prompt_compacts_long_context() -> None:
     )
 
     assert "Long document compacted" in prompt
-    assert '"name": "final_answer"' in prompt
-    assert prompt.rstrip().endswith("Assistant: ```json\n{")
+    assert '"name": "final_answer"' not in prompt
+    assert "Return no prose" not in prompt
+    assert "```json" not in prompt
+    assert prompt.rstrip().endswith("Assistant:")
     assert trace["compacted"] is True
-    assert trace["output_format"] == "rwkv_final_answer_json_call"
+    assert trace["output_format"] == "direct_final_answer"
     assert trace["prompt_chars"] <= 3000
 
 
@@ -175,3 +177,112 @@ def test_run_longbench_keeps_raw_completion_separate_from_sandbox_return(
     }
     assert payload["agent_trace"][0]["raw_completion"] == raw_completion
     assert payload["agent_trace"][0]["sandbox_return"] == sandbox_return
+    assert payload["agent_info"]["answer_extraction"] == "final_answer_json"
+
+
+def test_run_longbench_normalizes_bare_answer_json_fragment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dataset = tmp_path / "longbench_test.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "task_id": "lb-1",
+                "dataset": "hotpotqa",
+                "input": "Where is the answer?",
+                "context": "The answer is Zurich.",
+                "answers": ["Zurich"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    raw_completion = '"answer": "Zurich"\n}'
+
+    class FakeEngine:
+        def generate(self, prompts, **_kwargs):
+            return [
+                GenerationOutput(
+                    prompt_index=index,
+                    prompt=prompt,
+                    token_ids=[],
+                    text=raw_completion,
+                    finish_reason="stop_token",
+                )
+                for index, prompt in enumerate(prompts)
+            ]
+
+    captured: dict[str, object] = {}
+
+    def _fake_prepare_function_calling_run(**_kwargs):
+        writer = _CollectingWriter()
+        captured["writer"] = writer
+        return types.SimpleNamespace(
+            service=object(),
+            runtime=_FakeRuntime(),
+            writer=writer,
+            task_id="task",
+            skip_keys=frozenset(),
+        )
+
+    def _fake_finalize_function_calling_run(*, ctx, **_kwargs):
+        return list(ctx.writer.payloads), [], {}
+
+    monkeypatch.setattr(longbench_module, "resolve_sampling_config", lambda *_args, **_kwargs: SamplingConfig())
+    monkeypatch.setattr(longbench_module, "prepare_function_calling_run", _fake_prepare_function_calling_run)
+    monkeypatch.setattr(longbench_module, "finalize_function_calling_run", _fake_finalize_function_calling_run)
+
+    rc = _run_longbench(
+        types.SimpleNamespace(
+            max_samples=1,
+            avg_k=[1.0],
+            answer_max_tokens=64,
+            batch_size=1,
+            prompt_max_chars=4000,
+            long_doc_mode="off",
+            long_doc_max_chars=1000,
+            long_doc_overlap_lines=3,
+            long_doc_min_chars=6000,
+            long_doc_max_evidence_chunks=4,
+            long_doc_max_evidence_chars=6000,
+            db_write_queue=1,
+            db_close_timeout_s=0.1,
+            probe_only=False,
+        ),
+        ResolvedFunctionCallingRun(
+            benchmark_kind=FunctionCallingBenchmarkKind.LONGBENCH,
+            dataset_path=dataset,
+            dataset_slug="longbench_test",
+            benchmark_name="longbench",
+            dataset_split="test",
+            model_name="demo-model",
+            engine=FakeEngine(),
+        ),
+    )
+
+    writer = captured["writer"]
+    assert rc == 0
+    [payload] = writer.payloads
+    assert payload["agent_info"]["prediction"] == "Zurich"
+    assert payload["agent_info"]["parse_error"] == ""
+    assert payload["agent_info"]["answer_extraction"] == "answer_json"
+    assert payload["agent_info"]["final_answer_call"] == (
+        '{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"final_answer"}'
+    )
+
+
+def test_longbench_extracts_fenced_answer_json_after_echoed_assistant_prefix() -> None:
+    for raw_completion in (
+        'Assistant:\n```json\n{"answer": "Zurich"}\n```',
+        'Assistant: ```json\n{"answer": "Zurich"}\n```',
+    ):
+        prediction, decoded_call, call_id, parse_error, extraction = longbench_module._extract_longbench_prediction(
+            raw_completion
+        )
+
+        assert prediction == "Zurich"
+        assert decoded_call == {}
+        assert call_id == "final_answer"
+        assert parse_error == ""
+        assert extraction == "answer_json"

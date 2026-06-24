@@ -71,11 +71,13 @@ def test_human_eval_prompt_builder_matches_rwkv_rs_shape() -> None:
         cot_mode=CoTMode.NO_COT,
     )
     assert prompt_for_marker(context, CODE_COMPLETION_PLACEHOLDER) == (
-        "User: You are a top-level code master.\n"
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
         "def add(a, b):\n"
         "    return a + b\n"
-        "Complete the code without any additional text or explanation:\n\n\n"
-        "Assistant: ```python\n"
+        "\n"
+        "Assistant: <think>\n"
+        "</think>\n"
+        "```python"
         "def add(a, b):\n"
         "    return a + b"
     )
@@ -88,18 +90,17 @@ def test_mbpp_prompt_builder_matches_rwkv_rs_shape() -> None:
         cot_mode=CoTMode.COT,
     )
     assert context == (
-        "User: You are a top-level code master.\n"
+        "User: You are a top-level code master. Complete the following code without any additional text or explanation:\n"
         "Write a function that doubles a number.\n"
         "Function signature: def double(x):\n"
-        "Write the full function definition.\n"
-        "Output only the full Python function definition without any additional text or explanation.\n\n"
+        "Write the full function definition.\n\n"
         "Assistant: <think><|completions_of_cot|></think>\n"
-        "```python\n"
+        "```python"
         "<|completions|>"
     )
     assert prompt_for_cot(context).endswith("Assistant: <think>")
     assert prompt_for_marker(context, CODE_COMPLETION_PLACEHOLDER, completions_of_cot="reasoning").endswith(
-        "Assistant: <think>reasoning</think>\n```python\n"
+        "Assistant: <think>reasoning</think>\n```python"
     )
 
 
@@ -110,29 +111,36 @@ def test_livecodebench_prompt_builder_matches_rwkv_rs_shape() -> None:
         cot_mode=CoTMode.COT,
     )
     assert prompt_for_cot(context) == (
-        "User: You are an expert Python programmer.\n"
-        "Solve the following programming problem and output only the final code.\n"
-        "Problem:\n"
+        "User: You are an expert Python programmer. You will be given a question "
+        "(problem specification) and will generate a correct Python program "
+        "that matches the specification and passes all tests.\n"
+        "### Question:\n"
         "Read n and print n squared.\n"
-        "Use the following starter code and complete it into a full solution:\n"
+        "\n"
+        "### Format: You will use the following starter code to write the solution to the problem "
+        "and enclose your code within delimiters.\n"
         "```python\n"
         "def solve():\n"
         "    pass\n"
         "```\n\n"
-        "Assistant: <think>"
+        "### Answer: (use the provided format with backticks)\n\n"
+        "Assistant: <think"
     )
-    assert prompt_for_marker(context, CODE_COMPLETION_PLACEHOLDER, completions_of_cot="reasoning") == (
-        "User: You are an expert Python programmer.\n"
-        "Solve the following programming problem and output only the final code.\n"
-        "Problem:\n"
+    assert prompt_for_marker(context, CODE_COMPLETION_PLACEHOLDER, completions_of_cot=">reasoning") == (
+        "User: You are an expert Python programmer. You will be given a question "
+        "(problem specification) and will generate a correct Python program "
+        "that matches the specification and passes all tests.\n"
+        "### Question:\n"
         "Read n and print n squared.\n"
-        "Use the following starter code and complete it into a full solution:\n"
+        "\n"
+        "### Format: You will use the following starter code to write the solution to the problem "
+        "and enclose your code within delimiters.\n"
         "```python\n"
         "def solve():\n"
         "    pass\n"
         "```\n\n"
-        "Assistant: <think>reasoning</think>\n"
+        "### Answer: (use the provided format with backticks)\n\n"
+        "Assistant: <think>reasoning\n"
+        "</think>\n"
         "```python\n"
-        "def solve():\n"
-        "    pass\n"
     )

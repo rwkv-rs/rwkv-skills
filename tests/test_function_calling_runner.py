@@ -61,6 +61,10 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "4",
             "--sample-workers",
             "8",
+            "--browsecomp-plus-judge-mode",
+            "defer",
+            "--browsecomp-plus-judge-task-id",
+            "1234",
             "--candidate-router-prompt-max-chars",
             "8192",
             "--model-path",
@@ -78,6 +82,8 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.long_doc_min_chars == 2048
     assert args.long_doc_max_evidence_chunks == 3
     assert args.long_doc_max_evidence_chars == 1536
+    assert args.browsecomp_plus_judge_mode == "defer"
+    assert args.browsecomp_plus_judge_task_id == "1234"
     assert args.tool_router_mode == "lexical"
     assert args.tool_router_max_tools == 8
     assert args.tool_router_trigger_tool_count == 10
@@ -151,8 +157,35 @@ def test_function_calling_runner_rejects_unwired_sample_worker_benchmark() -> No
     )
 
     function_calling_runner._normalize_sample_worker_args(args)
-    with pytest.raises(ValueError, match="implemented only for: bfcl_v3"):
+    with pytest.raises(ValueError, match="implemented only for: .*bfcl_v3"):
         function_calling_runner._validate_sample_worker_benchmark(args, run)
+
+
+def test_function_calling_runner_allows_browsecomp_plus_sample_workers() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "browsecomp_plus_test.jsonl",
+            "--infer-base-url",
+            "http://127.0.0.1:8081",
+            "--infer-model",
+            "demo",
+            "--sample-workers",
+            "2",
+        ]
+    )
+    run = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.BROWSECOMP_PLUS,
+        dataset_path=Path("/tmp/browsecomp_plus_test.jsonl"),
+        dataset_slug="browsecomp_plus_test",
+        benchmark_name="browsecomp_plus",
+        dataset_split="test",
+        model_name="demo",
+        engine=object(),  # type: ignore[arg-type]
+    )
+
+    function_calling_runner._normalize_sample_worker_args(args)
+    function_calling_runner._validate_sample_worker_benchmark(args, run)
 
 
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:

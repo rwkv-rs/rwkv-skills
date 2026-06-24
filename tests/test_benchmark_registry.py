@@ -14,17 +14,18 @@ from src.eval.benchmark_registry import (
 )
 
 
-def test_mmlu_metadata_is_three_mode_knowledge_zeroshot() -> None:
+def test_mmlu_metadata_is_two_mode_knowledge_zeroshot() -> None:
     metadata = resolve_benchmark_metadata("mmlu_test")
 
     assert metadata.name == "mmlu"
     assert metadata.field is BenchmarkField.KNOWLEDGE
-    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.FAKE_COT, CoTMode.COT)
+    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
     assert metadata.default_split == "test"
     assert metadata.scheduler_jobs == (
         "multi_choice_plain",
-        "multi_choice_fake_cot",
         "multi_choice_cot",
+        "multi_choice_plain_naive",
+        "multi_choice_cot_naive",
     )
     assert metadata.n_shots == (0,)
     assert metadata.avg_ks == ()
@@ -40,8 +41,9 @@ def test_include_defaults_to_knowledge_test_split() -> None:
     assert metadata.default_split == "test"
     assert metadata.scheduler_jobs == (
         "multi_choice_plain",
-        "multi_choice_fake_cot",
         "multi_choice_cot",
+        "multi_choice_plain_naive",
+        "multi_choice_cot_naive",
     )
 
 
@@ -52,11 +54,12 @@ def test_gpqa_variants_use_explicit_catalog_entries_with_shared_dataset_source()
     assert metadata.dataset == "gpqa"
     assert metadata.default_split == "diamond"
     assert metadata.field is BenchmarkField.KNOWLEDGE
-    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.FAKE_COT, CoTMode.COT)
+    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
     assert metadata.scheduler_jobs == (
         "multi_choice_plain",
-        "multi_choice_fake_cot",
         "multi_choice_cot",
+        "multi_choice_plain_naive",
+        "multi_choice_cot_naive",
     )
     assert metadata.n_shots == (0,)
 
@@ -66,7 +69,7 @@ def test_human_eval_family_is_no_cot_only() -> None:
 
     assert metadata.field is BenchmarkField.CODING
     assert metadata.cot_modes == (CoTMode.NO_COT,)
-    assert metadata.scheduler_jobs == ("code_human_eval",)
+    assert metadata.scheduler_jobs == ("code_human_eval", "code_human_eval_naive")
     assert supports_cot_mode("human_eval_plus_test", CoTMode.NO_COT)
     assert not supports_cot_mode("human_eval_plus_test", CoTMode.COT)
 
@@ -76,16 +79,15 @@ def test_mbpp_family_is_legacy_no_cot_only() -> None:
 
     assert metadata.field is BenchmarkField.CODING
     assert metadata.cot_modes == (CoTMode.NO_COT,)
-    assert metadata.scheduler_jobs == ("code_mbpp",)
+    assert metadata.scheduler_jobs == ("code_mbpp", "code_mbpp_naive")
     assert supports_cot_mode("mbpp_plus_test", CoTMode.NO_COT)
-    assert not supports_cot_mode("mbpp_plus_test", CoTMode.FAKE_COT)
     assert not supports_cot_mode("mbpp_plus_test", CoTMode.COT)
 
 
-def test_swe_bench_family_is_coding_cot_only() -> None:
+def test_swe_bench_family_is_function_calling_cot_only() -> None:
     metadata = resolve_benchmark_metadata("swe_bench_lite_test")
 
-    assert metadata.field is BenchmarkField.CODING
+    assert metadata.field is BenchmarkField.FUNCTION_CALLING
     assert metadata.cot_modes == (CoTMode.COT,)
     assert metadata.scheduler_jobs == ("code_swe_bench",)
     assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
@@ -226,7 +228,7 @@ def test_simpleqa_defaults_to_cot_only_maths() -> None:
     assert metadata.field is BenchmarkField.MATHS
     assert metadata.cot_modes == (CoTMode.COT,)
     assert metadata.default_split == "verified"
-    assert metadata.scheduler_jobs == ("free_response",)
+    assert metadata.scheduler_jobs == ("free_response", "free_response_naive")
     assert metadata.n_shots == (0,)
     assert metadata.pass_ks == ()
 
@@ -237,14 +239,14 @@ def test_polymath_defaults_to_all_split_maths() -> None:
     assert metadata.name == "polymath"
     assert metadata.field is BenchmarkField.MATHS
     assert metadata.default_split == "all"
-    assert metadata.scheduler_jobs == ("free_response",)
+    assert metadata.scheduler_jobs == ("free_response", "free_response_naive")
 
 
 def test_judge_only_math_benchmarks_route_to_judge_runner() -> None:
     metadata = resolve_benchmark_metadata("gsm8k_test")
 
     assert metadata.field is BenchmarkField.MATHS
-    assert metadata.scheduler_jobs == ("free_response_judge",)
+    assert metadata.scheduler_jobs == ("free_response_judge", "free_response_judge_naive")
 
 
 def test_catalog_names_are_not_polluted_by_dataset_slug_aliases() -> None:

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from src.db.eval_db_service import EvalDbService
+import json
+
+from src.db.eval_db_service import (
+    EvalDbService,
+    _DATASET_REFERENCE_CACHE,
+    _EVAL_ANSWER_MAX_CHARS,
+    _EVAL_FAIL_REASON_MAX_CHARS,
+    _EVAL_REF_ANSWER_MAX_CHARS,
+)
 
 
 def test_eval_ingest_dedupes_by_completion() -> None:
@@ -19,6 +27,86 @@ def test_eval_ingest_dedupes_by_completion() -> None:
 
     assert inserted == 1
     assert repo.inserted == [10]
+
+
+def test_eval_ingest_bounds_large_text_fields() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+
+    inserted = service.ingest_eval_payloads(
+        task_id="123",
+        payloads=[
+            {
+                **_payload("a" * (_EVAL_ANSWER_MAX_CHARS + 100)),
+                "ref_answer": "r" * (_EVAL_REF_ANSWER_MAX_CHARS + 100),
+                "fail_reason": "f" * (_EVAL_FAIL_REASON_MAX_CHARS + 100),
+            },
+        ],
+    )
+
+    assert inserted == 1
+    payload = repo.eval_payloads[0]
+    assert len(payload["answer"]) == _EVAL_ANSWER_MAX_CHARS
+    assert len(payload["ref_answer"]) == _EVAL_REF_ANSWER_MAX_CHARS
+    assert len(payload["fail_reason"]) == _EVAL_FAIL_REASON_MAX_CHARS
+    assert "sha256=" in payload["answer"]
+    assert "sha256=" in payload["ref_answer"]
+    assert "sha256=" in payload["fail_reason"]
+
+
+def test_eval_ingest_resolves_missing_ref_answer_from_direct_dataset_path(tmp_path, monkeypatch) -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+    dataset_dir = tmp_path / "demo"
+    dataset_dir.mkdir()
+    dataset_path = dataset_dir / "test.jsonl"
+    dataset_path.write_text(
+        json.dumps({"question": "q0", "answer": "dataset gold"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("src.db.eval_db_service.DATASET_ROOTS", [tmp_path])
+    _DATASET_REFERENCE_CACHE.clear()
+
+    inserted = service.ingest_eval_payloads(
+        task_id="123",
+        payloads=[
+            {
+                **_payload("model output"),
+                "benchmark_name": "demo",
+                "dataset_split": "test",
+                "ref_answer": "",
+            },
+        ],
+    )
+
+    assert inserted == 1
+    assert repo.eval_payloads[0]["answer"] == "model output"
+    assert repo.eval_payloads[0]["ref_answer"] == "dataset gold"
+
+
+def test_completion_context_compacts_agent_trace_extras() -> None:
+    payload = {
+        **_completion_payload(),
+        "agent_trace": [
+            {"step": idx, "tool_output": "x" * 10_000}
+            for idx in range(40)
+        ],
+        "agent_info": {
+            "final_prompt_messages": [
+                {"role": "user", "content": "y" * 10_000}
+                for _idx in range(40)
+            ],
+        },
+    }
+
+    context = EvalDbService._build_completion_context(payload)
+
+    assert len(context["agent_trace"]) == 33
+    assert context["agent_trace"][-1] == {"__truncated_items__": 8}
+    assert len(context["agent_trace"][0]["tool_output"]) <= 4096
+    assert len(context["agent_info"]["final_prompt_messages"]) == 33
 
 
 def test_completion_ingest_uses_batch_repo_method() -> None:
@@ -155,6 +243,7 @@ class _FakeRepo:
     def __init__(self) -> None:
         self.known: set[int] = set()
         self.inserted: list[int] = []
+        self.eval_payloads: list[dict] = []
         self.completion_batches: list[list[tuple[dict, dict]]] = []
         self.checker_batches: list[list[int]] = []
 
@@ -186,9 +275,10 @@ class _FakeRepo:
 
     def insert_eval_batch(self, *, rows: list[tuple[int, dict]], created_at):
         _ = created_at
-        for completions_id, _payload in rows:
+        for completions_id, payload in rows:
             self.known.add(completions_id)
             self.inserted.append(completions_id)
+            self.eval_payloads.append(payload)
         return len(rows)
 
     def insert_checker_batch(self, *, rows: list[tuple[int, dict]], created_at):

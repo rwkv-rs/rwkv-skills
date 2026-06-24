@@ -11,6 +11,7 @@ from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.backpressure import RemoteConcurrencyBudget, parse_remote_backpressure
 from src.eval.scheduler.cli import build_parser
 from src.eval.scheduler.jobs import JOB_CATALOGUE
+from src.eval.scheduler.remote_slots import infer_workers_for_model
 from src.eval.scheduler.state import RunningEntry
 from src.infer.backend import resolve_backend_model_name, validate_inference_backend_args
 
@@ -40,6 +41,33 @@ def test_build_queue_supports_remote_inference_targets() -> None:
     assert item.model_name == "rwkv7-g1a4-2.9b-20250728"
     assert item.infer_model == "rwkv7-g1a4-2.9b-20250728"
     assert item.infer_base_url == "http://127.0.0.1:8081"
+
+
+def test_build_queue_deduplicates_remote_slot_aliases() -> None:
+    dataset_slug = JOB_CATALOGUE["free_response"].dataset_slugs[0]
+
+    items = queue.build_queue(
+        model_globs=(),
+        job_order=("free_response",),
+        completed=(),
+        failed=(),
+        running=(),
+        skip_dataset_slugs=(),
+        only_dataset_slugs=(dataset_slug,),
+        model_select="all",
+        min_param_b=None,
+        max_param_b=None,
+        infer_base_url="http://127.0.0.1:8081",
+        infer_models=(
+            "g1f15_slot1=rwkv7-g1f-1.5b-20260419-ctx8192",
+            "g1f15_slot2=rwkv7-g1f-1.5b-20260419-ctx8192",
+        ),
+    )
+
+    assert len(items) == 1
+    assert items[0].model_name == "rwkv7-g1f-1.5b-20260419-ctx8192"
+    assert items[0].infer_model == "rwkv7-g1f-1.5b-20260419-ctx8192"
+    assert "slot" not in items[0].job_id
 
 
 def test_build_command_uses_remote_backend_arguments(tmp_path: Path) -> None:
@@ -78,6 +106,33 @@ def test_build_command_uses_remote_backend_arguments(tmp_path: Path) -> None:
     assert "--device" not in command
     assert "remote-demo" in command
     assert "17" in command
+
+
+def test_param_size_worker_profile_gives_smaller_models_more_workers() -> None:
+    assert (
+        infer_workers_for_model(
+            "rwkv7-g1f-1.5b-20260419-ctx8192",
+            default_workers=32,
+            profile="param-size",
+        )
+        == 192
+    )
+    assert (
+        infer_workers_for_model(
+            "rwkv7-g1f-2.9b-20260420-ctx8192",
+            default_workers=32,
+            profile="param-size",
+        )
+        == 128
+    )
+    assert (
+        infer_workers_for_model(
+            "rwkv7-g1f-7.2b-20260428-ctx8192",
+            default_workers=32,
+            profile="param-size",
+        )
+        == 72
+    )
 
 
 def test_remote_dispatch_resources_use_model_slots(tmp_path: Path) -> None:
@@ -125,6 +180,22 @@ def test_remote_dispatch_resources_respect_backpressure_without_adding_slots(tmp
     }
 
     assert actions._resolve_available_dispatch_resources(opts, {}, remote_budgets=budgets) == ["model:remote_b"]
+
+
+def test_remote_dispatch_resources_support_alias_slots(tmp_path: Path) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("free_response",),
+        infer_base_url="http://127.0.0.1:8081",
+        infer_models=("slot-a=remote-a", "slot-b=remote-a"),
+    )
+    running = {
+        "free_response__gsm8k_test_nocot_remote_a": RunningEntry(pid=101, gpu="model:slot_a"),
+    }
+
+    assert actions._resolve_available_dispatch_resources(opts, running) == ["model:slot_b"]
 
 
 def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_path: Path) -> None:
@@ -186,6 +257,64 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
 
     assert [model for _job_id, model in launched] == ["remote-a", "remote-b", "remote-c"]
     assert len(list((tmp_path / "pid").glob("*.pid"))) == 3
+
+
+def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Path) -> None:
+    dataset_path = tmp_path / "dataset.jsonl"
+    dataset_path.write_text("[]", encoding="utf-8")
+    launched: list[tuple[str, str]] = []
+
+    def _item(dataset_slug: str) -> queue.QueueItem:
+        return queue.QueueItem(
+            job_name="code_human_eval",
+            job_id=f"code_human_eval__{dataset_slug}_nocot_{actions.safe_slug('remote-a')}",
+            dataset_slug=dataset_slug,
+            model_path=None,
+            model_slug=actions.safe_slug("remote-a"),
+            model_name="remote-a",
+            infer_base_url="http://127.0.0.1:19083/v1",
+            infer_model="remote-a",
+        )
+
+    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+
+    def _fake_launch_job(job_id, _command, **_kwargs):
+        launched.append((job_id, str(_kwargs.get("env", {}).get("RWKV_SKILLS_INFER_MODEL"))))
+        return SimpleNamespace(pid=1000 + len(launched))
+
+    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+
+    opts = DispatchOptions(
+        log_dir=tmp_path / "log",
+        pid_dir=tmp_path / "pid",
+        run_log_dir=tmp_path / "run",
+        job_order=("code_human_eval",),
+        infer_base_url="http://127.0.0.1:19083/v1",
+        infer_models=("slot-a=remote-a", "slot-b=remote-a"),
+    )
+    items = [_item("human_eval_test"), _item("human_eval_cn_test")]
+
+    actions.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
+    actions._launch_queue_items(
+        opts=opts,
+        queue=items,
+        available_resources=("model:slot_a", "model:slot_b"),
+        question_counts={},
+        batch_profiler=actions.BatchProfiler(tmp_path / "batch_cache.json"),
+        pending_since={item.job_id: 1.0 for item in items},
+        launch_times={},
+        job_metadata={},
+        lease_manager=None,
+        claimed_job_ids=set(),
+    )
+
+    assert [model for _job_id, model in launched] == ["remote-a", "remote-a"]
+    assert sorted(path.read_text(encoding="utf-8").splitlines()[1] for path in opts.pid_dir.glob("*.pid")) == [
+        "model:slot_a",
+        "model:slot_b",
+    ]
 
 
 def test_remote_launch_uses_backpressure_budget(monkeypatch, tmp_path: Path) -> None:
@@ -339,6 +468,8 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "64",
             "--infer-protocol",
             "vllm",
+            "--infer-worker-profile",
+            "param-size",
             "--infer-backpressure-timeout-s",
             "1.5",
             "--infer-backpressure-pending-high-watermark",
@@ -352,6 +483,7 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_models == ["remote-demo"]
     assert args.remote_batch_size == 64
     assert args.infer_protocol == "vllm"
+    assert args.infer_worker_profile == "param-size"
     assert args.infer_backpressure_timeout_s == 1.5
     assert args.infer_backpressure_pending_high_watermark == 2
     assert args.infer_budget_min_workers == 3

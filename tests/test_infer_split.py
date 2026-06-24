@@ -34,7 +34,9 @@ from src.infer.backend import (
     RemoteInferenceConfig,
     normalize_api_base,
     normalize_local_device,
+    remote_contents_inflight_batches,
     require_completion_style_remote_protocol,
+    resolve_generation_prompt_batch_size,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
@@ -1407,6 +1409,7 @@ def test_remote_backend_lightning_uses_v2_contents_and_choice_logits(monkeypatch
     assert calls[0][1]["contents"] == ["raw prompt A", "raw prompt B"]
     assert calls[0][1]["top_k"] == 42
     assert calls[0][1]["chunk_size"] == 64
+    assert calls[0][1]["ban_tokens"] == [123]
     assert calls[0][1]["password"] == "pw"
     assert "messages" not in calls[0][1]
     assert "seed" not in calls[0][1]
@@ -1474,6 +1477,48 @@ def test_remote_backend_legacy_nano_single_requests_keep_private_fields(monkeypa
     assert payload["pad_zero"] is False
     assert payload["no_penalty_token_ids"] == [33, 10]
     assert payload["prefill_chunk_size"] == 64
+
+
+def test_remote_backend_contents_protocol_pipelines_batches_by_worker_budget(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="127.0.0.1:19081",
+            model="remote-demo",
+            api_key="pw",
+            protocol="lightning",
+            max_workers=4,
+        )
+    )
+    calls: list[list[str]] = []
+
+    def _fake_post_json(_url: str, payload: dict[str, object]) -> dict[str, object]:
+        contents = [str(item) for item in payload["contents"]]  # type: ignore[index]
+        calls.append(contents)
+        return {
+            "choices": [
+                {
+                    "index": index,
+                    "message": {"role": "assistant", "content": f"answer-{prompt}"},
+                    "finish_reason": "stop",
+                }
+                for index, prompt in enumerate(contents)
+            ]
+        }
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    assert remote_contents_inflight_batches(backend, 2) == 2
+    assert resolve_generation_prompt_batch_size(backend, 2) == 4
+
+    outputs = backend.generate(
+        ["a", "b", "c", "d"],
+        sampling=SamplingConfig(max_generate_tokens=4, temperature=0.0),
+        batch_size=2,
+        show_progress=False,
+    )
+
+    assert [output.text for output in outputs] == ["answer-a", "answer-b", "answer-c", "answer-d"]
+    assert sorted(calls) == [["a", "b"], ["c", "d"]]
 
 
 def test_remote_backend_tqdm_cleanup_errors_do_not_fail_generation(monkeypatch) -> None:

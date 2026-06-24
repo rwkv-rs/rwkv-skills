@@ -231,6 +231,53 @@ def test_two_stage_payload_uses_legacy_completion1_scoring(monkeypatch, tmp_path
     assert evaluation.payloads[0]["answer"].endswith("8")
 
 
+def test_judgement_label_dataset_scores_final_stage_without_math_verify(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(fr, "_load_math_verify", lambda: None)
+    dataset = tmp_path / "answer_judge.jsonl"
+    dataset.write_text(
+        (
+            '{"question":"q","expected_answer":"reference text",'
+            '"predicted_answer":"candidate text","expected_judgement":"Judgement: No"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "answer_judge",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User: q\n\nAssistant: <think",
+                "completion1": "</think>\nJudgement: Yes",
+                "stop_reason1": "stop_token",
+                "prompt2": "\nReturn exactly one final label: ",
+                "completion2": "Judgement: No",
+                "stop_reason2": "stop_token",
+            }
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert evaluation.primary_group == "strategy_c"
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.metrics_by_group["strategy_c"]["exact_accuracy"] == 1.0
+    assert evaluation.rows_by_group["strategy_c"] == [(0, 0, True)]
+    assert evaluation.payloads[0]["answer"] == "Judgement: No"
+
+    metrics_payload, _task_details = build_grouped_metrics_payload(
+        evaluation,
+        pass_k=(1,),
+        avg_k=(1,),
+        report_pass_k=(1,),
+        report_avg_k=(1,),
+    )
+    assert metrics_payload["avg@1"] == 1.0
+    assert metrics_payload["strategy_metrics"]["strategy_a"]["avg@1"] == 0.0
+
+
 def test_a_judge_pass_skips_strategy_judge_and_inherits_correctness(monkeypatch, tmp_path) -> None:
     _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"

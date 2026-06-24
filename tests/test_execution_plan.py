@@ -69,3 +69,15 @@ def test_sample_repeat_seed_changes_when_pass_index_changes() -> None:
 
     assert base != alternate
     assert base == sample_repeat_seed(7, 3, pass_index=0, stage=2)
+
+
+def test_sample_repeat_seed_preserves_historical_low_stage_layout() -> None:
+    assert sample_repeat_seed(7, 3, stage=2) == (7 << 32) | (3 << 8) | 2
+
+
+def test_sample_repeat_seed_supports_extended_stage_ids() -> None:
+    seed = sample_repeat_seed(7, 3, stage=260)
+    assert 0 <= seed < (1 << 63)
+    assert seed == sample_repeat_seed(7, 3, stage=260)
+    assert seed != sample_repeat_seed(7, 3, stage=261)
+    assert sample_repeat_seed(7, 3, stage=10_001) != sample_repeat_seed(7, 3, pass_index=1, stage=10_001)

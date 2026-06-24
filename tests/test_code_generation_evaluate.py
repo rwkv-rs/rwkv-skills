@@ -35,3 +35,17 @@ def test_extract_code_completion_handles_leading_end_think_fenced_answer() -> No
     assert extract_code_completion(completion).startswith("from typing import List")
     assert "```" not in extract_code_completion(completion)
     assert "</think>" not in extract_code_completion(completion)
+
+
+def test_extract_code_completion_removes_dangling_trailing_fence() -> None:
+    completion = (
+        "from typing import List\n"
+        "def has_close_elements(numbers: List[float], threshold: float) -> bool:\n"
+        "    return any(abs(a - b) < threshold for i, a in enumerate(numbers) for b in numbers[i + 1:])\n"
+        "```"
+    )
+
+    extracted = extract_code_completion(completion)
+
+    assert extracted.startswith("from typing import List")
+    assert "```" not in extracted

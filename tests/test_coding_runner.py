@@ -16,18 +16,38 @@ def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:
             "--benchmark-kind",
             "mbpp",
             "--cot-mode",
-            "fake_cot",
+            "no_cot",
             "--probe-only",
         ]
     )
     assert args.benchmark_kind == "mbpp"
-    assert args.cot_mode == "fake_cot"
+    assert args.cot_mode == "no_cot"
     assert args.probe_only is True
 
 
 def test_coding_runner_rejects_non_legacy_mbpp_cot_modes() -> None:
     with pytest.raises(ValueError, match="mbpp legacy-aligned runner"):
-        coding_runner._resolve_cot_mode(coding_runner.CodingBenchmarkKind.MBPP, CoTMode.FAKE_COT.value)
+        coding_runner._resolve_cot_mode(coding_runner.CodingBenchmarkKind.MBPP, CoTMode.COT.value)
+
+
+@pytest.mark.parametrize(
+    "dataset_slug",
+    [
+        "human_eval_test",
+        "human_eval_cn_test",
+        "human_eval_fix_test",
+        "human_eval_plus_test",
+    ],
+)
+def test_coding_runner_treats_human_eval_variants_as_human_eval(dataset_slug: str) -> None:
+    assert (
+        coding_runner._resolve_benchmark_kind(dataset_slug, coding_runner.CodingBenchmarkKind.AUTO)
+        is coding_runner.CodingBenchmarkKind.HUMAN_EVAL
+    )
+    assert (
+        coding_runner._resolve_benchmark_kind(dataset_slug, coding_runner.CodingBenchmarkKind.HUMAN_EVAL)
+        is coding_runner.CodingBenchmarkKind.HUMAN_EVAL
+    )
 
 
 def test_coding_runner_parser_accepts_swebench_options() -> None:

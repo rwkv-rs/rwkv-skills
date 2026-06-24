@@ -225,6 +225,7 @@ def test_browsecomp_plus_budgeted_prompt_compacts_long_tool_output() -> None:
     )
 
     assert "Long document compacted" in prompt
+    assert "Conversation transcript JSON" not in prompt
     assert "target evidence: Zurich is the answer" in prompt
     assert '"name": "search"' in prompt
     assert '"name": "final_answer"' in prompt
@@ -233,6 +234,58 @@ def test_browsecomp_plus_budgeted_prompt_compacts_long_tool_output() -> None:
     assert trace["tool_route"]["routed"] is True
     assert trace["tool_route"]["selected_names"] == ["search", "final_answer"]
     assert trace["prompt_chars"] <= 5000
+
+
+def test_browsecomp_plus_prompt_uses_agent_state_shape() -> None:
+    prompt = browsecomp_plus_module.build_browsecomp_plus_prompt(
+        [
+            {"role": "user", "content": "Question: Who?"},
+            {"role": "assistant", "content": '{"name":"search","arguments":{"query":"Who"}}'},
+            {"role": "user", "content": "Function output:\n[]"},
+        ],
+        history_max_chars=4000,
+    )
+
+    assert "Conversation transcript JSON" not in prompt
+    assert '"name": "get_document"' in prompt
+    assert '"name":"final_answer","arguments":{"answer":"<exact answer>"}' in prompt
+    assert "Do not use reason, reasoning, explanation, output, or response keys" in prompt
+    assert 'Assistant action: {"name":"search"' in prompt
+    assert "Current observation:\nFunction output:\n[]" in prompt
+    assert prompt.endswith("Assistant: <think>\n</think>\n```json")
+
+
+def test_browsecomp_plus_prefers_record_documents_over_bm25(monkeypatch, tmp_path) -> None:
+    index_path = tmp_path / "bm25"
+    index_path.mkdir()
+
+    def _unexpected_bm25(*args, **kwargs):
+        raise AssertionError("BM25 should not be used by default")
+
+    monkeypatch.delenv("RWKV_BROWSECOMP_PLUS_RETRIEVER", raising=False)
+    monkeypatch.setattr(browsecomp_plus_module, "_pyserini_available", lambda: True)
+    monkeypatch.setattr(browsecomp_plus_module, "_search_bm25", _unexpected_bm25)
+
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord(
+            task_id="bc-plus-1",
+            query_id="q1",
+            question="Which city is the answer?",
+            answer="Zurich",
+            metadata={
+                "browsecomp_plus_bm25_index_path": str(index_path),
+                "browsecomp_plus_documents": [
+                    {"docid": "doc-1", "text": "Zurich is the answer."},
+                    {"docid": "doc-2", "text": "Paris is unrelated."},
+                ],
+            },
+        )
+    )
+
+    chunks = env.search("Zurich", 1)
+
+    assert chunks[0]["docid"] == "doc-1"
+    assert env._details()["retriever"] == "record_documents"
 
 
 def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_return(monkeypatch) -> None:
@@ -308,6 +361,73 @@ def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_retu
     }
     assert payload["agent_trace"][0]["decision_completion"] == raw_completion
     assert payload["agent_trace"][0]["sandbox_return"] == sandbox_return
+
+
+def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypatch) -> None:
+    class FakeEngine:
+        def __init__(self, raw_completion: str) -> None:
+            self.raw_completion = raw_completion
+
+        def generate(
+            self,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            prompt_seeds=None,
+            prompt_stop_suffixes=None,
+            constraints=None,
+            constraint_mode="off",
+        ):
+            return [types.SimpleNamespace(text=self.raw_completion, finish_reason="stop")]
+
+    def _fake_judge(inputs, config):
+        return [BrowseCompJudgeOutcome(is_passed=True, reason="matched")]
+
+    def _run(raw_completion: str) -> dict[str, object]:
+        monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
+        return browsecomp_plus_module._run_one_browsecomp_plus_attempt(
+            args=types.SimpleNamespace(max_steps=1),
+            run=types.SimpleNamespace(engine=FakeEngine(raw_completion), benchmark_name="browsecomp_plus", dataset_split="test"),
+            record=BrowseCompPlusRecord(
+                task_id="bc-plus-1",
+                query_id="q1",
+                question="Which city is the answer?",
+                answer="Zurich",
+                metadata={},
+            ),
+            sample_index=0,
+            repeat_index=0,
+            pass_index=0,
+            sampling=object(),
+            sampling_payload={"max_generate_tokens": 64},
+            history_max_chars=4000,
+            prompt_max_chars=4000,
+            long_doc_config=LongDocEvidenceConfig(enabled=False),
+            tool_routing_config=ToolRoutingConfig(mode="off"),
+            judge=BrowseCompJudgeConfig(api_key="", model="judge"),
+        )
+
+    trailing = '{"name":"final_answer","arguments":"{\\"answer\\":\\"Zurich\\"}","id":"call_42"},{"docid":"x"}'
+    bare_answer = '{"answer":"Zurich"}'
+    malformed_arguments = (
+        '{\n'
+        '  "name": "final_answer",\n'
+        '  "arguments": "{\\"answer\\": \\"Zurich\\", \\"evidence\\": [\\"doc\\"]", "is_output": true}",\n'
+        '  "id": "call_bad"\n'
+        '}'
+    )
+
+    trailing_payload = _run(trailing)
+    bare_payload = _run(bare_answer)
+    malformed_payload = _run(malformed_arguments)
+
+    assert trailing_payload["agent_info"]["final_answer"] == "Zurich"
+    assert trailing_payload["agent_info"]["fail_reason"] == ""
+    assert bare_payload["agent_info"]["final_answer"] == "Zurich"
+    assert bare_payload["agent_info"]["fail_reason"] == ""
+    assert malformed_payload["agent_info"]["final_answer"] == "Zurich"
+    assert malformed_payload["agent_info"]["fail_reason"] == ""
 
 
 def test_rwkv_json_call_prompt_collapses_history_to_single_user_and_assistant_turn() -> None:
