@@ -79,6 +79,7 @@ KNOWLEDGE_RUNNERS: tuple[RunnerSpec, ...] = (
         module="src.eval.knowledge.runner",
         is_cot=False,
         extra_args=("--cot-mode", "no_cot"),
+        batch_flag="--batch-size",
         probe_question_floor=TARGET_EVAL_ATTEMPTS,
     ),
     _runner(
@@ -88,6 +89,7 @@ KNOWLEDGE_RUNNERS: tuple[RunnerSpec, ...] = (
         module="src.eval.knowledge.runner",
         is_cot=False,
         extra_args=("--cot-mode", "no_cot", "--prompt-profile", "naive"),
+        batch_flag="--batch-size",
         probe_question_floor=TARGET_EVAL_ATTEMPTS,
     ),
     _runner(
@@ -277,24 +279,10 @@ CODING_RUNNERS: tuple[RunnerSpec, ...] = (
         probe_max_generate_flag="--max-tokens",
         probe_question_floor=TARGET_EVAL_ATTEMPTS,
     ),
-)
-
-INSTRUCTION_FOLLOWING_RUNNERS: tuple[RunnerSpec, ...] = (
-    _runner(
-        "instruction_following",
-        group=RunnerGroup.INSTRUCTION_FOLLOWING,
-        scheduler_domain="instruction_following",
-        module="src.eval.instruction_following.runner",
-        is_cot=False,
-        probe_question_floor=TARGET_EVAL_ATTEMPTS,
-    ),
-)
-
-FUNCTION_CALLING_RUNNERS: tuple[RunnerSpec, ...] = (
     _runner(
         "code_swe_bench",
-        group=RunnerGroup.FUNCTION_CALLING,
-        scheduler_domain="function_calling",
+        group=RunnerGroup.CODING,
+        scheduler_domain="code",
         module="src.eval.coding.runner",
         is_cot=True,
         fallback_dataset_slugs=(
@@ -309,6 +297,48 @@ FUNCTION_CALLING_RUNNERS: tuple[RunnerSpec, ...] = (
         probe_max_generate_flag="--max-tokens",
         probe_question_floor=TARGET_EVAL_ATTEMPTS,
     ),
+    _runner(
+        "code_swe_bench_naive",
+        group=RunnerGroup.CODING,
+        scheduler_domain="code",
+        module="src.eval.coding.runner",
+        is_cot=True,
+        fallback_dataset_slugs=(
+            "swe_bench_lite_test",
+            "swe_bench_verified_test",
+            "swe_bench_test",
+            "swe_bench_lite_oracle_test",
+            "swe_bench_lite_bm25_13k_test",
+        ),
+        extra_args=("--prompt-profile", "naive"),
+        batch_flag="--batch-size",
+        probe_flag="--probe-only",
+        probe_max_generate_flag="--max-tokens",
+        probe_question_floor=TARGET_EVAL_ATTEMPTS,
+    ),
+)
+
+INSTRUCTION_FOLLOWING_RUNNERS: tuple[RunnerSpec, ...] = (
+    _runner(
+        "instruction_following",
+        group=RunnerGroup.INSTRUCTION_FOLLOWING,
+        scheduler_domain="instruction_following",
+        module="src.eval.instruction_following.runner",
+        is_cot=False,
+        probe_question_floor=TARGET_EVAL_ATTEMPTS,
+    ),
+    _runner(
+        "instruction_following_naive",
+        group=RunnerGroup.INSTRUCTION_FOLLOWING,
+        scheduler_domain="instruction_following",
+        module="src.eval.instruction_following.runner",
+        is_cot=False,
+        extra_args=("--prompt-profile", "naive"),
+        probe_question_floor=TARGET_EVAL_ATTEMPTS,
+    ),
+)
+
+FUNCTION_CALLING_RUNNERS: tuple[RunnerSpec, ...] = (
     _runner(
         "function_browsecomp",
         group=RunnerGroup.FUNCTION_CALLING,

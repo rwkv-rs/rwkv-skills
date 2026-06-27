@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Knowledge benchmark pipeline for multiple-choice datasets."""
 
+import concurrent.futures
 from dataclasses import dataclass
 import re
 from typing import Callable, Sequence
@@ -150,16 +151,31 @@ class MultipleChoicePipeline:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
         payloads: list[dict] = []
-        for entry_index, (key, record) in enumerate(expanded):
-            prompt = self._format_prompt(record, prompt_template)
+        worker_count = self._direct_choice_worker_count(batch_size)
+        for start in range(0, len(expanded), batch_size):
+            chunk = expanded[start : start + batch_size]
             try:
-                _, pred_letter = self._score_prompt_choice_only(record, prompt)
+                if worker_count > 1 and len(chunk) > 1:
+                    chunk_payloads = self._run_direct_choice_chunk_parallel(
+                        chunk,
+                        prompt_template=prompt_template,
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        max_workers=worker_count,
+                    )
+                else:
+                    chunk_payloads = self._run_direct_choice_chunk_serial(
+                        chunk,
+                        prompt_template=prompt_template,
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                    )
             except NotImplementedError as exc:
                 if not self.allow_generation_fallback:
                     self._raise_choice_scoring_required("direct multiple-choice", exc)
                 payloads.extend(
                     self._run_direct_generation_batches(
-                        expanded[entry_index:],
+                        expanded[start:],
                         prompt_template=prompt_template,
                         benchmark_name=benchmark_name,
                         dataset_split=dataset_split,
@@ -168,16 +184,10 @@ class MultipleChoicePipeline:
                     )
                 )
                 break
-            payload = self._build_direct_payload(
-                benchmark_name=benchmark_name,
-                dataset_split=dataset_split,
-                key=key,
-                prompt=prompt,
-                pred_letter=pred_letter,
-            )
-            if on_record is not None:
-                on_record(payload)
-            payloads.append(payload)
+            for payload in chunk_payloads:
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     def run_chain_of_thought(
@@ -416,6 +426,82 @@ class MultipleChoicePipeline:
             sampling_config={},
             stages=stages,
         ).as_payload()
+
+    def _direct_choice_worker_count(self, batch_size: int) -> int:
+        config = getattr(self.backend, "config", None)
+        max_workers = getattr(config, "max_workers", None) if config is not None else None
+        if max_workers is None:
+            return 1
+        try:
+            return max(1, min(int(batch_size), int(max_workers)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _run_direct_choice_chunk_serial(
+        self,
+        entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
+        *,
+        prompt_template: str,
+        benchmark_name: str,
+        dataset_split: str,
+    ) -> list[dict]:
+        payloads: list[dict] = []
+        for key, record in entries:
+            prompt = self._format_prompt(record, prompt_template)
+            _, pred_letter = self._score_prompt_choice_only(record, prompt)
+            payloads.append(
+                self._build_direct_payload(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    key=key,
+                    prompt=prompt,
+                    pred_letter=pred_letter,
+                )
+            )
+        return payloads
+
+    def _run_direct_choice_chunk_parallel(
+        self,
+        entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
+        *,
+        prompt_template: str,
+        benchmark_name: str,
+        dataset_split: str,
+        max_workers: int,
+    ) -> list[dict]:
+        def _score_entry(local_index: int, key: AttemptKey, record: MultipleChoiceRecord) -> tuple[int, dict]:
+            prompt = self._format_prompt(record, prompt_template)
+            _, pred_letter = self._score_prompt_choice_only(record, prompt)
+            payload = self._build_direct_payload(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                key=key,
+                prompt=prompt,
+                pred_letter=pred_letter,
+            )
+            return local_index, payload
+
+        results: list[dict | None] = [None] * len(entries)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(int(max_workers), len(entries))),
+            thread_name_prefix="mc-choice-logits",
+        ) as executor:
+            future_to_index = {
+                executor.submit(_score_entry, local_index, key, record): local_index
+                for local_index, (key, record) in enumerate(entries)
+            }
+            for future in concurrent.futures.as_completed(future_to_index):
+                try:
+                    local_index, payload = future.result()
+                except NotImplementedError:
+                    for pending in future_to_index:
+                        pending.cancel()
+                    raise
+                results[local_index] = payload
+        missing_indexes = [index for index, payload in enumerate(results) if payload is None]
+        if missing_indexes:
+            raise RuntimeError(f"incomplete direct choice-logits chunk: missing indexes {missing_indexes}")
+        return [payload for payload in results if payload is not None]
 
     def _score_prompt_choice_only(
         self,

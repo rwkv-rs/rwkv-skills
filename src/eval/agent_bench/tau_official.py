@@ -37,6 +37,7 @@ _TAU_MULTI_TOOL_CALLS_NAME = "__tau_multi_tool_calls__"
 DEFAULT_TAU_PROMPT_MAX_CHARS = 24576
 _TAU_REWARD_TYPE_PREFIX = "RewardType."
 TAU_JSON_CALL_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=True)
+DEFAULT_TAU_BANKING_RETRIEVAL_VARIANT = "bm25"
 
 
 @dataclass(slots=True)
@@ -68,12 +69,18 @@ class TauOfficialRuntime:
         return Task.model_validate(normalize_tau_official_task_payload(payload))
 
     def create_environment(self, *, solo_mode: bool = False) -> Any:
+        env_kwargs = self._environment_kwargs()
         try:
-            return self._environment_constructor(solo_mode=solo_mode)
+            return self._environment_constructor(solo_mode=solo_mode, **env_kwargs)
         except TypeError:
-            if solo_mode:
+            if solo_mode or env_kwargs:
                 raise
             return self._environment_constructor()
+
+    def _environment_kwargs(self) -> dict[str, Any]:
+        if self.domain != "banking_knowledge":
+            return {}
+        return {"retrieval_variant": DEFAULT_TAU_BANKING_RETRIEVAL_VARIANT}
 
     def build_user(self, *, task: Any, environment: Any, user_model: Any | None, temperature: float = 0.0) -> Any:
         if user_model is None:
@@ -145,6 +152,7 @@ class TauOfficialRuntime:
             evaluation_type=evaluation_type,
             solo_mode=False,
             domain=self.domain,
+            env_kwargs=self._environment_kwargs(),
         )
         simulation.reward_info = reward_info
         details = _model_dump_safe(reward_info)

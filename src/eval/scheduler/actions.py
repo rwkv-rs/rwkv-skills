@@ -61,6 +61,7 @@ _NO_GENERATION_SLOT_RELEASE_JOBS = frozenset(
         "code_mbpp_naive",
         "code_livecodebench_naive",
         "code_swe_bench",
+        "code_swe_bench_naive",
     }
 )
 
@@ -89,6 +90,8 @@ class QueueOptions:
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"
     remote_batch_size: int | None = None
+    plain_choice_batch_size: int | None = None
+    plain_choice_timeout_s: float | None = None
     sample_workers: int | None = None
     infer_backpressure: bool = True
     infer_backpressure_timeout_s: float = 2.0
@@ -779,6 +782,11 @@ def _launch_queue_items(
                 batch_size = max(1, int(item_budget.remote_batch_size))
             elif opts.remote_batch_size is not None:
                 batch_size = max(1, int(opts.remote_batch_size))
+            if (
+                opts.plain_choice_batch_size is not None
+                and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
+            ):
+                batch_size = max(1, int(opts.plain_choice_batch_size))
         if not item.is_remote and item.model_path is not None:
             batch_size = batch_profiler.determine_batch_size(
                 job=job,
@@ -794,6 +802,12 @@ def _launch_queue_items(
         extra_args = item.extra_args + _coding_extra_args(opts, job) + _function_calling_extra_args(opts, job)
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
+        infer_timeout_s = opts.infer_timeout_s
+        if (
+            opts.plain_choice_timeout_s is not None
+            and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
+        ):
+            infer_timeout_s = max(1.0, float(opts.plain_choice_timeout_s))
 
         command = build_command(
             job,
@@ -803,7 +817,7 @@ def _launch_queue_items(
             batch_size=batch_size,
             extra_args=extra_args,
             infer_api_key=opts.infer_api_key,
-            infer_timeout_s=opts.infer_timeout_s,
+            infer_timeout_s=infer_timeout_s,
             infer_max_workers=(
                 item_budget.infer_max_workers
                 if item_budget is not None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from src.eval.function_calling.bfcl_exec import _bfcl_ast_model_config_stub, bfcl_official_ast_checker_status
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
 _BFCL_OFFICIAL_MODEL_NAME = "gorilla-openfunctions-v2"
+_BFCL_OFFICIAL_ROOT_RELATIVE = Path("references") / "gorilla" / "berkeley-function-call-leaderboard"
 
 
 def evaluate_bfcl_ast_calls(
@@ -188,7 +190,17 @@ def _record_language(record: SimpleToolCallRecord) -> str:
 
 
 def _record_official_root(record: SimpleToolCallRecord) -> str:
-    return str(record.metadata.get("official_root") or "").strip()
+    raw_root = str(record.metadata.get("official_root") or "").strip()
+    if raw_root and Path(raw_root).expanduser().exists():
+        return str(Path(raw_root).expanduser())
+    fallback_root = _repo_default_official_root()
+    if fallback_root.exists():
+        return str(fallback_root)
+    return raw_root
+
+
+def _repo_default_official_root() -> Path:
+    return Path(__file__).resolve().parents[3] / _BFCL_OFFICIAL_ROOT_RELATIVE
 
 
 def _officialize_tool_schema(tool: Mapping[str, Any]) -> dict[str, Any]:

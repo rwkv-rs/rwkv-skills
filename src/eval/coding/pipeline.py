@@ -878,6 +878,7 @@ class CodingPipeline:
         on_record: Callable[[dict], None] | None = None,
         max_context_chars: int | None = None,
         long_doc_config: LongDocEvidenceConfig | None = None,
+        prompt_profile: str = "normal",
     ) -> CodingPipelineResult:
         batch_size = max(1, int(batch_size))
         if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
@@ -906,6 +907,7 @@ class CodingPipeline:
                     engine=self.backend,
                     sampling=sampling,
                     prompt_seed=prompt_seed,
+                    prompt_profile=prompt_profile,
                 )
                 prompts.append(prompt_text)
                 probe_seeds.append(sample_repeat_seed(record_idx, repeat_idx, stage=1))
@@ -944,6 +946,7 @@ class CodingPipeline:
                 long_doc_config=long_doc_config,
                 engine=self.backend,
                 sampling=sampling,
+                prompt_profile=prompt_profile,
                 prompt_seed=sample_repeat_seed(
                     key.sample_index,
                     key.repeat_index,

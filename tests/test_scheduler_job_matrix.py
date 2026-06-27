@@ -20,7 +20,7 @@ from src.eval.scheduler.jobs import (
 from src.eval.scheduler.actions import (
     QueueOptions,
     _function_calling_extra_args,
-    _running_remote_model_slugs,
+    _running_remote_slot_slugs,
 )
 from src.eval.scheduler.state import RunningEntry
 
@@ -30,12 +30,15 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert "code_mbpp_fake_cot" not in JOB_CATALOGUE
     assert "code_mbpp_cot" not in JOB_CATALOGUE
     assert "code_swe_bench" in JOB_CATALOGUE
+    assert "code_swe_bench_naive" in JOB_CATALOGUE
 
     assert JOB_CATALOGUE["multi_choice_plain"].runner_group is RunnerGroup.KNOWLEDGE
     assert JOB_CATALOGUE["free_response"].runner_group is RunnerGroup.MATHS
     assert JOB_CATALOGUE["code_mbpp"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
-    assert JOB_CATALOGUE["code_swe_bench"].domain == "function_calling"
+    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING
+    assert JOB_CATALOGUE["code_swe_bench"].domain == "code"
+    assert JOB_CATALOGUE["code_swe_bench_naive"].runner_group is RunnerGroup.CODING
+    assert JOB_CATALOGUE["code_swe_bench_naive"].domain == "code"
     assert JOB_CATALOGUE["function_mcp_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
     assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.knowledge.runner"
     assert JOB_CATALOGUE["multi_choice_cot"].module == "src.eval.knowledge.runner"
@@ -45,7 +48,9 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_swe_bench_naive"].module == "src.eval.coding.runner"
     assert JOB_CATALOGUE["instruction_following"].module == "src.eval.instruction_following.runner"
+    assert JOB_CATALOGUE["instruction_following_naive"].module == "src.eval.instruction_following.runner"
     assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_longcodebench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.function_calling.runner"
@@ -59,15 +64,19 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["function_tau3_bench"].module == "src.eval.function_calling.runner"
     assert JOB_CATALOGUE["multi_choice_plain"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["multi_choice_cot"].extra_args == ("--cot-mode", "cot")
+    assert JOB_CATALOGUE["multi_choice_plain"].batch_flag == "--batch-size"
+    assert JOB_CATALOGUE["multi_choice_plain_naive"].batch_flag == "--batch-size"
     assert JOB_CATALOGUE["free_response"].extra_args == ("--judge-mode", "exact")
     assert JOB_CATALOGUE["free_response_judge"].extra_args == ("--judge-mode", "llm")
     assert JOB_CATALOGUE["code_mbpp"].extra_args == ("--cot-mode", "no_cot")
     assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
+    assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench_naive"].dataset_slugs
     assert detect_job_from_dataset(canonical_slug("swe_bench_lite_test"), is_cot=True) == "code_swe_bench"
     assert JOB_CATALOGUE["instruction_following"].extra_args == ()
+    assert JOB_CATALOGUE["instruction_following_naive"].extra_args == ("--prompt-profile", "naive")
 
 
-def test_swe_bench_function_field_does_not_receive_function_prompt_flags(tmp_path: Path) -> None:
+def test_swe_bench_coding_jobs_do_not_receive_function_prompt_flags(tmp_path: Path) -> None:
     opts = QueueOptions(
         log_dir=tmp_path / "logs",
         pid_dir=tmp_path / "pids",
@@ -76,9 +85,10 @@ def test_swe_bench_function_field_does_not_receive_function_prompt_flags(tmp_pat
         function_tool_catalog_format="json",
     )
 
-    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
+    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING
     assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.coding.runner"
     assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench"]) == ()
+    assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench_naive"]) == ()
     assert "--prompt-style" in _function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"])
 
 
@@ -88,13 +98,13 @@ def test_generated_remote_jobs_do_not_occupy_model_slots() -> None:
         "function_bfcl_v3__bfcl_v3_test_cot_rwkv7_g2": RunningEntry(pid=2, gpu=None),
     }
 
-    occupied = _running_remote_model_slugs(
+    occupied = _running_remote_slot_slugs(
         running,
-        ("rwkv7-g1", "rwkv7-g2"),
+        ("g1=rwkv7-g1", "g2=rwkv7-g2"),
         generated_job_ids={"code_swe_bench__swe_bench_lite_test_cot_rwkv7_g1"},
     )
 
-    assert occupied == {"rwkv7_g2"}
+    assert occupied == {"g2"}
 
 
 def test_instruction_following_matrix_includes_rule_scored_datasets_only() -> None:

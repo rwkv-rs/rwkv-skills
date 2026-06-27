@@ -47,6 +47,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     add_inference_backend_arguments(parser)
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for generation")
     parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
+    parser.add_argument(
+        "--prompt-profile",
+        choices=("normal", "naive"),
+        help="Prompt profile: normal and naive are recorded separately; naive keeps the raw instruction input.",
+    )
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
@@ -58,6 +63,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="avg@k values to compute from generated samples (defaults come from configs/<benchmark>.toml)",
     )
     return parser.parse_args(argv)
+
+
+def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
+    if raw:
+        return raw
+    if job_name.endswith("_naive"):
+        return "naive"
+    return "normal"
 
 
 def _ensure_rule_based_dataset(slug: str) -> None:
@@ -126,6 +139,7 @@ def main(
 
     service = EvalDbService()
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", "instruction_following")
+    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
@@ -138,6 +152,7 @@ def main(
             avg_k=plan.avg_k,
             sampling_config={"stage1": sampling_config_to_dict(sampling)},
             effective_sample_count=plan.effective_sample_count,
+            prompt_profile=prompt_profile,
         ),
     )
     task_run = TaskRunState.from_task_execution(
@@ -197,10 +212,14 @@ def main(
                 "tier0_accuracy": metrics.tier0_accuracy,
                 "tier1_accuracy": metrics.tier1_accuracy,
                 "scoring_mode": "loose" if is_ifbench else "strict",
-                **build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                **build_plan_task_details(
+                    plan,
+                    cot_mode=CoTMode.NO_COT.value,
+                    prompt_profile=prompt_profile,
+                ),
                 **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
             },
-            extra={"cot_mode": CoTMode.NO_COT.value},
+            extra={"cot_mode": CoTMode.NO_COT.value, "prompt_profile": prompt_profile},
         )
         runtime.record_score(score_payload)
     except Exception as exc:

@@ -24,6 +24,7 @@ class RemoteModelBackpressure:
     route_count: int = 0
     ok_route_count: int = 0
     pending_queue: int = 0
+    prefill_reserved_bsz: int = 0
     max_batch_size: int | None = None
     failed_batches: int = 0
     last_total_tok_s: float | None = None
@@ -39,6 +40,7 @@ class RemoteConcurrencyBudget:
     launch_allowed: bool = True
     reason: str = "static"
     pending_queue: int | None = None
+    prefill_reserved_bsz: int | None = None
     max_batch_size: int | None = None
     source_status: str | None = None
     error: str | None = None
@@ -55,6 +57,8 @@ class RemoteConcurrencyBudget:
             payload["remote_batch_size"] = int(self.remote_batch_size)
         if self.pending_queue is not None:
             payload["pending_queue"] = int(self.pending_queue)
+        if self.prefill_reserved_bsz is not None:
+            payload["prefill_reserved_bsz"] = int(self.prefill_reserved_bsz)
         if self.max_batch_size is not None:
             payload["max_batch_size"] = int(self.max_batch_size)
         if self.source_status:
@@ -118,6 +122,7 @@ def parse_remote_backpressure(payload: Mapping[str, Any]) -> dict[str, RemoteMod
             route_count=_int_or_zero(raw_entry.get("route_count", aggregate_map.get("route_count"))),
             ok_route_count=_int_or_zero(aggregate_map.get("ok_route_count")),
             pending_queue=_int_or_zero(aggregate_map.get("pending_queue")),
+            prefill_reserved_bsz=_int_or_zero(aggregate_map.get("prefill_reserved_bsz")),
             max_batch_size=_optional_int(aggregate_map.get("max_batch_size")),
             failed_batches=_int_or_zero(aggregate_map.get("failed_batches")),
             last_total_tok_s=_optional_float(aggregate_map.get("last_total_tok_s")),
@@ -169,6 +174,11 @@ def compute_remote_concurrency_budgets(
         elif signal.pending_queue > high_watermark:
             launch_allowed = False
             reason = "backend_queue_pending"
+        else:
+            prefill_high_watermark = _prefill_reserved_high_watermark(signal, high_watermark)
+            if signal.prefill_reserved_bsz > prefill_high_watermark:
+                launch_allowed = False
+                reason = "backend_prefill_reserved"
 
         worker_cap = _positive_or_none(signal.max_batch_size)
         infer_max_workers = max(min_workers, slot_workers)
@@ -185,6 +195,7 @@ def compute_remote_concurrency_budgets(
             launch_allowed=launch_allowed,
             reason=reason,
             pending_queue=signal.pending_queue,
+            prefill_reserved_bsz=signal.prefill_reserved_bsz,
             max_batch_size=signal.max_batch_size,
             source_status=signal.status,
             error=error,
@@ -222,6 +233,14 @@ def _positive_or_none(value: int | None) -> int | None:
     if value is None:
         return None
     return max(1, int(value))
+
+
+def _prefill_reserved_high_watermark(signal: RemoteModelBackpressure, pending_high_watermark: int) -> int:
+    if pending_high_watermark > 0:
+        return int(pending_high_watermark)
+    if signal.max_batch_size is not None and signal.max_batch_size > 0:
+        return max(16, int(signal.max_batch_size) // 5)
+    return 16
 
 
 def _normalize_api_base(base_url: str) -> str:

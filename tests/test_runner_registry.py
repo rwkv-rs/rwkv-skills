@@ -19,6 +19,7 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
     ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.INSTRUCTION_FOLLOWING]] == [
         "instruction_following",
+        "instruction_following_naive",
     ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.CODING]] == [
         "code_human_eval",
@@ -27,9 +28,10 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
         "code_mbpp_naive",
         "code_livecodebench",
         "code_livecodebench_naive",
+        "code_swe_bench",
+        "code_swe_bench_naive",
     ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]] == [
-        "code_swe_bench",
         "function_browsecomp",
         "function_browsecomp_plus",
         "function_complexfuncbench",
@@ -107,9 +109,5 @@ def test_function_calling_runners_share_unified_module() -> None:
     modules = {
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]
-        if runner.name != "code_swe_bench"
     }
     assert modules == {"src.eval.function_calling.runner"}
-    assert next(
-        runner for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING] if runner.name == "code_swe_bench"
-    ).module == "src.eval.coding.runner"

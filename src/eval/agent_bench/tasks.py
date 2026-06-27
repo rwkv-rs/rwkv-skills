@@ -20,6 +20,18 @@ TAU_V1_VENDOR_ROOT = ROOT / "data" / "tau_v1"
 TAU_V2_VENDOR_ROOT = ROOT / "data" / "tau_v2"
 TAU_V2_DATA_ROOT = TAU_V2_VENDOR_ROOT / "data"
 TAU_V2_REFERENCE_ROOT = REPO_ROOT / "references" / "tau2-bench"
+_TAU_V2_BENCH_ROOT_ENV_VARS = (
+    "RWKV_TAU3_BENCH_ROOT",
+    "TAU3_BENCH_ROOT",
+    "RWKV_TAU2_BENCH_ROOT",
+    "TAU2_BENCH_ROOT",
+)
+_TAU_V2_DATA_ROOT_ENV_VARS = (
+    "RWKV_TAU3_DATA_ROOT",
+    "TAU3_DATA_ROOT",
+    "RWKV_TAU2_DATA_ROOT",
+    "TAU2_DATA_DIR",
+)
 
 
 @dataclass(slots=True)
@@ -49,14 +61,8 @@ def ensure_tau_v2_vendor_path() -> Path:
 
 
 def tau_v2_vendor_root() -> Path:
-    override = (
-        os.environ.get("RWKV_TAU3_BENCH_ROOT")
-        or os.environ.get("TAU3_BENCH_ROOT")
-        or os.environ.get("RWKV_TAU2_BENCH_ROOT")
-        or os.environ.get("TAU2_BENCH_ROOT")
-    )
-    if override:
-        root = Path(override).expanduser().resolve()
+    root = _valid_tau_v2_bench_override()
+    if root is not None:
         src_root = root / "src"
         if (src_root / "tau2").exists():
             return src_root
@@ -68,14 +74,9 @@ def tau_v2_vendor_root() -> Path:
 
 
 def tau_v2_data_root() -> Path:
-    override = (
-        os.environ.get("RWKV_TAU3_DATA_ROOT")
-        or os.environ.get("TAU3_DATA_ROOT")
-        or os.environ.get("RWKV_TAU2_DATA_ROOT")
-        or os.environ.get("TAU2_DATA_DIR")
-    )
-    if override:
-        return Path(override).expanduser().resolve()
+    override = _valid_tau_v2_data_override()
+    if override is not None:
+        return override
     vendor_root = tau_v2_vendor_root()
     if vendor_root.name == "src":
         return vendor_root.parent / "data"
@@ -83,6 +84,28 @@ def tau_v2_data_root() -> Path:
     if (reference_data / "tau2").exists():
         return reference_data
     return TAU_V2_DATA_ROOT
+
+
+def _valid_tau_v2_bench_override() -> Path | None:
+    for name in _TAU_V2_BENCH_ROOT_ENV_VARS:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        root = Path(raw).expanduser().resolve()
+        if (root / "src" / "tau2").exists() or (root / "tau2").exists():
+            return root
+    return None
+
+
+def _valid_tau_v2_data_override() -> Path | None:
+    for name in _TAU_V2_DATA_ROOT_ENV_VARS:
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        root = Path(raw).expanduser().resolve()
+        if (root / "tau2").exists():
+            return root
+    return None
 
 
 def tau_v3_source_available() -> bool:

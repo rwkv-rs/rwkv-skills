@@ -13,6 +13,7 @@ from src.eval.function_calling import (
 )
 from src.eval.function_calling.rwkv_prompt import assistant_json_prefix, render_assistant_json_block
 from src.eval.agent_bench.tau_official import (
+    DEFAULT_TAU_BANKING_RETRIEVAL_VARIANT,
     RWKVTauOfficialAgent,
     _apply_tau_json_object_prefill,
     _apply_tau_retail_progressive_tool_disclosure,
@@ -62,6 +63,33 @@ def test_tau_v2_paths_prefer_repo_relative_reference_root(monkeypatch, tmp_path:
     assert tau_tasks.tau_v3_source_available() is True
     assert tau_deps._tau_v2_vendor_root() == reference_root / "src"
     assert tau_deps._tau_v2_data_root() == reference_root / "data"
+
+
+def test_tau_v2_paths_ignore_invalid_environment_overrides(monkeypatch, tmp_path: Path) -> None:
+    reference_root = tmp_path / "references" / "tau2-bench"
+    (reference_root / "src" / "tau2").mkdir(parents=True)
+    (reference_root / "data" / "tau2" / "domains" / "banking_knowledge").mkdir(parents=True)
+    invalid_root = tmp_path / "missing" / "tau2-bench"
+
+    monkeypatch.setenv("RWKV_TAU3_BENCH_ROOT", str(invalid_root))
+    monkeypatch.setenv("RWKV_TAU3_DATA_ROOT", str(invalid_root / "data"))
+    monkeypatch.setattr(tau_tasks, "TAU_V2_REFERENCE_ROOT", reference_root)
+    monkeypatch.setattr(tau_deps, "_TAU_V2_REFERENCE_ROOT", reference_root)
+
+    assert tau_tasks.tau_v2_vendor_root() == reference_root / "src"
+    assert tau_tasks.tau_v2_data_root() == reference_root / "data"
+    assert tau_deps._tau_v2_vendor_root() == reference_root / "src"
+    assert tau_deps._tau_v2_data_root() == reference_root / "data"
+
+
+def test_tau_official_runtime_uses_offline_banking_retrieval() -> None:
+    runtime = object.__new__(TauOfficialRuntime)
+
+    runtime.domain = "banking_knowledge"
+    assert runtime._environment_kwargs() == {"retrieval_variant": DEFAULT_TAU_BANKING_RETRIEVAL_VARIANT}
+
+    runtime.domain = "retail"
+    assert runtime._environment_kwargs() == {}
 
 
 def test_render_tau_user_prompt_prefers_ticket() -> None:

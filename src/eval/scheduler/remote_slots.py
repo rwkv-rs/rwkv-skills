@@ -91,11 +91,13 @@ def infer_workers_for_model(
     if params is None:
         return workers
     if params <= 1.6:
-        return 192
+        return 256
     if params <= 3.1:
         return 128
+    if params >= 13.0:
+        return 48
     if params >= 7.0:
-        return 72
+        return 96
     return workers
 
 

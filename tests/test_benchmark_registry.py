@@ -84,12 +84,12 @@ def test_mbpp_family_is_legacy_no_cot_only() -> None:
     assert not supports_cot_mode("mbpp_plus_test", CoTMode.COT)
 
 
-def test_swe_bench_family_is_function_calling_cot_only() -> None:
+def test_swe_bench_family_is_coding_cot_only_with_naive_variant() -> None:
     metadata = resolve_benchmark_metadata("swe_bench_lite_test")
 
-    assert metadata.field is BenchmarkField.FUNCTION_CALLING
+    assert metadata.field is BenchmarkField.CODING
     assert metadata.cot_modes == (CoTMode.COT,)
-    assert metadata.scheduler_jobs == ("code_swe_bench",)
+    assert metadata.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
     assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
     assert not supports_cot_mode("swe_bench_lite_test", CoTMode.NO_COT)
 
@@ -177,7 +177,7 @@ def test_instruction_following_benchmarks_are_no_cot_only() -> None:
 
     assert metadata.field is BenchmarkField.INSTRUCTION_FOLLOWING
     assert metadata.cot_modes == (CoTMode.NO_COT,)
-    assert metadata.scheduler_jobs == ("instruction_following",)
+    assert metadata.scheduler_jobs == ("instruction_following", "instruction_following_naive")
 
 
 def test_instruction_following_data_only_benchmarks_do_not_use_ifeval_scorer() -> None:

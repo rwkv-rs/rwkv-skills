@@ -53,6 +53,26 @@ def test_build_swebench_prompt_excludes_gold_patch() -> None:
     assert "diff --git a/gold b/gold" not in prompt
 
 
+def test_build_swebench_naive_prompt_uses_raw_issue_only() -> None:
+    record = CodeGenerationRecord(
+        task_id="sympy__sympy-20590",
+        prompt="Fix sympify.",
+        metadata={
+            "repo": "sympy/sympy",
+            "base_commit": "abc123",
+            "instance_id": "sympy__sympy-20590",
+            "retrieved_context": "sympy/core/sympify.py: class SympifyError",
+        },
+    )
+
+    prompt, trace = build_swebench_prompt_with_trace(record, prompt_profile="naive")
+
+    assert prompt == "User: Fix sympify.\n\nAssistant: <think>\n</think>\n```diff\n"
+    assert trace["prompt_profile"] == "naive"
+    assert "sympy/core/sympify.py" not in prompt
+    assert "Return only a unified git diff patch" not in prompt
+
+
 def test_build_swebench_prompt_can_compact_retrieved_context() -> None:
     context = "\n".join(
         [f"noise row {index:03d}" for index in range(35)]

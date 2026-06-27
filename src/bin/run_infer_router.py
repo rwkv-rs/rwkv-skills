@@ -28,6 +28,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=19081, help="Bind port")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="Backend request timeout")
     parser.add_argument(
+        "--choice-logits-timeout-s",
+        type=float,
+        default=None,
+        help="Backend request timeout for /v1/choice_logits; defaults to --timeout-s",
+    )
+    parser.add_argument(
         "--forward-max-workers",
         type=int,
         default=256,
@@ -112,17 +118,22 @@ def create_app(
     routes: Mapping[str, str | Sequence[str]],
     *,
     timeout_s: float = 600.0,
+    choice_logits_timeout_s: float | None = None,
     forward_max_workers: int = 256,
 ) -> FastAPI:
     route_map = normalize_routes(routes)
     route_offsets = {model: 0 for model in route_map}
+    request_timeout_s = float(timeout_s)
+    choice_timeout_s = (
+        request_timeout_s if choice_logits_timeout_s is None else float(choice_logits_timeout_s)
+    )
     forward_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=max(1, int(forward_max_workers)),
         thread_name_prefix="infer-router-forward",
     )
     forward_http_client = _build_forward_http_client(
         max_connections=max(1, int(forward_max_workers)),
-        timeout_s=float(timeout_s),
+        timeout_s=max(request_timeout_s, choice_timeout_s),
     )
 
     @asynccontextmanager
@@ -207,7 +218,7 @@ def create_app(
             routes=route_map,
             route_offsets=route_offsets,
             backend_path="choice_logits",
-            timeout_s=timeout_s,
+            timeout_s=choice_timeout_s,
         )
 
     @app.post("/v1/completions")
@@ -598,6 +609,7 @@ def _backend_backpressure_entry(base_url: str, status_code: int, payload: object
         "active_records": _int_or_zero(pending.get("active_records")),
         "scheduler_waiting": _int_or_zero(pending.get("scheduler_waiting")),
         "scheduler_running": _int_or_zero(pending.get("scheduler_running")),
+        "prefill_reserved_bsz": _int_or_zero(pending.get("prefill_reserved_bsz")),
         "total_batches": _int_or_zero(totals.get("total_batches")),
         "total_requests": _int_or_zero(totals.get("total_requests")),
         "completed_requests": _int_or_zero(totals.get("completed_requests")),
@@ -636,6 +648,7 @@ def _aggregate_backpressure(backends: Sequence[Mapping[str, object]]) -> dict[st
         "active_records": aggregate["active_records"],
         "scheduler_waiting": aggregate["scheduler_waiting"],
         "scheduler_running": aggregate["scheduler_running"],
+        "prefill_reserved_bsz": aggregate["prefill_reserved_bsz"],
         "max_batch_size": aggregate["max_batch_size"],
         "failed_batches": aggregate["failed_batches"],
         "total_batches": aggregate["total_batches"],
@@ -676,6 +689,7 @@ def _aggregate_live_metrics(backends: Sequence[Mapping[str, object]]) -> dict[st
         "active_records": sum(_int_or_zero(entry.get("active_records")) for entry in ok_backends),
         "scheduler_waiting": sum(_int_or_zero(entry.get("scheduler_waiting")) for entry in ok_backends),
         "scheduler_running": sum(_int_or_zero(entry.get("scheduler_running")) for entry in ok_backends),
+        "prefill_reserved_bsz": sum(_int_or_zero(entry.get("prefill_reserved_bsz")) for entry in ok_backends),
         "max_batch_size": sum(max_batch_values) if max_batch_values else None,
         "failed_batches": sum(_int_or_zero(entry.get("failed_batches")) for entry in ok_backends),
         "total_batches": sum(_int_or_zero(entry.get("total_batches")) for entry in ok_backends),
@@ -796,6 +810,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     app = create_app(
         routes,
         timeout_s=float(args.timeout_s),
+        choice_logits_timeout_s=args.choice_logits_timeout_s,
         forward_max_workers=int(args.forward_max_workers),
     )
     uvicorn.run(

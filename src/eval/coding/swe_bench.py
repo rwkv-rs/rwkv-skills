@@ -36,6 +36,7 @@ def build_swebench_prompt(
     engine: Any | None = None,
     sampling: Any | None = None,
     prompt_seed: int | None = None,
+    prompt_profile: str = "normal",
 ) -> str:
     prompt, _trace = build_swebench_prompt_with_trace(
         record,
@@ -44,6 +45,7 @@ def build_swebench_prompt(
         engine=engine,
         sampling=sampling,
         prompt_seed=prompt_seed,
+        prompt_profile=prompt_profile,
     )
     return prompt
 
@@ -56,8 +58,17 @@ def build_swebench_prompt_with_trace(
     engine: Any | None = None,
     sampling: Any | None = None,
     prompt_seed: int | None = None,
+    prompt_profile: str = "normal",
 ) -> tuple[str, dict[str, Any]]:
     metadata = dict(record.metadata)
+    if str(prompt_profile or "normal").strip().lower() == "naive":
+        clean_prompt = str(record.prompt or "").strip()
+        trace = _empty_long_doc_trace("", None)
+        prompt = f"User: {clean_prompt}\n\nAssistant: <think>\n</think>\n```diff\n"
+        trace["prompt_profile"] = "naive"
+        trace["prompt_chars"] = len(prompt)
+        return prompt, trace
+
     repo = str(metadata.get("repo") or "")
     base_commit = str(metadata.get("base_commit") or "")
     instance_id = str(metadata.get("instance_id") or record.task_id)

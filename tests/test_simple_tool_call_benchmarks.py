@@ -5,6 +5,7 @@ from pathlib import Path
 from src.eval.datasets.data_prepper.data_manager import available_function_calling_datasets, prepare_dataset
 from src.eval.datasets.runtime import read_jsonl_items
 from src.eval.function_calling import runner as function_calling_runner
+from src.eval.function_calling import bfcl_ast as bfcl_ast_module
 from src.eval.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
@@ -47,6 +48,23 @@ def test_simple_tool_call_benchmarks_are_registered() -> None:
     assert "toolalpaca_eval_real" in names
     assert "tau3_bench_mock" in names
     assert "tau3_bench_mock_long_context" in names
+
+
+def test_bfcl_ast_official_root_falls_back_when_manifest_path_is_stale(tmp_path: Path, monkeypatch) -> None:
+    fallback_root = tmp_path / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+    fallback_root.mkdir(parents=True)
+    stale_root = tmp_path / "old-machine" / "berkeley-function-call-leaderboard"
+    record = SimpleToolCallRecord(
+        task_id="exec_simple_0",
+        instruction="User: call the function.",
+        tools=(),
+        expected_tool_calls=(),
+        metadata={"source_format": "official_bfcl_v4_ast", "official_root": str(stale_root)},
+    )
+
+    monkeypatch.setattr(bfcl_ast_module, "_repo_default_official_root", lambda: fallback_root)
+
+    assert bfcl_ast_module._record_official_root(record) == str(fallback_root)
 
 
 def test_prepare_dataset_materializes_bfcl_small_ast_spec(tmp_path: Path, monkeypatch) -> None:

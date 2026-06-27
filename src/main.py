@@ -595,6 +595,8 @@ def _default_job_name(config: RunConfig, benchmark: BenchmarkMetadata) -> str:
         default_mode = benchmark.cot_modes[0] if benchmark.cot_modes else CoTMode.NO_COT
         _resolve_cot_mode(config.runner.cot_mode, benchmark=benchmark, default=default_mode)
         return _first_normal_scheduler_job(jobs)
+    if benchmark.field is BenchmarkField.INSTRUCTION_FOLLOWING:
+        return _first_normal_scheduler_job(jobs)
     if benchmark.field is BenchmarkField.FUNCTION_CALLING:
         return _first_normal_scheduler_job(jobs)
     raise ValueError(f"benchmark {benchmark.name!r} requires an explicit run.job")
@@ -685,7 +687,7 @@ def _coding_benchmark_kind(job_name: str) -> str:
         return "human_eval"
     if job_name == "code_livecodebench":
         return "livecodebench"
-    if job_name == "code_swe_bench":
+    if job_name in {"code_swe_bench", "code_swe_bench_naive"}:
         return "swe_bench"
     return "mbpp"
 

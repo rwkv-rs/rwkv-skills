@@ -8,7 +8,12 @@ from src.bin.param_search_select import parse_args as parse_param_search_select_
 from src.eval.scheduler import actions, queue
 from src.eval.scheduler.actions import DispatchOptions
 from src.eval.scheduler.admin import SchedulerStartRequest
-from src.eval.scheduler.backpressure import RemoteConcurrencyBudget, parse_remote_backpressure
+from src.eval.scheduler.backpressure import (
+    RemoteConcurrencyBudget,
+    RemoteModelBackpressure,
+    compute_remote_concurrency_budgets,
+    parse_remote_backpressure,
+)
 from src.eval.scheduler.cli import build_parser
 from src.eval.scheduler.jobs import JOB_CATALOGUE
 from src.eval.scheduler.remote_slots import infer_workers_for_model
@@ -115,7 +120,7 @@ def test_param_size_worker_profile_gives_smaller_models_more_workers() -> None:
             default_workers=32,
             profile="param-size",
         )
-        == 192
+        == 256
     )
     assert (
         infer_workers_for_model(
@@ -131,7 +136,15 @@ def test_param_size_worker_profile_gives_smaller_models_more_workers() -> None:
             default_workers=32,
             profile="param-size",
         )
-        == 72
+        == 96
+    )
+    assert (
+        infer_workers_for_model(
+            "rwkv7-g1f-14b-20260428-ctx8192",
+            default_workers=32,
+            profile="param-size",
+        )
+        == 48
     )
 
 
@@ -500,6 +513,7 @@ def test_parse_remote_backpressure_payload_uses_router_aggregate() -> None:
                     "aggregate": {
                         "ok_route_count": 1,
                         "pending_queue": 0,
+                        "prefill_reserved_bsz": 5,
                         "max_batch_size": 16,
                         "failed_batches": 0,
                         "last_total_tok_s": 12.5,
@@ -513,7 +527,33 @@ def test_parse_remote_backpressure_payload_uses_router_aggregate() -> None:
     assert signal.status == "ok"
     assert signal.ok_route_count == 1
     assert signal.pending_queue == 0
+    assert signal.prefill_reserved_bsz == 5
     assert signal.max_batch_size == 16
+
+
+def test_prefill_reserved_backpressure_blocks_launches() -> None:
+    budgets = compute_remote_concurrency_budgets(
+        infer_models=("remote-a",),
+        backpressure={
+            "remote_a": RemoteModelBackpressure(
+                model="remote-a",
+                model_slug="remote_a",
+                status="ok",
+                route_count=1,
+                ok_route_count=1,
+                pending_queue=0,
+                prefill_reserved_bsz=90,
+                max_batch_size=400,
+            )
+        },
+        default_infer_max_workers=8,
+        default_remote_batch_size=64,
+    )
+
+    budget = budgets["remote_a"]
+    assert budget.launch_allowed is False
+    assert budget.reason == "backend_prefill_reserved"
+    assert budget.prefill_reserved_bsz == 90
 
 
 def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:

@@ -7,7 +7,9 @@ from pathlib import Path
 from src.eval.function_calling import longbench as longbench_module
 from src.eval.function_calling.longbench import (
     LongBenchRecord,
+    MAX_LONGBENCH_GENERATION_BATCH_SIZE,
     _run_longbench,
+    _resolve_longbench_batch_size,
     build_longbench_budgeted_prompt,
     normalize_longbench_answer,
     score_longbench_answer,
@@ -46,6 +48,12 @@ def test_longbench_score_uses_best_reference_f1() -> None:
     assert score.f1 == 1.0
     assert score.passed is True
     assert score.best_reference == "Alice Smith"
+
+
+def test_longbench_batch_size_is_capped_for_long_context_generation() -> None:
+    assert _resolve_longbench_batch_size(64) == MAX_LONGBENCH_GENERATION_BATCH_SIZE
+    assert _resolve_longbench_batch_size(None) == MAX_LONGBENCH_GENERATION_BATCH_SIZE
+    assert _resolve_longbench_batch_size(2) == 2
 
 
 def test_longbench_budgeted_prompt_compacts_long_context() -> None:

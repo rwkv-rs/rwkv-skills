@@ -234,6 +234,16 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         help="远端 seed 策略：默认保留 seed；omit-for-contents 在 nano contents 批量时丢弃 seed",
     )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
+    parser.add_argument(
+        "--plain-choice-batch-size",
+        type=int,
+        help="远端 multi_choice_plain/multi_choice_plain_naive 的专用 --batch-size；未设置则使用 --remote-batch-size",
+    )
+    parser.add_argument(
+        "--plain-choice-timeout-s",
+        type=float,
+        help="远端 multi_choice_plain/multi_choice_plain_naive 的专用请求超时；未设置则使用 --infer-timeout-s",
+    )
     parser.add_argument("--sample-workers", type=int, help="runner 侧 episode 并发数；当前透传给 function-calling runner")
     parser.add_argument("--coding-eval-workers", type=int, help="coding runner 本地评测并发数；透传为 --eval-workers")
     parser.add_argument("--max-active-coding-runners", type=int, help="最多同时运行的 coding runner 数；空出的远端槽可调度非 coding 任务")
@@ -450,6 +460,16 @@ def _dispatch_options_from_args(
         remote_batch_size=(
             int(getattr(args, "remote_batch_size"))
             if getattr(args, "remote_batch_size", None) is not None
+            else None
+        ),
+        plain_choice_batch_size=(
+            int(getattr(args, "plain_choice_batch_size"))
+            if getattr(args, "plain_choice_batch_size", None) is not None
+            else None
+        ),
+        plain_choice_timeout_s=(
+            float(getattr(args, "plain_choice_timeout_s"))
+            if getattr(args, "plain_choice_timeout_s", None) is not None
             else None
         ),
         sample_workers=(

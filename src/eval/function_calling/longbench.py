@@ -96,6 +96,7 @@ LONGBENCH_STOP_SUFFIXES = (
     "\nSystem:",
     "\nAssistant:",
 )
+MAX_LONGBENCH_GENERATION_BATCH_SIZE = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +358,10 @@ def score_longbench_answer(prediction: str, references: Sequence[str]) -> LongBe
     return best
 
 
+def _resolve_longbench_batch_size(raw: Any) -> int:
+    return min(MAX_LONGBENCH_GENERATION_BATCH_SIZE, max(1, int(raw or 8)))
+
+
 def compute_longbench_completion_metrics(completions_payloads: Sequence[Mapping[str, object]]) -> dict[str, float]:
     if not completions_payloads:
         return {}
@@ -445,7 +450,7 @@ def _run_longbench(
     if sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     sampling = sampling.clamp(args.answer_max_tokens)
-    batch_size = max(1, int(args.batch_size or 8))
+    batch_size = _resolve_longbench_batch_size(args.batch_size)
     prompt_max_chars = int(args.prompt_max_chars or 8192)
     long_doc_config = _longbench_long_doc_config(args)
     sampling_payload = attach_function_calling_context_metadata(

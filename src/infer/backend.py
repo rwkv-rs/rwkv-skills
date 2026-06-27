@@ -871,9 +871,15 @@ class RemoteInferenceBackend:
                     headers=headers,
                     timeout=timeout_s,
                 )
-                if int(response.status_code) >= 400:
-                    raise RemoteHTTPError(int(response.status_code), response.text)
-                return response.content.decode("utf-8")
+                try:
+                    if int(response.status_code) >= 400:
+                        raise RemoteHTTPError(int(response.status_code), response.text)
+                    content = response.content
+                finally:
+                    close_response = getattr(response, "close", None)
+                    if callable(close_response):
+                        close_response()
+                return content.decode("utf-8")
             except RemoteHTTPError as exc:
                 last_exc = exc
                 if not _is_retryable_remote_http_error(exc) or attempt >= attempts:

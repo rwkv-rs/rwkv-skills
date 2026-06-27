@@ -17,6 +17,15 @@ DATA_OUTPUT_ROOT = DATASET_ROOTS[0]
 
 _dataset_index: dict[str, Path] = {}
 _dataset_index_stale = True
+_SKIP_INDEX_DIR_NAMES = {"cache", "__pycache__"}
+
+
+def _is_indexable_dataset_path(candidate: Path, root: Path) -> bool:
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        relative = candidate
+    return not any(part.startswith(".") or part in _SKIP_INDEX_DIR_NAMES for part in relative.parts)
 
 
 def refresh_dataset_index(roots: Sequence[Path] | None = None) -> None:
@@ -27,6 +36,8 @@ def refresh_dataset_index(roots: Sequence[Path] | None = None) -> None:
         if not root.exists():
             continue
         for candidate in root.rglob("*.jsonl"):
+            if not _is_indexable_dataset_path(candidate, root):
+                continue
             slug = infer_dataset_slug_from_path(str(candidate))
             resolved = candidate.resolve()
             previous = index.get(slug)

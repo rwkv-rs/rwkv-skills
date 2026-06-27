@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 
-from fastapi.testclient import TestClient
+from fastapi.responses import Response
 
+import src.bin.run_infer_router as infer_router
 from src.bin.run_infer_router import (
     _build_backpressure_payload,
     _build_batch_metrics_payload,
@@ -96,65 +99,121 @@ def test_router_forward_max_workers_is_configurable() -> None:
         _close_router_app(app)
 
 
-def test_choice_logits_contents_batch_is_sharded_across_replicas(monkeypatch) -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
+def test_choice_logits_timeout_is_configurable(monkeypatch) -> None:
+    calls: list[tuple[str, float]] = []
 
-    def _fake_post_raw(url, body, authorization, content_type, timeout_s, http_client):  # noqa: ANN001
-        del authorization, content_type, timeout_s, http_client
-        payload = json.loads(body.decode("utf-8"))
-        calls.append((url, payload))
-        results = [
-            {
-                "index": index,
-                "choice_logits": {"A": float(index), "B": -float(index)},
-                "choice_probabilities": {"A": 0.75, "B": 0.25},
-                "best_choice": "A",
-            }
-            for index, _content in enumerate(payload["contents"])
-        ]
-        return (
-            200,
-            json.dumps(
+    def _fake_post_bytes(url, body, authorization, content_type, timeout_s, http_client):  # noqa: ANN001
+        del body, authorization, content_type, http_client
+        calls.append((url, float(timeout_s)))
+        return Response(
+            content=json.dumps(
                 {
                     "id": "backend-choice-logits",
-                    "object": "choice.logits.batch",
-                    "model": payload["model"],
-                    "results": results,
+                    "object": "choice.logits",
+                    "model": "model-a",
+                    "choice_logits": {"A": 1.0},
+                    "best_choice": "A",
                 }
             ).encode("utf-8"),
-            "application/json",
+            status_code=200,
+            media_type="application/json",
         )
 
-    monkeypatch.setattr("src.bin.run_infer_router._post_raw", _fake_post_raw)
+    monkeypatch.setattr(infer_router, "_post_bytes", _fake_post_bytes)
+    args = parse_args(
+        [
+            "--route",
+            "model-a=http://127.0.0.1:18081",
+            "--timeout-s",
+            "900",
+            "--choice-logits-timeout-s",
+            "37",
+        ]
+    )
     app = create_app(
+        {"model-a": "http://127.0.0.1:18081"},
+        timeout_s=args.timeout_s,
+        choice_logits_timeout_s=args.choice_logits_timeout_s,
+    )
+    try:
+        async def _body() -> bytes:
+            return json.dumps(
+                {"model": "model-a", "content": "question", "choices": {"A": " A"}}
+            ).encode("utf-8")
+
+        response = asyncio.run(
+            infer_router._forward_json_request(
+                SimpleNamespace(
+                    app=SimpleNamespace(state=app.state),
+                    headers={"content-type": "application/json"},
+                    body=_body,
+                ),
+                routes=infer_router.normalize_routes({"model-a": "http://127.0.0.1:18081"}),
+                route_offsets={"model-a": 0},
+                backend_path="choice_logits",
+                timeout_s=float(args.choice_logits_timeout_s),
+            )
+        )
+    finally:
+        _close_router_app(app)
+
+    assert response.status_code == 200
+    assert calls == [("http://127.0.0.1:18081/v1/choice_logits", 37.0)]
+
+
+def test_choice_logits_contents_batch_is_sharded_across_replicas() -> None:
+    payload = {
+        "model": "model-a",
+        "contents": ["q0", "q1", "q2", "q3"],
+        "choices": {"A": " A", "B": " B"},
+    }
+    urls = infer_router.normalize_routes(
         {
             "model-a": (
                 "http://127.0.0.1:18081",
                 "http://127.0.0.1:18082",
             )
         }
-    )
-    client = TestClient(app)
-    try:
-        response = client.post(
-            "/v1/choice_logits",
-            json={
-                "model": "model-a",
-                "contents": ["q0", "q1", "q2", "q3"],
-                "choices": {"A": " A", "B": " B"},
-            },
+    )["model-a"]
+    subrequests = infer_router._split_contents_payload(payload, urls=urls, start_offset=0)
+    calls = [(base_url, subpayload) for base_url, _indices, subpayload in subrequests]
+    results = []
+    for _base_url, _indices, subpayload in subrequests:
+        local_results = [
+            {
+                "index": index,
+                "choice_logits": {"A": float(index), "B": -float(index)},
+                "choice_probabilities": {"A": 0.75, "B": 0.25},
+                "best_choice": "A",
+            }
+            for index, _content in enumerate(subpayload["contents"])
+        ]
+        results.append(
+            (
+                200,
+                json.dumps(
+                    {
+                        "id": "backend-choice-logits",
+                        "object": "choice.logits.batch",
+                        "model": subpayload["model"],
+                        "results": local_results,
+                    }
+                ).encode("utf-8"),
+                "application/json",
+            )
         )
-    finally:
-        client.close()
-        _close_router_app(app)
 
-    assert response.status_code == 200
+    body = infer_router._merge_choice_logits_batch_responses(
+        payload,
+        subrequests=subrequests,
+        results=results,
+    )
+
     assert [call[0] for call in calls] == [
-        "http://127.0.0.1:18081/v1/choice_logits",
-        "http://127.0.0.1:18082/v1/choice_logits",
+        "http://127.0.0.1:18081/v1",
+        "http://127.0.0.1:18082/v1",
     ]
     assert [call[1]["contents"] for call in calls] == [["q0", "q1"], ["q2", "q3"]]
-    body = response.json()
     assert body["object"] == "choice.logits.batch"
     assert body["model"] == "model-a"
     assert [result["index"] for result in body["results"]] == [0, 1, 2, 3]
@@ -172,7 +231,7 @@ def test_router_forward_http_client_is_shared(monkeypatch) -> None:
         def close(self):
             self.closed = True
 
-    monkeypatch.setattr("src.bin.run_infer_router.httpx.Client", _FakeHTTPClient)
+    monkeypatch.setattr(infer_router.httpx, "Client", _FakeHTTPClient)
     app = create_app({"model-a": "http://127.0.0.1:18081"}, forward_max_workers=96, timeout_s=12.0)
 
     assert len(created_clients) == 1
@@ -209,6 +268,7 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
                             "active_records": 2,
                             "scheduler_waiting": 1,
                             "scheduler_running": 1,
+                            "prefill_reserved_bsz": 3,
                         },
                         "totals": {
                             "total_batches": 3,
@@ -233,6 +293,7 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
                             "active_records": 1,
                             "scheduler_waiting": 1,
                             "scheduler_running": 0,
+                            "prefill_reserved_bsz": 2,
                         },
                         "totals": {
                             "total_batches": 2,
@@ -257,6 +318,7 @@ def test_build_backpressure_payload_aggregates_backend_metrics() -> None:
     assert aggregate["active_records"] == 3
     assert aggregate["scheduler_waiting"] == 2
     assert aggregate["scheduler_running"] == 1
+    assert aggregate["prefill_reserved_bsz"] == 5
     assert aggregate["max_batch_size"] == 24
     assert aggregate["failed_batches"] == 1
     assert aggregate["completed_requests"] == 18
@@ -283,6 +345,7 @@ def test_build_batch_metrics_payload_preserves_backend_live_metrics() -> None:
                             "active_records": 3,
                             "scheduler_waiting": 2,
                             "scheduler_running": 1,
+                            "prefill_reserved_bsz": 7,
                         },
                         "totals": {
                             "total_batches": 5,
@@ -305,5 +368,6 @@ def test_build_batch_metrics_payload_preserves_backend_live_metrics() -> None:
     model = payload["models"]["model-a"]
     assert model["status"] == "ok"
     assert model["aggregate"]["pending_queue"] == 4
+    assert model["aggregate"]["prefill_reserved_bsz"] == 7
     assert model["aggregate"]["completed_requests"] == 9
     assert model["backends"][0]["backend_live"]["state_cache"]["hits"] == 2

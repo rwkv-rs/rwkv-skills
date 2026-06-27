@@ -69,8 +69,8 @@ _MBPP_JOBS = ("code_mbpp",)
 _MBPP_NAIVE_JOBS = ("code_mbpp", "code_mbpp_naive")
 _LIVECODEBENCH_JOBS = ("code_livecodebench",)
 _LIVECODEBENCH_NAIVE_JOBS = ("code_livecodebench", "code_livecodebench_naive")
-_SWE_BENCH_JOBS = ("code_swe_bench",)
-_INSTRUCTION_FOLLOWING_JOBS = ("instruction_following",)
+_SWE_BENCH_JOBS = ("code_swe_bench", "code_swe_bench_naive")
+_INSTRUCTION_FOLLOWING_JOBS = ("instruction_following", "instruction_following_naive")
 _BROWSECOMP_JOBS = ("function_browsecomp",)
 _COMPLEXFUNCBENCH_JOBS = ("function_complexfuncbench",)
 _LONGBENCH_JOBS = ("function_longbench",)
@@ -176,10 +176,10 @@ def _coding_livecodebench(name: str, *, dataset_name: str | None = None) -> Benc
     )
 
 
-def _function_swe_bench(name: str, *, dataset_name: str | None = None) -> BenchmarkMetadata:
+def _coding_swe_bench(name: str, *, dataset_name: str | None = None) -> BenchmarkMetadata:
     return _metadata(
         name,
-        field=BenchmarkField.FUNCTION_CALLING,
+        field=BenchmarkField.CODING,
         cot_modes=_COT_ONLY,
         dataset_name=dataset_name,
         scheduler_jobs=_SWE_BENCH_JOBS,
@@ -267,11 +267,11 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("mbpp"): _coding_mbpp("mbpp"),
     canonical_slug("mbpp_plus"): _coding_mbpp("mbpp_plus"),
     canonical_slug("livecodebench"): _coding_livecodebench("livecodebench"),
-    canonical_slug("swe_bench"): _function_swe_bench("swe_bench"),
-    canonical_slug("swe_bench_lite"): _function_swe_bench("swe_bench_lite"),
-    canonical_slug("swe_bench_verified"): _function_swe_bench("swe_bench_verified"),
-    canonical_slug("swe_bench_lite_oracle"): _function_swe_bench("swe_bench_lite_oracle"),
-    canonical_slug("swe_bench_lite_bm25_13k"): _function_swe_bench("swe_bench_lite_bm25_13k"),
+    canonical_slug("swe_bench"): _coding_swe_bench("swe_bench"),
+    canonical_slug("swe_bench_lite"): _coding_swe_bench("swe_bench_lite"),
+    canonical_slug("swe_bench_verified"): _coding_swe_bench("swe_bench_verified"),
+    canonical_slug("swe_bench_lite_oracle"): _coding_swe_bench("swe_bench_lite_oracle"),
+    canonical_slug("swe_bench_lite_bm25_13k"): _coding_swe_bench("swe_bench_lite_bm25_13k"),
     # Instruction following
     canonical_slug("ifeval"): _instruction_following("ifeval"),
     canonical_slug("ifbench"): _instruction_following("ifbench"),

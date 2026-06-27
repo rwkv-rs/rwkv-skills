@@ -40,6 +40,17 @@ def bfcl_v3_source_paths(split: str) -> tuple[Path, ...]:
     if root.is_file():
         return (root,)
 
+    direct_sources = tuple(
+        dict.fromkeys(
+            path.resolve()
+            for pattern in ("BFCL_v3_multi_turn_*.json", "BFCL_v4_multi_turn_*.json")
+            for path in sorted(root.glob(pattern))
+            if path.is_file()
+        )
+    )
+    if direct_sources:
+        return direct_sources
+
     base_roots = [root]
     if not _bfcl_v3_source_override():
         cache_root = (

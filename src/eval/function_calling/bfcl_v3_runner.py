@@ -283,19 +283,34 @@ def _candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCand
         return None
     if mode != "parallel":
         raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off or parallel")
+    defaults = ParallelCandidateRouterConfig()
+    tool_schema_mode = str(
+        getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode
+    )
+    if tool_schema_mode not in {"minimal", "compact", "full"}:
+        tool_schema_mode = defaults.tool_schema_mode
     return ParallelCandidateRouterConfig(
-        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), 2),
-        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), 16),
-        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), 6000),
-        prompt_max_chars=_positive_int(getattr(args, "candidate_router_prompt_max_chars", None), 8192),
-        candidate_max_tokens=_positive_int(getattr(args, "candidate_router_candidate_max_tokens", None), 192),
-        aggregate_max_tokens=_positive_int(getattr(args, "candidate_router_aggregate_max_tokens", None), 192),
-        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), 12),
-        tool_schema_mode=str(getattr(args, "candidate_router_tool_schema_mode", "compact") or "compact"),
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
+        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
+        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
+        prompt_max_chars=_positive_int(
+            getattr(args, "candidate_router_prompt_max_chars", None),
+            defaults.prompt_max_chars,
+        ),
+        candidate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_candidate_max_tokens", None),
+            defaults.candidate_max_tokens,
+        ),
+        aggregate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_aggregate_max_tokens", None),
+            defaults.aggregate_max_tokens,
+        ),
+        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), defaults.max_candidates),
+        tool_schema_mode=tool_schema_mode,
         include_respond=False,
         fallback_to_highest_confidence=True,
-        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), 220),
-        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), 1200),
+        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), defaults.evidence_chars),
+        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), defaults.policy_chars),
         ground_identifier_arguments=not bool(getattr(args, "disable_candidate_router_grounding", False)),
     )
 

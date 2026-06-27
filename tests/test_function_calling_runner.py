@@ -91,8 +91,14 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert args.candidate_router_mode == "parallel"
     assert args.candidate_router_chunk_tools == 2
     assert args.candidate_router_batch_size == 4
+    assert args.candidate_router_tool_schema_mode == "compact"
     assert args.sample_workers == 8
     assert args.candidate_router_prompt_max_chars == 8192
+    candidate_router_config = bfcl_v3_runner._candidate_router_config_from_args(args)
+    assert candidate_router_config is not None
+    assert candidate_router_config.tool_schema_mode == "compact"
+    assert candidate_router_config.chunk_tools == 2
+    assert candidate_router_config.batch_size == 4
 
 
 def test_function_calling_runner_rejects_local_sample_workers() -> None:

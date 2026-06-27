@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 _SAMPLE_WORKER_ENABLED_KINDS = frozenset(
     {FunctionCallingBenchmarkKind.BFCL_V3, FunctionCallingBenchmarkKind.BROWSECOMP_PLUS}
 )
+_PARALLEL_CANDIDATE_ROUTER_DEFAULTS = ParallelCandidateRouterConfig()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -239,61 +240,61 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-router-chunk-tools",
         type=int,
-        default=ParallelCandidateRouterConfig.chunk_tools,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.chunk_tools,
         help="Tool count per parallel candidate-router shard",
     )
     parser.add_argument(
         "--candidate-router-batch-size",
         type=int,
-        default=ParallelCandidateRouterConfig.batch_size,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.batch_size,
         help="Generation batch size for candidate-router shard calls",
     )
     parser.add_argument(
         "--candidate-router-context-chars",
         type=int,
-        default=ParallelCandidateRouterConfig.context_chars,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.context_chars,
         help="Conversation characters shown to each candidate-router shard",
     )
     parser.add_argument(
         "--candidate-router-prompt-max-chars",
         type=int,
-        default=ParallelCandidateRouterConfig.prompt_max_chars,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.prompt_max_chars,
         help="Hard prompt character budget for each candidate-router shard prompt",
     )
     parser.add_argument(
         "--candidate-router-candidate-max-tokens",
         type=int,
-        default=ParallelCandidateRouterConfig.candidate_max_tokens,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.candidate_max_tokens,
         help="Generation token cap for each candidate-router shard",
     )
     parser.add_argument(
         "--candidate-router-aggregate-max-tokens",
         type=int,
-        default=ParallelCandidateRouterConfig.aggregate_max_tokens,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.aggregate_max_tokens,
         help="Generation token cap for candidate-router aggregation",
     )
     parser.add_argument(
         "--candidate-router-max-candidates",
         type=int,
-        default=ParallelCandidateRouterConfig.max_candidates,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.max_candidates,
         help="Maximum candidate calls considered by the aggregator",
     )
     parser.add_argument(
         "--candidate-router-tool-schema-mode",
         choices=("minimal", "compact", "full"),
-        default=ParallelCandidateRouterConfig.tool_schema_mode,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.tool_schema_mode,
         help="Tool schema verbosity used inside candidate-router shard prompts",
     )
     parser.add_argument(
         "--candidate-router-evidence-chars",
         type=int,
-        default=ParallelCandidateRouterConfig.evidence_chars,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.evidence_chars,
         help="Maximum evidence characters retained per candidate-router candidate",
     )
     parser.add_argument(
         "--candidate-router-policy-chars",
         type=int,
-        default=ParallelCandidateRouterConfig.policy_chars,
+        default=_PARALLEL_CANDIDATE_ROUTER_DEFAULTS.policy_chars,
         help="Policy/system prompt excerpt characters shown to candidate-router prompts",
     )
     parser.add_argument(

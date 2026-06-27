@@ -38,7 +38,7 @@ class CodingBenchmarkKind(str, Enum):
 _HUMAN_EVAL_JOB_NAMES = frozenset({"code_human_eval"})
 _MBPP_JOB_NAMES = frozenset({"code_mbpp"})
 _LIVECODEBENCH_JOB_NAMES = frozenset({"code_livecodebench"})
-_SWE_BENCH_JOB_NAMES = frozenset({"code_swe_bench"})
+_SWE_BENCH_JOB_NAMES = frozenset({"code_swe_bench", "code_swe_bench_naive"})
 _DEFAULT_PASS_K: tuple[int, ...] = ()
 _DEFAULT_AVG_K: tuple[float, ...] = ()
 
@@ -318,8 +318,6 @@ def main(
         _default_job_name(benchmark_kind, cot_mode),
     )
     prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
-    if prompt_profile == "naive" and benchmark_kind is CodingBenchmarkKind.SWE_BENCH:
-        raise ValueError("swe_bench does not support prompt_profile=naive")
     completion_style_remote = False
     if benchmark_kind in {CodingBenchmarkKind.HUMAN_EVAL, CodingBenchmarkKind.MBPP}:
         completion_style_remote = require_completion_style_remote_protocol(
@@ -407,6 +405,7 @@ def main(
                 samples_per_task=1,
                 max_context_chars=args.swebench_max_context_chars,
                 long_doc_config=long_doc_config,
+                prompt_profile=prompt_profile,
             )
         print(
             "🧪 probe-only run completed: "
@@ -519,6 +518,7 @@ def main(
                 on_record=writer.enqueue,
                 max_context_chars=args.swebench_max_context_chars,
                 long_doc_config=long_doc_config,
+                prompt_profile=prompt_profile,
             )
     except Exception:
         runtime.handle_attempt_stage_failure(writer)
