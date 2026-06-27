@@ -944,6 +944,29 @@ class EvalDbService:
             is_param_search=is_param_search,
         )
 
+    def list_score_history(self, *, model: str, dataset: str) -> list[dict[str, Any]]:
+        """Every official score for one model+benchmark (no dedup / latest-only)."""
+        benchmark_name, benchmark_split = split_benchmark_and_split(dataset)
+        return self._repo.fetch_score_history(
+            benchmark_name=benchmark_name,
+            benchmark_split=benchmark_split,
+            model_name=normalize_model_name(model),
+        )
+
+    def list_score_history_pairs(self) -> list[dict[str, Any]]:
+        """Distinct (model, dataset) options for the score-history picker."""
+        return self._repo.fetch_score_history_pairs()
+
+    def get_score_history_detail(self, *, task_id: str) -> dict[str, Any] | None:
+        """Score + task + representative completion context for one task."""
+        tid = int(task_id)
+        score = self._repo.fetch_score_by_task(task_id=tid)
+        task = self._repo.fetch_task(task_id=tid)
+        if score is None and task is None:
+            return None
+        context = self._repo.fetch_first_completion_context(task_id=tid)
+        return {"score": score, "task": task, "context": context}
+
     def count_completions(
         self,
         *,

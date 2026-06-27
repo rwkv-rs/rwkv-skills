@@ -60,6 +60,17 @@ export interface DomainTable {
   key: string;
   title: string;
   label: string;
+  param_columns: ParamColumn[];
+  rows: LeaderboardRow[];
+}
+
+/** 朴素榜 (naive board): a single flat detail table, always present. */
+export interface NaiveBoard {
+  key: string;
+  title: string;
+  label: string;
+  is_delta: boolean;
+  param_columns: ParamColumn[];
   rows: LeaderboardRow[];
 }
 
@@ -106,6 +117,7 @@ export interface LeaderboardResponse {
   param_columns: ParamColumn[];
   interaction_meta: Record<string, CellMeta>;
   domains: DomainTable[];
+  naive_board?: NaiveBoard;
   overview?: OverviewRow[];
   selection: SelectionInfo;
   charts: ChartPayload;
@@ -229,8 +241,111 @@ function adminHeaders(extra?: Record<string, string>): Record<string, string> {
   return headers;
 }
 
+// ---- Score history types ----------------------------------------------
+
+export interface ScoreHistoryPoint {
+  score_id: number;
+  task_id: number;
+  cot_mode: string;
+  evaluator: string | null;
+  board: "normal" | "naive";
+  percent: number | null;
+  metric: string | null;
+  created_at: string | null;
+  sampling_summary: string;
+  model: string | null;
+  benchmark: string | null;
+}
+
+export interface ScoreHistoryGroup {
+  cot_mode: string;
+  points: ScoreHistoryPoint[];
+}
+
+export interface ScoreHistoryResponse {
+  model: string;
+  benchmark: string;
+  total: number;
+  groups: ScoreHistoryGroup[];
+}
+
+export interface ScoreHistoryOptions {
+  models: string[];
+  benchmarks: string[];
+  pairs: { model: string; dataset: string }[];
+}
+
+export interface StopTokenRow {
+  id: number;
+  token: string;
+}
+
+export interface StageSampling {
+  temperature: number | null;
+  top_k: number | null;
+  top_p: number | null;
+  max_tokens: number | null;
+  stop_tokens: StopTokenRow[];
+  penalties: {
+    presence_penalty: number | null;
+    repetition_penalty: number | null;
+    penalty_decay: number | null;
+  };
+}
+
+export interface ScoreHistoryDetail {
+  found: boolean;
+  task_id: number;
+  model: string | null;
+  benchmark: string | null;
+  cot_mode: string | null;
+  evaluator: string | null;
+  board: string;
+  metric: string | null;
+  percent: number | null;
+  metrics: Record<string, unknown>;
+  sampling: {
+    stages: Record<string, StageSampling>;
+    effective_sample_count: number | null;
+    avg_k: unknown;
+    pass_ks: unknown;
+    n_shot: unknown;
+    sample_limit: unknown;
+    prompt_profile: string | null;
+  };
+  stages: { prompt: string; completion: string; stop_reason: unknown }[];
+}
+
+export interface CapturePageRequest {
+  url: string;
+  width?: number;
+  height?: number;
+}
+
+export interface CapturePageResponse {
+  path: string;
+  url: string;
+  width: number;
+  height: number;
+  page_height: number | null;
+  full_page: boolean;
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status}: ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${detail}`);
@@ -281,6 +396,16 @@ export const api = {
     });
     return getJson<EvalRecordsPage>(`/api/eval-records?${params.toString()}`);
   },
+  scoreHistoryOptions: () => getJson<ScoreHistoryOptions>("/api/score-history/options"),
+  scoreHistory: (model: string, benchmark: string) =>
+    getJson<ScoreHistoryResponse>(
+      `/api/score-history?model=${encodeURIComponent(model)}&benchmark=${encodeURIComponent(benchmark)}`
+  ),
+  scoreHistoryDetail: (taskId: number) =>
+    getJson<ScoreHistoryDetail>(`/api/score-history/detail?task_id=${taskId}`),
+  capturePage: (payload: CapturePageRequest) =>
+    postJson<CapturePageResponse>("/api/capture-page", payload),
+
   evalContext: (taskId: number, sampleIndex: number, repeatIndex: number, passIndex: number) => {
     const params = new URLSearchParams({
       task_id: String(taskId),

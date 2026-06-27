@@ -26,6 +26,39 @@ uv pip install -e .
 ```
 如需其他 CUDA/CPU 发行版，请改用 `--extra torch-cu126` / `--extra torch-cpu` 等。
 
+## 评测看板（FastAPI + React/Vite）
+看板由一个自包含的 FastAPI 后端（复用本项目的 Python 数据层 `src/dashboard`、`EvalDbService`）
+与 React 19 + Vite + TypeScript 单页应用组成，不再依赖任何外部 Rust/Next.js 服务：API 直接从
+`results/space/score_index.jsonl` 读取排行榜分数索引，并从 `PG_*` 指定的 Postgres 数据库拉取
+评测记录与补全上下文。
+
+```bash
+# 1. 后端 —— 在 :7860 提供 JSON API（以及已构建的 SPA）
+cp .env.example .env            # 填写 PG_* 连接信息
+rwkv-skills-dashboard           # 或：python -m src.bin.run_dashboard --reload
+
+# 2. 前端（开发模式）—— Vite 开发服务器在 :5173，将 /api 代理到 :7860
+cd frontend
+pnpm install
+pnpm dev
+```
+
+开发模式下访问 `http://localhost:5173`。若要单源部署，先构建 SPA，再让 FastAPI 从
+`frontend/dist` 提供静态资源：
+
+```bash
+cd frontend && pnpm build      # 产出 frontend/dist
+rwkv-skills-dashboard          # 此时在 :7860 同时提供 API 与 SPA
+```
+
+看板还内置**管理面板**（"管理面板"页签）用于驱动评测调度器：启动 / 暂停 / 恢复 / 取消任务，
+查看实时任务队列与进度，以及 GPU / 远端 worker 遥测。它在 `/api/admin/*` 下封装了
+`SchedulerAdminController`。
+
+可选环境变量覆盖：`RWKV_SPACE_SCORE_INDEX`（分数索引路径）、
+`RWKV_SPACE_RESULTS_DIR`（结果目录），以及 `RWKV_ADMIN_API_KEY`——设置后，所有
+`/api/admin/*` 请求都需要 `Authorization: Bearer <key>` 头（在管理面板的 Token 输入框填写）。
+
 ## 下载模型权重
 `rwkv-download-weights` 会从 Hugging Face 镜像枚举并并发下载 `.pth` 权重：
 ```bash

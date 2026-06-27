@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type CellMeta, type EvalRecord } from "../api";
 
@@ -12,6 +12,13 @@ export function EvalRecordsPanel({ meta }: Props) {
   const limit = 15;
 
   const taskId = meta?.task_id ?? null;
+
+  // Reset pagination when the selected cell/task changes, so switching tasks
+  // never requests a stale offset or briefly shows the previous task's rows.
+  useEffect(() => {
+    setPage(0);
+  }, [taskId]);
+
   const {
     data,
     isPending,
@@ -21,7 +28,10 @@ export function EvalRecordsPanel({ meta }: Props) {
     queryKey: ["eval-records", taskId, onlyWrong, page],
     queryFn: () => api.evalRecords(taskId!, onlyWrong, limit, page * limit),
     enabled: taskId !== null,
-    placeholderData: (prev) => prev, // keep previous page while loading
+    // Keep the previous page only while paging within the SAME task; on task
+    // switch, drop it so we never flash the previous task's rows.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery && prevQuery.queryKey[1] === taskId ? prev : undefined,
   });
 
   if (!meta) {
@@ -31,10 +41,12 @@ export function EvalRecordsPanel({ meta }: Props) {
     return <div className="empty muted">该单元格没有可查询的 task ID。</div>;
   }
 
+  const filterTag = onlyWrong ? "仅错题" : "全部";
+
   return (
     <div>
       <div className="card-title" style={{ marginBottom: 10 }}>
-        评测明细 · {meta.benchmark_name} · {meta.eval_method} · {meta.k_metric}
+        评测明细 · {meta.benchmark_name} · {meta.eval_method} · {meta.model ?? "—"} · {filterTag}
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
         <label className="toggle">
@@ -68,13 +80,14 @@ function EvalTable({ records, taskId }: { records: EvalRecord[]; taskId: number 
       <table className="eval-table">
         <thead>
           <tr>
-            <th>#</th>
-            <th>r</th>
-            <th>p</th>
-            <th>output</th>
-            <th>pass</th>
+            <th>sample</th>
+            <th>repeat</th>
+            <th>pass_idx</th>
+            <th>model_output</th>
+            <th>ref_answer</th>
+            <th>is_passed</th>
             <th>fail reason</th>
-            <th />
+            <th>context</th>
           </tr>
         </thead>
         <tbody>
@@ -84,13 +97,18 @@ function EvalTable({ records, taskId }: { records: EvalRecord[]; taskId: number 
               <td>{r.repeat_index}</td>
               <td>{r.pass_index}</td>
               <td className="pre">{r.answer?.slice(0, 140) || "—"}</td>
+              <td className="pre">{r.ref_answer?.slice(0, 140) || "—"}</td>
               <td>
                 <span className={`badge ${r.is_passed ? "pass" : "fail"}`}>{r.is_passed ? "✓ pass" : "✗ fail"}</span>
               </td>
               <td className="dim">{r.fail_reason?.slice(0, 80) || "—"}</td>
               <td>
-                <button className="btn" onClick={() => setContextRec(r)}>
-                  context
+                <button
+                  className="context-preview-btn"
+                  title={r.context_preview || "查看完整 context"}
+                  onClick={() => setContextRec(r)}
+                >
+                  {r.context_preview || "查看 context"}
                 </button>
               </td>
             </tr>
@@ -99,6 +117,7 @@ function EvalTable({ records, taskId }: { records: EvalRecord[]; taskId: number 
       </table>
       {contextRec && (
         <ContextModal
+          record={contextRec}
           taskId={taskId}
           sampleIndex={contextRec.sample_index}
           repeatIndex={contextRec.repeat_index}
@@ -112,12 +131,14 @@ function EvalTable({ records, taskId }: { records: EvalRecord[]; taskId: number 
 
 /** Private: context modal with lazy API fetch. */
 function ContextModal({
+  record,
   taskId,
   sampleIndex,
   repeatIndex,
   passIndex,
   onClose,
 }: {
+  record: EvalRecord;
   taskId: number;
   sampleIndex: number;
   repeatIndex: number;
@@ -133,9 +154,19 @@ function ContextModal({
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <span className="card-title" style={{ margin: 0 }}>
-            context · sample={sampleIndex} repeat={repeatIndex} pass={passIndex}
-          </span>
+          <div>
+            <span className="card-title" style={{ margin: 0 }}>
+              context · sample={sampleIndex} repeat={repeatIndex} pass={passIndex}
+            </span>
+            <div className="context-outcome">
+              <span>answer={record.answer || "—"}</span>
+              <span>ref={record.ref_answer || "—"}</span>
+              <span className={record.is_passed ? "outcome-pass" : "outcome-fail"}>
+                {record.is_passed ? "passed" : "failed"}
+              </span>
+              {record.fail_reason ? <span>{record.fail_reason}</span> : null}
+            </div>
+          </div>
           <button className="btn" onClick={onClose}>✕</button>
         </div>
         <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>

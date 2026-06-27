@@ -910,6 +910,93 @@ class SqlEvalDbRepository:
                 row = cur.fetchone()
         return dict(row) if row else None
 
+    def fetch_score_history(
+        self,
+        *,
+        benchmark_name: str,
+        benchmark_split: str,
+        model_name: str,
+    ) -> list[dict[str, Any]]:
+        """Return EVERY official score for one model+benchmark (no dedup, no latest-only).
+
+        Excludes temp tasks and param-search. Ordered by created_at ASC so the
+        caller can lay them out as a time series.
+        """
+        with self._connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        s.score_id AS score_id,
+                        s.task_id AS task_id,
+                        s.cot_mode AS cot_mode,
+                        s.metrics AS metrics,
+                        s.created_at AS created_at,
+                        t.evaluator AS evaluator,
+                        t.sampling_config AS sampling_config,
+                        m.model_name AS model,
+                        CASE
+                            WHEN b.benchmark_split <> '' THEN CONCAT(b.benchmark_name, '_', b.benchmark_split)
+                            ELSE b.benchmark_name
+                        END AS dataset,
+                        b.num_samples AS num_samples
+                    FROM scores s
+                    JOIN task t ON t.task_id = s.task_id
+                    JOIN model m ON m.model_id = t.model_id
+                    JOIN benchmark b ON b.benchmark_id = t.benchmark_id
+                    WHERE b.benchmark_name = %s
+                      AND b.benchmark_split = %s
+                      AND m.model_name = %s
+                      AND t.is_tmp = FALSE
+                      AND t.is_param_search = FALSE
+                    ORDER BY s.created_at ASC, s.score_id ASC
+                    """,
+                    (benchmark_name, benchmark_split, model_name),
+                )
+                rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_score_history_pairs(self) -> list[dict[str, Any]]:
+        """Distinct (model, dataset) combinations that have at least one official score."""
+        with self._connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT
+                        m.model_name AS model,
+                        CASE
+                            WHEN b.benchmark_split <> '' THEN CONCAT(b.benchmark_name, '_', b.benchmark_split)
+                            ELSE b.benchmark_name
+                        END AS dataset
+                    FROM scores s
+                    JOIN task t ON t.task_id = s.task_id
+                    JOIN model m ON m.model_id = t.model_id
+                    JOIN benchmark b ON b.benchmark_id = t.benchmark_id
+                    WHERE t.is_tmp = FALSE
+                      AND t.is_param_search = FALSE
+                    ORDER BY m.model_name, dataset
+                    """,
+                )
+                rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def fetch_first_completion_context(self, *, task_id: int) -> Any | None:
+        """Return the context JSONB of one representative completion for a task."""
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT context
+                    FROM completions
+                    WHERE task_id = %s
+                    ORDER BY sample_index ASC, avg_repeat_index ASC, pass_index ASC
+                    LIMIT 1
+                    """,
+                    (int(task_id),),
+                )
+                row = cur.fetchone()
+        return row[0] if row else None
+
     def fetch_latest_task_generation_progress(
         self,
         *,
@@ -1025,7 +1112,16 @@ class SqlEvalDbRepository:
         # preview/full context; the default fast path reads only small columns.
         select_context = ", c.context AS context" if include_context else ""
         select_preview = (
-            ", LEFT(c.context::TEXT, 80) AS context_preview"
+            """,
+                LEFT(
+                    COALESCE(
+                        c.context #>> '{stages,0,prompt}',
+                        c.context #>> '{prompt}',
+                        c.context::TEXT
+                    ),
+                    240
+                ) AS context_preview
+            """
             if (include_preview or include_context)
             else ""
         )

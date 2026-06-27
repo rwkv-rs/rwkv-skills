@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type CellMeta, type LeaderboardResponse } from "./api";
 import { LeaderboardTable } from "./components/LeaderboardTable";
@@ -6,29 +6,59 @@ import { OverviewTable } from "./components/OverviewTable";
 import { DomainCharts } from "./components/DomainCharts";
 import { EvalRecordsPanel } from "./components/EvalRecords";
 import { AdminPage } from "./components/Admin";
+import { ScoreHistory } from "./components/ScoreHistory";
 
-type Page = "dashboard" | "admin";
+type Page = "dashboard" | "history" | "admin";
+
+type CaptureState =
+  | { status: "idle" }
+  | { status: "saving" }
+  | { status: "saved"; path: string }
+  | { status: "error"; message: string };
+
+function queryValue(name: string, fallback: string): string {
+  if (typeof window === "undefined") return fallback;
+  const value = new URLSearchParams(window.location.search).get(name);
+  return value && value.trim() ? value : fallback;
+}
+
+function queryPage(): Page {
+  const value = queryValue("page", "dashboard");
+  return value === "history" || value === "admin" ? value : "dashboard";
+}
+
+function hasQueryValue(name: string): boolean {
+  if (typeof window === "undefined") return false;
+  const value = new URLSearchParams(window.location.search).get(name);
+  return Boolean(value && value.trim());
+}
 
 export function App() {
   const qc = useQueryClient();
 
   // ---- top-level page ----
-  const [page, setPage] = useState<Page>("dashboard");
+  const [page, setPage] = useState<Page>(() => queryPage());
 
   // ---- meta (model list, domains, view labels) ----
   const meta = useQuery({ queryKey: ["meta"], queryFn: api.meta, staleTime: 300_000 });
 
   // ---- control state ----
-  const [model, setModel] = useState<string>("");
-  const [view, setView] = useState<string>("benchmark_detail_latest");
-  const [activeTab, setActiveTab] = useState<string>("knowledge");
+  const [model, setModel] = useState<string>(() => queryValue("model", ""));
+  const [view, setView] = useState<string>(() => queryValue("view", "benchmark_detail_delta"));
+  const [activeTab, setActiveTab] = useState<string>(() => queryValue("tab", "knowledge"));
+  const [tabPinned, setTabPinned] = useState<boolean>(() => hasQueryValue("tab"));
   const [clickedMeta, setClickedMeta] = useState<CellMeta | null>(null);
+  const [capture, setCapture] = useState<CaptureState>({ status: "idle" });
 
   // Once meta loads, set defaults
-  useMemo(() => {
-    if (meta.data && !model) setModel(meta.data.auto_label);
-    if (meta.data && view === "benchmark_detail_latest") setView(meta.data.default_view);
-  }, [meta.data]);
+  useEffect(() => {
+    if (!meta.data) return;
+    if (!model) setModel(meta.data.auto_label);
+    if (!meta.data.table_views.some((v) => v.key === view)) setView(meta.data.default_view);
+    if (!meta.data.domain_groups.some((g) => g.key === activeTab)) {
+      setActiveTab(meta.data.domain_groups[0]?.key ?? "knowledge");
+    }
+  }, [activeTab, meta.data, model, view]);
 
   // ---- leaderboard ----
   const lb = useQuery({
@@ -40,12 +70,41 @@ export function App() {
 
   const leaderboard: LeaderboardResponse | undefined = lb.data;
 
+  useEffect(() => {
+    if (!leaderboard || tabPinned || activeTab === "naive") return;
+    const current = leaderboard.domains.find((d) => d.key === activeTab);
+    if (current?.rows.length) return;
+    const firstPopulated = leaderboard.domains.find((d) => d.rows.length)?.key;
+    if (firstPopulated && firstPopulated !== activeTab) setActiveTab(firstPopulated);
+  }, [activeTab, leaderboard, tabPinned]);
+
   // ---- helpers ----
   const refresh = () => {
     api.refresh().then(() => {
       qc.invalidateQueries({ queryKey: ["leaderboard"] });
       qc.invalidateQueries({ queryKey: ["meta"] });
     });
+  };
+
+  const capturePage = async () => {
+    if (typeof window === "undefined") return;
+    const target = new URL(window.location.href);
+    target.searchParams.set("page", page);
+    target.searchParams.set("tab", activeTab);
+    target.searchParams.set("view", view);
+    if (model) target.searchParams.set("model", model);
+
+    setCapture({ status: "saving" });
+    try {
+      const result = await api.capturePage({
+        url: target.toString(),
+        width: Math.max(window.innerWidth, 1440),
+        height: Math.max(window.innerHeight, 1000),
+      });
+      setCapture({ status: "saved", path: result.path });
+    } catch (err) {
+      setCapture({ status: "error", message: err instanceof Error ? err.message : String(err) });
+    }
   };
 
   const viewLabel = meta.data?.table_views.find((v) => v.key === view)?.label ?? view;
@@ -59,7 +118,7 @@ export function App() {
             <span className="brand-dot">⦿</span> RWKV Skills
           </h1>
           <div className="subtitle">
-            {page === "dashboard" ? `评测看板 · ${viewLabel}` : "调度器管理"}
+            {page === "dashboard" ? `评测看板 · ${viewLabel}` : page === "history" ? "分数历史" : "调度器管理"}
           </div>
         </div>
         <nav className="page-nav">
@@ -68,6 +127,12 @@ export function App() {
             onClick={() => setPage("dashboard")}
           >
             评测看板
+          </button>
+          <button
+            className={`page-nav-btn${page === "history" ? " active" : ""}`}
+            onClick={() => setPage("history")}
+          >
+            分数历史
           </button>
           <button
             className={`page-nav-btn${page === "admin" ? " active" : ""}`}
@@ -80,6 +145,8 @@ export function App() {
 
       {page === "admin" ? (
         <AdminPage />
+      ) : page === "history" ? (
+        <ScoreHistory />
       ) : (
         <>
       {/* ---- Errors ---- */}
@@ -113,17 +180,26 @@ export function App() {
             </select>
           </div>
           <button className="btn btn-primary" onClick={refresh}>
-            🔄 刷新数据
+            刷新数据
+          </button>
+          <button className="btn" onClick={capturePage} disabled={capture.status === "saving"}>
+            {capture.status === "saving" ? "截图中..." : "长截图"}
           </button>
           {leaderboard?.selection && (
             <span className="muted" style={{ fontSize: 12 }}>
-              {leaderboard.selection.model_sequence.length} 个模型 ·
+              {leaderboard.selection.model_sequence.length} 个模型
               {leaderboard.selection.skipped_small_params > 0
                 ? ` 跳过 ${leaderboard.selection.skipped_small_params} 个小参数档位`
                 : ""}
             </span>
           )}
           {lb.isFetching && <span className="muted" style={{ fontSize: 12 }}>加载中…</span>}
+          {capture.status === "saved" && (
+            <span className="capture-status">已保存：{capture.path}</span>
+          )}
+          {capture.status === "error" && (
+            <span className="capture-status error">截图失败：{capture.message}</span>
+          )}
         </div>
       </div>
 
@@ -133,7 +209,10 @@ export function App() {
           <button
             key={g.key}
             className={`tab${activeTab === g.key ? " active" : ""}`}
-            onClick={() => setActiveTab(g.key)}
+            onClick={() => {
+              setActiveTab(g.key);
+              setTabPinned(true);
+            }}
           >
             {g.label}
           </button>
@@ -142,10 +221,27 @@ export function App() {
 
       {/* ---- Tab content ---- */}
       {leaderboard && (() => {
+        // 朴素榜: a single flat detail table over all naive scores, shown even in
+        // the field-average views (it has no domain split / no charts).
+        if (activeTab === "naive") {
+          const nb = leaderboard.naive_board;
+          if (!nb || !nb.rows.length) return <div className="empty">朴素榜暂无数据。</div>;
+          return (
+            <div className="card">
+              <div className="card-title">朴素榜 · {leaderboard.view_label}</div>
+              <LeaderboardTable
+                paramColumns={nb.param_columns}
+                isDelta={nb.is_delta}
+                rows={nb.rows}
+                onCellClick={(m) => setClickedMeta(m)}
+              />
+            </div>
+          );
+        }
         if (leaderboard.is_field_avg && leaderboard.overview) {
           return (
             <div className="card">
-              <div className="card-title">领域均分</div>
+              <div className="card-title">领域均分 · {leaderboard.view_label}</div>
               <OverviewTable rows={leaderboard.overview} columns={leaderboard.param_columns} isDelta={leaderboard.is_delta} />
             </div>
           );
@@ -159,24 +255,29 @@ export function App() {
                 {domain.title} · {leaderboard.view_label}
               </div>
               <LeaderboardTable
-                data={leaderboard}
-                domain={domain}
+                paramColumns={domain.param_columns}
+                isDelta={leaderboard.is_delta}
+                rows={domain.rows}
                 onCellClick={(m) => setClickedMeta(m)}
               />
             </div>
-            <div className="card">
-              <div className="card-title">图表</div>
-              <DomainCharts chart={leaderboard.charts[activeTab as keyof typeof leaderboard.charts]} />
-            </div>
+            {activeTab === "coding" ? (
+              <div className="card">
+                <div className="card-title">图表</div>
+                <DomainCharts chart={leaderboard.charts.coding} />
+              </div>
+            ) : null}
           </>
         );
       })()}
       {lb.isFetching && !leaderboard && <div className="spinner">加载排行榜…</div>}
 
       {/* ---- Eval records ---- */}
-      <div className="card" style={{ marginTop: 20 }}>
-        <EvalRecordsPanel meta={clickedMeta} />
-      </div>
+      {clickedMeta ? (
+        <div className="card" style={{ marginTop: 20 }}>
+          <EvalRecordsPanel meta={clickedMeta} />
+        </div>
+      ) : null}
         </>
       )}
     </div>

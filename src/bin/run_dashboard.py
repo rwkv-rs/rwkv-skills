@@ -22,9 +22,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     import uvicorn
 
     if args.reload:
-        uvicorn.run("src.space.api:app", host=args.host, port=args.port, reload=True)
+        uvicorn.run("src.dashboard.web.api:app", host=args.host, port=args.port, reload=True)
     else:
-        from src.space.api import app
+        from src.dashboard.web.api import app
 
         uvicorn.run(app, host=args.host, port=args.port)
 

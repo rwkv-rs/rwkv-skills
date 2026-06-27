@@ -26,6 +26,41 @@ uv pip install -e .
 ```
 For other CUDA/CPU builds, use `--extra torch-cu126` / `--extra torch-cpu`, etc.
 
+## Evaluation dashboard (FastAPI + React/Vite)
+The dashboard is a self-contained FastAPI backend that reuses this project's Python data layer
+(`src/dashboard`, `EvalDbService`) plus a React 19 + Vite + TypeScript single-page app. There is no
+external Rust/Next.js service: the API reads the leaderboard score index from
+`results/space/score_index.jsonl` and pulls eval records / completion context directly from the
+`PG_*` Postgres database.
+
+```bash
+# 1. Backend — serves the JSON API (and the built SPA) on :7860
+cp .env.example .env            # fill in PG_* connection settings
+rwkv-skills-dashboard           # or: python -m src.bin.run_dashboard --reload
+
+# 2. Frontend (development) — Vite dev server on :5173, proxies /api -> :7860
+cd frontend
+pnpm install
+pnpm dev
+```
+
+Open `http://localhost:5173` in development. For a single-origin deployment, build the SPA and let
+FastAPI serve it from `frontend/dist`:
+
+```bash
+cd frontend && pnpm build      # emits frontend/dist
+rwkv-skills-dashboard          # now serves API + SPA together on :7860
+```
+
+The dashboard also includes an **admin panel** (the "管理面板" tab) that drives the eval scheduler:
+start / pause / resume / cancel runs, watch the live job queue and progress, and view GPU /
+remote-worker telemetry. It wraps `SchedulerAdminController` under `/api/admin/*`.
+
+Optional environment overrides: `RWKV_SPACE_SCORE_INDEX` (score index path),
+`RWKV_SPACE_RESULTS_DIR` (results directory), and `RWKV_ADMIN_API_KEY` — when set, every
+`/api/admin/*` request requires an `Authorization: Bearer <key>` header (enter it in the admin
+panel's token field).
+
 ## Download model weights
 `rwkv-download-weights` enumerates and downloads `.pth` weights concurrently from a Hugging Face mirror:
 ```bash
