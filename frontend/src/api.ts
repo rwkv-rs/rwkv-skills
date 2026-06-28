@@ -1,6 +1,16 @@
 // Typed client for the FastAPI dashboard API. All calls are same-origin in
 // production; in dev Vite proxies /api -> FastAPI (see vite.config.ts).
 
+const API_PREFIX = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
+
+function apiUrl(path: string): string {
+  if (/^https?:\/\//.test(path)) {
+    return path;
+  }
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  return API_PREFIX ? `${API_PREFIX}${normalized}` : normalized;
+}
+
 export interface TableViewOption {
   key: string;
   label: string;
@@ -332,7 +342,7 @@ export interface CapturePageResponse {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  const res = await fetch(apiUrl(url), { headers: { Accept: "application/json" } });
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status}: ${detail}`);
@@ -341,7 +351,7 @@ async function getJson<T>(url: string): Promise<T> {
 }
 
 async function postJson<T>(url: string, body?: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetch(apiUrl(url), {
     method: "POST",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -354,13 +364,13 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
 }
 
 async function getJsonAuth<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: adminHeaders() });
+  const res = await fetch(apiUrl(url), { headers: adminHeaders() });
   if (!res.ok) throw new Error(`${res.status}: ${await errText(res)}`);
   return res.json() as Promise<T>;
 }
 
 async function postJsonAuth<T>(url: string, body?: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetch(apiUrl(url), {
     method: "POST",
     headers: adminHeaders({ "Content-Type": "application/json" }),
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -381,7 +391,7 @@ async function errText(res: Response): Promise<string> {
 export const api = {
   meta: () => getJson<MetaResponse>("/api/meta"),
   refresh: () =>
-    fetch("/api/refresh", { method: "POST" }).then((r) => r.json() as Promise<{ entry_count: number; errors: string[] }>),
+    fetch(apiUrl("/api/refresh"), { method: "POST" }).then((r) => r.json() as Promise<{ entry_count: number; errors: string[] }>),
   leaderboard: (model: string | null, view: string) => {
     const params = new URLSearchParams({ view });
     if (model) params.set("model", model);
