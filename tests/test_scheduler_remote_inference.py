@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +21,25 @@ from src.eval.scheduler.jobs import JOB_CATALOGUE
 from src.eval.scheduler.remote_slots import infer_workers_for_model
 from src.eval.scheduler.state import RunningEntry
 from src.infer.backend import resolve_backend_model_name, validate_inference_backend_args
+
+
+def test_remote_backend_import_does_not_load_local_cuda_engines() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import src.infer.backend; "
+                "print('src.infer.engine' in sys.modules, "
+                "'src.infer.lightning_engine' in sys.modules)"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "False False"
 
 
 def test_build_queue_supports_remote_inference_targets() -> None:
@@ -276,6 +297,7 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
     dataset_path = tmp_path / "dataset.jsonl"
     dataset_path.write_text("[]", encoding="utf-8")
     launched: list[tuple[str, str]] = []
+    child_envs: list[dict[str, str]] = []
 
     def _item(dataset_slug: str) -> queue.QueueItem:
         return queue.QueueItem(
@@ -294,6 +316,7 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
     monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
 
     def _fake_launch_job(job_id, _command, **_kwargs):
+        child_envs.append(dict(_kwargs.get("env", {})))
         launched.append((job_id, str(_kwargs.get("env", {}).get("RWKV_SKILLS_INFER_MODEL"))))
         return SimpleNamespace(pid=1000 + len(launched))
 
@@ -324,6 +347,7 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
     )
 
     assert [model for _job_id, model in launched] == ["remote-a", "remote-a"]
+    assert [env.get("CUDA_VISIBLE_DEVICES") for env in child_envs] == ["", ""]
     assert sorted(path.read_text(encoding="utf-8").splitlines()[1] for path in opts.pid_dir.glob("*.pid")) == [
         "model:slot_a",
         "model:slot_b",

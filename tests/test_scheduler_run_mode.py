@@ -20,6 +20,11 @@ def test_completed_for_queue_merges_or_resets_by_run_mode() -> None:
         completed={historical},
         session_completed={current},
     ) == {current}
+    assert actions._completed_for_queue(
+        run_mode=RunMode.FRESH,
+        completed={historical},
+        session_completed={current},
+    ) == {historical, current}
 
 
 def test_action_queue_auto_filters_completed(monkeypatch, tmp_path) -> None:

@@ -13,15 +13,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
 
 import httpx
-import torch
 from tqdm import tqdm
 
 from .constraints import DecodeConstraint
-from .engine import DEFAULT_PREFILL_CHUNK_SIZE, TokenizerProtocol
-from .lightning_engine import LocalEngineProtocol, build_local_engine
 from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
 
 if TYPE_CHECKING:
+    from .engine import TokenizerProtocol
+    from .lightning_engine import LocalEngineProtocol
     from .model import ModelLoadConfig
 
 
@@ -36,6 +35,7 @@ _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 _REMOTE_GENERATION_MIN_TEMPERATURE = 0.001
 _REMOTE_GENERATION_MAX_TEMPERATURE = 1000.0
+DEFAULT_PREFILL_CHUNK_SIZE = 16
 
 RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "lightning", "nano-vllm-contents"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
@@ -79,6 +79,8 @@ def normalize_api_base(base_url: str) -> str:
 
 
 def normalize_local_device(device: str) -> str:
+    import torch
+
     raw = str(device or "").strip() or "cuda"
     parsed = torch.device(raw)
     if parsed.type == "cuda" and parsed.index is None:
@@ -235,8 +237,8 @@ class InferenceBackend(Protocol):
 class LocalInferenceBackend:
     model_name: str
     model: object
-    tokenizer: TokenizerProtocol
-    engine: LocalEngineProtocol
+    tokenizer: "TokenizerProtocol"
+    engine: "LocalEngineProtocol"
     engine_mode: str = "classic"
 
     @classmethod
@@ -247,6 +249,7 @@ class LocalInferenceBackend:
         engine_mode: str = "classic",
         state_db_path: str | None = None,
     ) -> LocalInferenceBackend:
+        from .lightning_engine import build_local_engine
         from .model import load_rwkv_model
 
         normalized_device = normalize_local_device(str(getattr(config, "device", "cuda") or "cuda"))
@@ -309,6 +312,8 @@ class LocalInferenceBackend:
         prompt: str,
         choice_token_texts: Sequence[str],
     ) -> tuple[dict[str, float], str]:
+        import torch
+
         if not choice_token_texts:
             raise ValueError("choice_token_texts cannot be empty")
         tokens = [0] + list(self.tokenizer.encode(prompt.strip()))
@@ -1063,7 +1068,7 @@ def _blank_state(model: object):
         return model.generate_zero_state()
 
 
-def _single_token_id(tokenizer: TokenizerProtocol, text: str) -> int:
+def _single_token_id(tokenizer: "TokenizerProtocol", text: str) -> int:
     token_ids = list(tokenizer.encode(text))
     if len(token_ids) != 1:
         raise ValueError(f"candidate token text {text!r} must map to a single token, got {token_ids}")

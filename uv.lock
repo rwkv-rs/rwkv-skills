@@ -1039,17 +1039,6 @@ wheels = [
 ]
 
 [[package]]
-name = "dotenv"
-version = "0.9.9"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "python-dotenv" },
-]
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/b2/b7/545d2c10c1fc15e48653c91efde329a790f2eecfbbf2bd16003b5db2bab0/dotenv-0.9.9-py2.py3-none-any.whl", hash = "sha256:29cf74a087b31dafdb5a446b6d7e11cbce8ed2741540e2339c69fbef92c94ce9", size = 1892, upload-time = "2025-02-19T22:15:01.647Z" },
-]
-
-[[package]]
 name = "einops"
 version = "0.8.1"
 source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
@@ -5638,7 +5627,6 @@ dependencies = [
     { name = "deepdiff" },
     { name = "deepspeed" },
     { name = "docstring-parser" },
-    { name = "dotenv" },
     { name = "einops" },
     { name = "emoji" },
     { name = "evalplus" },
@@ -5701,6 +5689,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pynvml" },
     { name = "pyrwkv-tokenizer" },
+    { name = "python-dotenv" },
     { name = "rwkv" },
     { name = "rwkv-fla" },
     { name = "scikit-build-core" },
@@ -5759,7 +5748,6 @@ requires-dist = [
     { name = "deepdiff", specifier = ">=8.6.1" },
     { name = "deepspeed", specifier = ">=0.17.1" },
     { name = "docstring-parser", specifier = ">=0.17.0" },
-    { name = "dotenv", specifier = ">=0.9.9" },
     { name = "einops", specifier = ">=0.8.1" },
     { name = "emoji", specifier = ">=2.15.0" },
     { name = "evalplus", git = "https://github.com/evalplus/evalplus?rev=c91370f" },
@@ -5804,6 +5792,7 @@ requires-dist = [
     { name = "pynvml", specifier = ">=13.0.1" },
     { name = "pyrwkv-tokenizer", specifier = ">=0.9.1" },
     { name = "pyserini", marker = "extra == 'function-calling-official'", specifier = ">=1.2.0" },
+    { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "pytorch-triton-rocm", marker = "extra == 'torch-rocm'", index = "https://download.pytorch.org/whl/rocm6.4" },
     { name = "requests", marker = "extra == 'dev'", specifier = ">=2.32.5" },
     { name = "rwkv", specifier = ">=0.8.29" },

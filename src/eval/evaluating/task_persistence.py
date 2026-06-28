@@ -17,6 +17,7 @@ class RunMode(str, Enum):
     NEW = "new"
     RESUME = "resume"
     RERUN = "rerun"
+    FRESH = "fresh"
 
     @classmethod
     def parse(cls, value: str | None) -> "RunMode":
@@ -63,7 +64,7 @@ def prepare_task_execution(
     if run_mode is None:
         requested_mode = current_run_mode()
 
-    if requested_mode is RunMode.RERUN:
+    if requested_mode in {RunMode.RERUN, RunMode.FRESH}:
         ctx = service.get_resume_context(
             dataset=dataset,
             model=model,
@@ -80,7 +81,7 @@ def prepare_task_execution(
             is_param_search=is_param_search,
             sampling_config=sampling_config,
         )
-        return TaskExecutionState(task_id=task_id, run_mode=RunMode.RERUN, resume_context=ctx)
+        return TaskExecutionState(task_id=task_id, run_mode=requested_mode, resume_context=ctx)
 
     ctx = service.get_resume_context(
         dataset=dataset,

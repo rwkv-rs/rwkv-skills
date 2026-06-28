@@ -377,7 +377,10 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
         "--run-mode",
         choices=_RUN_MODE_CHOICES,
         default=RunMode.AUTO.value,
-        help="任务执行语义：auto/new/resume/rerun；strict 模式对齐 rwkv-rs，默认 auto 保持当前兼容行为",
+        help=(
+            "任务执行语义：auto/new/resume/rerun/fresh；fresh 在队列层跳过已完成分数，"
+            "但对缺失项强制新建 task，避免续跑旧 Running/Failed"
+        ),
     )
     parser.add_argument(
         "--dispatch-poll-seconds",

@@ -24,6 +24,7 @@ class _FakeService:
 
 def test_current_run_mode_prefers_explicit_env_and_legacy_overwrite() -> None:
     assert current_run_mode({"RWKV_EVAL_RUN_MODE": "resume"}) is RunMode.RESUME
+    assert current_run_mode({"RWKV_EVAL_RUN_MODE": "fresh"}) is RunMode.FRESH
     assert current_run_mode({"RWKV_SCHEDULER_OVERWRITE": "1"}) is RunMode.RERUN
     assert current_run_mode({}) is RunMode.AUTO
 
@@ -137,6 +138,32 @@ def test_prepare_task_execution_rerun_forces_new_task_lookup() -> None:
             "model": "rwkv",
             "is_param_search": False,
             "job_name": "free_response",
+            "sampling_config": None,
+            "force_new_task": True,
+        }
+    ]
+
+
+def test_prepare_task_execution_fresh_forces_new_task_lookup_without_rerun_mode() -> None:
+    service = _FakeService(ResumeContext(), task_id="43")
+    state = prepare_task_execution(
+        service=service,
+        dataset="mmlu_test",
+        model="rwkv",
+        is_param_search=False,
+        job_name="multi_choice_plain",
+        run_mode=RunMode.FRESH,
+    )
+
+    assert state.task_id == "43"
+    assert state.run_mode is RunMode.FRESH
+    assert state.skip_keys == set()
+    assert service.get_calls == [
+        {
+            "dataset": "mmlu_test",
+            "model": "rwkv",
+            "is_param_search": False,
+            "job_name": "multi_choice_plain",
             "sampling_config": None,
             "force_new_task": True,
         }

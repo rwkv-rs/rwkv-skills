@@ -766,6 +766,7 @@ def _launch_queue_items(
         if item.is_remote:
             env["RWKV_SKILLS_INFER_BASE_URL"] = str(item.infer_base_url or "")
             env["RWKV_SKILLS_INFER_MODEL"] = str(item.infer_model or item.model_name or "")
+            env["CUDA_VISIBLE_DEVICES"] = ""
             if opts.infer_api_key:
                 env["RWKV_SKILLS_INFER_API_KEY"] = opts.infer_api_key
             env["RWKV_SKILLS_INFER_PROTOCOL"] = str(opts.infer_protocol or "openai")
