@@ -237,8 +237,8 @@ foreground_dispatch() {
     --infer-timeout-s 900 \
     --infer-max-workers "${INFER_MAX_WORKERS}" \
     --infer-worker-profile "${INFER_WORKER_PROFILE}" \
-    --infer-protocol lightning \
-    --infer-seed-policy preserve \
+    --infer-protocol "${INFER_PROTOCOL:-vllm}" \
+    --infer-seed-policy "${INFER_SEED_POLICY:-preserve}" \
     --remote-batch-size "${REMOTE_BATCH_SIZE}" \
     "${plain_choice_args[@]}" \
     "${coding_eval_args[@]}" \

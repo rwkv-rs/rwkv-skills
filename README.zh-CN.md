@@ -2,11 +2,11 @@
 
 [English](README.md) | 中文
 
-面向 RWKV7 的推理与评测脚手架，包含批量推理引擎、常见评测数据集的准备器以及一个 GPU 调度器骨架。
+面向 RWKV7 的评测脚手架，推理侧接入外部 vLLM-RWKV OpenAI 兼容服务，包含常见评测数据集准备器以及一个 GPU 调度器骨架。
 
 ## 目录速览
-- `src/infer`：RWKV 模型加载、采样策略与连续批量生成引擎。
-- `src/infer/rwkv7`：上游 RWKV7 参考实现（含 CUDA 扩展、词表）已内置，无需额外子模块。
+- `src/infer`：远端 OpenAI/vLLM 推理客户端、采样配置与约束。
+- `src/bin/run_infer_server.py`：外部 `~/GitHub/vllm-rwkv` checkout 的轻量启动包装器。
 - `src/eval/datasets`：数据结构定义、JSONL 加载器以及各类数据集的准备脚本。
 - `src/eval/evaluators`：多选 / 自由问答 / 指令遵循 / 代码生成（HumanEval、MBPP）评测管线。
 - `src/eval/scheduler`：评测任务排队、GPU 侦测与调度的 CLI（现已附带 multi-choice / free-response / instruction-following / human-eval / mbpp 入口脚本）。
@@ -14,7 +14,7 @@
 
 ## 环境要求
 - Python 3.12+，推荐安装 `uv` 以管理依赖。
-- NVIDIA/AMD GPU（使用 `triton` 与内置 rapid-sampling 内核），需要与所选 PyTorch 发行版匹配的 CUDA/ROCm。
+- 外部 vLLM-RWKV 服务需要 NVIDIA/AMD GPU，并与其服务环境中的 CUDA/ROCm 匹配。
 
 ## 安装
 ```bash
@@ -81,20 +81,15 @@ PY
 支持的数据集别名可通过 `available_*_datasets()` 系列函数查看。
 
 ## 评测与推理示例
-目前推荐直接调用管线类：
-```python
-from src.eval.evaluators.multi_choice import MultipleChoicePipeline
-from src.infer.model import ModelLoadConfig
-
-pipeline = MultipleChoicePipeline(ModelLoadConfig(weights_path="weights/rwkv7-*.pth", device="cuda:0"))
-result = pipeline.run_direct(
-    dataset_path="data/mmlu/test.jsonl",
-    output_path="results/completions/mmlu_direct.jsonl",
-    sample_limit=50
-)
-print(result)
+通过包装器启动外部 vLLM-RWKV 服务：
+```bash
+rwkv-skills-infer \
+  --model-path /path/to/rwkv7.pth \
+  --model-name rwkv7-demo \
+  --vllm-rwkv-path ~/GitHub/vllm-rwkv \
+  --port 19082
 ```
-自由问答与指令遵循的用法类似，分别使用 `FreeResponsePipeline` 与 `InstructionFollowingPipeline`。
+评测命令随后使用 `--infer-base-url http://127.0.0.1:19082 --infer-model rwkv7-demo --infer-protocol vllm` 连接该服务。
 
 ## 调度器 CLI
 `rwkv-skills-scheduler` 暴露了一组命令（队列预览、调度、状态、停止、日志轮播）：

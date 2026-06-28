@@ -54,7 +54,6 @@ def test_plan_deployments_skips_assigned_gpus_and_increments_ports(tmp_path: Pat
     ]
     assert [spec.max_batch_size for spec in specs] == [64, 128]
     assert specs[0].log_path == tmp_path / "logs" / "model-a.port18082.log"
-    assert specs[0].state_db_path == tmp_path / "state" / "model-a.sqlite3"
 
 
 def test_plan_deployments_spreads_replicas_across_distinct_gpus(tmp_path: Path) -> None:
@@ -75,8 +74,6 @@ def test_plan_deployments_spreads_replicas_across_distinct_gpus(tmp_path: Path) 
         ("model-a", "0", 18081, 0),
         ("model-a", "1", 18082, 1),
     ]
-    assert specs[0].state_db_path == tmp_path / "state" / "model-a.r1.sqlite3"
-    assert specs[1].state_db_path == tmp_path / "state" / "model-a.r2.sqlite3"
 
 
 def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
@@ -93,19 +90,36 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
         spec,
         host="127.0.0.1",
         api_key="secret",
-        engine_mode="classic",
+        engine_mode="vllm-rwkv",
+        vllm_rwkv_path="/opt/vllm-rwkv",
+        vllm_python="/opt/vllm/bin/python",
         infer_auto_config="off",
         batch_collect_ms=10,
         log_level="warning",
+        max_model_len=8192,
+        max_num_seqs=256,
+        max_num_batched_tokens=32768,
+        gpu_memory_utilization=0.97,
+        tensor_parallel_size=1,
+        enforce_eager=True,
     )
 
     assert command[:3][-2:] == ["-m", "src.bin.run_infer_server"]
     assert "--device" in command
     assert command[command.index("--device") + 1] == "cuda:0"
+    assert command[command.index("--cuda-visible-devices") + 1] == "3"
+    assert command[command.index("--engine-mode") + 1] == "vllm-rwkv"
+    assert command[command.index("--vllm-rwkv-path") + 1] == "/opt/vllm-rwkv"
+    assert command[command.index("--vllm-python") + 1] == "/opt/vllm/bin/python"
     assert command[command.index("--port") + 1] == "18081"
     assert command[command.index("--max-batch-size") + 1] == "4"
     assert command[command.index("--infer-auto-config") + 1] == "off"
     assert command[command.index("--api-key") + 1] == "secret"
+    assert command[command.index("--max-model-len") + 1] == "8192"
+    assert command[command.index("--max-num-seqs") + 1] == "256"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.97"
+    assert "--enforce-eager" in command
 
 
 def test_parse_args_ignores_removed_nano_engine_default(monkeypatch, tmp_path: Path) -> None:
@@ -118,7 +132,7 @@ def test_parse_args_ignores_removed_nano_engine_default(monkeypatch, tmp_path: P
         ]
     )
 
-    assert args.engine_mode == "rwkv-lightning"
+    assert args.engine_mode == "vllm-rwkv"
 
 
 def test_write_manifest_serializes_service_urls(tmp_path: Path) -> None:
@@ -145,3 +159,4 @@ def test_write_manifest_serializes_service_urls(tmp_path: Path) -> None:
     assert payload["services"][0]["health_url"] == "http://127.0.0.1:18081/healthz"
     assert payload["services"][0]["max_batch_size"] == 64
     assert payload["services"][0]["pid"] == 1234
+    assert "state_db_path" not in payload["services"][0]

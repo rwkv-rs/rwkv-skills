@@ -178,7 +178,6 @@ def main(
     pipeline = MultipleChoicePipeline(
         backend,
         target_token_format=args.target_token_format,
-        allow_generation_fallback=bool(args.allow_generative_mc_fallback),
     )
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
@@ -334,11 +333,7 @@ def main(
                 "prompt_profile": prompt_profile,
                 "infer_protocol": getattr(args, "infer_protocol", "local"),
                 "completion_style_remote": completion_style_remote,
-                "choice_scoring": (
-                    "logits_only_required"
-                    if not args.allow_generative_mc_fallback
-                    else "generative_fallback_allowed"
-                ),
+                "choice_scoring": "generative_fill_in",
             },
         )
         runtime.record_score(score_payload)

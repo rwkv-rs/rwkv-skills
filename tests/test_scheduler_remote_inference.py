@@ -30,8 +30,9 @@ def test_remote_backend_import_does_not_load_local_cuda_engines() -> None:
             "-c",
             (
                 "import sys; import src.infer.backend; "
-                "print('src.infer.engine' in sys.modules, "
-                "'src.infer.lightning_engine' in sys.modules)"
+                "print('src.infer.model' in sys.modules, "
+                "'src.infer.lightning_engine' in sys.modules, "
+                "'src.infer.engine' in sys.modules)"
             ),
         ],
         check=True,
@@ -39,7 +40,7 @@ def test_remote_backend_import_does_not_load_local_cuda_engines() -> None:
         text=True,
     )
 
-    assert result.stdout.strip() == "False False"
+    assert result.stdout.strip() == "False False False"
 
 
 def test_build_queue_supports_remote_inference_targets() -> None:

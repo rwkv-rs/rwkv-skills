@@ -21,8 +21,9 @@ PHASE_GATE_SCHEMA_VERSION = 2
 DEFAULT_PHASE_TIMEOUT_S = 600.0
 DEFAULT_COMPILE_TARGETS = (
     "src/infer/backend.py",
-    "src/infer/api.py",
-    "src/infer/server.py",
+    "src/infer/auto_config.py",
+    "src/infer/sampling.py",
+    "src/bin/run_infer_server.py",
     "src/bin/run_infer_router.py",
     "src/bin/run_infer_fleet.py",
     "src/eval/scheduler/remote_profiler.py",
@@ -42,7 +43,8 @@ PHASE_TESTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "backend_protocol",
         (
-            "tests/test_infer_split.py",
+            "tests/test_infer_backend.py",
+            "tests/test_run_infer_server.py",
             "tests/test_scheduler_remote_inference.py",
             "tests/test_main_config.py",
         ),

@@ -268,7 +268,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="infer_protocol",
         default="completions",
     )
-    parser.add_argument("--infer-seed-policy", choices=("preserve", "omit-for-contents"), default="preserve")
+    parser.add_argument("--infer-seed-policy", choices=("preserve", "omit"), default="preserve")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top-p", type=float, default=0.3)
     parser.add_argument("--top-k", type=int, default=50)

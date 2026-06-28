@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import importlib.util
+import importlib
 from pathlib import Path
 from typing import Protocol, Sequence
 
@@ -27,15 +27,12 @@ class RwkvTokenizerAdapter:
 
     @classmethod
     def load(cls, tokenizer_path: str | None = None) -> "RwkvTokenizerAdapter":
-        vocab_path = (
-            Path(tokenizer_path).expanduser().resolve()
-            if tokenizer_path
-            else (Path(__file__).resolve().parents[2] / "infer" / "rwkv7" / "rwkv_vocab_v20230424.txt")
-        )
-        if not vocab_path.exists():
+        vocab_path = Path(tokenizer_path).expanduser().resolve() if tokenizer_path else None
+        if vocab_path is not None and not vocab_path.exists():
             raise FileNotFoundError(f"RWKV tokenizer vocab 不存在: {vocab_path}")
         trie_tokenizer_cls = _load_rwkv_trie_tokenizer_class()
-        return cls(tokenizer_path=str(vocab_path), tokenizer=trie_tokenizer_cls(str(vocab_path)))
+        tokenizer = trie_tokenizer_cls(str(vocab_path)) if vocab_path is not None else trie_tokenizer_cls()
+        return cls(tokenizer_path=str(vocab_path or "pyrwkv-tokenizer-default"), tokenizer=tokenizer)
 
     @property
     def label(self) -> str:
@@ -85,16 +82,19 @@ def load_benchmark_tokenizer(
 
 
 def _load_rwkv_trie_tokenizer_class():
-    utils_path = Path(__file__).resolve().parents[2] / "infer" / "rwkv7" / "utils.py"
-    spec = importlib.util.spec_from_file_location("rwkv_perf_utils", utils_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"无法加载 RWKV tokenizer utils: {utils_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    trie_tokenizer_cls = getattr(module, "TRIE_TOKENIZER", None)
-    if trie_tokenizer_cls is None:
-        raise RuntimeError(f"RWKV tokenizer utils 缺少 TRIE_TOKENIZER: {utils_path}")
-    return trie_tokenizer_cls
+    errors: list[str] = []
+    for module_name in ("pyrwkv_tokenizer", "rwkv_tokenizer", "rwkv.rwkv_tokenizer"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - report all attempted tokenizer modules.
+            errors.append(f"{module_name}: {exc}")
+            continue
+        for attr_name in ("TRIE_TOKENIZER", "RWKV_TOKENIZER", "Tokenizer"):
+            tokenizer_cls = getattr(module, attr_name, None)
+            if tokenizer_cls is not None:
+                return tokenizer_cls
+        errors.append(f"{module_name}: missing tokenizer class")
+    raise RuntimeError("无法加载外部 RWKV tokenizer；请安装 pyrwkv-tokenizer 或改用 --tokenizer-type hf。 " + "; ".join(errors))
 
 
 __all__ = [

@@ -16,14 +16,14 @@ from typing import Sequence
 from src.eval.scheduler.process import list_idle_gpus
 
 
-_ENGINE_MODE_CHOICES = ("rwkv-lightning", "lightning", "classic")
+_ENGINE_MODE_CHOICES = ("vllm-rwkv",)
 
 
 def _default_engine_mode() -> str:
-    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "rwkv-lightning").strip().lower()
+    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "vllm-rwkv").strip().lower()
     if value in _ENGINE_MODE_CHOICES:
         return value
-    return "rwkv-lightning"
+    return "vllm-rwkv"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +34,6 @@ class InferServiceSpec:
     port: int
     max_batch_size: int
     log_path: Path
-    state_db_path: Path | None = None
     model_index: int = 0
     replica_index: int = 0
     replica_count: int = 1
@@ -93,14 +92,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--engine-mode",
         choices=_ENGINE_MODE_CHOICES,
         default=_default_engine_mode(),
-        help="Inference backend implementation; rwkv-lightning is the formal server backend",
+        help="Inference backend implementation; vllm-rwkv is the only supported server backend",
     )
+    parser.add_argument("--vllm-rwkv-path", help="Path to the vllm-rwkv source checkout")
+    parser.add_argument("--vllm-python", help="Python executable used to launch vllm-rwkv")
     parser.add_argument(
         "--infer-auto-config",
         choices=("off", "balanced", "throughput"),
         help="Startup auto-config mode passed to each infer service; omit to use run_infer_server default",
     )
-    parser.add_argument("--state-db-dir", help="Directory for per-model lightning sqlite state caches")
+    parser.add_argument("--state-db-dir", help="Deprecated compatibility no-op")
     parser.add_argument("--max-batch-size", type=int, default=8, help="Max queued requests per infer batch")
     parser.add_argument(
         "--max-batch-sizes",
@@ -109,6 +110,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Per-model infer batch sizes; length must match --models. Overrides --max-batch-size.",
     )
     parser.add_argument("--batch-collect-ms", type=int, default=10, help="Batch collection window")
+    parser.add_argument("--max-model-len", type=int, default=4096, help="vLLM max model length")
+    parser.add_argument("--max-num-seqs", type=int, help="vLLM scheduler max active sequences")
+    parser.add_argument("--max-num-batched-tokens", type=int, help="vLLM scheduler max batched tokens")
+    parser.add_argument("--gpu-memory-utilization", type=float, help="vLLM GPU memory utilization target")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size")
+    parser.add_argument("--enforce-eager", action="store_true", help="Disable vLLM CUDA graph capture")
     parser.add_argument(
         "--replicas-per-model",
         type=int,
@@ -185,6 +192,7 @@ def plan_deployments(
     launched_count: int,
     replicas_per_model: int = 1,
 ) -> list[InferServiceSpec]:
+    del state_db_dir
     available_gpus = [gpu for gpu in idle_gpus if gpu not in assigned_gpus]
     specs: list[InferServiceSpec] = []
     replica_count = max(1, int(replicas_per_model))
@@ -200,9 +208,6 @@ def plan_deployments(
             gpu_cursor += 1
             port = int(base_port) + int(launched_count) + len(specs)
             replica_suffix = "" if replica_count == 1 else f".r{replica_index + 1}"
-            state_db_path = None
-            if state_db_dir is not None:
-                state_db_path = state_db_dir / f"{safe_name}{replica_suffix}.sqlite3"
             specs.append(
                 InferServiceSpec(
                     model_path=model_path,
@@ -211,7 +216,6 @@ def plan_deployments(
                     port=port,
                     max_batch_size=max(1, int(max_batch_size)),
                     log_path=log_dir / f"{safe_name}{replica_suffix}.port{port}.log",
-                    state_db_path=state_db_path,
                     model_index=model_index,
                     replica_index=replica_index,
                     replica_count=replica_count,
@@ -226,9 +230,17 @@ def build_command(
     host: str,
     api_key: str,
     engine_mode: str,
-    infer_auto_config: str | None,
-    batch_collect_ms: int,
-    log_level: str,
+    vllm_rwkv_path: str | None = None,
+    vllm_python: str | None = None,
+    infer_auto_config: str | None = None,
+    batch_collect_ms: int = 10,
+    log_level: str = "info",
+    max_model_len: int | None = None,
+    max_num_seqs: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    gpu_memory_utilization: float | None = None,
+    tensor_parallel_size: int | None = None,
+    enforce_eager: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -240,6 +252,8 @@ def build_command(
         spec.model_name,
         "--device",
         "cuda:0",
+        "--cuda-visible-devices",
+        str(spec.gpu),
         "--engine-mode",
         engine_mode,
         "--host",
@@ -255,10 +269,24 @@ def build_command(
     ]
     if infer_auto_config:
         command.extend(["--infer-auto-config", str(infer_auto_config)])
+    if vllm_rwkv_path:
+        command.extend(["--vllm-rwkv-path", str(vllm_rwkv_path)])
+    if vllm_python:
+        command.extend(["--vllm-python", str(vllm_python)])
     if api_key:
         command.extend(["--api-key", api_key])
-    if spec.state_db_path is not None:
-        command.extend(["--state-db-path", str(spec.state_db_path)])
+    if max_model_len is not None:
+        command.extend(["--max-model-len", str(int(max_model_len))])
+    if max_num_seqs is not None:
+        command.extend(["--max-num-seqs", str(int(max_num_seqs))])
+    if max_num_batched_tokens is not None:
+        command.extend(["--max-num-batched-tokens", str(int(max_num_batched_tokens))])
+    if gpu_memory_utilization is not None:
+        command.extend(["--gpu-memory-utilization", str(float(gpu_memory_utilization))])
+    if tensor_parallel_size is not None:
+        command.extend(["--tensor-parallel-size", str(int(tensor_parallel_size))])
+    if enforce_eager:
+        command.append("--enforce-eager")
     return command
 
 
@@ -289,9 +317,17 @@ def launch_service(
     host: str,
     api_key: str,
     engine_mode: str,
+    vllm_rwkv_path: str | None,
+    vllm_python: str | None,
     infer_auto_config: str | None,
     batch_collect_ms: int,
     log_level: str,
+    max_model_len: int | None,
+    max_num_seqs: int | None,
+    max_num_batched_tokens: int | None,
+    gpu_memory_utilization: float | None,
+    tensor_parallel_size: int | None,
+    enforce_eager: bool,
     detach: bool,
 ) -> subprocess.Popen[bytes]:
     command = build_command(
@@ -299,13 +335,19 @@ def launch_service(
         host=host,
         api_key=api_key,
         engine_mode=engine_mode,
+        vllm_rwkv_path=vllm_rwkv_path,
+        vllm_python=vllm_python,
         infer_auto_config=infer_auto_config,
         batch_collect_ms=batch_collect_ms,
         log_level=log_level,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=max_num_batched_tokens,
+        gpu_memory_utilization=gpu_memory_utilization,
+        tensor_parallel_size=tensor_parallel_size,
+        enforce_eager=enforce_eager,
     )
     spec.log_path.parent.mkdir(parents=True, exist_ok=True)
-    if spec.state_db_path is not None:
-        spec.state_db_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(spec.gpu)
     with spec.log_path.open("ab", buffering=0) as stream:
@@ -387,7 +429,6 @@ def write_manifest(
                 "replica_index": service.spec.replica_index,
                 "replica_count": service.spec.replica_count,
                 "log_path": str(service.spec.log_path),
-                "state_db_path": None if service.spec.state_db_path is None else str(service.spec.state_db_path),
                 "base_url": service.spec.base_url,
                 "health_url": service.spec.health_url,
                 "pid": service.pid,
@@ -492,9 +533,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     host=str(args.host),
                     api_key=str(args.api_key or ""),
                     engine_mode=str(args.engine_mode),
+                    vllm_rwkv_path=args.vllm_rwkv_path,
+                    vllm_python=args.vllm_python,
                     infer_auto_config=args.infer_auto_config,
                     batch_collect_ms=int(args.batch_collect_ms),
                     log_level=str(args.log_level),
+                    max_model_len=args.max_model_len,
+                    max_num_seqs=args.max_num_seqs,
+                    max_num_batched_tokens=args.max_num_batched_tokens,
+                    gpu_memory_utilization=args.gpu_memory_utilization,
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    enforce_eager=bool(args.enforce_eager),
                     detach=bool(args.detach),
                 )
                 assigned_gpus.add(spec.gpu)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Hardware- and model-aware defaults for RWKV nano-vLLM inference services."""
+"""Hardware- and model-aware defaults for RWKV vLLM inference services."""
 
 import math
 import re

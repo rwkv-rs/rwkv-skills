@@ -134,7 +134,9 @@ class SchedulerStartRequest:
         if infer_protocol not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
             raise ValueError(f"unknown infer_protocol={infer_protocol!r}")
         infer_seed_policy = str(self.infer_seed_policy or "preserve")
-        if infer_seed_policy not in {"preserve", "omit-for-contents"}:
+        if infer_seed_policy == "omit-for-contents":
+            infer_seed_policy = "omit"
+        if infer_seed_policy not in {"preserve", "omit"}:
             raise ValueError(f"unknown infer_seed_policy={infer_seed_policy!r}")
         infer_worker_profile = str(self.infer_worker_profile or "fixed")
         if infer_worker_profile not in INFER_WORKER_PROFILE_CHOICES:

@@ -2,11 +2,11 @@
 
 English | [中文](README.zh-CN.md)
 
-An inference & evaluation scaffold for RWKV7, including a continuous-batching inference engine, dataset preppers for common benchmarks, and a GPU scheduler skeleton.
+An evaluation scaffold for RWKV7 that targets an external vLLM-RWKV OpenAI-compatible inference service, with dataset preppers for common benchmarks and a GPU scheduler skeleton.
 
 ## Quick tour
-- `src/infer`: RWKV model loading, sampling strategies, and a continuous-batching generation engine.
-- `src/infer/rwkv7`: The upstream RWKV7 reference implementation (CUDA extension, vocab) is vendored in; no extra submodule is required.
+- `src/infer`: Remote OpenAI/vLLM inference client, sampling configuration, and constraints.
+- `src/bin/run_infer_server.py`: Thin launcher for the external `~/GitHub/vllm-rwkv` checkout.
 - `src/eval/datasets`: Data structures, JSONL loaders, and dataset preparation scripts.
 - `src/eval/evaluators`: Evaluation pipelines for multiple-choice / free-response / instruction-following / code generation (HumanEval, MBPP).
 - `src/eval/scheduler`: A CLI for queueing evaluation jobs, GPU detection, and dispatching (with entry scripts for multi-choice / free-response / instruction-following / human-eval / mbpp).
@@ -14,7 +14,7 @@ An inference & evaluation scaffold for RWKV7, including a continuous-batching in
 
 ## Requirements
 - Python 3.12+. `uv` is recommended for dependency management.
-- NVIDIA/AMD GPU (via dependencies like `triton` + bundled rapid-sampling kernels), with CUDA/ROCm matching your chosen PyTorch build.
+- NVIDIA/AMD GPU for the external vLLM-RWKV server, with CUDA/ROCm matching that server environment.
 
 ## Installation
 ```bash
@@ -83,20 +83,15 @@ PY
 To see supported dataset aliases, check the `available_*_datasets()` family of functions.
 
 ## Evaluation & inference example
-At the moment, the recommended entry point is to call pipeline classes directly:
-```python
-from src.eval.evaluators.multi_choice import MultipleChoicePipeline
-from src.infer.model import ModelLoadConfig
-
-pipeline = MultipleChoicePipeline(ModelLoadConfig(weights_path="weights/rwkv7-*.pth", device="cuda:0"))
-result = pipeline.run_direct(
-    dataset_path="data/mmlu/test.jsonl",
-    output_path="results/completions/mmlu_direct.jsonl",
-    sample_limit=50
-)
-print(result)
+Start the external vLLM-RWKV server through the wrapper:
+```bash
+rwkv-skills-infer \
+  --model-path /path/to/rwkv7.pth \
+  --model-name rwkv7-demo \
+  --vllm-rwkv-path ~/GitHub/vllm-rwkv \
+  --port 19082
 ```
-Free-response and instruction-following work similarly via `FreeResponsePipeline` and `InstructionFollowingPipeline`.
+Then point eval commands at `--infer-base-url http://127.0.0.1:19082 --infer-model rwkv7-demo --infer-protocol vllm`.
 
 ## Scheduler CLI
 `rwkv-skills-scheduler` provides commands for queue preview, dispatch, status, stop, and log rotation:

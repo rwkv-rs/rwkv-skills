@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-"""Launch the standalone RWKV infer service."""
+"""Launch the RWKV vLLM server used by rwkv-skills evaluations."""
 
 import argparse
 import logging
 import os
-import sys
 from pathlib import Path
-from typing import Sequence, cast
+import subprocess
+import sys
+from typing import Mapping, Sequence
+
 
 def _bootstrap_cuda_visible_devices(argv: Sequence[str]) -> None:
     for index, arg in enumerate(argv):
@@ -21,30 +23,16 @@ def _bootstrap_cuda_visible_devices(argv: Sequence[str]) -> None:
 
 _bootstrap_cuda_visible_devices(sys.argv[1:])
 
-import uvicorn
-
 from src.infer.auto_config import AutoConfigMode, GpuProfile, choose_infer_auto_config, detect_visible_gpu_profile
-from src.infer.backend import InferenceBackend, LocalInferenceBackend
-from src.infer.model import ModelLoadConfig
-from src.infer.rwkv_lightning_server import (
-    DEFAULT_RWKV_LIGHTNING_PATH,
-    RWKVLightningServerConfig,
-    build_rwkv_lightning_app,
-)
-from src.infer.server import create_app
-from src.infer.service import InferenceService
 
 
+DEFAULT_VLLM_RWKV_PATH = Path.home() / "GitHub" / "vllm-rwkv"
 _AUTO_CONFIG_MODES = ("off", "balanced", "throughput")
-_ENGINE_MODE_CHOICES = ("rwkv-lightning", "lightning", "classic")
 _AUTO_CONFIG_DEFAULTS = {
     "max_batch_size": 32,
     "batch_collect_ms": 5,
     "max_num_seqs": 512,
     "max_num_batched_tokens": 16384,
-    "rwkv_prefill_token_budget": 2048,
-    "rwkv_prefill_max_batch_size": 128,
-    "max_state_slots": -1,
     "gpu_memory_utilization": 0.9,
 }
 _LOG = logging.getLogger(__name__)
@@ -54,44 +42,46 @@ def _default_auto_config_mode() -> str:
     return os.environ.get("RWKV_INFER_AUTO_CONFIG", "throughput").strip().lower()
 
 
-def _default_engine_mode() -> str:
-    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "rwkv-lightning").strip().lower()
-    if value in _ENGINE_MODE_CHOICES:
-        return value
-    return "rwkv-lightning"
+def _default_vllm_rwkv_path() -> str:
+    return os.environ.get("VLLM_RWKV_PATH", str(DEFAULT_VLLM_RWKV_PATH))
+
+
+def _default_vllm_python() -> str:
+    return os.environ.get("VLLM_PYTHON", sys.executable)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the standalone RWKV infer service")
+    parser = argparse.ArgumentParser(description="Run the RWKV vLLM infer service")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument(
         "--device",
         default="cuda",
-        help="Compatibility flag; rwkv-lightning selects cuda:0 after any --cuda-visible-devices remap",
+        help="Compatibility flag; vLLM uses CUDA_VISIBLE_DEVICES for GPU binding",
     )
     parser.add_argument(
         "--cuda-visible-devices",
         help=(
-            "Process-local CUDA_VISIBLE_DEVICES value applied before infer modules load. "
+            "Process-local CUDA_VISIBLE_DEVICES value applied before vLLM loads. "
             "Use this to bind a server to one physical GPU without changing shell or .env configuration."
         ),
     )
     parser.add_argument(
         "--engine-mode",
-        choices=_ENGINE_MODE_CHOICES,
-        default=_default_engine_mode(),
-        help="Inference backend implementation; rwkv-lightning is the formal server backend",
+        choices=("vllm-rwkv",),
+        default="vllm-rwkv",
+        help="Inference backend implementation; only vllm-rwkv is supported",
     )
     parser.add_argument(
-        "--state-db-path",
-        help="Path to the local sqlite state cache database used by the lightning engine",
+        "--vllm-rwkv-path",
+        default=_default_vllm_rwkv_path(),
+        help="Path to the vllm-rwkv source checkout",
     )
     parser.add_argument(
-        "--rwkv-lightning-path",
-        default=os.environ.get("RWKV_LIGHTNING_PATH", str(DEFAULT_RWKV_LIGHTNING_PATH)),
-        help="Path to the vendored RWKV-Lightning server source",
+        "--vllm-python",
+        default=_default_vllm_python(),
+        help="Python executable used to launch vllm-rwkv",
     )
-    parser.add_argument("--model-name", help="Public model name exposed by the infer API")
+    parser.add_argument("--model-name", help="Public model name exposed by the OpenAI-compatible API")
     parser.add_argument(
         "--infer-auto-config",
         "--auto-config-mode",
@@ -99,80 +89,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=_AUTO_CONFIG_MODES,
         default=_default_auto_config_mode(),
         help=(
-            "Startup parameter selector for omitted infer tuning flags. "
+            "Startup parameter selector for omitted vLLM tuning flags. "
             "throughput uses the highest usable tier, balanced steps one tier down, "
-            "off keeps legacy defaults. Explicit CLI values always win."
+            "off keeps static defaults. Explicit CLI values always win."
         ),
     )
     parser.add_argument(
         "--max-num-seqs",
         type=int,
         default=None,
-        help="nano-vLLM scheduler max active sequences",
+        help="vLLM scheduler max active sequences; values <= 0 omit the flag",
     )
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
         default=None,
-        help="nano-vLLM scheduler max batched tokens",
+        help="vLLM scheduler max batched tokens",
     )
-    parser.add_argument("--max-model-len", type=int, default=4096, help="nano-vLLM max model length")
-    parser.add_argument(
-        "--rwkv-prefill-token-budget",
-        type=int,
-        default=None,
-        help="nano-vLLM RWKV prefill token budget",
-    )
-    parser.add_argument(
-        "--rwkv-prefill-max-batch-size",
-        type=int,
-        default=None,
-        help="nano-vLLM RWKV prefill max batch size",
-    )
-    parser.add_argument(
-        "--rwkv-prefill-chunk-size",
-        type=int,
-        default=-1,
-        help="nano-vLLM RWKV prefill chunk size; -1 lets the engine use its default",
-    )
-    parser.add_argument(
-        "--rwkv-state-cache-enable",
-        action="store_true",
-        help="Enable nano-vLLM RWKV state cache",
-    )
-    parser.add_argument("--max-state-slots", type=int, default=None, help="nano-vLLM max RWKV state slots")
-    parser.add_argument(
-        "--rwkv-state-cache-safety-reserve-slots",
-        type=int,
-        default=0,
-        help="nano-vLLM RWKV state cache reserve slots",
-    )
-    parser.add_argument(
-        "--sampling-bucket-temperature-resolution",
-        type=float,
-        default=0.0,
-        help="nano-vLLM sampler temperature bucket resolution",
-    )
-    parser.add_argument(
-        "--sampling-bucket-top-p-resolution",
-        type=float,
-        default=0.0,
-        help="nano-vLLM sampler top-p bucket resolution",
-    )
-    parser.add_argument("--rwkv-quant-int8", action="store_true", help="Enable nano-vLLM RWKV int8 quantization")
-    parser.add_argument(
-        "--rwkv-int8-fp16-lm-head",
-        action="store_true",
-        help="Use fp16 lm_head with nano-vLLM int8 quantization",
-    )
+    parser.add_argument("--max-model-len", type=int, default=4096, help="vLLM max model length")
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=None,
-        help="nano-vLLM GPU memory utilization target",
+        help="vLLM GPU memory utilization target",
     )
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="nano-vLLM tensor parallel size")
-    parser.add_argument("--enforce-eager", action="store_true", help="Disable nano-vLLM CUDA graph capture")
+    parser.add_argument("--tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size")
+    parser.add_argument("--enforce-eager", action="store_true", help="Disable vLLM CUDA graph capture")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8081, help="Bind port")
     parser.add_argument("--api-key", default="", help="Optional bearer token required by the infer API")
@@ -180,15 +122,46 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-batch-size",
         type=int,
         default=None,
-        help="Max number of queued requests per infer batch",
+        help="Compatibility no-op retained for old launch scripts",
     )
     parser.add_argument(
         "--batch-collect-ms",
         type=int,
         default=None,
-        help="How long the worker waits to collect a batch",
+        help="Compatibility no-op retained for old launch scripts",
     )
-    parser.add_argument("--log-level", default="info", help="uvicorn log level")
+    parser.add_argument(
+        "--rwkv-wkv-mode",
+        default=os.environ.get("VLLM_RWKV7_WKV_MODE", "fp16"),
+        help="VLLM_RWKV7_WKV_MODE passed to vllm-rwkv",
+    )
+    parser.add_argument(
+        "--rwkv-emb-device",
+        default=os.environ.get("VLLM_RWKV7_EMB_DEVICE", "gpu"),
+        help="VLLM_RWKV7_EMB_DEVICE passed to vllm-rwkv",
+    )
+    parser.add_argument(
+        "--rwkv-rkv-mode",
+        default=os.environ.get("VLLM_RWKV7_RKV_MODE", "off"),
+        help="VLLM_RWKV7_RKV_MODE passed to vllm-rwkv",
+    )
+    parser.add_argument(
+        "--rwkv-cmix-sparse",
+        default=os.environ.get("VLLM_RWKV7_CMIX_SPARSE", "no-fc"),
+        help="VLLM_RWKV7_CMIX_SPARSE passed to vllm-rwkv",
+    )
+    parser.add_argument(
+        "--rwkv-low-rank-weight",
+        default=os.environ.get("VLLM_RWKV7_LOW_RANK_WEIGHT", "both"),
+        help="VLLM_RWKV7_LOW_RANK_WEIGHT passed to vllm-rwkv",
+    )
+    parser.add_argument(
+        "--extra-vllm-arg",
+        action="append",
+        default=[],
+        help="Additional raw argument appended to `vllm serve`; repeat for multiple arguments",
+    )
+    parser.add_argument("--log-level", default="info", help="vLLM log level")
     args = parser.parse_args(argv)
     return apply_startup_auto_config(args)
 
@@ -209,7 +182,7 @@ def apply_startup_auto_config(
             model_path=str(args.model_path),
             model_name=str(args.model_name) if args.model_name else None,
             gpu_profile=profile,
-            mode=cast(AutoConfigMode, mode),
+            mode=mode,  # type: ignore[arg-type]
         )
         for field in omitted_fields:
             setattr(args, field, getattr(config, field))
@@ -225,62 +198,64 @@ def apply_startup_auto_config(
     return args
 
 
-def build_backend(args: argparse.Namespace) -> InferenceBackend:
-    engine_mode = str(args.engine_mode or "lightning").strip().lower()
-    if engine_mode == "rwkv-lightning":
-        raise ValueError("rwkv-lightning is a standalone server mode; call main() to launch it")
-    if engine_mode in {"lightning", "classic"}:
-        return LocalInferenceBackend.from_model_config(
-            ModelLoadConfig(
-                weights_path=str(args.model_path),
-                device=str(args.device or "cuda"),
-            ),
-            engine_mode=engine_mode,
-            state_db_path=None if args.state_db_path in (None, "") else str(args.state_db_path),
-        )
-    raise ValueError(f"unsupported engine mode: {args.engine_mode!r}")
+def build_vllm_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        str(args.vllm_python),
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        str(args.model_path),
+        "--host",
+        str(args.host),
+        "--port",
+        str(int(args.port)),
+        "--max-model-len",
+        str(int(args.max_model_len)),
+        "--gpu-memory-utilization",
+        str(float(args.gpu_memory_utilization)),
+        "--tensor-parallel-size",
+        str(int(args.tensor_parallel_size)),
+    ]
+    if args.model_name:
+        command.extend(["--served-model-name", str(args.model_name)])
+    if args.api_key:
+        command.extend(["--api-key", str(args.api_key)])
+    if int(args.max_num_seqs) > 0:
+        command.extend(["--max-num-seqs", str(int(args.max_num_seqs))])
+    if int(args.max_num_batched_tokens) > 0:
+        command.extend(["--max-num-batched-tokens", str(int(args.max_num_batched_tokens))])
+    if bool(args.enforce_eager):
+        command.append("--enforce-eager")
+    if str(args.log_level or "").strip():
+        command.extend(["--uvicorn-log-level", str(args.log_level)])
+    command.extend(str(item) for item in (args.extra_vllm_arg or ()))
+    return command
+
+
+def build_vllm_env(args: argparse.Namespace, *, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    vllm_path = str(Path(str(args.vllm_rwkv_path)).expanduser().resolve())
+    pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = vllm_path if not pythonpath else f"{vllm_path}{os.pathsep}{pythonpath}"
+    if args.cuda_visible_devices:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.cuda_visible_devices)
+    env["VLLM_RWKV7_WKV_MODE"] = str(args.rwkv_wkv_mode)
+    env["VLLM_RWKV7_EMB_DEVICE"] = str(args.rwkv_emb_device)
+    env["VLLM_RWKV7_RKV_MODE"] = str(args.rwkv_rkv_mode)
+    env["VLLM_RWKV7_CMIX_SPARSE"] = str(args.rwkv_cmix_sparse)
+    env["VLLM_RWKV7_LOW_RANK_WEIGHT"] = str(args.rwkv_low_rank_weight)
+    return env
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
     if bool(getattr(args, "infer_auto_config_applied", False)):
-        logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
         _LOG.info("applied infer auto config: %s", args.infer_auto_config_reason)
-    if str(args.engine_mode).strip().lower() == "rwkv-lightning":
-        server = build_rwkv_lightning_app(
-            RWKVLightningServerConfig(
-                model_path=str(args.model_path),
-                model_name=str(args.model_name) if args.model_name else None,
-                password=str(args.api_key) if args.api_key else None,
-                rwkv_lightning_path=str(args.rwkv_lightning_path),
-            )
-        )
-        try:
-            uvicorn.run(
-                server.app,
-                host=args.host,
-                port=int(args.port),
-                log_level=str(args.log_level),
-                access_log=False,
-            )
-        finally:
-            server.cleanup()
-        return 0
-    backend = build_backend(args)
-    service = InferenceService(
-        backend,
-        max_batch_size=args.max_batch_size,
-        batch_collect_ms=args.batch_collect_ms,
-    )
-    app = create_app(service, api_key=args.api_key)
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=int(args.port),
-        log_level=str(args.log_level),
-        access_log=False,
-    )
-    return 0
+    command = build_vllm_command(args)
+    env = build_vllm_env(args)
+    _LOG.info("launching vllm-rwkv: %s", " ".join(command))
+    return int(subprocess.run(command, env=env, check=False).returncode)
 
 
 if __name__ == "__main__":  # pragma: no cover

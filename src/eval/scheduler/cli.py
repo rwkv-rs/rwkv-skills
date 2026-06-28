@@ -229,9 +229,9 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--infer-seed-policy",
-        choices=("preserve", "omit-for-contents"),
+        choices=("preserve", "omit"),
         default="preserve",
-        help="远端 seed 策略：默认保留 seed；omit-for-contents 在 nano contents 批量时丢弃 seed",
+        help="远端 seed 策略：默认保留 seed；omit 在 vLLM/completions 请求中丢弃逐 prompt seed",
     )
     parser.add_argument("--remote-batch-size", type=int, help="远端推理模式下传给支持 batch 的 runner 的 --batch-size")
     parser.add_argument(

@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import ast
 from functools import lru_cache
+import os
 from pathlib import Path
 
 
-_VOCAB_PATH = Path(__file__).resolve().parents[1] / "infer" / "rwkv7" / "rwkv_vocab_v20230424.txt"
+def _rwkv_vocab_path() -> Path | None:
+    raw = os.environ.get("RWKV_TOKENIZER_VOCAB_PATH") or os.environ.get("RWKV_VOCAB_PATH")
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
 
 
 @lru_cache(maxsize=1)
@@ -17,10 +22,11 @@ def load_rwkv_vocab() -> dict[int, bytes]:
     where python-literal is a repr of either bytes or str.
     """
     vocab: dict[int, bytes] = {}
-    if not _VOCAB_PATH.exists():
+    vocab_path = _rwkv_vocab_path()
+    if vocab_path is None or not vocab_path.exists():
         return vocab
 
-    for line in _VOCAB_PATH.read_text(encoding="utf-8").splitlines():
+    for line in vocab_path.read_text(encoding="utf-8").splitlines():
         if not line:
             continue
         first_space = line.find(" ")
@@ -90,4 +96,3 @@ __all__ = [
     "load_rwkv_vocab",
     "token_id_to_display",
 ]
-

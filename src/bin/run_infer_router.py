@@ -28,12 +28,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=19081, help="Bind port")
     parser.add_argument("--timeout-s", type=float, default=600.0, help="Backend request timeout")
     parser.add_argument(
-        "--choice-logits-timeout-s",
-        type=float,
-        default=None,
-        help="Backend request timeout for /v1/choice_logits; defaults to --timeout-s",
-    )
-    parser.add_argument(
         "--forward-max-workers",
         type=int,
         default=256,
@@ -118,22 +112,18 @@ def create_app(
     routes: Mapping[str, str | Sequence[str]],
     *,
     timeout_s: float = 600.0,
-    choice_logits_timeout_s: float | None = None,
     forward_max_workers: int = 256,
 ) -> FastAPI:
     route_map = normalize_routes(routes)
     route_offsets = {model: 0 for model in route_map}
     request_timeout_s = float(timeout_s)
-    choice_timeout_s = (
-        request_timeout_s if choice_logits_timeout_s is None else float(choice_logits_timeout_s)
-    )
     forward_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=max(1, int(forward_max_workers)),
         thread_name_prefix="infer-router-forward",
     )
     forward_http_client = _build_forward_http_client(
         max_connections=max(1, int(forward_max_workers)),
-        timeout_s=max(request_timeout_s, choice_timeout_s),
+        timeout_s=request_timeout_s,
     )
 
     @asynccontextmanager
@@ -210,17 +200,6 @@ def create_app(
             timeout_s=timeout_s,
         )
 
-    @app.post("/v1/choice_logits")
-    @app.post("/openai/v1/choice_logits")
-    async def choice_logits(request: Request) -> Response:
-        return await _forward_json_request(
-            request,
-            routes=route_map,
-            route_offsets=route_offsets,
-            backend_path="choice_logits",
-            timeout_s=choice_timeout_s,
-        )
-
     @app.post("/v1/completions")
     @app.post("/openai/v1/completions")
     async def completions(request: Request) -> Response:
@@ -253,7 +232,7 @@ async def _forward_json_request(
     model = str(payload.get("model") or "").strip()
     should_split_contents_batch = (
         isinstance(payload.get("contents"), list)
-        and (backend_path.endswith("chat/completions") or backend_path == "choice_logits")
+        and backend_path.endswith("chat/completions")
     )
     if should_split_contents_batch:
         urls = _backend_urls_for_model(model, routes)
@@ -320,10 +299,7 @@ async def _forward_contents_batch_request(
     for status_code, raw, media_type in results:
         if int(status_code) >= 400:
             return Response(content=raw, status_code=int(status_code), media_type=media_type)
-    if backend_path == "choice_logits":
-        merged = _merge_choice_logits_batch_responses(payload, subrequests=subrequests, results=results)
-    else:
-        merged = _merge_contents_batch_responses(payload, subrequests=subrequests, results=results)
+    merged = _merge_contents_batch_responses(payload, subrequests=subrequests, results=results)
     return Response(
         content=json.dumps(merged, ensure_ascii=False).encode("utf-8"),
         status_code=200,
@@ -396,61 +372,6 @@ def _merge_contents_batch_responses(
     template["choices"] = sorted(merged_choices, key=lambda choice: int(choice.get("index", 0)))
     template["model"] = str(payload.get("model") or template.get("model") or "")
     return template
-
-
-def _merge_choice_logits_batch_responses(
-    payload: dict[str, Any],
-    *,
-    subrequests: Sequence[tuple[str, tuple[int, ...], dict[str, Any]]],
-    results: Sequence[tuple[int, bytes, str]],
-) -> dict[str, Any]:
-    merged_results: list[dict[str, Any]] = []
-    template: dict[str, Any] | None = None
-    for (_base_url, indices, _subpayload), (_status_code, raw, _media_type) in zip(subrequests, results, strict=True):
-        try:
-            response = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise HTTPException(status_code=502, detail="backend response must be JSON") from exc
-        if not isinstance(response, dict):
-            raise HTTPException(status_code=502, detail="backend response must be a JSON object")
-        if template is None:
-            template = dict(response)
-        response_results = response.get("results")
-        if isinstance(response_results, list):
-            local_results = response_results
-        elif "choice_logits" in response:
-            local_results = [_single_choice_logits_response_to_result(response)]
-        else:
-            raise HTTPException(status_code=502, detail="backend choice_logits response missing results")
-        for fallback_index, result in enumerate(local_results):
-            if not isinstance(result, dict):
-                raise HTTPException(status_code=502, detail="backend choice_logits result must be an object")
-            local_index = int(result.get("index", fallback_index))
-            if local_index < 0 or local_index >= len(indices):
-                raise HTTPException(status_code=502, detail="backend choice_logits result index out of range")
-            rewritten = dict(result)
-            rewritten["index"] = indices[local_index]
-            merged_results.append(rewritten)
-    response_model = str(payload.get("model") or (template or {}).get("model") or "")
-    merged: dict[str, Any] = {
-        "id": str((template or {}).get("id") or "router-choice-logits"),
-        "object": "choice.logits.batch",
-        "model": response_model,
-        "results": sorted(merged_results, key=lambda result: int(result.get("index", 0))),
-    }
-    if template is not None and template.get("created") is not None:
-        merged["created"] = template["created"]
-    return merged
-
-
-def _single_choice_logits_response_to_result(response: Mapping[str, Any]) -> dict[str, Any]:
-    result = {
-        key: value
-        for key, value in response.items()
-        if key not in {"id", "object", "created", "model"}
-    }
-    result.setdefault("index", 0)
-    return result
 
 
 async def _collect_backpressure(
@@ -810,7 +731,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     app = create_app(
         routes,
         timeout_s=float(args.timeout_s),
-        choice_logits_timeout_s=args.choice_logits_timeout_s,
         forward_max_workers=int(args.forward_max_workers),
     )
     uvicorn.run(

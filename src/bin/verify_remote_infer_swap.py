@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Sequence
 
 from src.infer.backend import (
-    REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES,
     REMOTE_INFERENCE_PROTOCOL_CHOICES,
     RemoteInferenceBackend,
     RemoteInferenceConfig,
@@ -160,7 +159,7 @@ def _verify_protocol(
             timeout_s=timeout_s,
             max_workers=request_count,
             protocol=protocol,
-            seed_policy="omit-for-contents" if protocol == "nano-vllm-contents" else "preserve",
+            seed_policy="preserve",
         )
     )
     prompts = [prompt] * request_count
@@ -216,7 +215,7 @@ def _normalize_protocols(protocols: Sequence[str]) -> tuple[RemoteInferenceProto
             protocol = item.strip()
             if not protocol:
                 continue
-            if protocol not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:
+            if protocol not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
                 choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)
                 raise ValueError(f"protocol must be one of: {choices}")
             normalized.append(protocol)  # type: ignore[arg-type]

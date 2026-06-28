@@ -306,15 +306,15 @@ def test_run_from_config_invokes_runner_and_restores_env(monkeypatch, tmp_path: 
     assert "RWKV_EVAL_RUN_MODE" not in os.environ
 
 
-def test_local_model_config_passes_lightning_state_cache_args(monkeypatch, tmp_path: Path) -> None:
+def test_remote_model_config_passes_vllm_infer_args(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
             "dataset": {"name": "mmlu"},
             "model": {
-                "path": "weights/model.pth",
-                "device": "cuda:0",
-                "engine_mode": "lightning",
-                "state_db_path": "tmp/state-cache.sqlite3",
+                "infer_base_url": "http://127.0.0.1:19082",
+                "infer_model": "demo",
+                "infer_protocol": "vllm",
+                "infer_seed_policy": "preserve",
             },
             "runner": {"cot_mode": "cot"},
         }
@@ -327,12 +327,13 @@ def test_local_model_config_passes_lightning_state_cache_args(monkeypatch, tmp_p
 
     resolved = main_module.resolve_run_config(config)
 
-    assert "--model-path" in resolved.argv
-    assert "weights/model.pth" in resolved.argv
-    assert "--engine-mode" in resolved.argv
-    assert "lightning" in resolved.argv
-    assert "--state-db-path" in resolved.argv
-    assert "tmp/state-cache.sqlite3" in resolved.argv
+    assert "--infer-base-url" in resolved.argv
+    assert "http://127.0.0.1:19082" in resolved.argv
+    assert "--infer-model" in resolved.argv
+    assert "demo" in resolved.argv
+    assert "--infer-protocol" in resolved.argv
+    assert "vllm" in resolved.argv
+    assert "--model-path" not in resolved.argv
 
 
 def test_run_from_config_passes_contracts_and_patches_env(monkeypatch, tmp_path: Path) -> None:

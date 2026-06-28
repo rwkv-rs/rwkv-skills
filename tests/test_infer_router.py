@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-import json
-from types import SimpleNamespace
-
-from fastapi.responses import Response
-
 import src.bin.run_infer_router as infer_router
 from src.bin.run_infer_router import (
     _build_backpressure_payload,
@@ -44,8 +38,8 @@ def test_backend_url_for_path_switches_api_version() -> None:
         == "http://127.0.0.1:18081/v2/chat/completions"
     )
     assert (
-        _backend_url_for_path("http://127.0.0.1:18081/openai/v1", "choice_logits")
-        == "http://127.0.0.1:18081/openai/v1/choice_logits"
+        _backend_url_for_path("http://127.0.0.1:18081/openai/v1", "completions")
+        == "http://127.0.0.1:18081/openai/v1/completions"
     )
 
 
@@ -76,7 +70,6 @@ def test_create_app_registers_openai_routes() -> None:
         assert "/v1/batch-metrics" in paths
         assert "/v1/chat/completions" in paths
         assert "/v2/chat/completions" in paths
-        assert "/v1/choice_logits" in paths
         assert "/v1/completions" in paths
     finally:
         _close_router_app(app)
@@ -97,126 +90,6 @@ def test_router_forward_max_workers_is_configurable() -> None:
         assert app.state.forward_executor._max_workers == 96
     finally:
         _close_router_app(app)
-
-
-def test_choice_logits_timeout_is_configurable(monkeypatch) -> None:
-    calls: list[tuple[str, float]] = []
-
-    def _fake_post_bytes(url, body, authorization, content_type, timeout_s, http_client):  # noqa: ANN001
-        del body, authorization, content_type, http_client
-        calls.append((url, float(timeout_s)))
-        return Response(
-            content=json.dumps(
-                {
-                    "id": "backend-choice-logits",
-                    "object": "choice.logits",
-                    "model": "model-a",
-                    "choice_logits": {"A": 1.0},
-                    "best_choice": "A",
-                }
-            ).encode("utf-8"),
-            status_code=200,
-            media_type="application/json",
-        )
-
-    monkeypatch.setattr(infer_router, "_post_bytes", _fake_post_bytes)
-    args = parse_args(
-        [
-            "--route",
-            "model-a=http://127.0.0.1:18081",
-            "--timeout-s",
-            "900",
-            "--choice-logits-timeout-s",
-            "37",
-        ]
-    )
-    app = create_app(
-        {"model-a": "http://127.0.0.1:18081"},
-        timeout_s=args.timeout_s,
-        choice_logits_timeout_s=args.choice_logits_timeout_s,
-    )
-    try:
-        async def _body() -> bytes:
-            return json.dumps(
-                {"model": "model-a", "content": "question", "choices": {"A": " A"}}
-            ).encode("utf-8")
-
-        response = asyncio.run(
-            infer_router._forward_json_request(
-                SimpleNamespace(
-                    app=SimpleNamespace(state=app.state),
-                    headers={"content-type": "application/json"},
-                    body=_body,
-                ),
-                routes=infer_router.normalize_routes({"model-a": "http://127.0.0.1:18081"}),
-                route_offsets={"model-a": 0},
-                backend_path="choice_logits",
-                timeout_s=float(args.choice_logits_timeout_s),
-            )
-        )
-    finally:
-        _close_router_app(app)
-
-    assert response.status_code == 200
-    assert calls == [("http://127.0.0.1:18081/v1/choice_logits", 37.0)]
-
-
-def test_choice_logits_contents_batch_is_sharded_across_replicas() -> None:
-    payload = {
-        "model": "model-a",
-        "contents": ["q0", "q1", "q2", "q3"],
-        "choices": {"A": " A", "B": " B"},
-    }
-    urls = infer_router.normalize_routes(
-        {
-            "model-a": (
-                "http://127.0.0.1:18081",
-                "http://127.0.0.1:18082",
-            )
-        }
-    )["model-a"]
-    subrequests = infer_router._split_contents_payload(payload, urls=urls, start_offset=0)
-    calls = [(base_url, subpayload) for base_url, _indices, subpayload in subrequests]
-    results = []
-    for _base_url, _indices, subpayload in subrequests:
-        local_results = [
-            {
-                "index": index,
-                "choice_logits": {"A": float(index), "B": -float(index)},
-                "choice_probabilities": {"A": 0.75, "B": 0.25},
-                "best_choice": "A",
-            }
-            for index, _content in enumerate(subpayload["contents"])
-        ]
-        results.append(
-            (
-                200,
-                json.dumps(
-                    {
-                        "id": "backend-choice-logits",
-                        "object": "choice.logits.batch",
-                        "model": subpayload["model"],
-                        "results": local_results,
-                    }
-                ).encode("utf-8"),
-                "application/json",
-            )
-        )
-
-    body = infer_router._merge_choice_logits_batch_responses(
-        payload,
-        subrequests=subrequests,
-        results=results,
-    )
-
-    assert [call[0] for call in calls] == [
-        "http://127.0.0.1:18081/v1",
-        "http://127.0.0.1:18082/v1",
-    ]
-    assert [call[1]["contents"] for call in calls] == [["q0", "q1"], ["q2", "q3"]]
-    assert body["object"] == "choice.logits.batch"
-    assert body["model"] == "model-a"
-    assert [result["index"] for result in body["results"]] == [0, 1, 2, 3]
 
 
 def test_router_forward_http_client_is_shared(monkeypatch) -> None:

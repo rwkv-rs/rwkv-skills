@@ -1,27 +1,20 @@
 from __future__ import annotations
 
-"""Shared local/remote inference backends for evaluation pipelines."""
+"""Shared remote inference backend for evaluation pipelines."""
 
 import argparse
 import concurrent.futures
 import json
-import math
 import threading
 import time
-from dataclasses import dataclass, field, is_dataclass, replace
-from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Callable, Literal, Protocol, Sequence
 
 import httpx
 from tqdm import tqdm
 
 from .constraints import DecodeConstraint
 from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
-
-if TYPE_CHECKING:
-    from .engine import TokenizerProtocol
-    from .lightning_engine import LocalEngineProtocol
-    from .model import ModelLoadConfig
 
 
 class RemoteHTTPError(RuntimeError):
@@ -33,29 +26,19 @@ class RemoteHTTPError(RuntimeError):
 
 _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
-_REMOTE_GENERATION_MIN_TEMPERATURE = 0.001
-_REMOTE_GENERATION_MAX_TEMPERATURE = 1000.0
 DEFAULT_PREFILL_CHUNK_SIZE = 16
 
-RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "lightning", "nano-vllm-contents"]
-RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
+RemoteInferenceProtocol = Literal["openai", "vllm", "completions"]
+RemoteInferenceSeedPolicy = Literal["preserve", "omit"]
 REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
     "openai",
     "vllm",
     "completions",
-    "lightning",
-)
-REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("nano-vllm-contents",)
-REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
-    *REMOTE_INFERENCE_PROTOCOL_CHOICES,
-    *REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES,
 )
 REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
     "preserve",
-    "omit-for-contents",
+    "omit",
 )
-_CONTENTS_BATCH_PROTOCOLS = frozenset({"nano-vllm-contents", "lightning"})
-_DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES = 4
 
 
 def normalize_api_root(base_url: str) -> str:
@@ -107,17 +90,17 @@ def _is_retryable_remote_http_error(exc: RemoteHTTPError) -> bool:
 
 
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model-path", help="Path to RWKV weights (.pth)")
-    parser.add_argument("--device", default="cuda", help="Device string, e.g. cuda:0 or cpu")
+    parser.add_argument("--model-path", help="Deprecated; local model loading has been removed from this branch")
+    parser.add_argument("--device", default="cuda", help="Deprecated compatibility flag")
     parser.add_argument(
         "--engine-mode",
-        choices=("classic", "lightning"),
-        default="classic",
-        help="Local inference engine implementation to use",
+        choices=("vllm-rwkv",),
+        default="vllm-rwkv",
+        help="Deprecated compatibility flag; vllm-rwkv is the only supported engine",
     )
     parser.add_argument(
         "--state-db-path",
-        help="Path to the local sqlite state cache database used by the lightning engine",
+        help="Deprecated compatibility flag; local Lightning state caches have been removed",
     )
     parser.add_argument("--infer-base-url", help="OpenAI-compatible infer service base URL")
     parser.add_argument("--infer-model", help="Model name exposed by the remote infer service")
@@ -140,10 +123,8 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
         choices=REMOTE_INFERENCE_SEED_POLICY_CHOICES,
         default="preserve",
         help=(
-            "Remote seed handling. preserve keeps per-prompt seeds, falling back to OpenAI requests when needed; "
-            "vllm, completions, lightning, and omit-for-contents omit per-prompt seeds for standard concurrent requests; "
-            "completions preserves raw prompts and private RWKV sampling fields; "
-            "omit-for-contents also drops seeds for contents batching."
+            "Remote seed handling. preserve keeps per-prompt seeds when the protocol supports them; "
+            "omit drops per-prompt seeds for higher-throughput vLLM/completions requests."
         ),
     )
 
@@ -156,8 +137,10 @@ def validate_inference_backend_args(args: argparse.Namespace) -> None:
     has_remote = bool(infer_base_url or infer_model)
     if has_local and has_remote:
         raise ValueError("请二选一：使用本地 --model-path，或远端 --infer-base-url/--infer-model。")
-    if not has_local and not has_remote:
-        raise ValueError("必须提供 --model-path，或同时提供 --infer-base-url 和 --infer-model。")
+    if has_local and not has_remote:
+        raise ValueError("本分支已移除本地推理；请使用 --infer-base-url 和 --infer-model 连接 vllm-rwkv 服务。")
+    if not has_remote:
+        raise ValueError("必须同时提供 --infer-base-url 和 --infer-model。")
     if has_remote and not infer_base_url:
         raise ValueError("远端推理模式缺少 --infer-base-url。")
     if has_remote and not infer_model:
@@ -167,10 +150,7 @@ def validate_inference_backend_args(args: argparse.Namespace) -> None:
 def resolve_backend_model_name(args: argparse.Namespace) -> str:
     validate_inference_backend_args(args)
     infer_model = str(getattr(args, "infer_model", "") or "").strip()
-    if infer_model:
-        return infer_model
-    model_path = str(getattr(args, "model_path", "") or "").strip()
-    return Path(model_path).stem
+    return infer_model
 
 
 def require_completion_style_remote_protocol(
@@ -185,15 +165,10 @@ def require_completion_style_remote_protocol(
     if not infer_base_url:
         return False
     protocol = _normalize_remote_protocol(getattr(args, "infer_protocol", "openai"))
-    if protocol == "vllm":
-        raise ValueError(
-            f"{benchmark_name} requires completion-style remote generation; "
-            "use --infer-protocol completions or lightning instead of vllm/chat."
-        )
-    if protocol == "openai":
+    if protocol in {"openai", "vllm"}:
         setattr(args, "infer_protocol", "completions")
         return True
-    if protocol in {"completions", "lightning"}:
+    if protocol == "completions":
         return True
     raise ValueError(
         f"{benchmark_name} requires completion-style remote generation; "
@@ -224,117 +199,6 @@ class InferenceBackend(Protocol):
     ) -> list[GenerationOutput]:
         ...
 
-    def score_choice_tokens(
-        self,
-        *,
-        prompt: str,
-        choice_token_texts: Sequence[str],
-    ) -> tuple[dict[str, float], str]:
-        ...
-
-
-@dataclass(slots=True)
-class LocalInferenceBackend:
-    model_name: str
-    model: object
-    tokenizer: "TokenizerProtocol"
-    engine: "LocalEngineProtocol"
-    engine_mode: str = "classic"
-
-    @classmethod
-    def from_model_config(
-        cls,
-        config: ModelLoadConfig,
-        *,
-        engine_mode: str = "classic",
-        state_db_path: str | None = None,
-    ) -> LocalInferenceBackend:
-        from .lightning_engine import build_local_engine
-        from .model import load_rwkv_model
-
-        normalized_device = normalize_local_device(str(getattr(config, "device", "cuda") or "cuda"))
-        if getattr(config, "device", None) != normalized_device:
-            if is_dataclass(config):
-                config = replace(config, device=normalized_device)
-            else:
-                setattr(config, "device", normalized_device)
-        model, tokenizer = load_rwkv_model(config)
-        model_name = Path(config.weights_path).stem
-        return cls(
-            model_name=model_name,
-            model=model,
-            tokenizer=tokenizer,
-            engine=build_local_engine(model, tokenizer, mode=engine_mode, state_db_path=state_db_path),
-            engine_mode=engine_mode,
-        )
-
-    def generate(
-        self,
-        prompts: Sequence[str],
-        *,
-        sampling: SamplingConfig,
-        batch_size: int,
-        progress_desc: str = "Generating",
-        probe_only: bool = False,
-        on_complete: Callable[[GenerationOutput], None] | None = None,
-        on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
-        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
-        constraints: Sequence[DecodeConstraint | None] | None = None,
-        constraint_mode: Literal["off", "soft", "strict"] = "off",
-        prompt_seeds: Sequence[int | None] | None = None,
-        top_logprobs: int = 0,
-        prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
-        show_progress: bool = True,
-    ) -> list[GenerationOutput]:
-        effective_constraints = _resolve_effective_constraints(
-            constraints=constraints,
-            constraint_mode=constraint_mode,
-        )
-        return self.engine.generate(
-            prompts,
-            sampling=sampling,
-            batch_size=batch_size,
-            prefill_chunk_size=prefill_chunk_size,
-            progress_desc=progress_desc,
-            probe_only=probe_only,
-            on_complete=on_complete,
-            on_token=on_token,
-            prompt_stop_suffixes=prompt_stop_suffixes,
-            prompt_constraints=effective_constraints,
-            prompt_seeds=prompt_seeds,
-            top_logprobs=top_logprobs,
-            show_progress=show_progress,
-        )
-
-    def score_choice_tokens(
-        self,
-        *,
-        prompt: str,
-        choice_token_texts: Sequence[str],
-    ) -> tuple[dict[str, float], str]:
-        import torch
-
-        if not choice_token_texts:
-            raise ValueError("choice_token_texts cannot be empty")
-        tokens = [0] + list(self.tokenizer.encode(prompt.strip()))
-        state = _blank_state(self.model)
-        with torch.no_grad():
-            logits = self.model.forward(tokens, state, full_output=False)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-        logits = logits.to(torch.float32)
-        choice_token_ids = [_single_token_id(self.tokenizer, token_text) for token_text in choice_token_texts]
-        slice_values = logits[choice_token_ids]
-        scores = {
-            token_text: float(value)
-            for token_text, value in zip(choice_token_texts, slice_values.cpu(), strict=True)
-        }
-        pred_idx = int(torch.argmax(slice_values).item())
-        return scores, choice_token_texts[pred_idx]
-
-    def shutdown(self) -> None:
-        self.engine.shutdown()
-
 
 @dataclass(slots=True, frozen=True)
 class RemoteInferenceConfig:
@@ -361,52 +225,20 @@ class RemoteInferenceConfig:
     def chat_completions_url(self) -> str:
         return f"{normalize_api_base_for_version(self.base_url, 'v1')}/chat/completions"
 
-    def lightning_api_root(self) -> str:
-        root = normalize_api_root(self.base_url)
-        if root.endswith("/openai"):
-            return root.rsplit("/", 1)[0]
-        return root
-
-    def lightning_chat_completions_url(self) -> str:
-        return f"{self.lightning_api_root()}/v2/chat/completions"
-
-    def choice_logits_url(self) -> str:
-        return f"{self.lightning_api_root()}/v1/choice_logits"
-
-
-def remote_contents_inflight_batches(
-    backend: object,
-    batch_size: int,
-    *,
-    max_inflight_batches: int = _DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES,
-) -> int:
-    config = getattr(backend, "config", None)
-    if getattr(config, "protocol", None) not in _CONTENTS_BATCH_PROTOCOLS:
-        return 1
-    request_batch = max(1, int(batch_size))
-    worker_budget = max(1, int(getattr(config, "max_workers", request_batch) or request_batch))
-    cap = max(1, int(max_inflight_batches))
-    return max(1, min(cap, worker_budget // request_batch))
-
 
 def resolve_generation_prompt_batch_size(
     backend: object,
     batch_size: int,
     *,
-    max_inflight_batches: int = _DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES,
+    max_inflight_batches: int = 4,
 ) -> int:
-    request_batch = max(1, int(batch_size))
-    return request_batch * remote_contents_inflight_batches(
-        backend,
-        request_batch,
-        max_inflight_batches=max_inflight_batches,
-    )
+    del backend, max_inflight_batches
+    return max(1, int(batch_size))
 
 
 @dataclass(slots=True)
 class RemoteInferenceBackend:
     config: RemoteInferenceConfig
-    _legacy_choice_scoring_supported: bool | None = field(default=None, init=False, repr=False)
     _http_client: httpx.Client | None = field(default=None, init=False, repr=False)
     _http_client_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
@@ -445,36 +277,16 @@ class RemoteInferenceBackend:
         if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
             raise ValueError("prompt_stop_suffixes length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
-        force_openai_single_requests = False
-        use_contents_protocol = self.config.protocol in {"nano-vllm-contents", "lightning"}
         omit_prompt_seeds = (
-            self.config.protocol in {"vllm", "completions", "lightning"}
-            or self.config.seed_policy == "omit-for-contents"
+            self.config.protocol in {"vllm", "completions"}
+            or self.config.seed_policy == "omit"
         )
         if prompt_seeds is not None:
             has_prompt_seeds = any(seed is not None for seed in prompt_seeds)
-            if (
-                has_prompt_seeds
-                and (omit_prompt_seeds or (use_contents_protocol and self.config.seed_policy == "omit-for-contents"))
-            ):
+            if has_prompt_seeds and omit_prompt_seeds:
                 prompt_seeds = None
-            elif has_prompt_seeds:
-                force_openai_single_requests = True
-            else:
+            elif not has_prompt_seeds:
                 prompt_seeds = None
-        if use_contents_protocol and not force_openai_single_requests:
-            return self._generate_contents_batches(
-                prompts,
-                sampling=effective_sampling,
-                batch_size=batch_size,
-                progress_desc=progress_desc,
-                probe_only=probe_only,
-                on_complete=on_complete,
-                on_token=on_token,
-                prompt_stop_suffixes=prompt_stop_suffixes,
-                prefill_chunk_size=prefill_chunk_size,
-                show_progress=show_progress,
-            )
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
@@ -504,240 +316,6 @@ class RemoteInferenceBackend:
             _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
 
-    def _generate_contents_batches(
-        self,
-        prompts: Sequence[str],
-        *,
-        sampling: SamplingConfig,
-        batch_size: int,
-        progress_desc: str,
-        probe_only: bool,
-        on_complete: Callable[[GenerationOutput], None] | None,
-        on_token: Callable[[int, GeneratedTextDelta], None] | None,
-        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
-        prefill_chunk_size: int,
-        show_progress: bool,
-    ) -> list[GenerationOutput]:
-        outputs: list[GenerationOutput | None] = [None] * len(prompts)
-        max_batch = max(1, min(int(batch_size), len(prompts)))
-        max_inflight = remote_contents_inflight_batches(self, max_batch)
-        batches = _iter_contents_batches(
-            prompt_count=len(prompts),
-            max_batch=max_batch,
-            prompt_stop_suffixes=prompt_stop_suffixes,
-        )
-        progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_inflight) as executor:
-                future_map = {
-                    executor.submit(
-                        self._generate_contents_batch,
-                        indices=indices,
-                        prompts=[prompts[index] for index in indices],
-                        sampling=sampling,
-                        stop_suffixes=stop_suffixes,
-                        prefill_chunk_size=prefill_chunk_size,
-                    ): indices
-                    for indices, stop_suffixes in batches
-                }
-                for future in concurrent.futures.as_completed(future_map):
-                    indices = future_map[future]
-                    batch_outputs = future.result()
-                    for output in batch_outputs:
-                        outputs[output.prompt_index] = output
-                        if on_token is not None and output.text:
-                            on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
-                        if on_complete is not None and not probe_only:
-                            on_complete(output)
-                    _safe_tqdm_update(progress, len(indices))
-        finally:
-            _safe_tqdm_close(progress)
-        return [output for output in outputs if output is not None]
-
-    def _generate_contents_batch(
-        self,
-        *,
-        indices: Sequence[int],
-        prompts: Sequence[str],
-        sampling: SamplingConfig,
-        stop_suffixes: tuple[str, ...],
-        prefill_chunk_size: int,
-    ) -> list[GenerationOutput]:
-        payload: dict[str, object] = {
-            "model": self.model_name,
-            "contents": list(prompts),
-            "max_tokens": int(sampling.max_generate_tokens),
-            "temperature": _remote_generation_temperature(sampling.temperature),
-            "top_k": int(sampling.top_k),
-            "top_p": float(sampling.top_p),
-            "alpha_presence": float(sampling.alpha_presence),
-            "alpha_frequency": float(sampling.alpha_frequency),
-            "alpha_decay": float(sampling.alpha_decay),
-            "pad_zero": bool(sampling.pad_zero),
-            "stream": False,
-            "stop_tokens": list(stop_suffixes),
-            "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
-            "chunk_size": max(1, int(prefill_chunk_size)),
-            "prefill_chunk_size": max(1, int(prefill_chunk_size)),
-        }
-        if self.config.protocol == "lightning" and self.config.api_key:
-            payload["password"] = str(self.config.api_key)
-        response = self._post_json(
-            self.config.lightning_chat_completions_url()
-            if self.config.protocol == "lightning"
-            else self.config.chat_completions_url(),
-            payload,
-        )
-        choices = response.get("choices")
-        if not isinstance(choices, list):
-            raise RuntimeError("remote infer response missing choices")
-        by_index: dict[int, dict[str, object]] = {}
-        for choice in choices:
-            if not isinstance(choice, dict):
-                raise RuntimeError("remote infer response choice format is invalid")
-            raw_index = choice.get("index", len(by_index))
-            try:
-                choice_index = int(raw_index)
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("remote infer response choice index is invalid") from exc
-            by_index[choice_index] = choice
-        if len(by_index) != len(indices):
-            raise RuntimeError("remote infer response choice count does not match contents batch")
-
-        outputs: list[GenerationOutput] = []
-        for local_index, prompt_index in enumerate(indices):
-            choice = by_index.get(local_index)
-            if choice is None:
-                raise RuntimeError("remote infer response missing contents batch choice")
-            text = _extract_chat_choice_text(choice)
-            outputs.append(
-                GenerationOutput(
-                    prompt_index=int(prompt_index),
-                    prompt=prompts[local_index],
-                    token_ids=[],
-                    text=text,
-                    finish_reason=_normalize_remote_finish_reason(choice.get("finish_reason")),
-                )
-            )
-        return outputs
-
-    def score_choice_tokens(
-        self,
-        *,
-        prompt: str,
-        choice_token_texts: Sequence[str],
-    ) -> tuple[dict[str, float], str]:
-        if not choice_token_texts:
-            raise ValueError("choice_token_texts cannot be empty")
-        if self.config.protocol == "vllm":
-            self._legacy_choice_scoring_supported = False
-            raise NotImplementedError(
-                f"{self.config.protocol} remote protocol does not support candidate choice scoring"
-            )
-        if self.config.protocol == "lightning":
-            return self._score_choice_logits(prompt=prompt, choice_token_texts=choice_token_texts)
-        if self._legacy_choice_scoring_supported is False:
-            raise NotImplementedError("remote infer service does not support candidate choice scoring")
-        payload = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "max_tokens": 1,
-            "logprobs": 1,
-            "candidate_token_texts": list(choice_token_texts),
-        }
-        try:
-            response = self._post_json(self.config.completions_url(), payload)
-        except RemoteHTTPError as exc:
-            unsupported_choice_scoring = (
-                exc.status_code in {400, 404, 405, 422, 501}
-                or (
-                    exc.status_code == 500
-                    and "does not support candidate choice scoring" in exc.detail
-                )
-            )
-            if unsupported_choice_scoring:
-                self._legacy_choice_scoring_supported = False
-                raise NotImplementedError(
-                    "remote infer service does not support candidate choice scoring"
-                ) from exc
-            raise
-        choices = response.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise RuntimeError("remote infer response missing choices")
-        choice0 = choices[0]
-        if not isinstance(choice0, dict):
-            raise RuntimeError("remote infer response choice format is invalid")
-        logprobs = choice0.get("logprobs")
-        if not isinstance(logprobs, dict):
-            self._legacy_choice_scoring_supported = False
-            raise NotImplementedError("remote infer service does not support candidate choice scoring")
-        top_logprobs = logprobs.get("top_logprobs")
-        if not isinstance(top_logprobs, list) or not top_logprobs or not isinstance(top_logprobs[0], dict):
-            self._legacy_choice_scoring_supported = False
-            raise NotImplementedError("remote infer service does not support candidate choice scoring")
-        self._legacy_choice_scoring_supported = True
-        scores = {str(key): float(value) for key, value in top_logprobs[0].items()}
-        best_text = max(choice_token_texts, key=lambda item: scores.get(item, float("-inf")))
-        return scores, best_text
-
-    def _score_choice_logits(
-        self,
-        *,
-        prompt: str,
-        choice_token_texts: Sequence[str],
-    ) -> tuple[dict[str, float], str]:
-        labels = [f"choice_{index}" for index, _choice in enumerate(choice_token_texts)]
-        label_to_text = {
-            label: str(choice)
-            for label, choice in zip(labels, choice_token_texts, strict=True)
-        }
-        payload = {
-            "model": self.model_name,
-            "prompt": str(prompt),
-            "choices": label_to_text,
-            "temperature": 1.0,
-            "use_prefix_cache": False,
-        }
-        if self.config.api_key:
-            payload["password"] = str(self.config.api_key)
-        response = self._post_json(self.config.choice_logits_url(), payload)
-        label_logits = response.get("choice_logits")
-        if isinstance(label_logits, dict):
-            missing_labels = [label for label in labels if label not in label_logits]
-            if missing_labels:
-                raise RuntimeError(f"remote choice_logits response missing labels: {missing_labels!r}")
-            scores = {
-                label_to_text[label]: float(label_logits[label])
-                for label in labels
-            }
-            best_label = response.get("best_choice")
-            if not isinstance(best_label, str) or best_label not in label_to_text:
-                best_label = max(labels, key=lambda label: float(label_logits[label]))
-            return scores, label_to_text[best_label]
-
-        raw_scores = response.get("scores")
-        if isinstance(raw_scores, list):
-            scores: dict[str, float] = {}
-            for item in raw_scores:
-                if not isinstance(item, dict):
-                    raise RuntimeError("remote choice_logits score entry must be an object")
-                text = item.get("text")
-                if not isinstance(text, str):
-                    raise RuntimeError("remote choice_logits score entry missing text")
-                try:
-                    scores[text] = float(item["logit"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise RuntimeError("remote choice_logits score entry missing numeric logit") from exc
-            missing = [choice for choice in choice_token_texts if str(choice) not in scores]
-            if missing:
-                raise RuntimeError(f"remote choice_logits response missing choices: {missing!r}")
-            best_text = response.get("best_text")
-            if not isinstance(best_text, str) or best_text not in scores:
-                best_text = max((str(choice) for choice in choice_token_texts), key=lambda item: scores[item])
-            return scores, best_text
-
-        raise RuntimeError("remote choice_logits response missing choice_logits")
-
     def shutdown(self) -> None:
         with self._http_client_lock:
             client = self._http_client
@@ -754,7 +332,7 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol in {"completions", "lightning", "nano-vllm-contents"}
+        include_private_fields = self.config.protocol == "completions"
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -771,12 +349,6 @@ class RemoteInferenceBackend:
         )
         if self.config.protocol == "vllm":
             response = self._post_json(self.config.chat_completions_url(), chat_payload)
-            is_chat_response = True
-        elif self.config.protocol == "lightning":
-            if self.config.api_key:
-                chat_payload["password"] = str(self.config.api_key)
-            chat_payload["temperature"] = _remote_generation_temperature(chat_payload.get("temperature"))
-            response = self._post_json(self.config.lightning_chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
             response = self._post_json(self.config.completions_url(), payload)
@@ -941,18 +513,6 @@ def _completion_payload_from_sampling(
     return payload
 
 
-def _remote_generation_temperature(value: object) -> float:
-    try:
-        temperature = float(value)
-    except (TypeError, ValueError):
-        return _REMOTE_GENERATION_MIN_TEMPERATURE
-    if not math.isfinite(temperature):
-        return _REMOTE_GENERATION_MIN_TEMPERATURE
-    if temperature < _REMOTE_GENERATION_MIN_TEMPERATURE:
-        return _REMOTE_GENERATION_MIN_TEMPERATURE
-    return min(temperature, _REMOTE_GENERATION_MAX_TEMPERATURE)
-
-
 def _chat_payload_from_completion_payload(
     payload: dict[str, object],
     prompt: str,
@@ -1032,47 +592,17 @@ def _normalize_remote_finish_reason(finish_reason: object) -> str:
 def build_inference_backend_from_args(args: argparse.Namespace) -> InferenceBackend:
     validate_inference_backend_args(args)
     infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip()
-    if infer_base_url:
-        return RemoteInferenceBackend(
-            RemoteInferenceConfig(
-                base_url=infer_base_url,
-                model=str(getattr(args, "infer_model", "") or "").strip(),
-                api_key=str(getattr(args, "infer_api_key", "") or ""),
-                timeout_s=float(getattr(args, "infer_timeout_s", 600.0) or 600.0),
-                max_workers=max(1, int(getattr(args, "infer_max_workers", 32) or 32)),
-                protocol=_normalize_remote_protocol(getattr(args, "infer_protocol", "openai")),
-                seed_policy=_normalize_remote_seed_policy(getattr(args, "infer_seed_policy", "preserve")),
-            )
+    return RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url=infer_base_url,
+            model=str(getattr(args, "infer_model", "") or "").strip(),
+            api_key=str(getattr(args, "infer_api_key", "") or ""),
+            timeout_s=float(getattr(args, "infer_timeout_s", 600.0) or 600.0),
+            max_workers=max(1, int(getattr(args, "infer_max_workers", 32) or 32)),
+            protocol=_normalize_remote_protocol(getattr(args, "infer_protocol", "openai")),
+            seed_policy=_normalize_remote_seed_policy(getattr(args, "infer_seed_policy", "preserve")),
         )
-    model_path = str(getattr(args, "model_path", "") or "").strip()
-    from .model import ModelLoadConfig
-
-    return LocalInferenceBackend.from_model_config(
-        ModelLoadConfig(
-            weights_path=model_path,
-            device=str(getattr(args, "device", "cuda") or "cuda"),
-        ),
-        engine_mode=str(getattr(args, "engine_mode", "classic") or "classic"),
-        state_db_path=(
-            None
-            if getattr(args, "state_db_path", None) in (None, "")
-            else str(getattr(args, "state_db_path"))
-        ),
     )
-
-
-def _blank_state(model: object):
-    try:
-        return model.generate_zero_state(0)
-    except TypeError:
-        return model.generate_zero_state()
-
-
-def _single_token_id(tokenizer: "TokenizerProtocol", text: str) -> int:
-    token_ids = list(tokenizer.encode(text))
-    if len(token_ids) != 1:
-        raise ValueError(f"candidate token text {text!r} must map to a single token, got {token_ids}")
-    return int(token_ids[0])
 
 
 def _normalize_constraint_mode(mode: str | None) -> Literal["off", "soft", "strict"]:
@@ -1088,11 +618,9 @@ def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
         value = "vllm"
     if value in {"completion", "raw-completion", "raw-completions", "text-completion", "text-completions"}:
         value = "completions"
-    if value in {"rwkv-lightning", "lightning-v2"}:
-        value = "lightning"
-    if value in {"nano-vllm", "nanovllm", "contents"}:
-        value = "nano-vllm-contents"
-    if value not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:
+    if value in {"rwkv-lightning", "lightning", "lightning-v2", "nano-vllm", "nanovllm", "contents"}:
+        raise ValueError("旧 Lightning/nano-vLLM 协议已移除；请使用 vllm、openai 或 completions。")
+    if value not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
         choices = ", ".join(REMOTE_INFERENCE_PROTOCOL_CHOICES)
         raise ValueError(f"infer_protocol must be one of: {choices}")
     return value  # type: ignore[return-value]
@@ -1104,50 +632,16 @@ def _normalize_remote_seed_policy(seed_policy: object) -> RemoteInferenceSeedPol
         "keep": "preserve",
         "keep-seeds": "preserve",
         "preserve-seeds": "preserve",
-        "omit": "omit-for-contents",
-        "drop": "omit-for-contents",
-        "drop-for-contents": "omit-for-contents",
-        "omit-seeds": "omit-for-contents",
+        "drop": "omit",
+        "omit-for-contents": "omit",
+        "drop-for-contents": "omit",
+        "omit-seeds": "omit",
     }
     value = aliases.get(value, value)
     if value not in REMOTE_INFERENCE_SEED_POLICY_CHOICES:
         choices = ", ".join(REMOTE_INFERENCE_SEED_POLICY_CHOICES)
         raise ValueError(f"infer_seed_policy must be one of: {choices}")
     return value  # type: ignore[return-value]
-
-
-def _contents_stop_key(
-    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
-    index: int,
-) -> tuple[str, ...]:
-    if prompt_stop_suffixes is None:
-        return ()
-    raw = prompt_stop_suffixes[index]
-    if raw is None:
-        return ()
-    return tuple(str(item) for item in raw if str(item))
-
-
-def _iter_contents_batches(
-    *,
-    prompt_count: int,
-    max_batch: int,
-    prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
-) -> list[tuple[tuple[int, ...], tuple[str, ...]]]:
-    batches: list[tuple[tuple[int, ...], tuple[str, ...]]] = []
-    start = 0
-    while start < prompt_count:
-        stop_key = _contents_stop_key(prompt_stop_suffixes, start)
-        indices = [start]
-        next_index = start + 1
-        while next_index < prompt_count and len(indices) < max_batch:
-            if _contents_stop_key(prompt_stop_suffixes, next_index) != stop_key:
-                break
-            indices.append(next_index)
-            next_index += 1
-        batches.append((tuple(indices), stop_key))
-        start = next_index
-    return batches
 
 
 def _resolve_effective_constraints(
@@ -1163,10 +657,7 @@ def _resolve_effective_constraints(
 
 __all__ = [
     "InferenceBackend",
-    "LocalInferenceBackend",
     "REMOTE_INFERENCE_PROTOCOL_CHOICES",
-    "REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES",
-    "REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES",
     "REMOTE_INFERENCE_SEED_POLICY_CHOICES",
     "RemoteInferenceProtocol",
     "RemoteInferenceSeedPolicy",
@@ -1177,7 +668,6 @@ __all__ = [
     "normalize_api_base",
     "normalize_local_device",
     "require_completion_style_remote_protocol",
-    "remote_contents_inflight_batches",
     "resolve_backend_model_name",
     "resolve_generation_prompt_batch_size",
     "validate_inference_backend_args",

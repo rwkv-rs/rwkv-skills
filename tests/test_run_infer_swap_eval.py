@@ -3,7 +3,7 @@ from __future__ import annotations
 from src.bin import run_infer_swap_eval, validate_infer_swap_phases
 
 
-def test_run_infer_swap_eval_builds_lightning_scheduler_args_by_default() -> None:
+def test_run_infer_swap_eval_builds_vllm_scheduler_args_by_default() -> None:
     args = run_infer_swap_eval.parse_args(
         [
             "--infer-max-workers",
@@ -17,13 +17,13 @@ def test_run_infer_swap_eval_builds_lightning_scheduler_args_by_default() -> Non
 
     scheduler_args = run_infer_swap_eval.build_scheduler_args(args)
 
-    assert _flag_value(scheduler_args, "--infer-protocol") == "lightning"
+    assert _flag_value(scheduler_args, "--infer-protocol") == "vllm"
     assert _flag_value(scheduler_args, "--infer-seed-policy") == "preserve"
     assert _flag_value(scheduler_args, "--infer-max-workers") == "8"
     assert _flag_value(scheduler_args, "--remote-batch-size") == "8"
 
 
-def test_phase_gate_validation_accepts_lightning_probe_and_protocol_smoke() -> None:
+def test_phase_gate_validation_accepts_vllm_probe_and_protocol_smoke() -> None:
     dispatch_args = run_infer_swap_eval.parse_args(
         [
             "--infer-max-workers",
@@ -60,7 +60,7 @@ def test_phase_gate_validation_accepts_lightning_probe_and_protocol_smoke() -> N
         "protocol_smoke_ok": True,
         "protocol_smoke_protocols": [
             {
-                "protocol": "lightning",
+                "protocol": "vllm",
                 "ok": True,
                 "request_count": run_infer_swap_eval.DEFAULT_PROTOCOL_SMOKE_BATCH_SIZE,
                 "nonempty_output_count": run_infer_swap_eval.DEFAULT_PROTOCOL_SMOKE_BATCH_SIZE,
@@ -69,7 +69,7 @@ def test_phase_gate_validation_accepts_lightning_probe_and_protocol_smoke() -> N
     }
     by_name["probe_json"]["details"] = {
         "model": run_infer_swap_eval.DEFAULT_INFER_MODEL,
-        "protocol": "lightning",
+        "protocol": "vllm",
         "required_concurrency": 4,
         "gpu_full_concurrency": 4,
         "largest_successful_concurrency": 4,

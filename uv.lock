@@ -2263,48 +2263,6 @@ antlr4-13-2 = [
 ]
 
 [[package]]
-name = "lightning"
-version = "2.5.6"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "fsspec", extra = ["http"] },
-    { name = "lightning-utilities" },
-    { name = "packaging" },
-    { name = "pytorch-lightning" },
-    { name = "pyyaml" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra != 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+rocm6.4", source = { registry = "https://download.pytorch.org/whl/rocm6.4" }, marker = "extra == 'extra-11-rwkv-skills-torch-rocm' or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torchmetrics" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/e9/da/289e17b2d4631b885771ce10ab7fe19c6c0ab2b1208d1dda418818ffbbfd/lightning-2.5.6.tar.gz", hash = "sha256:57b6abe87080895bc237fb7f36b7b4abaa2793760cbca00e3907e56607e0ed27", size = 640106, upload-time = "2025-11-05T20:53:06.823Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/23/dc/d7804f13928b6a81a0e948cfecbf0071e8cc74e3f341c704e23e75e504ad/lightning-2.5.6-py3-none-any.whl", hash = "sha256:25bb2053078c2efc57c082fda89dfbd975dfa76beb08def191947c2b571a8c8a", size = 827915, upload-time = "2025-11-05T20:53:03.169Z" },
-]
-
-[[package]]
-name = "lightning-utilities"
-version = "0.15.2"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "packaging" },
-    { name = "setuptools" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/b8/39/6fc58ca81492db047149b4b8fd385aa1bfb8c28cd7cacb0c7eb0c44d842f/lightning_utilities-0.15.2.tar.gz", hash = "sha256:cdf12f530214a63dacefd713f180d1ecf5d165338101617b4742e8f22c032e24", size = 31090, upload-time = "2025-08-06T13:57:39.242Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/de/73/3d757cb3fc16f0f9794dd289bcd0c4a031d9cf54d8137d6b984b2d02edf3/lightning_utilities-0.15.2-py3-none-any.whl", hash = "sha256:ad3ab1703775044bbf880dbf7ddaaac899396c96315f3aa1779cec9d618a9841", size = 29431, upload-time = "2025-08-06T13:57:38.046Z" },
-]
-
-[[package]]
 name = "litellm"
 version = "1.82.0"
 source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
@@ -5060,7 +5018,7 @@ sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/8d/1d/5b2d854ce426fa3
 
 [[package]]
 name = "pytest"
-version = "9.0.1"
+version = "9.1.1"
 source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32' or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
@@ -5069,9 +5027,9 @@ dependencies = [
     { name = "pluggy" },
     { name = "pygments" },
 ]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/07/56/f013048ac4bc4c1d9be45afd4ab209ea62822fb1598f40687e6bf45dcea4/pytest-9.0.1.tar.gz", hash = "sha256:3e9c069ea73583e255c3b21cf46b8d3c56f6e3a1a8f6da94ccb0fcf57b9d73c8", size = 1564125, upload-time = "2025-11-12T13:05:09.333Z" }
+sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
 wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/0b/8b/6300fb80f858cda1c51ffa17075df5d846757081d11ab4aa35cef9e6258b/pytest-9.0.1-py3-none-any.whl", hash = "sha256:67be0030d194df2dfa7b556f2e56fb3c3315bd5c8822c6951162b92b32ce7dad", size = 373668, upload-time = "2025-11-12T13:05:07.379Z" },
+    { url = "https://mirrors.ustc.edu.cn/pypi/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
 ]
 
 [[package]]
@@ -5111,33 +5069,6 @@ source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
 sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/f3/87/f44d7c9f274c7ee665a29b885ec97089ec5dc034c7f3fafa03da9e39a09e/python_multipart-0.0.20.tar.gz", hash = "sha256:8dd0cab45b8e23064ae09147625994d090fa46f5b0d1e13af944c331a7fa9d13", size = 37158, upload-time = "2024-12-16T19:45:46.972Z" }
 wheels = [
     { url = "https://mirrors.ustc.edu.cn/pypi/packages/45/58/38b5afbc1a800eeea951b9285d3912613f2603bdf897a4ab0f4bd7f405fc/python_multipart-0.0.20-py3-none-any.whl", hash = "sha256:8a62d3a8335e06589fe01f2a3e178cdcc632f3fbe0d492ad9ee0ec35aab1f104", size = 24546, upload-time = "2024-12-16T19:45:44.423Z" },
-]
-
-[[package]]
-name = "pytorch-lightning"
-version = "2.5.6"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "fsspec", extra = ["http"] },
-    { name = "lightning-utilities" },
-    { name = "packaging" },
-    { name = "pyyaml" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra != 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+rocm6.4", source = { registry = "https://download.pytorch.org/whl/rocm6.4" }, marker = "extra == 'extra-11-rwkv-skills-torch-rocm' or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torchmetrics" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/0a/1f/94a441d30779e1ffa5f7dc2ac5fa374c142d8b96c347a49a30226264124e/pytorch_lightning-2.5.6.tar.gz", hash = "sha256:c428faaceef74be50b870814d0d7e9f9c6ee748b8769a2afd3366bc69daf3a0f", size = 642830, upload-time = "2025-11-05T20:53:04.871Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/17/e4/32ed2f33c1b634f7c2895369222f4f8cb345044f4642bbff718e7dd1e0b7/pytorch_lightning-2.5.6-py3-none-any.whl", hash = "sha256:037bad1e2fd94d5eb6c5144f045fd4c1070c3d38fc9c14d9f3774a3a9be54dff", size = 831555, upload-time = "2025-11-05T20:53:03.316Z" },
 ]
 
 [[package]]
@@ -5587,33 +5518,6 @@ wheels = [
 ]
 
 [[package]]
-name = "rwkv"
-version = "0.8.30"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "tokenizers" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/79/38/708c06ac8ca9ec17efeb1b851a7bca83bbd5376eae867991a0b61fa28922/rwkv-0.8.30.tar.gz", hash = "sha256:e705618d1764a891c53ecb4b3463a621ebb99af0b4d316553e64c45ceb3634b3", size = 407892, upload-time = "2025-08-25T17:24:44.69Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/d4/99/53bf4bc620a74eac6434a7eaf35316d85b83e6eb6ae0baed33683eeec9e9/rwkv-0.8.30-py3-none-any.whl", hash = "sha256:463f8958f968da93b7a071aa14461d2fde1a4634167ba56b5c75fe60325b528d", size = 410016, upload-time = "2025-08-25T17:24:43.262Z" },
-]
-
-[[package]]
-name = "rwkv-fla"
-version = "0.7.202508221413"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "datasets" },
-    { name = "einops" },
-    { name = "pytest" },
-    { name = "transformers" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/4b/6c/36cba6f48efec409923e9524a0c9bd229fc846d7292a9d1f6329392e59b6/rwkv_fla-0.7.202508221413.tar.gz", hash = "sha256:147ab596ac2c795eb3c9d2ff9f398e8d99a92a6b75b0cd412cc12251d654ff03", size = 802714, upload-time = "2025-08-22T14:13:32.015Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/ca/a9/d5857d911cbc499b39fec0003f8c6ead1aa38304ae47c6d5bcffb92a45fa/rwkv_fla-0.7.202508221413-py3-none-any.whl", hash = "sha256:abf8cbc6aac7e7fec994912014d055c6050fa5605710bce2e36db87f88769fb7", size = 1343621, upload-time = "2025-08-22T14:13:30.596Z" },
-]
-
-[[package]]
 name = "rwkv-skills"
 version = "0.1.0"
 source = { editable = "." }
@@ -5637,7 +5541,6 @@ dependencies = [
     { name = "immutabledict" },
     { name = "jsonschema" },
     { name = "langdetect" },
-    { name = "lightning" },
     { name = "litellm" },
     { name = "loguru" },
     { name = "math-verify", extra = ["antlr4-13-2"] },
@@ -5690,14 +5593,11 @@ dependencies = [
     { name = "pynvml" },
     { name = "pyrwkv-tokenizer" },
     { name = "python-dotenv" },
-    { name = "rwkv" },
-    { name = "rwkv-fla" },
     { name = "scikit-build-core" },
     { name = "socksio" },
     { name = "syllapy" },
     { name = "toml" },
     { name = "transformers" },
-    { name = "triton" },
     { name = "uvicorn" },
     { name = "wandb" },
 ]
@@ -5705,6 +5605,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "openai" },
+    { name = "pytest" },
     { name = "requests" },
     { name = "tqdm" },
 ]
@@ -5758,7 +5659,6 @@ requires-dist = [
     { name = "immutabledict", specifier = ">=2.2.5" },
     { name = "jsonschema", specifier = ">=4.25.1" },
     { name = "langdetect", specifier = ">=1.0.9" },
-    { name = "lightning", specifier = ">=2.5.1.post0" },
     { name = "litellm", specifier = ">=1.74.9" },
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "math-verify", extras = ["antlr4-13-2"], specifier = ">=0.8.0" },
@@ -5792,11 +5692,10 @@ requires-dist = [
     { name = "pynvml", specifier = ">=13.0.1" },
     { name = "pyrwkv-tokenizer", specifier = ">=0.9.1" },
     { name = "pyserini", marker = "extra == 'function-calling-official'", specifier = ">=1.2.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "pytorch-triton-rocm", marker = "extra == 'torch-rocm'", index = "https://download.pytorch.org/whl/rocm6.4" },
     { name = "requests", marker = "extra == 'dev'", specifier = ">=2.32.5" },
-    { name = "rwkv", specifier = ">=0.8.29" },
-    { name = "rwkv-fla", specifier = ">=0.7.202506181413" },
     { name = "scikit-build-core", specifier = ">=0.11.6" },
     { name = "socksio", specifier = ">=1.0.0" },
     { name = "syllapy", specifier = ">=0.7.2" },
@@ -5813,7 +5712,6 @@ requires-dist = [
     { name = "tree-sitter", marker = "extra == 'function-calling-official'", specifier = "==0.21.3" },
     { name = "tree-sitter-java", marker = "extra == 'function-calling-official'", specifier = "==0.21.0" },
     { name = "tree-sitter-javascript", marker = "extra == 'function-calling-official'", specifier = "==0.21.4" },
-    { name = "triton", specifier = ">=3.3.1" },
     { name = "uvicorn", specifier = ">=0.30.0,<1.0.0" },
     { name = "vllm", marker = "extra == 'vllm-cu128'", specifier = "==0.19.0" },
     { name = "wandb", specifier = ">=0.20.1" },
@@ -6740,29 +6638,6 @@ wheels = [
     { url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.10.0%2Bcu128-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:de318c9c00d3cb2cd57eaa67cfe63beff7fe7ec851ba8976c016994080df19ce", upload-time = "2026-01-21T15:05:48Z" },
     { url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.10.0%2Bcu128-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:e6aaaf49a986faef74e8d3a04412ed0bb17c748aaf6dc6bd748726d8beba0886", upload-time = "2026-01-21T15:05:48Z" },
     { url = "https://download-r2.pytorch.org/whl/cu128/torchaudio-2.10.0%2Bcu128-cp314-cp314t-win_amd64.whl", hash = "sha256:e80f81a454f182a48310c16b68ec1cc2d439d76eebcf6ed03bd3a69fef9986b0", upload-time = "2026-01-21T15:05:48Z" },
-]
-
-[[package]]
-name = "torchmetrics"
-version = "1.8.2"
-source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
-dependencies = [
-    { name = "lightning-utilities" },
-    { name = "numpy" },
-    { name = "packaging" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1", source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra != 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'darwin' and extra == 'extra-11-rwkv-skills-torch-cpu') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform != 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.9.1+rocm6.4", source = { registry = "https://download.pytorch.org/whl/rocm6.4" }, marker = "extra == 'extra-11-rwkv-skills-torch-rocm' or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu126", source = { registry = "https://download.pytorch.org/whl/cu126" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "(extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra != 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra != 'extra-11-rwkv-skills-torch-cpu' and extra != 'extra-11-rwkv-skills-torch-cu126' and extra != 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-    { name = "torch", version = "2.10.0+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "(sys_platform == 'linux' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu129' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu126') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cpu' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-cu129') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-torch-rocm') or (extra == 'extra-11-rwkv-skills-torch-cu126' and extra == 'extra-11-rwkv-skills-vllm-cu128') or (extra == 'extra-11-rwkv-skills-torch-rocm' and extra == 'extra-11-rwkv-skills-vllm-cu128')" },
-]
-sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/85/2e/48a887a59ecc4a10ce9e8b35b3e3c5cef29d902c4eac143378526e7485cb/torchmetrics-1.8.2.tar.gz", hash = "sha256:cf64a901036bf107f17a524009eea7781c9c5315d130713aeca5747a686fe7a5", size = 580679, upload-time = "2025-09-03T14:00:54.077Z" }
-wheels = [
-    { url = "https://mirrors.ustc.edu.cn/pypi/packages/02/21/aa0f434434c48490f91b65962b1ce863fdcce63febc166ca9fe9d706c2b6/torchmetrics-1.8.2-py3-none-any.whl", hash = "sha256:08382fd96b923e39e904c4d570f3d49e2cc71ccabd2a94e0f895d1f0dac86242", size = 983161, upload-time = "2025-09-03T14:00:51.921Z" },
 ]
 
 [[package]]
