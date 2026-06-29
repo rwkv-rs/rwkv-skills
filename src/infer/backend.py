@@ -37,13 +37,21 @@ _REMOTE_GENERATION_MIN_TEMPERATURE = 0.001
 _REMOTE_GENERATION_MAX_TEMPERATURE = 1000.0
 DEFAULT_PREFILL_CHUNK_SIZE = 16
 
-RemoteInferenceProtocol = Literal["openai", "vllm", "completions", "lightning", "nano-vllm-contents"]
+RemoteInferenceProtocol = Literal[
+    "openai",
+    "vllm",
+    "completions",
+    "lightning",
+    "lightning-high-throughput",
+    "nano-vllm-contents",
+]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit-for-contents"]
 REMOTE_INFERENCE_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
     "openai",
     "vllm",
     "completions",
     "lightning",
+    "lightning-high-throughput",
 )
 REMOTE_INFERENCE_LEGACY_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = ("nano-vllm-contents",)
 REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES: tuple[RemoteInferenceProtocol, ...] = (
@@ -54,7 +62,7 @@ REMOTE_INFERENCE_SEED_POLICY_CHOICES: tuple[RemoteInferenceSeedPolicy, ...] = (
     "preserve",
     "omit-for-contents",
 )
-_CONTENTS_BATCH_PROTOCOLS = frozenset({"nano-vllm-contents", "lightning"})
+_CONTENTS_BATCH_PROTOCOLS = frozenset({"nano-vllm-contents", "lightning", "lightning-high-throughput"})
 _DEFAULT_CONTENTS_MAX_INFLIGHT_BATCHES = 4
 
 
@@ -86,6 +94,18 @@ def normalize_local_device(device: str) -> str:
     if parsed.type == "cuda" and parsed.index is None:
         return "cuda:0"
     return str(parsed)
+
+
+def build_local_engine(
+    model: object,
+    tokenizer: "TokenizerProtocol",
+    *,
+    mode: str = "classic",
+    state_db_path: str | None = None,
+) -> "LocalEngineProtocol":
+    from .lightning_engine import build_local_engine as _build_local_engine
+
+    return _build_local_engine(model, tokenizer, mode=mode, state_db_path=state_db_path)
 
 
 def _safe_tqdm_update(progress: tqdm, amount: int = 1) -> None:
@@ -193,7 +213,7 @@ def require_completion_style_remote_protocol(
     if protocol == "openai":
         setattr(args, "infer_protocol", "completions")
         return True
-    if protocol in {"completions", "lightning"}:
+    if protocol in {"completions", "lightning", "lightning-high-throughput"}:
         return True
     raise ValueError(
         f"{benchmark_name} requires completion-style remote generation; "
@@ -249,7 +269,6 @@ class LocalInferenceBackend:
         engine_mode: str = "classic",
         state_db_path: str | None = None,
     ) -> LocalInferenceBackend:
-        from .lightning_engine import build_local_engine
         from .model import load_rwkv_model
 
         normalized_device = normalize_local_device(str(getattr(config, "device", "cuda") or "cuda"))
@@ -370,6 +389,9 @@ class RemoteInferenceConfig:
     def lightning_chat_completions_url(self) -> str:
         return f"{self.lightning_api_root()}/v2/chat/completions"
 
+    def lightning_high_throughput_chat_completions_url(self) -> str:
+        return f"{self.lightning_api_root()}/high_throughput/chat/completions"
+
     def choice_logits_url(self) -> str:
         return f"{self.lightning_api_root()}/v1/choice_logits"
 
@@ -446,9 +468,9 @@ class RemoteInferenceBackend:
             raise ValueError("prompt_stop_suffixes length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
         force_openai_single_requests = False
-        use_contents_protocol = self.config.protocol in {"nano-vllm-contents", "lightning"}
+        use_contents_protocol = self.config.protocol in _CONTENTS_BATCH_PROTOCOLS
         omit_prompt_seeds = (
-            self.config.protocol in {"vllm", "completions", "lightning"}
+            self.config.protocol in {"vllm", "completions", "lightning", "lightning-high-throughput"}
             or self.config.seed_policy == "omit-for-contents"
         )
         if prompt_seeds is not None:
@@ -580,11 +602,17 @@ class RemoteInferenceBackend:
             "chunk_size": max(1, int(prefill_chunk_size)),
             "prefill_chunk_size": max(1, int(prefill_chunk_size)),
         }
-        if self.config.protocol == "lightning" and self.config.api_key:
+        if self.config.protocol in {"lightning", "lightning-high-throughput"} and self.config.api_key:
             payload["password"] = str(self.config.api_key)
+        if self.config.protocol == "lightning-high-throughput":
+            payload["max_batch_size"] = max(1, len(prompts))
         response = self._post_json(
-            self.config.lightning_chat_completions_url()
-            if self.config.protocol == "lightning"
+            (
+                self.config.lightning_high_throughput_chat_completions_url()
+                if self.config.protocol == "lightning-high-throughput"
+                else self.config.lightning_chat_completions_url()
+            )
+            if self.config.protocol in {"lightning", "lightning-high-throughput"}
             else self.config.chat_completions_url(),
             payload,
         )
@@ -634,7 +662,7 @@ class RemoteInferenceBackend:
             raise NotImplementedError(
                 f"{self.config.protocol} remote protocol does not support candidate choice scoring"
             )
-        if self.config.protocol == "lightning":
+        if self.config.protocol in {"lightning", "lightning-high-throughput"}:
             return self._score_choice_logits(prompt=prompt, choice_token_texts=choice_token_texts)
         if self._legacy_choice_scoring_supported is False:
             raise NotImplementedError("remote infer service does not support candidate choice scoring")
@@ -754,7 +782,12 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol in {"completions", "lightning", "nano-vllm-contents"}
+        include_private_fields = self.config.protocol in {
+            "completions",
+            "lightning",
+            "lightning-high-throughput",
+            "nano-vllm-contents",
+        }
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -777,6 +810,14 @@ class RemoteInferenceBackend:
                 chat_payload["password"] = str(self.config.api_key)
             chat_payload["temperature"] = _remote_generation_temperature(chat_payload.get("temperature"))
             response = self._post_json(self.config.lightning_chat_completions_url(), chat_payload)
+            is_chat_response = True
+        elif self.config.protocol == "lightning-high-throughput":
+            if self.config.api_key:
+                chat_payload["password"] = str(self.config.api_key)
+            chat_payload["temperature"] = _remote_generation_temperature(chat_payload.get("temperature"))
+            chat_payload["contents"] = [prompt]
+            chat_payload["max_batch_size"] = 1
+            response = self._post_json(self.config.lightning_high_throughput_chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
             response = self._post_json(self.config.completions_url(), payload)
@@ -1090,6 +1131,15 @@ def _normalize_remote_protocol(protocol: object) -> RemoteInferenceProtocol:
         value = "completions"
     if value in {"rwkv-lightning", "lightning-v2"}:
         value = "lightning"
+    if value in {
+        "rwkv-lightning-high-throughput",
+        "lightning-high-throughput",
+        "lightning-highthroughput",
+        "lightning-ht",
+        "high-throughput",
+        "highthroughput",
+    }:
+        value = "lightning-high-throughput"
     if value in {"nano-vllm", "nanovllm", "contents"}:
         value = "nano-vllm-contents"
     if value not in REMOTE_INFERENCE_ALL_PROTOCOL_CHOICES:

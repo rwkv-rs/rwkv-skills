@@ -91,6 +91,52 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("RWKV_LIGHTNING_PATH", str(DEFAULT_RWKV_LIGHTNING_PATH)),
         help="Path to the vendored RWKV-Lightning server source",
     )
+    parser.add_argument(
+        "--enable-high-throughput",
+        action="store_true",
+        help="Enable the RWKV-Lightning high_throughput endpoint when the selected lightning path supports it",
+    )
+    parser.add_argument(
+        "--high-throughput-max-active-states",
+        "--high-throughput-max-batch-size",
+        type=int,
+        default=512,
+        dest="high_throughput_max_active_states",
+        help="Resident pool max active states for the RWKV-Lightning high_throughput endpoint",
+    )
+    parser.add_argument(
+        "--high-throughput-prefill-batch-size",
+        "--high-throughput-prefill-target-batch-size",
+        type=int,
+        default=8,
+        dest="high_throughput_prefill_batch_size",
+        help="Preferred prefill batch size for the RWKV-Lightning high_throughput endpoint",
+    )
+    parser.add_argument(
+        "--high-throughput-prefill-area",
+        "--high-throughput-prefill-target-area",
+        type=int,
+        default=4096,
+        dest="high_throughput_prefill_area",
+        help="Preferred prefill batch-size times chunk-size area for the high_throughput endpoint",
+    )
+    parser.add_argument(
+        "--high-throughput-prefill-cache-shape-limit",
+        type=int,
+        default=64,
+        help="Number of distinct high_throughput prefill shapes to keep cached before clearing CUDA cache; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--high-throughput-cuda-cache-budget-gb",
+        type=float,
+        default=6.0,
+        help="Extra CUDA reserved-memory budget, in GB, above the resident high_throughput pool before clearing cache; 0 disables the budget",
+    )
+    parser.add_argument(
+        "--high-throughput-clear-cuda-cache-each-request",
+        action="store_true",
+        help="Clear CUDA cache after every high_throughput request instead of reusing planned prefill shape cache",
+    )
     parser.add_argument("--model-name", help="Public model name exposed by the infer API")
     parser.add_argument(
         "--infer-auto-config",
@@ -253,6 +299,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model_name=str(args.model_name) if args.model_name else None,
                 password=str(args.api_key) if args.api_key else None,
                 rwkv_lightning_path=str(args.rwkv_lightning_path),
+                high_throughput_enabled=bool(args.enable_high_throughput),
+                high_throughput_max_active_states=int(args.high_throughput_max_active_states),
+                high_throughput_prefill_batch_size=int(args.high_throughput_prefill_batch_size),
+                high_throughput_prefill_area=int(args.high_throughput_prefill_area),
+                high_throughput_prefill_cache_shape_limit=int(args.high_throughput_prefill_cache_shape_limit),
+                high_throughput_cuda_cache_budget_gb=float(args.high_throughput_cuda_cache_budget_gb),
+                high_throughput_clear_cuda_cache_each_request=bool(
+                    args.high_throughput_clear_cuda_cache_each_request
+                ),
             )
         )
         try:

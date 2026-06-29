@@ -1424,6 +1424,47 @@ def test_remote_backend_lightning_uses_v2_contents_and_choice_logits(monkeypatch
     }
 
 
+def test_remote_backend_lightning_high_throughput_uses_batch_endpoint(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19081",
+            model="remote-demo",
+            protocol="lightning-high-throughput",
+            seed_policy="omit-for-contents",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
+        calls.append((url, payload))
+        if url.endswith("/high_throughput/chat/completions"):
+            return {
+                "choices": [
+                    {
+                        "index": index,
+                        "message": {"role": "assistant", "content": f"answer-{index}"},
+                        "finish_reason": "stop",
+                    }
+                    for index, _prompt in enumerate(payload["contents"])  # type: ignore[index]
+                ]
+            }
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", lambda self, url, payload: _fake_post_json(url, payload))
+
+    outputs = backend.generate(
+        ["raw prompt A", "raw prompt B"],
+        sampling=SamplingConfig(max_generate_tokens=4, temperature=0.0),
+        batch_size=2,
+        show_progress=False,
+    )
+
+    assert [output.text for output in outputs] == ["answer-0", "answer-1"]
+    assert calls[0][0] == "http://127.0.0.1:19081/high_throughput/chat/completions"
+    assert calls[0][1]["contents"] == ["raw prompt A", "raw prompt B"]
+    assert calls[0][1]["max_batch_size"] == 2
+
+
 def test_remote_backend_legacy_nano_single_requests_keep_private_fields(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(

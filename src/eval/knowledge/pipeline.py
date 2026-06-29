@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Knowledge benchmark pipeline for multiple-choice datasets."""
 
-import concurrent.futures
 from dataclasses import dataclass
 import re
 from typing import Callable, Sequence
@@ -13,18 +12,13 @@ from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
 from src.eval.execution_plan import AttemptKey
 from src.eval.prompt_builders import (
     ALPHABET,
-    LOGPROBS_PLACEHOLDER,
-    build_multiple_choice_expected_context,
     concat_choices,
-    normalize_subject,
-    prompt_for_cot,
-    prompt_for_marker,
 )
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.infer.backend import InferenceBackend
-from src.infer.sampling import GenerationOutput, SamplingConfig
+from src.infer.sampling import SamplingConfig
 
 TARGET_TOKEN_FORMAT = " <LETTER>"
 
@@ -94,12 +88,9 @@ class MultipleChoicePipeline:
         self,
         backend: InferenceBackend,
         target_token_format: str = TARGET_TOKEN_FORMAT,
-        *,
-        allow_generation_fallback: bool = False,
     ) -> None:
         self.backend = backend
         self.target_token_format = target_token_format
-        self.allow_generation_fallback = bool(allow_generation_fallback)
 
     def run_direct(
         self,
@@ -150,44 +141,14 @@ class MultipleChoicePipeline:
         if not expanded:
             return MultipleChoicePipelineResult(dataset_name, 0, [])
 
-        payloads: list[dict] = []
-        worker_count = self._direct_choice_worker_count(batch_size)
-        for start in range(0, len(expanded), batch_size):
-            chunk = expanded[start : start + batch_size]
-            try:
-                if worker_count > 1 and len(chunk) > 1:
-                    chunk_payloads = self._run_direct_choice_chunk_parallel(
-                        chunk,
-                        prompt_template=prompt_template,
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        max_workers=worker_count,
-                    )
-                else:
-                    chunk_payloads = self._run_direct_choice_chunk_serial(
-                        chunk,
-                        prompt_template=prompt_template,
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                    )
-            except NotImplementedError as exc:
-                if not self.allow_generation_fallback:
-                    self._raise_choice_scoring_required("direct multiple-choice", exc)
-                payloads.extend(
-                    self._run_direct_generation_batches(
-                        expanded[start:],
-                        prompt_template=prompt_template,
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        batch_size=batch_size,
-                        on_record=on_record,
-                    )
-                )
-                break
-            for payload in chunk_payloads:
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
+        payloads = self._run_direct_generation_batches(
+            expanded,
+            prompt_template=prompt_template,
+            benchmark_name=benchmark_name,
+            dataset_split=dataset_split,
+            batch_size=batch_size,
+            on_record=on_record,
+        )
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     def run_chain_of_thought(
@@ -271,23 +232,41 @@ class MultipleChoicePipeline:
 
         payloads: list[dict] = []
         sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling)])
+        answer_sampling = self._answer_generation_sampling()
         chunk_size = max(1, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            expected_contexts = [self._build_expected_context(record, CoTMode.COT) for _key, record in chunk]
             prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in chunk]
-
-            def _on_cot_complete(output: GenerationOutput) -> None:
-                local_idx = output.prompt_index
-                if local_idx < 0 or local_idx >= len(chunk):
-                    return
-                key, record = chunk[local_idx]
+            cot_outputs = self.backend.generate(
+                prompts,
+                sampling=cot_sampling,
+                batch_size=batch_size,
+                progress_desc="Generating CoT" if not probe_only else "Probing CoT",
+                probe_only=probe_only,
+                prompt_seeds=[
+                    sample_repeat_seed(
+                        key.sample_index,
+                        key.repeat_index,
+                        pass_index=key.pass_index,
+                        stage=1,
+                    )
+                    for key, _record in chunk
+                ],
+            )
+            if probe_only:
+                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+            cot_by_index = {int(output.prompt_index): output for output in cot_outputs}
+            final_entries: list[tuple[AttemptKey, MultipleChoiceRecord, StageRecord, str, str]] = []
+            final_prompts: list[str] = []
+            for local_idx, (key, record) in enumerate(chunk):
+                cot_output = cot_by_index.get(local_idx)
+                if cot_output is None:
+                    raise RuntimeError("backend returned incomplete multiple-choice CoT batch")
                 cot_prompt = prompts[local_idx]
-                expected_context = expected_contexts[local_idx]
                 cot_stage = StageRecord(
                     prompt=cot_prompt,
-                    completion=output.text,
-                    stop_reason=output.finish_reason,
+                    completion=cot_output.text,
+                    stop_reason=cot_output.finish_reason,
                 )
                 cot_payload = SampleRecord(
                     benchmark_name=benchmark_name,
@@ -302,16 +281,31 @@ class MultipleChoicePipeline:
                 if on_record is not None:
                     on_record(cot_payload)
                 final_prompt = (
-                    final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", output.text)
+                    final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", cot_output.text)
                 )
-                _, pred_letter = self._score_prompt(record, final_prompt)
-                prior_context = f"{cot_prompt}{output.text}"
+                final_entries.append((key, record, cot_stage, cot_prompt, final_prompt))
+                final_prompts.append(final_prompt)
+
+            final_outputs = self.backend.generate(
+                final_prompts,
+                sampling=answer_sampling,
+                batch_size=batch_size,
+                progress_desc="Generating MC final answer",
+                show_progress=False,
+            )
+            final_by_index = {int(output.prompt_index): output for output in final_outputs}
+            for local_idx, (key, record, cot_stage, cot_prompt, final_prompt) in enumerate(final_entries):
+                final_output = final_by_index.get(local_idx)
+                if final_output is None:
+                    raise RuntimeError("backend returned incomplete multiple-choice final-answer batch")
+                pred_letter = self._extract_generated_choice_letter(final_output.text, len(record.choices))
+                prior_context = f"{cot_prompt}{cot_stage.completion}"
                 delta_prompt = prompt_delta(final_prompt, prior_context)
                 token_text = self.target_token_format.replace("<LETTER>", pred_letter)
                 final_stage = StageRecord(
                     prompt=delta_prompt,
                     completion=token_text,
-                    stop_reason="logits_only",
+                    stop_reason="generated_answer",
                 )
                 payload = SampleRecord(
                     benchmark_name=benchmark_name,
@@ -326,26 +320,6 @@ class MultipleChoicePipeline:
                 if on_record is not None:
                     on_record(payload)
                 payloads.append(payload)
-
-            _ = self.backend.generate(
-                prompts,
-                sampling=cot_sampling,
-                batch_size=batch_size,
-                progress_desc="Generating CoT" if not probe_only else "Probing CoT",
-                probe_only=probe_only,
-                on_complete=None if probe_only else _on_cot_complete,
-                prompt_seeds=[
-                    sample_repeat_seed(
-                        key.sample_index,
-                        key.repeat_index,
-                        pass_index=key.pass_index,
-                        stage=1,
-                    )
-                    for key, _record in chunk
-                ],
-            )
-            if probe_only:
-                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     def _load_records(
@@ -367,24 +341,6 @@ class MultipleChoicePipeline:
         dataset_name = infer_dataset_slug_from_path(dataset_path)
         return indexed_records, dataset_name
 
-    def _build_expected_context(self, record: MultipleChoiceRecord, cot_mode: CoTMode) -> str:
-        return build_multiple_choice_expected_context(
-            subject=normalize_subject(record.subject, "unknown"),
-            question=record.question,
-            choices=record.choices,
-            cot_mode=cot_mode,
-        )
-
-    def _prompt_for_cot(self, expected_context: str) -> str:
-        return prompt_for_cot(expected_context)
-
-    def _prompt_for_final_answer(self, expected_context: str, completions_of_cot: str | None) -> str:
-        return prompt_for_marker(
-            expected_context,
-            LOGPROBS_PLACEHOLDER,
-            completions_of_cot=completions_of_cot,
-        )
-
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
         subject = (record.subject or "unknown").replace("_", " ")
         question = record.question.lstrip()
@@ -393,12 +349,6 @@ class MultipleChoicePipeline:
             .replace("<Q>", question)
             .replace("<CHOICES>", concat_choices(record.choices))
         ).rstrip(" ")
-
-    def _choice_tokens(self, num_choices: int) -> list[int]:
-        return [
-            self.target_token_format.replace("<LETTER>", letter)
-            for letter in ALPHABET[:num_choices]
-        ]
 
     def _build_direct_payload(
         self,
@@ -414,7 +364,7 @@ class MultipleChoicePipeline:
             StageRecord(
                 prompt=prompt,
                 completion=token_text,
-                stop_reason="logits_only",
+                stop_reason="generated_answer",
             )
         ]
         return SampleRecord(
@@ -427,149 +377,6 @@ class MultipleChoicePipeline:
             stages=stages,
         ).as_payload()
 
-    def _direct_choice_worker_count(self, batch_size: int) -> int:
-        config = getattr(self.backend, "config", None)
-        max_workers = getattr(config, "max_workers", None) if config is not None else None
-        if max_workers is None:
-            return 1
-        try:
-            return max(1, min(int(batch_size), int(max_workers)))
-        except (TypeError, ValueError):
-            return 1
-
-    def _run_direct_choice_chunk_serial(
-        self,
-        entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
-        *,
-        prompt_template: str,
-        benchmark_name: str,
-        dataset_split: str,
-    ) -> list[dict]:
-        payloads: list[dict] = []
-        for key, record in entries:
-            prompt = self._format_prompt(record, prompt_template)
-            _, pred_letter = self._score_prompt_choice_only(record, prompt)
-            payloads.append(
-                self._build_direct_payload(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    key=key,
-                    prompt=prompt,
-                    pred_letter=pred_letter,
-                )
-            )
-        return payloads
-
-    def _run_direct_choice_chunk_parallel(
-        self,
-        entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
-        *,
-        prompt_template: str,
-        benchmark_name: str,
-        dataset_split: str,
-        max_workers: int,
-    ) -> list[dict]:
-        def _score_entry(local_index: int, key: AttemptKey, record: MultipleChoiceRecord) -> tuple[int, dict]:
-            prompt = self._format_prompt(record, prompt_template)
-            _, pred_letter = self._score_prompt_choice_only(record, prompt)
-            payload = self._build_direct_payload(
-                benchmark_name=benchmark_name,
-                dataset_split=dataset_split,
-                key=key,
-                prompt=prompt,
-                pred_letter=pred_letter,
-            )
-            return local_index, payload
-
-        results: list[dict | None] = [None] * len(entries)
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, min(int(max_workers), len(entries))),
-            thread_name_prefix="mc-choice-logits",
-        ) as executor:
-            future_to_index = {
-                executor.submit(_score_entry, local_index, key, record): local_index
-                for local_index, (key, record) in enumerate(entries)
-            }
-            for future in concurrent.futures.as_completed(future_to_index):
-                try:
-                    local_index, payload = future.result()
-                except NotImplementedError:
-                    for pending in future_to_index:
-                        pending.cancel()
-                    raise
-                results[local_index] = payload
-        missing_indexes = [index for index, payload in enumerate(results) if payload is None]
-        if missing_indexes:
-            raise RuntimeError(f"incomplete direct choice-logits chunk: missing indexes {missing_indexes}")
-        return [payload for payload in results if payload is not None]
-
-    def _score_prompt_choice_only(
-        self,
-        record: MultipleChoiceRecord,
-        prompt: str,
-    ) -> tuple[dict[str, float], str]:
-        choice_texts = self._choice_tokens(len(record.choices))
-        score_map, best_text = self.backend.score_choice_tokens(
-            prompt=prompt,
-            choice_token_texts=choice_texts,
-        )
-        logits_map = {
-            ALPHABET[index]: float(score_map.get(choice_texts[index], float("-inf")))
-            for index in range(len(choice_texts))
-        }
-        try:
-            pred_idx = choice_texts.index(best_text)
-        except ValueError as exc:
-            raise RuntimeError(f"backend returned unexpected choice token text: {best_text!r}") from exc
-        return logits_map, ALPHABET[pred_idx]
-
-    def _score_prompt(self, record: MultipleChoiceRecord, prompt: str) -> tuple[dict[str, float], str]:
-        try:
-            return self._score_prompt_choice_only(record, prompt)
-        except NotImplementedError as exc:
-            if not self.allow_generation_fallback:
-                self._raise_choice_scoring_required("multiple-choice final answer", exc)
-            return self._score_prompt_via_generation(record, prompt)
-
-    def _raise_choice_scoring_required(self, stage: str, exc: NotImplementedError) -> None:
-        raise RuntimeError(
-            f"{stage} requires backend candidate choice scoring; "
-            "refusing generative fallback because it is not comparable with logits-only scoring. "
-            "Use a backend that supports score_choice_tokens, or pass "
-            "--allow-generative-mc-fallback for a non-comparable diagnostic run."
-        ) from exc
-
-    def _score_prompt_via_generation(
-        self,
-        record: MultipleChoiceRecord,
-        prompt: str,
-    ) -> tuple[dict[str, float], str]:
-        outputs = self.backend.generate(
-            [prompt],
-            sampling=SamplingConfig(
-                max_generate_tokens=8,
-                temperature=0.0,
-                top_k=1,
-                top_p=1.0,
-                alpha_presence=0.0,
-                alpha_frequency=0.0,
-                alpha_decay=1.0,
-                stop_tokens=(),
-                no_penalty_token_ids=(),
-            ),
-            batch_size=1,
-            progress_desc="Generating MC answer",
-            show_progress=False,
-        )
-        if not outputs:
-            raise RuntimeError("backend returned no output for multiple-choice fallback generation")
-        pred_letter = self._extract_generated_choice_letter(outputs[0].text, len(record.choices))
-        score_map = {
-            letter: (0.0 if letter == pred_letter else float("-inf"))
-            for letter in ALPHABET[: len(record.choices)]
-        }
-        return score_map, pred_letter
-
     def _run_direct_generation_batches(
         self,
         entries: Sequence[tuple[AttemptKey, MultipleChoiceRecord]],
@@ -581,17 +388,7 @@ class MultipleChoicePipeline:
         on_record: Callable[[dict], None] | None,
     ) -> list[dict]:
         payloads: list[dict] = []
-        sampling = SamplingConfig(
-            max_generate_tokens=8,
-            temperature=0.0,
-            top_k=1,
-            top_p=1.0,
-            alpha_presence=0.0,
-            alpha_frequency=0.0,
-            alpha_decay=1.0,
-            stop_tokens=(),
-            no_penalty_token_ids=(),
-        )
+        sampling = self._answer_generation_sampling()
         chunk_size = max(1, int(batch_size))
         for start in range(0, len(entries), chunk_size):
             chunk = list(entries[start : start + chunk_size])
@@ -607,7 +404,7 @@ class MultipleChoicePipeline:
             for local_index, ((key, record), prompt) in enumerate(zip(chunk, prompts, strict=True)):
                 output = by_index.get(local_index)
                 if output is None:
-                    raise RuntimeError("backend returned incomplete multiple-choice fallback batch")
+                    raise RuntimeError("backend returned incomplete multiple-choice answer batch")
                 pred_letter = self._extract_generated_choice_letter(output.text, len(record.choices))
                 payload = self._build_direct_payload(
                     benchmark_name=benchmark_name,
@@ -631,6 +428,19 @@ class MultipleChoicePipeline:
             if char in valid_letters:
                 return char
         return ""
+
+    def _answer_generation_sampling(self) -> SamplingConfig:
+        return SamplingConfig(
+            max_generate_tokens=8,
+            temperature=0.0,
+            top_k=1,
+            top_p=1.0,
+            alpha_presence=0.0,
+            alpha_frequency=0.0,
+            alpha_decay=1.0,
+            stop_tokens=(),
+            no_penalty_token_ids=(),
+        )
 
 
 __all__ = ["MultipleChoicePipeline", "MultipleChoicePipelineResult"]

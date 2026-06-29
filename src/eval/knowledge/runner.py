@@ -52,11 +52,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run a single-batch CoT probe and skip scoring",
     )
     parser.add_argument(
-        "--allow-generative-mc-fallback",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--pass-k",
         type=int,
         action="append",
@@ -118,7 +113,7 @@ def _task_sampling_config(
     sampling_payload: dict[str, object] = {}
     if cot_mode is CoTMode.COT:
         sampling_payload["stage1"] = sampling_config_to_dict(cot_sampling)
-    return build_task_sampling_config(
+    task_sampling = build_task_sampling_config(
         cot_mode=cot_mode,
         avg_k=avg_k,
         sampling_config=sampling_payload,
@@ -126,6 +121,9 @@ def _task_sampling_config(
         effective_sample_count=effective_sample_count,
         prompt_profile=prompt_profile,
     )
+    task_sampling["mc_answer_mode"] = "generate"
+    task_sampling["choice_scoring"] = "generated_answer"
+    return task_sampling
 
 
 def main(
@@ -178,7 +176,6 @@ def main(
     pipeline = MultipleChoicePipeline(
         backend,
         target_token_format=args.target_token_format,
-        allow_generation_fallback=bool(args.allow_generative_mc_fallback),
     )
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
@@ -334,11 +331,8 @@ def main(
                 "prompt_profile": prompt_profile,
                 "infer_protocol": getattr(args, "infer_protocol", "local"),
                 "completion_style_remote": completion_style_remote,
-                "choice_scoring": (
-                    "logits_only_required"
-                    if not args.allow_generative_mc_fallback
-                    else "generative_fallback_allowed"
-                ),
+                "choice_scoring": "generated_answer",
+                "mc_answer_mode": "generate",
             },
         )
         runtime.record_score(score_payload)

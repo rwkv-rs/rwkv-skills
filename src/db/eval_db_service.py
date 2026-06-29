@@ -81,16 +81,19 @@ def _get_cached_git_sha() -> str:
     if env_sha:
         _GIT_SHA_CACHE = env_sha
         return _GIT_SHA_CACHE
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=str(REPO_ROOT),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    sha = result.stdout.strip()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        sha = result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        sha = "unknown"
     if not sha:
-        raise RuntimeError("git rev-parse HEAD returned empty output")
+        sha = "unknown"
     _GIT_SHA_CACHE = sha
     return _GIT_SHA_CACHE
 

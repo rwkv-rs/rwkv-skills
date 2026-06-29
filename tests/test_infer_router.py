@@ -44,6 +44,10 @@ def test_backend_url_for_path_switches_api_version() -> None:
         == "http://127.0.0.1:18081/v2/chat/completions"
     )
     assert (
+        _backend_url_for_path("http://127.0.0.1:18081/v1", "high_throughput/chat/completions")
+        == "http://127.0.0.1:18081/high_throughput/chat/completions"
+    )
+    assert (
         _backend_url_for_path("http://127.0.0.1:18081/openai/v1", "choice_logits")
         == "http://127.0.0.1:18081/openai/v1/choice_logits"
     )
@@ -76,6 +80,7 @@ def test_create_app_registers_openai_routes() -> None:
         assert "/v1/batch-metrics" in paths
         assert "/v1/chat/completions" in paths
         assert "/v2/chat/completions" in paths
+        assert "/high_throughput/chat/completions" in paths
         assert "/v1/choice_logits" in paths
         assert "/v1/completions" in paths
     finally:

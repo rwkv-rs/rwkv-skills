@@ -63,7 +63,11 @@ def normalize_api_base(base_url: str) -> str:
 
 
 def _backend_url_for_path(base_url: str, backend_path: str) -> str:
-    if backend_path.startswith("v1/") or backend_path.startswith("v2/"):
+    if (
+        backend_path.startswith("v1/")
+        or backend_path.startswith("v2/")
+        or backend_path.startswith("high_throughput/")
+    ):
         return f"{normalize_api_root(base_url)}/{backend_path}"
     return f"{base_url}/{backend_path}"
 
@@ -207,6 +211,16 @@ def create_app(
             routes=route_map,
             route_offsets=route_offsets,
             backend_path="v2/chat/completions",
+            timeout_s=timeout_s,
+        )
+
+    @app.post("/high_throughput/chat/completions")
+    async def high_throughput_chat_completions(request: Request) -> Response:
+        return await _forward_json_request(
+            request,
+            routes=route_map,
+            route_offsets=route_offsets,
+            backend_path="high_throughput/chat/completions",
             timeout_s=timeout_s,
         )
 
@@ -586,6 +600,8 @@ def _build_batch_metrics_payload(
 
 
 def _backend_backpressure_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
+    if int(status_code) == 404:
+        return _backend_missing_metrics_fallback_entry(base_url, status_code, payload)
     if not isinstance(payload, dict):
         return {
             "base_url": base_url,
@@ -622,6 +638,38 @@ def _backend_backpressure_entry(base_url: str, status_code: int, payload: object
     if status != "ok":
         entry["error"] = payload.get("error") or payload.get("detail") or "backend metrics request failed"
     return entry
+
+
+def _backend_missing_metrics_fallback_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
+    return {
+        "base_url": base_url,
+        "status": "ok",
+        "http_status": int(status_code),
+        "model_name": None,
+        "max_batch_size": 512,
+        "batch_collect_ms": 0,
+        "pending_queue": 0,
+        "service_queue": 0,
+        "engine_inbox": 0,
+        "active_records": 0,
+        "scheduler_waiting": 0,
+        "scheduler_running": 0,
+        "prefill_reserved_bsz": 0,
+        "total_batches": 0,
+        "total_requests": 0,
+        "completed_requests": 0,
+        "error_requests": 0,
+        "failed_batches": 0,
+        "last_total_tok_s": None,
+        "last_output_tok_s": None,
+        "avg_batch_size": None,
+        "metrics_fallback": "backend_missing_batch_metrics",
+        "backend_live": {"protocol": "lightning-high-throughput", "metrics_fallback": True},
+        "recent_batches": [],
+        "totals": {},
+        "pending": {},
+        "error": str(payload.get("error") if isinstance(payload, dict) else payload),
+    }
 
 
 def _backend_batch_metrics_entry(base_url: str, status_code: int, payload: object) -> dict[str, object]:
