@@ -533,7 +533,6 @@ rtk uv run python -m src.bin.run_infer_fleet \
   --base-port 18082 \
   --replicas-per-model 3 \
   --max-batch-size 64 \
-  --batch-collect-ms 10 \
   --router-port 19082 \
   --manifest-path logs/infer/fleet.json \
   --detach

@@ -63,13 +63,8 @@ GPU0 当前不是本轮项目服务，且没有 `/healthz`、`/v1/batch-metrics`
 共同参数：
 
 ```bash
---max-batch-size 512
---batch-collect-ms 50
 --max-num-seqs 512
 --max-num-batched-tokens 32768
---rwkv-prefill-token-budget 8192
---rwkv-prefill-max-batch-size 256
---max-state-slots 8192
 --gpu-memory-utilization 0.96
 ```
 
@@ -81,7 +76,7 @@ curl -sS http://127.0.0.1:18083/healthz
 curl -sS http://127.0.0.1:18084/healthz
 ```
 
-三路均返回 `max_batch_size=512`、`batch_collect_ms=50`。
+三路 `/healthz` 均返回 OK。
 
 ### 8222 router
 
@@ -178,13 +173,8 @@ curl -sS http://127.0.0.1:19083/v1/models
 
 推理端变量：
 
-- `--max-batch-size`
-- `--batch-collect-ms`
 - `--max-num-seqs`
 - `--max-num-batched-tokens`
-- `--rwkv-prefill-token-budget`
-- `--rwkv-prefill-max-batch-size`
-- `--max-state-slots`
 - `--gpu-memory-utilization`
 
 router 变量：

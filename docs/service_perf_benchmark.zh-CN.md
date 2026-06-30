@@ -128,11 +128,9 @@ source .venv/bin/activate
 nohup python -m src.bin.run_infer_server \
   --model-path /home/chase/GitHub/rwkv-skills/weights/BlinkDL__rwkv7-g1/rwkv7-g1e-1.5b-20260309-ctx8192.pth \
   --model-name rwkv7-g1e-1.5b-20260309-ctx8192 \
-  --device cuda:0 \
+  --cuda-visible-devices 0 \
   --host 127.0.0.1 \
   --port 8081 \
-  --max-batch-size 32 \
-  --batch-collect-ms 5 \
   > /tmp/rwkv7-g1e-1.5b-infer.log 2>&1 &
 ```
 

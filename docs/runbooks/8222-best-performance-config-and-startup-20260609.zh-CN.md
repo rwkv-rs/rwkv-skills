@@ -76,13 +76,8 @@ cd /home/chase/chase-rwkv-skills
 共同参数：
 
 ```bash
---max-batch-size 1024
---batch-collect-ms 50
 --max-num-seqs -1
 --max-num-batched-tokens 32768
---rwkv-prefill-token-budget 8192
---rwkv-prefill-max-batch-size 1024
---max-state-slots -1
 --gpu-memory-utilization 0.98
 --log-level info
 ```
@@ -95,13 +90,8 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/python -m src.bin.run_infer_server \
   --model-name rwkv7-g1g-2.9b-20260526-ctx8192 \
   --host 127.0.0.1 \
   --port 18082 \
-  --max-batch-size 1024 \
-  --batch-collect-ms 50 \
   --max-num-seqs -1 \
   --max-num-batched-tokens 32768 \
-  --rwkv-prefill-token-budget 8192 \
-  --rwkv-prefill-max-batch-size 1024 \
-  --max-state-slots -1 \
   --gpu-memory-utilization 0.98 \
   --log-level info
 ```
@@ -114,13 +104,8 @@ CUDA_VISIBLE_DEVICES=2 .venv/bin/python -m src.bin.run_infer_server \
   --model-name rwkv7-g1f-2.9b-20260420-ctx8192 \
   --host 127.0.0.1 \
   --port 18083 \
-  --max-batch-size 1024 \
-  --batch-collect-ms 50 \
   --max-num-seqs -1 \
   --max-num-batched-tokens 32768 \
-  --rwkv-prefill-token-budget 8192 \
-  --rwkv-prefill-max-batch-size 1024 \
-  --max-state-slots -1 \
   --gpu-memory-utilization 0.98 \
   --log-level info
 ```
@@ -133,13 +118,8 @@ CUDA_VISIBLE_DEVICES=3 .venv/bin/python -m src.bin.run_infer_server \
   --model-name rwkv7-g1g-7.2b-20260523-ctx8192 \
   --host 127.0.0.1 \
   --port 18084 \
-  --max-batch-size 1024 \
-  --batch-collect-ms 50 \
   --max-num-seqs -1 \
   --max-num-batched-tokens 32768 \
-  --rwkv-prefill-token-budget 8192 \
-  --rwkv-prefill-max-batch-size 1024 \
-  --max-state-slots -1 \
   --gpu-memory-utilization 0.98 \
   --log-level info
 ```
