@@ -103,8 +103,8 @@ def test_multiple_choice_pipeline_batches_generation(tmp_path) -> None:
 
     assert result.sample_count == 5
     assert len(result.payloads) == 5
-    assert [len(call) for call in backend.generate_calls] == [3, 2]
-    assert backend.generate_batch_sizes == [3, 3]
+    assert [len(call) for call in backend.generate_calls] == [5]
+    assert backend.generate_batch_sizes == [3]
 
 
 def test_multiple_choice_pipeline_streams_generated_payloads_in_order(tmp_path) -> None:

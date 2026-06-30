@@ -280,11 +280,11 @@ class MultipleChoicePipeline:
             if on_record is not None:
                 on_record(cot_payload)
 
-        # 阶段一：并发跑完所有 CoT
+        # 阶段一：流式提交所有 CoT，在飞并发上限用本 benchmark 的 batch_size（去屏障、保档位）
         _ = self.backend.generate(
             cot_prompts,
             sampling=cot_sampling,
-            batch_size=len(cot_prompts),
+            batch_size=batch_size,
             progress_desc="Generating CoT" if not probe_only else "Probing CoT",
             probe_only=probe_only,
             on_complete=None if probe_only else _on_cot_complete,
@@ -313,7 +313,7 @@ class MultipleChoicePipeline:
             answer_outputs = self.backend.generate(
                 answer_prompts,
                 sampling=_multiple_choice_answer_sampling(),
-                batch_size=len(answer_prompts),
+                batch_size=batch_size,
                 progress_desc="Generating MC answer",
                 show_progress=False,
             )
@@ -473,14 +473,14 @@ class MultipleChoicePipeline:
         entries = list(entries)
         if not entries:
             return payloads
-        # 一次性提交整段 prompts，去掉分块屏障；并发由 backend 的 config.max_workers
-        # 与服务端连续批处理 / backpressure 决定。prompt_index→record 映射不变，
-        # 答案采样为贪心（temperature=0/top_k=1），解析逻辑完全保留 ⇒ 逐条结果等价。
+        # 一次性提交整段 prompts，去掉分块屏障；但在飞并发上限仍用本 benchmark 自己的
+        # batch_size（ThreadPoolExecutor 会持续填充，长尾不阻塞、又不超过该档并发）。
+        # prompt_index→record 映射不变，贪心采样 + 原解析逻辑保留 ⇒ 逐条结果等价。
         prompts = [self._format_prompt(record, prompt_template) for _key, record in entries]
         outputs = self.backend.generate(
             prompts,
             sampling=sampling,
-            batch_size=len(prompts),
+            batch_size=batch_size,
             progress_desc="Generating MC answer",
             show_progress=False,
         )
