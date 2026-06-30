@@ -92,6 +92,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--infer-max-workers", type=int, help="Override profile infer workers")
     parser.add_argument("--remote-batch-size", type=int, help="Override profile remote batch size")
+    parser.add_argument(
+        "--infer-slots-per-model",
+        type=int,
+        default=2,
+        help="每个远端模型展开为多少个并发 slot，使多个评测任务同时喂一个批处理服务",
+    )
     parser.add_argument("--run-mode", default="new", choices=("auto", "new", "resume", "rerun"))
     parser.add_argument("--only-jobs", nargs="+", default=list(DEFAULT_JOBS))
     parser.add_argument("--only-datasets", nargs="+", default=list(DEFAULT_DATASETS))
@@ -190,6 +196,8 @@ def build_scheduler_args(args: argparse.Namespace) -> list[str]:
         str(workers),
         "--remote-batch-size",
         str(batch_size),
+        "--infer-slots-per-model",
+        str(int(args.infer_slots_per_model)),
         "--only-jobs",
         *[str(item) for item in args.only_jobs],
         "--only-datasets",

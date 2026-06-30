@@ -85,7 +85,7 @@ class QueueOptions:
     infer_models: tuple[str, ...] = ()
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
-    infer_max_workers: int = 32
+    infer_max_workers: int = 96
     infer_worker_profile: str = "fixed"
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"

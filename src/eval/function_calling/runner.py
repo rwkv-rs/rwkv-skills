@@ -126,8 +126,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--sample-workers",
         type=int,
-        default=1,
-        help="Concurrent episode workers for remote-safe function-calling runners",
+        default=8,
+        help=(
+            "Concurrent episode workers for remote-safe function-calling runners; "
+            "未实现 episode 并发的 benchmark 或本地模式会自动回退为 1"
+        ),
     )
     parser.add_argument("--max-samples", type=int, help="Limit source task count before avg@k planning")
     parser.add_argument(
@@ -477,15 +480,17 @@ def _normalize_sample_worker_args(args: argparse.Namespace) -> None:
     workers = int(getattr(args, "sample_workers", 1) or 1)
     if workers < 1:
         raise ValueError("--sample-workers must be >= 1")
-    args.sample_workers = workers
     if workers == 1:
+        args.sample_workers = 1
         return
     infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip()
     if not infer_base_url:
-        raise ValueError(
-            "--sample-workers > 1 currently requires remote inference "
-            "(--infer-base-url/--infer-model); local in-process batching is not enabled yet."
-        )
+        # 本地进程内 episode 并发尚未实现：非远端时回退为串行而非报错，
+        # 以便 sample_workers 默认 >1 不破坏本地运行。
+        print("⚠️ --sample-workers > 1 需要远端推理；当前为本地模式，回退为 1。")
+        args.sample_workers = 1
+        return
+    args.sample_workers = workers
     args.infer_max_workers = max(workers, int(getattr(args, "infer_max_workers", 1) or 1))
 
 
@@ -495,7 +500,13 @@ def _validate_sample_worker_benchmark(args: argparse.Namespace, run: ResolvedFun
     if run.benchmark_kind in _SAMPLE_WORKER_ENABLED_KINDS:
         return
     enabled = ", ".join(sorted(kind.value for kind in _SAMPLE_WORKER_ENABLED_KINDS))
-    raise ValueError(f"--sample-workers > 1 is currently implemented only for: {enabled}")
+    # 该 benchmark 尚未实现 episode 并发：回退为串行而非报错，
+    # 让默认 >1 的 sample_workers 对未实现的 kind 安全降级。
+    print(
+        f"⚠️ --sample-workers > 1 目前仅实现于 {enabled}；"
+        f"benchmark {run.benchmark_kind.value} 回退为 1。"
+    )
+    args.sample_workers = 1
 
 
 __all__ = [

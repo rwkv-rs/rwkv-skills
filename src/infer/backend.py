@@ -27,6 +27,7 @@ class RemoteHTTPError(RuntimeError):
 _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 DEFAULT_PREFILL_CHUNK_SIZE = 16
+DEFAULT_REMOTE_MAX_WORKERS = 128
 
 RemoteInferenceProtocol = Literal["openai", "vllm", "completions"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit"]
@@ -109,7 +110,7 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--infer-max-workers",
         type=int,
-        default=32,
+        default=DEFAULT_REMOTE_MAX_WORKERS,
         help="Max concurrent HTTP workers used by the eval-side remote client",
     )
     parser.add_argument(
@@ -206,7 +207,7 @@ class RemoteInferenceConfig:
     model: str
     api_key: str = ""
     timeout_s: float = 600.0
-    max_workers: int = 32
+    max_workers: int = DEFAULT_REMOTE_MAX_WORKERS
     max_retries: int = 3
     retry_initial_delay_s: float = 1.0
     retry_max_delay_s: float = 10.0
@@ -598,7 +599,10 @@ def build_inference_backend_from_args(args: argparse.Namespace) -> InferenceBack
             model=str(getattr(args, "infer_model", "") or "").strip(),
             api_key=str(getattr(args, "infer_api_key", "") or ""),
             timeout_s=float(getattr(args, "infer_timeout_s", 600.0) or 600.0),
-            max_workers=max(1, int(getattr(args, "infer_max_workers", 32) or 32)),
+            max_workers=max(
+                1,
+                int(getattr(args, "infer_max_workers", DEFAULT_REMOTE_MAX_WORKERS) or DEFAULT_REMOTE_MAX_WORKERS),
+            ),
             protocol=_normalize_remote_protocol(getattr(args, "infer_protocol", "openai")),
             seed_policy=_normalize_remote_seed_policy(getattr(args, "infer_seed_policy", "preserve")),
         )
@@ -656,6 +660,7 @@ def _resolve_effective_constraints(
 
 
 __all__ = [
+    "DEFAULT_REMOTE_MAX_WORKERS",
     "InferenceBackend",
     "REMOTE_INFERENCE_PROTOCOL_CHOICES",
     "REMOTE_INFERENCE_SEED_POLICY_CHOICES",

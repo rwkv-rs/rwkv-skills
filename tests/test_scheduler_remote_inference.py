@@ -16,7 +16,7 @@ from src.eval.scheduler.backpressure import (
     compute_remote_concurrency_budgets,
     parse_remote_backpressure,
 )
-from src.eval.scheduler.cli import build_parser
+from src.eval.scheduler.cli import _expand_infer_model_slots, build_parser
 from src.eval.scheduler.jobs import JOB_CATALOGUE
 from src.eval.scheduler.remote_slots import infer_workers_for_model
 from src.eval.scheduler.state import RunningEntry
@@ -525,6 +525,20 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_backpressure_timeout_s == 1.5
     assert args.infer_backpressure_pending_high_watermark == 2
     assert args.infer_budget_min_workers == 3
+
+
+def test_scheduler_slot_expansion_preserves_explicit_slots() -> None:
+    assert _expand_infer_model_slots(("slot-a=remote-a", "slot-b=remote-a"), 2) == (
+        "slot-a=remote-a",
+        "slot-b=remote-a",
+    )
+
+
+def test_scheduler_slot_expansion_expands_bare_model_names() -> None:
+    assert _expand_infer_model_slots(("remote-a",), 2) == (
+        "remote-a-s0=remote-a",
+        "remote-a-s1=remote-a",
+    )
 
 
 def test_parse_remote_backpressure_payload_uses_router_aggregate() -> None:

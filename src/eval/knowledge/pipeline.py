@@ -240,81 +240,126 @@ class MultipleChoicePipeline:
 
         payloads: list[dict] = []
         sampling_config = normalize_sampling_config_by_stage([(1, cot_sampling)])
-        chunk_size = max(1, batch_size)
-        for start in range(0, len(remaining_entries), chunk_size):
-            chunk = remaining_entries[start : start + chunk_size]
-            expected_contexts = [self._build_expected_context(record, CoTMode.COT) for _key, record in chunk]
-            prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in chunk]
+        remaining_entries = list(remaining_entries)
 
-            def _on_cot_complete(output: GenerationOutput) -> None:
-                local_idx = output.prompt_index
-                if local_idx < 0 or local_idx >= len(chunk):
-                    return
-                key, record = chunk[local_idx]
-                cot_prompt = prompts[local_idx]
-                expected_context = expected_contexts[local_idx]
-                cot_stage = StageRecord(
-                    prompt=cot_prompt,
-                    completion=output.text,
-                    stop_reason=output.finish_reason,
-                )
-                cot_payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=key.sample_index,
-                    repeat_index=key.repeat_index,
-                    pass_index=key.pass_index,
-                    sampling_config=sampling_config,
-                    stages=[cot_stage],
-                ).as_payload()
-                cot_payload["_stage"] = "cot"
-                if on_record is not None:
-                    on_record(cot_payload)
-                final_prompt = (
-                    final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", output.text)
-                )
-                pred_letter = self._generate_prompt_choice(record, final_prompt)
-                prior_context = f"{cot_prompt}{output.text}"
-                delta_prompt = prompt_delta(final_prompt, prior_context)
-                token_text = self.target_token_format.replace("<LETTER>", pred_letter)
-                final_stage = StageRecord(
-                    prompt=delta_prompt,
-                    completion=token_text,
-                    stop_reason="generated_choice",
-                )
-                payload = SampleRecord(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    sample_index=key.sample_index,
-                    repeat_index=key.repeat_index,
-                    pass_index=key.pass_index,
-                    sampling_config=sampling_config,
-                    stages=[cot_stage, final_stage],
-                ).as_payload()
-                payload["_stage"] = "answer"
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
-
-            _ = self.backend.generate(
-                prompts,
-                sampling=cot_sampling,
-                batch_size=batch_size,
-                progress_desc="Generating CoT" if not probe_only else "Probing CoT",
-                probe_only=probe_only,
-                on_complete=None if probe_only else _on_cot_complete,
-                prompt_seeds=[
-                    sample_repeat_seed(
-                        key.sample_index,
-                        key.repeat_index,
-                        pass_index=key.pass_index,
-                        stage=1,
-                    )
-                    for key, _record in chunk
-                ],
+        # 整段一次性构造，去掉分块屏障。每条的 stage-1 seed 由 sample/repeat/pass 决定，
+        # 与分块边界无关；prompt_index→entry 映射保持不变。
+        cot_prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in remaining_entries]
+        cot_seeds = [
+            sample_repeat_seed(
+                key.sample_index,
+                key.repeat_index,
+                pass_index=key.pass_index,
+                stage=1,
             )
-            if probe_only:
-                return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+            for key, _record in remaining_entries
+        ]
+        cot_outputs: list[GenerationOutput | None] = [None] * len(remaining_entries)
+
+        def _on_cot_complete(output: GenerationOutput) -> None:
+            idx = output.prompt_index
+            if idx < 0 or idx >= len(remaining_entries):
+                return
+            cot_outputs[idx] = output
+            key, _record = remaining_entries[idx]
+            cot_stage = StageRecord(
+                prompt=cot_prompts[idx],
+                completion=output.text,
+                stop_reason=output.finish_reason,
+            )
+            cot_payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=key.sample_index,
+                repeat_index=key.repeat_index,
+                pass_index=key.pass_index,
+                sampling_config=sampling_config,
+                stages=[cot_stage],
+            ).as_payload()
+            cot_payload["_stage"] = "cot"
+            if on_record is not None:
+                on_record(cot_payload)
+
+        # 阶段一：并发跑完所有 CoT
+        _ = self.backend.generate(
+            cot_prompts,
+            sampling=cot_sampling,
+            batch_size=len(cot_prompts),
+            progress_desc="Generating CoT" if not probe_only else "Probing CoT",
+            probe_only=probe_only,
+            on_complete=None if probe_only else _on_cot_complete,
+            prompt_seeds=cot_seeds,
+        )
+        if probe_only:
+            return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+
+        # 阶段二：用全部 CoT 输出构造答案段 prompt，单次并发生成。
+        # 采样与无 seed 行为同原 _generate_prompt_choice（贪心），解析函数不变 ⇒ 逐条等价。
+        answer_indices: list[int] = []
+        answer_prompts: list[str] = []
+        final_prompt_by_idx: dict[int, str] = {}
+        for idx, output in enumerate(cot_outputs):
+            if output is None:
+                continue
+            final_prompt = (
+                final_answer_template.replace("<Q>", cot_prompts[idx]).replace("<COT>", output.text)
+            )
+            final_prompt_by_idx[idx] = final_prompt
+            answer_indices.append(idx)
+            answer_prompts.append(final_prompt)
+
+        pred_letter_by_idx: dict[int, str] = {}
+        if answer_prompts:
+            answer_outputs = self.backend.generate(
+                answer_prompts,
+                sampling=_multiple_choice_answer_sampling(),
+                batch_size=len(answer_prompts),
+                progress_desc="Generating MC answer",
+                show_progress=False,
+            )
+            by_index = {int(o.prompt_index): o for o in answer_outputs}
+            for local_index, idx in enumerate(answer_indices):
+                ans_output = by_index.get(local_index)
+                if ans_output is None:
+                    raise RuntimeError("backend returned incomplete multiple-choice answer batch")
+                _key, record = remaining_entries[idx]
+                pred_letter_by_idx[idx] = self._extract_generated_choice_letter(
+                    ans_output.text, len(record.choices)
+                )
+
+        for idx, output in enumerate(cot_outputs):
+            if output is None:
+                continue
+            key, _record = remaining_entries[idx]
+            cot_prompt = cot_prompts[idx]
+            cot_stage = StageRecord(
+                prompt=cot_prompt,
+                completion=output.text,
+                stop_reason=output.finish_reason,
+            )
+            final_prompt = final_prompt_by_idx[idx]
+            pred_letter = pred_letter_by_idx.get(idx, "")
+            prior_context = f"{cot_prompt}{output.text}"
+            delta_prompt = prompt_delta(final_prompt, prior_context)
+            token_text = self.target_token_format.replace("<LETTER>", pred_letter)
+            final_stage = StageRecord(
+                prompt=delta_prompt,
+                completion=token_text,
+                stop_reason="generated_choice",
+            )
+            payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=key.sample_index,
+                repeat_index=key.repeat_index,
+                pass_index=key.pass_index,
+                sampling_config=sampling_config,
+                stages=[cot_stage, final_stage],
+            ).as_payload()
+            payload["_stage"] = "answer"
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
     def _load_records(
@@ -425,33 +470,36 @@ class MultipleChoicePipeline:
     ) -> list[dict]:
         payloads: list[dict] = []
         sampling = _multiple_choice_answer_sampling()
-        chunk_size = max(1, int(batch_size))
-        for start in range(0, len(entries), chunk_size):
-            chunk = list(entries[start : start + chunk_size])
-            prompts = [self._format_prompt(record, prompt_template) for _key, record in chunk]
-            outputs = self.backend.generate(
-                prompts,
-                sampling=sampling,
-                batch_size=chunk_size,
-                progress_desc="Generating MC answer",
-                show_progress=False,
+        entries = list(entries)
+        if not entries:
+            return payloads
+        # 一次性提交整段 prompts，去掉分块屏障；并发由 backend 的 config.max_workers
+        # 与服务端连续批处理 / backpressure 决定。prompt_index→record 映射不变，
+        # 答案采样为贪心（temperature=0/top_k=1），解析逻辑完全保留 ⇒ 逐条结果等价。
+        prompts = [self._format_prompt(record, prompt_template) for _key, record in entries]
+        outputs = self.backend.generate(
+            prompts,
+            sampling=sampling,
+            batch_size=len(prompts),
+            progress_desc="Generating MC answer",
+            show_progress=False,
+        )
+        by_index = {int(output.prompt_index): output for output in outputs}
+        for index, ((key, record), prompt) in enumerate(zip(entries, prompts, strict=True)):
+            output = by_index.get(index)
+            if output is None:
+                raise RuntimeError("backend returned incomplete multiple-choice generation batch")
+            pred_letter = self._extract_generated_choice_letter(output.text, len(record.choices))
+            payload = self._build_direct_payload(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                key=key,
+                prompt=prompt,
+                pred_letter=pred_letter,
             )
-            by_index = {int(output.prompt_index): output for output in outputs}
-            for local_index, ((key, record), prompt) in enumerate(zip(chunk, prompts, strict=True)):
-                output = by_index.get(local_index)
-                if output is None:
-                    raise RuntimeError("backend returned incomplete multiple-choice generation batch")
-                pred_letter = self._extract_generated_choice_letter(output.text, len(record.choices))
-                payload = self._build_direct_payload(
-                    benchmark_name=benchmark_name,
-                    dataset_split=dataset_split,
-                    key=key,
-                    prompt=prompt,
-                    pred_letter=pred_letter,
-                )
-                if on_record is not None:
-                    on_record(payload)
-                payloads.append(payload)
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
         return payloads
 
     def _extract_generated_choice_letter(self, text: str, num_choices: int) -> str:

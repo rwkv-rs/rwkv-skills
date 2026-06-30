@@ -5,8 +5,11 @@ import argparse
 import pytest
 
 from src.infer.backend import (
+    DEFAULT_REMOTE_MAX_WORKERS,
     RemoteInferenceBackend,
     RemoteInferenceConfig,
+    add_inference_backend_arguments,
+    build_inference_backend_from_args,
     require_completion_style_remote_protocol,
     validate_inference_backend_args,
 )
@@ -32,6 +35,18 @@ def test_completion_style_converts_vllm_to_completions() -> None:
 
     assert changed is True
     assert args.infer_protocol == "completions"
+
+
+def test_inference_backend_cli_defaults_to_remote_config_workers() -> None:
+    parser = argparse.ArgumentParser()
+    add_inference_backend_arguments(parser)
+
+    args = parser.parse_args(["--infer-base-url", "http://127.0.0.1:19082", "--infer-model", "demo"])
+    backend = build_inference_backend_from_args(args)
+
+    assert args.infer_max_workers == DEFAULT_REMOTE_MAX_WORKERS
+    assert isinstance(backend, RemoteInferenceBackend)
+    assert backend.config.max_workers == DEFAULT_REMOTE_MAX_WORKERS
 
 
 def test_vllm_generation_uses_chat_completions(monkeypatch) -> None:

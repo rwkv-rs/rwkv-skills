@@ -214,7 +214,13 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-models", nargs="+", help="远端推理服务上的模型名列表")
     parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
-    parser.add_argument("--infer-max-workers", type=int, default=32, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument("--infer-max-workers", type=int, default=96, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument(
+        "--infer-slots-per-model",
+        type=int,
+        default=2,
+        help="每个远端模型展开为多少个并发 slot，使多个评测任务同时喂一个批处理服务（单 GPU 单服务建议 2-4）",
+    )
     parser.add_argument(
         "--infer-worker-profile",
         choices=INFER_WORKER_PROFILE_CHOICES,
@@ -650,8 +656,46 @@ def _resolve_scheduler_inference_args(
             parser.error("远端推理模式缺少 --infer-base-url")
         if not infer_models:
             parser.error("远端推理模式缺少 --infer-models")
+        slots_per_model = int(getattr(args, "infer_slots_per_model", 1) or 1)
+        infer_models = _expand_infer_model_slots(infer_models, slots_per_model)
         return tuple(), infer_base_url, infer_models
     return model_globs, None, tuple()
+
+
+def _expand_infer_model_slots(
+    infer_models: Sequence[str],
+    slots_per_model: int,
+) -> tuple[str, ...]:
+    """把每个模型展开为 N 个并发 slot（slot 唯一、model 保持真实名）。
+
+    机制见 scheduler/remote_slots.py：多个 slot 可指向同一后端模型，让多个
+    benchmark job 并行喂同一个批处理服务，而 DB 身份仍用真实模型名。
+    """
+    count = max(1, int(slots_per_model))
+    if count == 1:
+        return tuple(infer_models)
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for raw in infer_models:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if "=" in text:
+            slot, model = (part.strip() for part in text.split("=", 1))
+            spec = f"{slot}={model}"
+            if spec not in seen:
+                seen.add(spec)
+                expanded.append(spec)
+            continue
+        else:
+            slot = model = text
+        for index in range(count):
+            spec = f"{slot}-s{index}={model}"
+            if spec in seen:
+                continue
+            seen.add(spec)
+            expanded.append(spec)
+    return tuple(expanded)
 
 
 def _run_probe_infer(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
