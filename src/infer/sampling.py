@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-"""Sampling primitives shared across所有推理/评估流水线。"""
+"""Sampling primitives shared across all inference / evaluation pipelines."""
 
 from dataclasses import dataclass, field, replace
 
+# RWKV world 词表（rwkv_vocab_v20230424）中前 256 个 token 为单字节，token id == byte + 1。
+# 这里豁免重复惩罚的是：空格(33→0x20)、制表符(10→0x09)、数字 '0'-'9'(49-58→0x30-0x39)，
+# 避免对空白与数字的正常重复施加 presence/frequency penalty。
 DEFAULT_NO_PENALTY_TOKEN_IDS = (33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58)
 
 
@@ -18,6 +21,8 @@ class SamplingConfig:
     alpha_presence: float = 0.5
     alpha_frequency: float = 0.5
     alpha_decay: float = 0.99
+    # 0 = EOS/pad；261、24281 为 RWKV world 词表中的对话分隔 token（双换行 / 角色边界类），
+    # 命中即停止生成，对应 RWKV 对话模板的回合结束标记。
     stop_tokens: tuple[int, ...] = (0, 261, 24281)
     ban_tokens: tuple[int, ...] | None = None
     pad_zero: bool = True

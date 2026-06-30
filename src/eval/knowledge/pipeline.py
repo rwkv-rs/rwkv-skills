@@ -12,12 +12,7 @@ from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
 from src.eval.execution_plan import AttemptKey
 from src.eval.prompt_builders import (
     ALPHABET,
-    LOGPROBS_PLACEHOLDER,
-    build_multiple_choice_expected_context,
     concat_choices,
-    normalize_subject,
-    prompt_for_cot,
-    prompt_for_marker,
 )
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -294,7 +289,7 @@ class MultipleChoicePipeline:
             return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
 
         # 阶段二：用全部 CoT 输出构造答案段 prompt，单次并发生成。
-        # 采样与无 seed 行为同原 _generate_prompt_choice（贪心），解析函数不变 ⇒ 逐条等价。
+        # 贪心采样、无 seed，解析函数（_extract_generated_choice_letter）不变 ⇒ 逐条等价。
         answer_indices: list[int] = []
         answer_prompts: list[str] = []
         final_prompt_by_idx: dict[int, str] = {}
@@ -381,24 +376,6 @@ class MultipleChoicePipeline:
         dataset_name = infer_dataset_slug_from_path(dataset_path)
         return indexed_records, dataset_name
 
-    def _build_expected_context(self, record: MultipleChoiceRecord, cot_mode: CoTMode) -> str:
-        return build_multiple_choice_expected_context(
-            subject=normalize_subject(record.subject, "unknown"),
-            question=record.question,
-            choices=record.choices,
-            cot_mode=cot_mode,
-        )
-
-    def _prompt_for_cot(self, expected_context: str) -> str:
-        return prompt_for_cot(expected_context)
-
-    def _prompt_for_final_answer(self, expected_context: str, completions_of_cot: str | None) -> str:
-        return prompt_for_marker(
-            expected_context,
-            LOGPROBS_PLACEHOLDER,
-            completions_of_cot=completions_of_cot,
-        )
-
     def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
         subject = (record.subject or "unknown").replace("_", " ")
         question = record.question.lstrip()
@@ -407,12 +384,6 @@ class MultipleChoicePipeline:
             .replace("<Q>", question)
             .replace("<CHOICES>", concat_choices(record.choices))
         ).rstrip(" ")
-
-    def _choice_tokens(self, num_choices: int) -> list[int]:
-        return [
-            self.target_token_format.replace("<LETTER>", letter)
-            for letter in ALPHABET[:num_choices]
-        ]
 
     def _build_direct_payload(
         self,
@@ -440,23 +411,6 @@ class MultipleChoicePipeline:
             sampling_config={},
             stages=stages,
         ).as_payload()
-
-    def _generate_prompt_choice(
-        self,
-        record: MultipleChoiceRecord,
-        prompt: str,
-    ) -> str:
-        outputs = self.backend.generate(
-            [prompt],
-            sampling=_multiple_choice_answer_sampling(),
-            batch_size=1,
-            progress_desc="Generating MC answer",
-            show_progress=False,
-        )
-        if not outputs:
-            raise RuntimeError("backend returned no output for multiple-choice generation")
-        pred_letter = self._extract_generated_choice_letter(outputs[0].text, len(record.choices))
-        return pred_letter
 
     def _run_direct_generation_batches(
         self,

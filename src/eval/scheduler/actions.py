@@ -15,6 +15,7 @@ from .config import (
     DEFAULT_DB_CONFIG,
     DEFAULT_DISPATCH_POLL_SECONDS,
     DEFAULT_GPU_IDLE_MAX_MEM,
+    DEFAULT_INFER_MAX_WORKERS,
     DEFAULT_MODEL_GLOBS,
     DEFAULT_PYTHON,
     DEFAULT_RUN_LOG_DIR,
@@ -85,7 +86,7 @@ class QueueOptions:
     infer_models: tuple[str, ...] = ()
     infer_api_key: str = ""
     infer_timeout_s: float = 600.0
-    infer_max_workers: int = 96
+    infer_max_workers: int = DEFAULT_INFER_MAX_WORKERS
     infer_worker_profile: str = "fixed"
     infer_protocol: str = "openai"
     infer_seed_policy: str = "preserve"

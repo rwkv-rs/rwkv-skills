@@ -39,6 +39,8 @@ from .config import (
     DEFAULT_ADMIN_HOST,
     DEFAULT_ADMIN_PORT,
     DEFAULT_ADMIN_STATE_DIR,
+    DEFAULT_INFER_MAX_WORKERS,
+    DEFAULT_INFER_SLOTS_PER_MODEL,
     DEFAULT_LOG_DIR,
     DEFAULT_MODEL_GLOBS,
     DEFAULT_PID_DIR,
@@ -214,11 +216,16 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-models", nargs="+", help="远端推理服务上的模型名列表")
     parser.add_argument("--infer-api-key", default="", help="远端推理服务 API key")
     parser.add_argument("--infer-timeout-s", type=float, default=600.0, help="远端推理请求超时")
-    parser.add_argument("--infer-max-workers", type=int, default=96, help="每个评测 worker 的远端请求并发上限")
+    parser.add_argument(
+        "--infer-max-workers",
+        type=int,
+        default=DEFAULT_INFER_MAX_WORKERS,
+        help="每个评测 worker 的远端请求并发上限",
+    )
     parser.add_argument(
         "--infer-slots-per-model",
         type=int,
-        default=2,
+        default=DEFAULT_INFER_SLOTS_PER_MODEL,
         help="每个远端模型展开为多少个并发 slot，使多个评测任务同时喂一个批处理服务（单 GPU 单服务建议 2-4）",
     )
     parser.add_argument(
@@ -462,7 +469,7 @@ def _dispatch_options_from_args(
         infer_models=infer_models,
         infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
         infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
-        infer_max_workers=int(getattr(args, "infer_max_workers", 32)),
+        infer_max_workers=int(getattr(args, "infer_max_workers", DEFAULT_INFER_MAX_WORKERS)),
         infer_worker_profile=str(getattr(args, "infer_worker_profile", "fixed") or "fixed"),
         infer_protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),
         infer_seed_policy=str(getattr(args, "infer_seed_policy", "preserve") or "preserve"),
@@ -656,7 +663,7 @@ def _resolve_scheduler_inference_args(
             parser.error("远端推理模式缺少 --infer-base-url")
         if not infer_models:
             parser.error("远端推理模式缺少 --infer-models")
-        slots_per_model = int(getattr(args, "infer_slots_per_model", 1) or 1)
+        slots_per_model = int(getattr(args, "infer_slots_per_model", DEFAULT_INFER_SLOTS_PER_MODEL) or 1)
         infer_models = _expand_infer_model_slots(infer_models, slots_per_model)
         return tuple(), infer_base_url, infer_models
     return model_globs, None, tuple()

@@ -36,13 +36,16 @@ _MODEL_GLOBS_ENV = os.environ.get("RUN_MODEL_GLOBS")
 if _MODEL_GLOBS_ENV:
     DEFAULT_MODEL_GLOBS = tuple(filter(None, _MODEL_GLOBS_ENV.split(os.pathsep)))
 else:
+    # 仅保留仓库内默认权重路径；机器特定的外部权重目录请用 RUN_MODEL_GLOBS 覆盖
+    # （os.pathsep 分隔），不要把个人绝对路径硬编码进默认值。
     DEFAULT_MODEL_GLOBS = (
-        "/public/home/ssjxzkz/Weights/BlinkDL__rwkv7-g1/*.pth",
-        "/home/caizus/Weights/BlinkDL__rwkv7-g1/*.pth",
         str(REPO_ROOT / "weights" / "rwkv7-*.pth"),
     )
 
 DEFAULT_GPU_IDLE_MAX_MEM = int(os.environ.get("RUN_GPU_IDLE_MAX_MEM", "1000"))
+# Scheduler 层推理并发默认值的单一来源（cli argparse / QueueOptions / getattr 兜底共用）
+DEFAULT_INFER_MAX_WORKERS = int(os.environ.get("RUN_INFER_MAX_WORKERS", "96"))
+DEFAULT_INFER_SLOTS_PER_MODEL = int(os.environ.get("RUN_INFER_SLOTS_PER_MODEL", "2"))
 DEFAULT_PYTHON = os.environ.get("RUN_PYTHON", sys.executable or "python3")
 DEFAULT_DISPATCH_POLL_SECONDS = int(os.environ.get("RUN_DISPATCH_POLL", "30"))
 DEFAULT_TAIL_LINES = int(os.environ.get("RUN_TAIL_LINES", "60"))
@@ -82,6 +85,8 @@ __all__ = [
     "DEFAULT_ADMIN_STATE_DIR",
     "DEFAULT_MODEL_GLOBS",
     "DEFAULT_GPU_IDLE_MAX_MEM",
+    "DEFAULT_INFER_MAX_WORKERS",
+    "DEFAULT_INFER_SLOTS_PER_MODEL",
     "DEFAULT_PYTHON",
     "DEFAULT_DISPATCH_POLL_SECONDS",
     "DEFAULT_TAIL_LINES",
