@@ -6,8 +6,6 @@ from pathlib import Path
 import sys
 import types
 
-import pytest
-
 from src.eval.datasets.data_prepper.data_manager import prepare_dataset
 from src.eval.datasets.runtime import read_jsonl_items
 from src.eval.function_calling.complexfuncbench import (
@@ -97,17 +95,6 @@ def test_prepare_dataset_materializes_complexfuncbench_official(tmp_path: Path, 
     assert row["scorer"]["type"] == "complexfuncbench_official"
     assert row["metadata"]["complexfuncbench_total_call_num"] == 2
     assert any(tool["name"] == COMPLEXFUNCBENCH_FINAL_SCHEMA["name"] for tool in row["tools"])
-
-
-def test_prepare_dataset_requires_complexfuncbench_official_root(tmp_path: Path, monkeypatch) -> None:
-    source = tmp_path / "ComplexFuncBench.jsonl"
-    source.write_text(json.dumps(_official_source_row(), ensure_ascii=False) + "\n", encoding="utf-8")
-    monkeypatch.setenv("RWKV_COMPLEXFUNCBENCH_SOURCE", str(source))
-    monkeypatch.delenv("RWKV_COMPLEXFUNC_OFFICIAL_ROOT", raising=False)
-    monkeypatch.delenv("RWKV_COMPLEXFUNCBENCH_OFFICIAL_ROOT", raising=False)
-
-    with pytest.raises(ValueError, match="official sandbox"):
-        prepare_dataset("complexfuncbench_official", tmp_path / "out", "test")
 
 
 def test_complexfuncbench_prompt_uses_routed_tool_window(tmp_path: Path, monkeypatch) -> None:

@@ -574,13 +574,9 @@ manifest 里会记录 `source_kind`、`row_count` 和源文件路径。
 | 测试目标 | 当前项目参考测试 |
 |---|---|
 | prompt 使用 `rwkv_official_json` 格式 | `tests/test_function_calling_common.py` |
-| APIBank 执行 official-style sandbox | `tests/test_simple_tool_call_benchmarks.py::test_api_bank_evaluator_executes_official_style_sandbox` |
-| BFCL exec 数据准备 | `tests/test_simple_tool_call_benchmarks.py::test_prepare_dataset_materializes_bfcl_exec_spec` |
-| BFCL exec 执行结果判分 | `tests/test_simple_tool_call_benchmarks.py::test_bfcl_exec_evaluator_executes_decoded_and_reference_calls` |
-| BFCL parallel 无序匹配 | `tests/test_simple_tool_call_benchmarks.py::test_bfcl_exec_parallel_evaluator_matches_calls_without_order` |
-| ToolAlpaca 数据准备 | `tests/test_simple_tool_call_benchmarks.py::test_prepare_dataset_materializes_toolalpaca_spec` |
-| ToolAlpaca simulator HTTP | `tests/test_simple_tool_call_benchmarks.py::test_toolalpaca_evaluator_calls_configured_official_simulator` |
-| ToolAlpaca real 过滤/鉴权 | `tests/test_simple_tool_call_benchmarks.py::test_toolalpaca_real_loader_skips_auth_required_apis` |
+| APIBank / BFCL / ToolAlpaca 数据准备 | `tests/test_function_calling_dataset_prep.py` |
+| BFCL exec 解析与执行判分 | `tests/test_function_calling_bfcl_v3.py` |
+| function-calling runner 分发 | `tests/test_function_calling_runner.py` |
 | scheduler job matrix | `tests/test_scheduler_job_matrix.py` |
 | runner kind auto-detect | `tests/test_function_calling_runner.py` |
 
@@ -589,7 +585,8 @@ manifest 里会记录 `source_kind`、`row_count` 和源文件路径。
 ```bash
 .venv/bin/pytest \
   tests/test_function_calling_common.py \
-  tests/test_simple_tool_call_benchmarks.py \
+  tests/test_function_calling_dataset_prep.py \
+  tests/test_function_calling_bfcl_v3.py \
   tests/test_function_calling_runner.py \
   tests/test_scheduler_job_matrix.py
 ```

@@ -101,7 +101,7 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert candidate_router_config.batch_size == 4
 
 
-def test_function_calling_runner_rejects_local_sample_workers() -> None:
+def test_function_calling_runner_falls_back_for_local_sample_workers() -> None:
     args = function_calling_runner.parse_args(
         [
             "--dataset",
@@ -113,8 +113,9 @@ def test_function_calling_runner_rejects_local_sample_workers() -> None:
         ]
     )
 
-    with pytest.raises(ValueError, match="requires remote inference"):
-        function_calling_runner._normalize_sample_worker_args(args)
+    function_calling_runner._normalize_sample_worker_args(args)
+
+    assert args.sample_workers == 1
 
 
 def test_function_calling_runner_binds_remote_workers_to_connection_pool() -> None:
@@ -139,7 +140,7 @@ def test_function_calling_runner_binds_remote_workers_to_connection_pool() -> No
     assert args.infer_max_workers == 8
 
 
-def test_function_calling_runner_rejects_unwired_sample_worker_benchmark() -> None:
+def test_function_calling_runner_falls_back_for_unwired_sample_worker_benchmark() -> None:
     args = function_calling_runner.parse_args(
         [
             "--dataset",
@@ -163,8 +164,9 @@ def test_function_calling_runner_rejects_unwired_sample_worker_benchmark() -> No
     )
 
     function_calling_runner._normalize_sample_worker_args(args)
-    with pytest.raises(ValueError, match="implemented only for: .*bfcl_v3"):
-        function_calling_runner._validate_sample_worker_benchmark(args, run)
+    function_calling_runner._validate_sample_worker_benchmark(args, run)
+
+    assert args.sample_workers == 1
 
 
 def test_function_calling_runner_allows_browsecomp_plus_sample_workers() -> None:

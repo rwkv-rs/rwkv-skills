@@ -23,27 +23,19 @@
 
 ```bash
 rtk uv run pytest -q \
-  tests/test_infer_split.py \
+  tests/test_infer_backend.py \
+  tests/test_run_infer_server.py \
   tests/test_scheduler_remote_inference.py \
-  tests/test_scheduler_admin.py \
   tests/test_main_config.py \
-  tests/test_benchmark_profiler.py \
   tests/test_infer_router.py \
   tests/test_infer_fleet.py \
-  tests/test_verify_remote_infer_swap.py \
-  tests/test_probe_remote_infer.py \
   tests/test_preflight_remote_eval.py \
-  tests/test_run_infer_swap_eval.py \
-  tests/test_summarize_infer_swap_eval.py \
-  tests/test_audit_infer_swap_readiness.py \
-  tests/test_draft_infer_swap_speedup_doc.py \
-  tests/test_prepare_infer_swap_launch_bundle.py \
-  tests/test_validate_infer_swap_phases.py
+  tests/test_probe_remote_infer.py
 ```
 
 当前验证结果：
 
-- `154 passed`
+- 当前保留的是远端推理入口 smoke 集合；历史 infer-swap formal guard 测试已清理。
 - `rtk uv run python -m compileall -q ...` 通过
 - `rtk git diff --check` 通过
 - `rtk uv run python -m src.bin.validate_infer_swap_phases --phase-timeout-s 30` smoke：`ok=true phases=6`

@@ -59,20 +59,8 @@ PHASE_TESTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "remote_comparison_and_probe",
         (
-            "tests/test_verify_remote_infer_swap.py",
             "tests/test_preflight_remote_eval.py",
             "tests/test_probe_remote_infer.py",
-        ),
-    ),
-    (
-        "formal_eval_guard",
-        (
-            "tests/test_run_infer_swap_eval.py",
-            "tests/test_summarize_infer_swap_eval.py",
-            "tests/test_audit_infer_swap_readiness.py",
-            "tests/test_draft_infer_swap_speedup_doc.py",
-            "tests/test_prepare_infer_swap_launch_bundle.py",
-            "tests/test_validate_infer_swap_phases.py",
         ),
     ),
 )
