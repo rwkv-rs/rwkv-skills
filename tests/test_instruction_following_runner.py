@@ -12,8 +12,6 @@ from src.eval.metrics.instruction_following.ifbench_official import instructions
 def test_instruction_following_runner_parser_accepts_core_flags() -> None:
     args = instruction_following_runner.parse_args(
         [
-            "--model-path",
-            "model.pth",
             "--dataset",
             "dataset.jsonl",
             "--enable-think",

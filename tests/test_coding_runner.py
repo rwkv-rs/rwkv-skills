@@ -9,8 +9,6 @@ from src.eval.coding import runner as coding_runner
 def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:
     args = coding_runner.parse_args(
         [
-            "--model-path",
-            "model.pth",
             "--dataset",
             "dataset.jsonl",
             "--benchmark-kind",
@@ -53,8 +51,6 @@ def test_coding_runner_treats_human_eval_variants_as_human_eval(dataset_slug: st
 def test_coding_runner_parser_accepts_swebench_options() -> None:
     args = coding_runner.parse_args(
         [
-            "--model-path",
-            "model.pth",
             "--dataset",
             "dataset.jsonl",
             "--benchmark-kind",

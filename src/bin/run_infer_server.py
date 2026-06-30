@@ -29,8 +29,6 @@ from src.infer.auto_config import AutoConfigMode, GpuProfile, choose_infer_auto_
 DEFAULT_VLLM_RWKV_PATH = Path.home() / "GitHub" / "vllm-rwkv"
 _AUTO_CONFIG_MODES = ("off", "balanced", "throughput")
 _AUTO_CONFIG_DEFAULTS = {
-    "max_batch_size": 32,
-    "batch_collect_ms": 5,
     "max_num_seqs": 512,
     "max_num_batched_tokens": 16384,
     "gpu_memory_utilization": 0.9,
@@ -54,22 +52,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the RWKV vLLM infer service")
     parser.add_argument("--model-path", required=True, help="Path to RWKV weights (.pth)")
     parser.add_argument(
-        "--device",
-        default="cuda",
-        help="Compatibility flag; vLLM uses CUDA_VISIBLE_DEVICES for GPU binding",
-    )
-    parser.add_argument(
         "--cuda-visible-devices",
         help=(
             "Process-local CUDA_VISIBLE_DEVICES value applied before vLLM loads. "
             "Use this to bind a server to one physical GPU without changing shell or .env configuration."
         ),
-    )
-    parser.add_argument(
-        "--engine-mode",
-        choices=("vllm-rwkv",),
-        default="vllm-rwkv",
-        help="Inference backend implementation; only vllm-rwkv is supported",
     )
     parser.add_argument(
         "--vllm-rwkv-path",
@@ -118,18 +105,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8081, help="Bind port")
     parser.add_argument("--api-key", default="", help="Optional bearer token required by the infer API")
-    parser.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=None,
-        help="Compatibility no-op retained for old launch scripts",
-    )
-    parser.add_argument(
-        "--batch-collect-ms",
-        type=int,
-        default=None,
-        help="Compatibility no-op retained for old launch scripts",
-    )
     parser.add_argument(
         "--rwkv-wkv-mode",
         default=os.environ.get("VLLM_RWKV7_WKV_MODE", "fp16"),

@@ -62,16 +62,6 @@ def normalize_api_base(base_url: str) -> str:
     return normalize_api_base_for_version(base_url, "v1")
 
 
-def normalize_local_device(device: str) -> str:
-    import torch
-
-    raw = str(device or "").strip() or "cuda"
-    parsed = torch.device(raw)
-    if parsed.type == "cuda" and parsed.index is None:
-        return "cuda:0"
-    return str(parsed)
-
-
 def _safe_tqdm_update(progress: tqdm, amount: int = 1) -> None:
     try:
         progress.update(amount)
@@ -91,18 +81,6 @@ def _is_retryable_remote_http_error(exc: RemoteHTTPError) -> bool:
 
 
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model-path", help="Deprecated; local model loading has been removed from this branch")
-    parser.add_argument("--device", default="cuda", help="Deprecated compatibility flag")
-    parser.add_argument(
-        "--engine-mode",
-        choices=("vllm-rwkv",),
-        default="vllm-rwkv",
-        help="Deprecated compatibility flag; vllm-rwkv is the only supported engine",
-    )
-    parser.add_argument(
-        "--state-db-path",
-        help="Deprecated compatibility flag; local Lightning state caches have been removed",
-    )
     parser.add_argument("--infer-base-url", help="OpenAI-compatible infer service base URL")
     parser.add_argument("--infer-model", help="Model name exposed by the remote infer service")
     parser.add_argument("--infer-api-key", default="", help="API key for the remote infer service")
@@ -131,20 +109,11 @@ def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def validate_inference_backend_args(args: argparse.Namespace) -> None:
-    model_path = str(getattr(args, "model_path", "") or "").strip()
     infer_base_url = str(getattr(args, "infer_base_url", "") or "").strip()
     infer_model = str(getattr(args, "infer_model", "") or "").strip()
-    has_local = bool(model_path)
-    has_remote = bool(infer_base_url or infer_model)
-    if has_local and has_remote:
-        raise ValueError("请二选一：使用本地 --model-path，或远端 --infer-base-url/--infer-model。")
-    if has_local and not has_remote:
-        raise ValueError("本分支已移除本地推理；请使用 --infer-base-url 和 --infer-model 连接 vllm-rwkv 服务。")
-    if not has_remote:
-        raise ValueError("必须同时提供 --infer-base-url 和 --infer-model。")
-    if has_remote and not infer_base_url:
+    if not infer_base_url:
         raise ValueError("远端推理模式缺少 --infer-base-url。")
-    if has_remote and not infer_model:
+    if not infer_model:
         raise ValueError("远端推理模式缺少 --infer-model。")
 
 
@@ -194,7 +163,6 @@ class InferenceBackend(Protocol):
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
-        top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
@@ -261,7 +229,6 @@ class RemoteInferenceBackend:
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
-        top_logprobs: int = 0,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
@@ -671,7 +638,6 @@ __all__ = [
     "add_inference_backend_arguments",
     "build_inference_backend_from_args",
     "normalize_api_base",
-    "normalize_local_device",
     "require_completion_style_remote_protocol",
     "resolve_backend_model_name",
     "resolve_generation_prompt_batch_size",

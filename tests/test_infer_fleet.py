@@ -44,7 +44,6 @@ def test_plan_deployments_skips_assigned_gpus_and_increments_ports(tmp_path: Pat
         assigned_gpus={"0"},
         base_port=18081,
         log_dir=tmp_path / "logs",
-        state_db_dir=tmp_path / "state",
         launched_count=1,
     )
 
@@ -65,7 +64,6 @@ def test_plan_deployments_spreads_replicas_across_distinct_gpus(tmp_path: Path) 
         assigned_gpus=set(),
         base_port=18081,
         log_dir=tmp_path / "logs",
-        state_db_dir=tmp_path / "state",
         launched_count=0,
         replicas_per_model=2,
     )
@@ -90,11 +88,9 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
         spec,
         host="127.0.0.1",
         api_key="secret",
-        engine_mode="vllm-rwkv",
         vllm_rwkv_path="/opt/vllm-rwkv",
         vllm_python="/opt/vllm/bin/python",
         infer_auto_config="off",
-        batch_collect_ms=10,
         log_level="warning",
         max_model_len=8192,
         max_num_seqs=256,
@@ -105,14 +101,13 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
     )
 
     assert command[:3][-2:] == ["-m", "src.bin.run_infer_server"]
-    assert "--device" in command
-    assert command[command.index("--device") + 1] == "cuda:0"
+    assert "--device" not in command
     assert command[command.index("--cuda-visible-devices") + 1] == "3"
-    assert command[command.index("--engine-mode") + 1] == "vllm-rwkv"
+    assert "--engine-mode" not in command
     assert command[command.index("--vllm-rwkv-path") + 1] == "/opt/vllm-rwkv"
     assert command[command.index("--vllm-python") + 1] == "/opt/vllm/bin/python"
     assert command[command.index("--port") + 1] == "18081"
-    assert command[command.index("--max-batch-size") + 1] == "4"
+    assert "--max-batch-size" not in command
     assert command[command.index("--infer-auto-config") + 1] == "off"
     assert command[command.index("--api-key") + 1] == "secret"
     assert command[command.index("--max-model-len") + 1] == "8192"
@@ -132,7 +127,7 @@ def test_parse_args_ignores_removed_nano_engine_default(monkeypatch, tmp_path: P
         ]
     )
 
-    assert args.engine_mode == "vllm-rwkv"
+    assert not hasattr(args, "engine_mode")
 
 
 def test_write_manifest_serializes_service_urls(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from src.bin import run_infer_server
 from src.infer.auto_config import GpuProfile
 
 
-def test_parse_args_defaults_to_vllm_rwkv(monkeypatch) -> None:
+def test_parse_args_uses_vllm_rwkv_defaults(monkeypatch) -> None:
     monkeypatch.setenv("RWKV_INFER_ENGINE_MODE", "rwkv-lightning")
 
     args = run_infer_server.parse_args(
@@ -19,7 +19,7 @@ def test_parse_args_defaults_to_vllm_rwkv(monkeypatch) -> None:
         ]
     )
 
-    assert args.engine_mode == "vllm-rwkv"
+    assert not hasattr(args, "engine_mode")
     assert args.vllm_rwkv_path == str(run_infer_server.DEFAULT_VLLM_RWKV_PATH)
     assert args.max_num_seqs == 512
     assert args.max_num_batched_tokens == 16384
@@ -122,8 +122,8 @@ def test_parse_args_applies_throughput_auto_config_for_large_visible_gpu(monkeyp
     assert args.infer_auto_config_applied is True
     assert "gpu_memory_mb=97887" in args.infer_auto_config_reason
     assert "model_params_b=7.2" in args.infer_auto_config_reason
-    assert args.max_batch_size == 1024
-    assert args.batch_collect_ms == 50
+    assert not hasattr(args, "max_batch_size")
+    assert not hasattr(args, "batch_collect_ms")
     assert args.max_num_seqs == -1
     assert args.max_num_batched_tokens == 32768
     assert args.gpu_memory_utilization == 0.98

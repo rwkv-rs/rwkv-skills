@@ -16,10 +16,10 @@ from src.infer.backend import (
 from src.infer.sampling import SamplingConfig
 
 
-def test_validate_args_rejects_removed_local_backend() -> None:
+def test_validate_args_requires_remote_base_url() -> None:
     args = argparse.Namespace(model_path="/models/rwkv.pth", infer_base_url="", infer_model="")
 
-    with pytest.raises(ValueError, match="已移除本地推理"):
+    with pytest.raises(ValueError, match="缺少 --infer-base-url"):
         validate_inference_backend_args(args)
 
 

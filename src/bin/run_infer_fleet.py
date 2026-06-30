@@ -16,16 +16,6 @@ from typing import Sequence
 from src.eval.scheduler.process import list_idle_gpus
 
 
-_ENGINE_MODE_CHOICES = ("vllm-rwkv",)
-
-
-def _default_engine_mode() -> str:
-    value = os.environ.get("RWKV_INFER_ENGINE_MODE", "vllm-rwkv").strip().lower()
-    if value in _ENGINE_MODE_CHOICES:
-        return value
-    return "vllm-rwkv"
-
-
 @dataclass(frozen=True, slots=True)
 class InferServiceSpec:
     model_path: Path
@@ -88,12 +78,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host passed to each infer service")
     parser.add_argument("--base-port", type=int, default=18081, help="First service port; later services increment")
     parser.add_argument("--api-key", default="", help="Bearer token required by each infer service")
-    parser.add_argument(
-        "--engine-mode",
-        choices=_ENGINE_MODE_CHOICES,
-        default=_default_engine_mode(),
-        help="Inference backend implementation; vllm-rwkv is the only supported server backend",
-    )
     parser.add_argument("--vllm-rwkv-path", help="Path to the vllm-rwkv source checkout")
     parser.add_argument("--vllm-python", help="Python executable used to launch vllm-rwkv")
     parser.add_argument(
@@ -101,7 +85,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("off", "balanced", "throughput"),
         help="Startup auto-config mode passed to each infer service; omit to use run_infer_server default",
     )
-    parser.add_argument("--state-db-dir", help="Deprecated compatibility no-op")
     parser.add_argument("--max-batch-size", type=int, default=8, help="Max queued requests per infer batch")
     parser.add_argument(
         "--max-batch-sizes",
@@ -109,7 +92,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Per-model infer batch sizes; length must match --models. Overrides --max-batch-size.",
     )
-    parser.add_argument("--batch-collect-ms", type=int, default=10, help="Batch collection window")
     parser.add_argument("--max-model-len", type=int, default=4096, help="vLLM max model length")
     parser.add_argument("--max-num-seqs", type=int, help="vLLM scheduler max active sequences")
     parser.add_argument("--max-num-batched-tokens", type=int, help="vLLM scheduler max batched tokens")
@@ -188,11 +170,9 @@ def plan_deployments(
     assigned_gpus: set[str],
     base_port: int,
     log_dir: Path,
-    state_db_dir: Path | None,
     launched_count: int,
     replicas_per_model: int = 1,
 ) -> list[InferServiceSpec]:
-    del state_db_dir
     available_gpus = [gpu for gpu in idle_gpus if gpu not in assigned_gpus]
     specs: list[InferServiceSpec] = []
     replica_count = max(1, int(replicas_per_model))
@@ -229,11 +209,9 @@ def build_command(
     *,
     host: str,
     api_key: str,
-    engine_mode: str,
     vllm_rwkv_path: str | None = None,
     vllm_python: str | None = None,
     infer_auto_config: str | None = None,
-    batch_collect_ms: int = 10,
     log_level: str = "info",
     max_model_len: int | None = None,
     max_num_seqs: int | None = None,
@@ -250,20 +228,12 @@ def build_command(
         str(spec.model_path),
         "--model-name",
         spec.model_name,
-        "--device",
-        "cuda:0",
         "--cuda-visible-devices",
         str(spec.gpu),
-        "--engine-mode",
-        engine_mode,
         "--host",
         host,
         "--port",
         str(spec.port),
-        "--max-batch-size",
-        str(int(spec.max_batch_size)),
-        "--batch-collect-ms",
-        str(int(batch_collect_ms)),
         "--log-level",
         log_level,
     ]
@@ -316,11 +286,9 @@ def launch_service(
     *,
     host: str,
     api_key: str,
-    engine_mode: str,
     vllm_rwkv_path: str | None,
     vllm_python: str | None,
     infer_auto_config: str | None,
-    batch_collect_ms: int,
     log_level: str,
     max_model_len: int | None,
     max_num_seqs: int | None,
@@ -334,11 +302,9 @@ def launch_service(
         spec,
         host=host,
         api_key=api_key,
-        engine_mode=engine_mode,
         vllm_rwkv_path=vllm_rwkv_path,
         vllm_python=vllm_python,
         infer_auto_config=infer_auto_config,
-        batch_collect_ms=batch_collect_ms,
         log_level=log_level,
         max_model_len=max_model_len,
         max_num_seqs=max_num_seqs,
@@ -488,7 +454,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     pending_batch_sizes = list(max_batch_sizes)
     log_dir = Path(args.log_dir).expanduser()
     manifest_path = Path(args.manifest_path).expanduser()
-    state_db_dir = None if not args.state_db_dir else Path(args.state_db_dir).expanduser()
     wait_for_gpus = not bool(args.no_wait_for_gpus)
 
     assigned_gpus: set[str] = set()
@@ -507,7 +472,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 assigned_gpus=assigned_gpus,
                 base_port=int(args.base_port),
                 log_dir=log_dir,
-                state_db_dir=state_db_dir,
                 launched_count=len(services),
                 replicas_per_model=int(args.replicas_per_model),
             )
@@ -532,11 +496,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     spec,
                     host=str(args.host),
                     api_key=str(args.api_key or ""),
-                    engine_mode=str(args.engine_mode),
                     vllm_rwkv_path=args.vllm_rwkv_path,
                     vllm_python=args.vllm_python,
                     infer_auto_config=args.infer_auto_config,
-                    batch_collect_ms=int(args.batch_collect_ms),
                     log_level=str(args.log_level),
                     max_model_len=args.max_model_len,
                     max_num_seqs=args.max_num_seqs,

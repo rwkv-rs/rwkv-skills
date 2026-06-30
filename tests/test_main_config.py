@@ -45,7 +45,7 @@ extra_args = ["--foo", "bar"]
     assert config.dataset.name == "mmlu"
     assert config.dataset.split == "test"
     assert config.model.path == "weights/model.pth"
-    assert config.model.device == "cuda:1"
+    assert not hasattr(config.model, "device")
     assert config.runner.result_store == "db"
     assert config.runner.cot_mode == "cot"
     assert config.runner.db_write_queue == 2048

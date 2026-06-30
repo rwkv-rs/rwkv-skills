@@ -67,8 +67,6 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
             "1234",
             "--candidate-router-prompt-max-chars",
             "8192",
-            "--model-path",
-            "model.pth",
         ]
     )
     assert args.dataset == "browsecomp_test.jsonl"
@@ -106,8 +104,6 @@ def test_function_calling_runner_falls_back_for_local_sample_workers() -> None:
         [
             "--dataset",
             "bfcl_v3_test.jsonl",
-            "--model-path",
-            "model.pth",
             "--sample-workers",
             "2",
         ]
@@ -338,7 +334,7 @@ def test_function_calling_runner_main_dispatches_to_internal_implementation(monk
         lambda _args, _run, *, run_context=None: called.append("browsecomp") or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "browsecomp_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "browsecomp_test.jsonl"])
 
     assert rc == 0
     assert called == ["browsecomp"]
@@ -364,7 +360,7 @@ def test_function_calling_runner_main_dispatches_longbench(monkeypatch) -> None:
         lambda _args, _run, *, run_context=None: called.append("longbench") or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "longbench_qa_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "longbench_qa_test.jsonl"])
 
     assert rc == 0
     assert called == ["longbench"]
@@ -390,7 +386,7 @@ def test_function_calling_runner_main_dispatches_longcodebench(monkeypatch) -> N
         lambda _args, _run, *, run_context=None: called.append("longcodebench") or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "longcodeqa_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "longcodeqa_test.jsonl"])
 
     assert rc == 0
     assert called == ["longcodebench"]
@@ -419,7 +415,7 @@ def test_function_calling_runner_main_forwards_explicit_run_context(monkeypatch)
     monkeypatch.setattr(function_calling_runner, "_run_mcp_bench", _fake_run)
 
     rc = function_calling_runner.main(
-        ["--dataset", "mcp_bench_test.jsonl", "--model-path", "model.pth"],
+        ["--dataset", "mcp_bench_test.jsonl"],
         run_context=run_context,
     )
 
@@ -447,7 +443,7 @@ def test_function_calling_runner_main_dispatches_complexfuncbench(monkeypatch) -
         lambda _args, _run, *, run_context=None: called.append("complexfuncbench") or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "complexfuncbench_official_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "complexfuncbench_official_test.jsonl"])
 
     assert rc == 0
     assert called == ["complexfuncbench"]
@@ -473,7 +469,7 @@ def test_function_calling_runner_main_dispatches_bfcl_v3(monkeypatch) -> None:
         lambda _args, _run, *, run_context=None: called.append("bfcl_v3") or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "bfcl_v3_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "bfcl_v3_test.jsonl"])
 
     assert rc == 0
     assert called == ["bfcl_v3"]
@@ -499,7 +495,7 @@ def test_function_calling_runner_main_dispatches_simple_tool_call_runner(monkeyp
         lambda _args, _run, *, run_context=None: called.append(("function_bfcl_ast", _run.dataset_slug)) or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "bfcl_simple_python_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "bfcl_simple_python_test.jsonl"])
 
     assert rc == 0
     assert called == [("function_bfcl_ast", "bfcl_simple_python_test")]
@@ -525,7 +521,7 @@ def test_function_calling_runner_main_dispatches_bfcl_exec(monkeypatch) -> None:
         lambda _args, _run, *, run_context=None: called.append(_run.dataset_slug) or 0,
     )
 
-    rc = function_calling_runner.main(["--dataset", "bfcl_exec_simple_test.jsonl", "--model-path", "model.pth"])
+    rc = function_calling_runner.main(["--dataset", "bfcl_exec_simple_test.jsonl"])
 
     assert rc == 0
     assert called == ["bfcl_exec_simple_test"]
