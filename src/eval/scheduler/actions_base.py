@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -164,6 +164,35 @@ class LogsOptions:
     rotate_seconds: int = 15
 
 
+@dataclass(slots=True)
+class DispatcherState:
+    """Mutable per-job bookkeeping for a single ``action_dispatch`` loop.
+
+    Consolidates the per-job tracking dicts (plus the cancel flag) that the
+    dispatch loop and its helpers thread around, with :meth:`forget` collapsing
+    the scattered ``pop`` calls used when a job leaves the pipeline.
+    """
+
+    pending_since: dict[str, float] = field(default_factory=dict)
+    launch_times: dict[str, float] = field(default_factory=dict)
+    job_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
+    completed_versions: dict[str, str | None] = field(default_factory=dict)
+    cooldown_until: dict[str, float] = field(default_factory=dict)
+    cancel_requested: bool = False
+
+    def forget(self, job_id: str) -> tuple[dict[str, object], float | None]:
+        """Drop all per-job tracking for ``job_id`` once it leaves the pipeline.
+
+        Returns the job's metadata and recorded launch time (``None`` when it
+        was never launched) so callers can still build their completion events.
+        """
+        meta = self.job_metadata.pop(job_id, {})
+        start = self.launch_times.pop(job_id, None)
+        self.pending_since.pop(job_id, None)
+        self.cooldown_until.pop(job_id, None)
+        return meta, start
+
+
 def _read_scheduler_state(
     *,
     pid_dir: Path,
@@ -216,31 +245,24 @@ def _build_pending_queue(
 def _reconcile_completed_versions(
     *,
     completed_records: Mapping[str, CompletedRecord],
-    completed_versions: dict[str, str | None],
-    job_metadata: dict[str, dict[str, object]],
-    launch_times: dict[str, float],
-    pending_since: dict[str, float],
+    state: DispatcherState,
     session_completed: set[CompletedKey],
-    cooldown_until: dict[str, float],
     now: float,
 ) -> set[str]:
     current_versions = {job_id: info.version_id for job_id, info in completed_records.items()}
-    if not completed_versions:
-        completed_versions.update(current_versions)
+    if not state.completed_versions:
+        state.completed_versions.update(current_versions)
         return set()
 
     new_completed = {
-        job_id for job_id, version_id in current_versions.items() if completed_versions.get(job_id) != version_id
+        job_id for job_id, version_id in current_versions.items() if state.completed_versions.get(job_id) != version_id
     }
     if new_completed:
         for job_id in sorted(new_completed):
             info = completed_records[job_id]
-            meta = job_metadata.pop(job_id, {})
-            start = launch_times.pop(job_id, None)
+            meta, start = state.forget(job_id)
             runtime = now - start if start else None
-            pending_since.pop(job_id, None)
             session_completed.add(info.key)
-            cooldown_until.pop(job_id, None)
             payload: dict[str, object] = {
                 "job": info.key.job,
                 "dataset_slug": info.key.dataset_slug,
@@ -253,8 +275,8 @@ def _reconcile_completed_versions(
                 payload["version_id"] = info.version_id
             payload.update(meta)
             log_job_event("job_done", job_id, **payload)
-    completed_versions.clear()
-    completed_versions.update(current_versions)
+    state.completed_versions.clear()
+    state.completed_versions.update(current_versions)
     return new_completed
 
 
@@ -263,28 +285,27 @@ def _update_cooldown_jobs(
     previous_running: set[str],
     running_entries: Mapping[str, RunningEntry],
     completed_records: Mapping[str, CompletedRecord],
-    cooldown_until: dict[str, float],
+    state: DispatcherState,
     now: float,
     dispatch_poll_seconds: int,
 ) -> set[str]:
     ended_jobs = previous_running - set(running_entries.keys())
     for job_id in ended_jobs:
         if job_id not in completed_records:
-            cooldown_until[job_id] = max(cooldown_until.get(job_id, 0.0), now + 2 * dispatch_poll_seconds)
-    return {job_id for job_id, until in cooldown_until.items() if until > now}
+            state.cooldown_until[job_id] = max(state.cooldown_until.get(job_id, 0.0), now + 2 * dispatch_poll_seconds)
+    return {job_id for job_id, until in state.cooldown_until.items() if until > now}
 
 
 def _mark_pending_jobs(
     *,
     queue: Sequence[QueueItem],
-    pending_since: dict[str, float],
-    job_metadata: dict[str, dict[str, object]],
+    state: DispatcherState,
     now: float,
 ) -> None:
     for position, item in enumerate(queue):
-        if item.job_id not in pending_since:
-            pending_since[item.job_id] = now
-            meta = job_metadata.setdefault(item.job_id, {})
+        if item.job_id not in state.pending_since:
+            state.pending_since[item.job_id] = now
+            meta = state.job_metadata.setdefault(item.job_id, {})
             meta.setdefault("job", item.job_name)
             meta.setdefault("dataset_slug", item.dataset_slug)
             meta.setdefault("model_name", item.model_name)
@@ -587,6 +608,7 @@ __all__ = [
     "StatusOptions",
     "StopOptions",
     "LogsOptions",
+    "DispatcherState",
     "RunMode",
     "RunnerGroup",
     "QueueItem",

@@ -471,17 +471,12 @@ def action_dispatch(
     job_priority = base._job_priority_map(opts.job_priority)
 
     base.FAILURE_MONITOR.reset()
-    pending_since: dict[str, float] = {}
-    launch_times: dict[str, float] = {}
-    job_metadata: dict[str, dict[str, object]] = {}
-    completed_versions: dict[str, str | None] = {}
+    state = base.DispatcherState()
     session_completed: set[CompletedKey] = set()
     skipped_missing_keys: set[CompletedKey] = set()
-    cooldown_until: dict[str, float] = {}
     previous_running: set[str] = set()
     claimed_job_ids: set[str] = set()
     pending_notice_printed = False
-    cancel_requested = False
     lease_manager = base._build_lease_manager(opts)
 
     if runtime_control is not None:
@@ -490,8 +485,8 @@ def action_dispatch(
     while True:
         failure = base.FAILURE_MONITOR.wait_failure(timeout=0)
         if failure is not None:
-            failure_meta = job_metadata.get(failure.job_id, {}).copy()
-            base.handle_job_failure(failure, opts.pid_dir, job_metadata, launch_times)
+            failure_meta = state.job_metadata.get(failure.job_id, {}).copy()
+            base.handle_job_failure(failure, opts.pid_dir, state.job_metadata, state.launch_times)
             _handle_batch_failure(batch_profiler, failure, failure_meta)
             if runtime_control is not None:
                 runtime_control.write_status(
@@ -500,7 +495,7 @@ def action_dispatch(
                     progress=_build_progress_snapshot(
                         queue=(),
                         running_entries=base.load_running(opts.pid_dir),
-                        completed_count=len(completed_versions),
+                        completed_count=len(state.completed_versions),
                         available_gpus=(),
                     ),
                 )
@@ -513,12 +508,8 @@ def action_dispatch(
 
         completed_job_ids = base._reconcile_completed_versions(
             completed_records=completed_records,
-            completed_versions=completed_versions,
-            job_metadata=job_metadata,
-            launch_times=launch_times,
-            pending_since=pending_since,
+            state=state,
             session_completed=session_completed,
-            cooldown_until=cooldown_until,
             now=now,
         )
         if lease_manager is not None and completed_job_ids:
@@ -530,7 +521,7 @@ def action_dispatch(
             previous_running=previous_running,
             running_entries=running_entries,
             completed_records=completed_records,
-            cooldown_until=cooldown_until,
+            state=state,
             now=now,
             dispatch_poll_seconds=opts.dispatch_poll_seconds,
         )
@@ -564,15 +555,14 @@ def action_dispatch(
         )
         base._mark_pending_jobs(
             queue=queue,
-            pending_since=pending_since,
-            job_metadata=job_metadata,
+            state=state,
             now=now,
         )
         remote_budgets = base._resolve_remote_concurrency_budgets(opts) if base._dispatch_uses_remote_inference(opts) else {}
         generated_job_ids = (
             base._generated_running_job_ids(
                 running_entries=running_entries,
-                job_metadata=job_metadata,
+                job_metadata=state.job_metadata,
             )
             if base._dispatch_uses_remote_inference(opts)
             else set()
@@ -594,8 +584,8 @@ def action_dispatch(
         if desired_state is DesiredState.CANCELLED:
             if runtime_control is not None:
                 runtime_control.write_status(ObservedStatus.CANCELLING, progress=progress)
-            if not cancel_requested:
-                cancel_requested = True
+            if not state.cancel_requested:
+                state.cancel_requested = True
                 base.FAILURE_MONITOR.mark_aborting()
                 base.stop_all_jobs(opts.pid_dir)
             if running_entries:
@@ -692,9 +682,9 @@ def action_dispatch(
             available_resources=available_resources,
             question_counts=question_counts,
             batch_profiler=batch_profiler,
-            pending_since=pending_since,
-            launch_times=launch_times,
-            job_metadata=job_metadata,
+            pending_since=state.pending_since,
+            launch_times=state.launch_times,
+            job_metadata=state.job_metadata,
             lease_manager=lease_manager,
             claimed_job_ids=claimed_job_ids,
             skipped_missing_keys=skipped_missing_keys,
