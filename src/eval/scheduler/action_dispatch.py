@@ -1,0 +1,1046 @@
+from __future__ import annotations
+
+"""Dispatch action and its launch/command helpers backed by the scheduler library."""
+
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Mapping, Sequence
+
+from . import actions_base as base
+from .config import DEFAULT_PYTHON
+from .actions_base import (
+    CompletedKey,
+    DispatchOptions,
+    JobFailure,
+    JobSpec,
+    QueueItem,
+    QueueOptions,
+    RemoteConcurrencyBudget,
+    RunningEntry,
+    RunMode,
+    RunnerGroup,
+    SchedulerLeaseManager,
+    SchedulerProgressSnapshot,
+    SchedulerRuntimeControl,
+)
+from .control import DesiredState, ObservedStatus
+
+
+def _select_remote_candidate(
+    *,
+    opts: DispatchOptions,
+    queue: Sequence[QueueItem],
+    skipped_remote_job_ids: set[str],
+    resource_model_slug: str | None,
+    active_coding_runners: int,
+    resource: str,
+) -> QueueItem | None:
+    """Pick the next remote queue item whose model matches this worker slot.
+
+    Marks every examined-and-rejected item (coding-limited or chosen) in
+    ``skipped_remote_job_ids`` so a later slot does not reconsider it; items
+    skipped only for a model-slug mismatch stay available for other slots.
+    """
+    for maybe in queue:
+        if maybe.job_id in skipped_remote_job_ids:
+            continue
+        candidate_model_slug = base.safe_slug(maybe.infer_model or maybe.model_name or maybe.model_slug)
+        if resource_model_slug is not None and candidate_model_slug != resource_model_slug:
+            continue
+        if _candidate_exceeds_coding_limit(
+            opts=opts,
+            candidate=maybe,
+            active_coding_runners=active_coding_runners,
+        ):
+            base.log_job_event(
+                "job_defer",
+                maybe.job_id,
+                reason="max_active_coding_runners",
+                active_coding_runners=active_coding_runners,
+                max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                worker_slot=resource,
+            )
+            skipped_remote_job_ids.add(maybe.job_id)
+            continue
+        skipped_remote_job_ids.add(maybe.job_id)
+        return maybe
+    return None
+
+
+def _claim_item_for_resource(
+    *,
+    opts: DispatchOptions,
+    queue: Sequence[QueueItem],
+    resource: str,
+    remote_mode: bool,
+    resource_slot_slug: str | None,
+    resource_model_slug: str | None,
+    queue_index: int,
+    skipped_remote_job_ids: set[str],
+    budgets: Mapping[str, RemoteConcurrencyBudget],
+    occupied_remote_slots: set[str],
+    lease_manager: SchedulerLeaseManager | None,
+    active_coding_runners: int,
+) -> tuple[QueueItem | None, int]:
+    """Select and lease-claim the item (if any) this worker slot should launch.
+
+    Returns the chosen item plus the advanced local-queue cursor, emitting the
+    same ``job_defer`` / ``job_claim_conflict`` events the inline loop did.
+    """
+    while queue_index < len(queue):
+        if remote_mode:
+            candidate = _select_remote_candidate(
+                opts=opts,
+                queue=queue,
+                skipped_remote_job_ids=skipped_remote_job_ids,
+                resource_model_slug=resource_model_slug,
+                active_coding_runners=active_coding_runners,
+                resource=resource,
+            )
+            if candidate is None:
+                break
+        else:
+            candidate = queue[queue_index]
+            queue_index += 1
+            if _candidate_exceeds_coding_limit(
+                opts=opts,
+                candidate=candidate,
+                active_coding_runners=active_coding_runners,
+            ):
+                base.log_job_event(
+                    "job_defer",
+                    candidate.job_id,
+                    reason="max_active_coding_runners",
+                    active_coding_runners=active_coding_runners,
+                    max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                    worker_slot=resource,
+                )
+                continue
+        if remote_mode:
+            candidate_model_slug = base.safe_slug(candidate.infer_model or candidate.model_name or candidate.model_slug)
+            budget = budgets.get(resource_slot_slug or candidate_model_slug)
+            if budget is not None and not budget.launch_allowed:
+                base.log_job_event(
+                    "job_defer",
+                    candidate.job_id,
+                    reason=budget.reason,
+                    infer_model=str(candidate.infer_model or candidate.model_name or ""),
+                    worker_slot=resource,
+                    pending_queue=budget.pending_queue,
+                    source_status=budget.source_status,
+                )
+                continue
+            if resource_slot_slug is not None and resource_slot_slug in occupied_remote_slots:
+                base.log_job_event(
+                    "job_defer",
+                    candidate.job_id,
+                    reason="remote_slot_busy",
+                    infer_model=str(candidate.infer_model or candidate.model_name or ""),
+                    worker_slot=resource,
+                )
+                continue
+        if lease_manager is not None and not lease_manager.claim(
+            candidate.job_id,
+            lease_meta=base._lease_meta_for_item(candidate),
+        ):
+            base.log_job_event("job_claim_conflict", candidate.job_id, worker_slot=resource, **base._lease_meta_for_item(candidate))
+            continue
+        return candidate, queue_index
+    return None, queue_index
+
+
+def _launch_queue_items(
+    *,
+    opts: DispatchOptions,
+    queue: Sequence[QueueItem],
+    available_resources: Sequence[str],
+    question_counts: Mapping[str, int],
+    batch_profiler: base.BatchProfiler,
+    pending_since: dict[str, float],
+    launch_times: dict[str, float],
+    job_metadata: dict[str, dict[str, object]],
+    lease_manager: SchedulerLeaseManager | None,
+    claimed_job_ids: set[str],
+    skipped_missing_keys: set[CompletedKey] | None = None,
+    generated_job_ids: Sequence[str] | set[str] = (),
+    remote_budgets: Mapping[str, RemoteConcurrencyBudget] | None = None,
+) -> None:
+    if skipped_missing_keys is None:
+        skipped_missing_keys = set()
+    remote_mode = base._dispatch_uses_remote_inference(opts)
+    resource_label = "Free slots" if remote_mode else "Idle GPUs"
+    print(f"🧮 Pending={len(queue)} | {resource_label}={', '.join(available_resources)}")
+    running_now = base.load_running(opts.pid_dir)
+    remote_slots = base.remote_slot_map(opts.infer_models) if remote_mode else {}
+    occupied_remote_slots = (
+        base._running_remote_slot_slugs(
+            running_now,
+            opts.infer_models,
+            generated_job_ids=generated_job_ids,
+        )
+        if remote_mode
+        else set()
+    )
+    budgets = remote_budgets or {}
+    active_coding_runners = _running_job_group_count(running_now, RunnerGroup.CODING)
+
+    queue_index = 0
+    skipped_remote_job_ids: set[str] = set()
+    for resource in available_resources:
+        resource_slot_slug = base._remote_resource_model_slug(resource) if remote_mode else None
+        resource_model_slug = None
+        if remote_mode and resource_slot_slug is not None:
+            slot_spec = remote_slots.get(resource_slot_slug)
+            resource_model_slug = slot_spec.model_slug if slot_spec is not None else resource_slot_slug
+        item, queue_index = _claim_item_for_resource(
+            opts=opts,
+            queue=queue,
+            resource=resource,
+            remote_mode=remote_mode,
+            resource_slot_slug=resource_slot_slug,
+            resource_model_slug=resource_model_slug,
+            queue_index=queue_index,
+            skipped_remote_job_ids=skipped_remote_job_ids,
+            budgets=budgets,
+            occupied_remote_slots=occupied_remote_slots,
+            lease_manager=lease_manager,
+            active_coding_runners=active_coding_runners,
+        )
+        if item is None and remote_mode:
+            continue
+        if item is None:
+            break
+
+        job = base.JOB_CATALOGUE[item.job_name]
+        dataset_slug = item.dataset_slug
+        try:
+            dataset_path = base.locate_dataset(dataset_slug, search=base.DATASET_ROOTS, output_root=base.DATA_OUTPUT_ROOT)
+        except Exception as exc:
+            if opts.skip_missing_dataset:
+                print(f"⚠️  {item.job_id} 数据集不可用：{exc}. 已跳过。")
+                skipped_missing_keys.add(
+                    CompletedKey(
+                        job=item.job_name,
+                        model_slug=item.model_slug,
+                        dataset_slug=dataset_slug,
+                        is_cot=job.is_cot,
+                    )
+                )
+                pending_since.pop(item.job_id, None)
+                job_metadata.pop(item.job_id, None)
+                if lease_manager is not None:
+                    lease_manager.release((item.job_id,))
+                base.log_job_event(
+                    "job_skip",
+                    item.job_id,
+                    reason="unavailable_dataset",
+                    dataset_slug=dataset_slug,
+                    error=type(exc).__name__,
+                )
+                continue
+            base.log_job_event(
+                "job_error",
+                item.job_id,
+                reason="missing_dataset",
+                dataset_slug=dataset_slug,
+                error=type(exc).__name__,
+            )
+            if lease_manager is not None:
+                lease_manager.release((item.job_id,))
+            raise
+
+        log_relpath = base.build_run_log_name(item.model_name or item.model_slug, dataset_slug, is_cot=job.is_cot)
+        console_log_path = _allocate_console_log_path(opts.run_log_dir, log_relpath)
+        pid_path = opts.pid_dir / f"{item.job_id}.pid"
+        item.dataset_path = dataset_path
+
+        if pid_path.exists():
+            lines = pid_path.read_text().splitlines()
+            if lines:
+                try:
+                    existing_pid = int(lines[0])
+                except ValueError:
+                    existing_pid = None
+                else:
+                    if existing_pid and existing_pid > 0:
+                        print(f"ℹ️  {item.job_id} 已有运行中的 PID({existing_pid})，跳过")
+                        base.log_job_event(
+                            "job_skip",
+                            item.job_id,
+                            reason="already_running",
+                            pid=existing_pid,
+                        )
+                        if lease_manager is not None:
+                            lease_manager.release((item.job_id,))
+                        continue
+            pid_path.unlink(missing_ok=True)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "RWKV_SKILLS_JOB_ID": item.job_id,
+                "RWKV_SKILLS_JOB_NAME": item.job_name,
+                "RWKV_SKILLS_MODEL_NAME": str(item.model_name or item.model_slug),
+                "RWKV_SKILLS_DATASET": str(dataset_path),
+                "RWKV_SKILLS_DATASET_SLUG": dataset_slug,
+                "RWKV_TASK_DESC": f"job={item.job_name}, dataset={dataset_slug}",
+                "RUN_LOG_DIR": str(opts.log_dir),
+                "RUN_RUN_LOG_DIR": str(opts.run_log_dir),
+                "RWKV_EVAL_RUN_MODE": opts.run_mode.value,
+                "RWKV_SCHEDULER_OVERWRITE": "1" if opts.run_mode is RunMode.RERUN else "0",
+            }
+        )
+        if item.model_path is not None:
+            env["RWKV_SKILLS_MODEL_PATH"] = str(item.model_path)
+        if item.is_remote:
+            env["RWKV_SKILLS_INFER_BASE_URL"] = str(item.infer_base_url or "")
+            env["RWKV_SKILLS_INFER_MODEL"] = str(item.infer_model or item.model_name or "")
+            env["CUDA_VISIBLE_DEVICES"] = ""
+            if opts.infer_api_key:
+                env["RWKV_SKILLS_INFER_API_KEY"] = opts.infer_api_key
+            env["RWKV_SKILLS_INFER_PROTOCOL"] = str(opts.infer_protocol or "openai")
+            env["RWKV_SKILLS_INFER_SEED_POLICY"] = str(opts.infer_seed_policy or "preserve")
+        if opts.disable_checker:
+            env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
+
+        questions = question_counts.get(dataset_slug)
+
+        batch_size = None
+        item_budget = budgets.get(resource_slot_slug or "") if item.is_remote else None
+        if item.is_remote and job.batch_flag:
+            if item_budget is not None and item_budget.remote_batch_size is not None:
+                batch_size = max(1, int(item_budget.remote_batch_size))
+            elif opts.remote_batch_size is not None:
+                batch_size = max(1, int(opts.remote_batch_size))
+            if (
+                opts.plain_choice_batch_size is not None
+                and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
+            ):
+                batch_size = max(1, int(opts.plain_choice_batch_size))
+        if not item.is_remote and item.model_path is not None:
+            batch_size = batch_profiler.determine_batch_size(
+                job=job,
+                job_id=item.job_id,
+                gpu=resource,
+                dataset_path=dataset_path,
+                model_path=item.model_path,
+                model_slug=item.model_slug,
+                env=env,
+                dataset_questions=questions,
+            )
+
+        extra_args = item.extra_args + _coding_extra_args(opts, job) + _function_calling_extra_args(opts, job)
+        if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
+            extra_args = extra_args + ("--overwrite",)
+        infer_timeout_s = opts.infer_timeout_s
+        if (
+            opts.plain_choice_timeout_s is not None
+            and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
+        ):
+            infer_timeout_s = max(1.0, float(opts.plain_choice_timeout_s))
+
+        command = build_command(
+            job,
+            item,
+            dataset_path,
+            None if item.is_remote else f"cuda:{resource}",
+            batch_size=batch_size,
+            extra_args=extra_args,
+            infer_api_key=opts.infer_api_key,
+            infer_timeout_s=infer_timeout_s,
+            infer_max_workers=(
+                item_budget.infer_max_workers
+                if item_budget is not None
+                else opts.infer_max_workers
+            ),
+            infer_protocol=opts.infer_protocol,
+            infer_seed_policy=opts.infer_seed_policy,
+        )
+        _backup_run_config(
+            model_name=item.model_name or item.model_slug,
+            model_path=item.model_path,
+            infer_base_url=item.infer_base_url,
+            infer_model=item.infer_model,
+            infer_protocol=opts.infer_protocol,
+            infer_seed_policy=opts.infer_seed_policy,
+            dataset_slug=dataset_slug,
+            dataset_path=dataset_path,
+            job_name=item.job_name,
+            job_id=item.job_id,
+            batch_size=batch_size,
+            sample_workers=opts.sample_workers,
+            infer_max_workers=(
+                item_budget.infer_max_workers
+                if item_budget is not None
+                else opts.infer_max_workers
+            ),
+            budget_reason=(item_budget.reason if item_budget is not None else None),
+            gpu=(None if item.is_remote else f"cuda:{resource}"),
+            log_path=console_log_path,
+        )
+        print(f"🚀 Launch {item.job_id} -> {base._launch_target_label(item, resource)}")
+        print(f"    Dataset: {dataset_path}")
+        print(f"    Console: {console_log_path}")
+        print(f"    Cmd: {' '.join(command)}")
+        meta = job_metadata.setdefault(item.job_id, {})
+        meta.update(
+            job=item.job_name,
+            dataset_slug=dataset_slug,
+            dataset_path=str(dataset_path),
+            model_name=item.model_name or item.model_slug,
+            model_slug=item.model_slug,
+            console_log_path=str(console_log_path),
+        )
+        if item.model_path is not None:
+            meta["model_path"] = str(item.model_path)
+        if item.is_remote:
+            meta["infer_base_url"] = str(item.infer_base_url)
+            meta["infer_model"] = str(item.infer_model or item.model_name)
+            meta["remote_slot"] = resource
+            if opts.sample_workers is not None:
+                meta["sample_workers"] = max(1, int(opts.sample_workers))
+            if item_budget is not None:
+                meta["infer_max_workers"] = item_budget.infer_max_workers
+                meta["remote_budget_reason"] = item_budget.reason
+                if item_budget.remote_batch_size is not None:
+                    meta["remote_batch_size"] = item_budget.remote_batch_size
+        else:
+            meta["gpu"] = resource
+
+        try:
+            process = base.launch_job(
+                item.job_id,
+                command,
+                cwd=base.REPO_ROOT,
+                log_path=console_log_path,
+                env=env,
+            )
+        except Exception:
+            if lease_manager is not None:
+                lease_manager.release((item.job_id,))
+            raise
+        claimed_job_ids.add(item.job_id)
+        try:
+            log_reference = str(console_log_path.relative_to(opts.run_log_dir))
+        except ValueError:
+            log_reference = str(console_log_path)
+        base.write_pid_file(opts.pid_dir, item.job_id, process.pid, resource, log_reference)
+        launch_times[item.job_id] = base.time.time()
+        pending_start = pending_since.pop(item.job_id, None)
+        wait_s = base.time.time() - pending_start if pending_start else None
+        payload: dict[str, object] = {
+            "job": item.job_name,
+            "dataset_slug": dataset_slug,
+            "dataset_path": str(dataset_path),
+            "model_name": item.model_name or item.model_slug,
+            "pid": process.pid,
+            "wait_s": wait_s,
+        }
+        if item.model_path is not None:
+            payload["model_path"] = str(item.model_path)
+            payload["gpu"] = f"cuda:{resource}"
+        if item.is_remote:
+            payload["infer_base_url"] = str(item.infer_base_url)
+            payload["infer_model"] = str(item.infer_model or item.model_name)
+            payload["worker_slot"] = resource
+            if item_budget is not None:
+                payload["infer_max_workers"] = item_budget.infer_max_workers
+                payload["remote_budget_reason"] = item_budget.reason
+                if item_budget.remote_batch_size is not None:
+                    payload["remote_batch_size"] = item_budget.remote_batch_size
+        base.log_job_event("job_launch", item.job_id, **payload)
+        if remote_mode:
+            if resource_slot_slug is not None:
+                occupied_remote_slots.add(resource_slot_slug)
+        if job.runner_group is RunnerGroup.CODING:
+            active_coding_runners += 1
+
+
+def action_dispatch(
+    opts: DispatchOptions,
+    *,
+    runtime_control: SchedulerRuntimeControl | None = None,
+) -> None:
+    base.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
+    if opts.clean_param_swap:
+        _clean_param_swap_records(opts.log_dir)
+
+    batch_cache = opts.batch_cache_path or (opts.log_dir / "batch_cache.json")
+    batch_profiler = base.BatchProfiler(batch_cache)
+    job_priority = base._job_priority_map(opts.job_priority)
+
+    base.FAILURE_MONITOR.reset()
+    pending_since: dict[str, float] = {}
+    launch_times: dict[str, float] = {}
+    job_metadata: dict[str, dict[str, object]] = {}
+    completed_versions: dict[str, str | None] = {}
+    session_completed: set[CompletedKey] = set()
+    skipped_missing_keys: set[CompletedKey] = set()
+    cooldown_until: dict[str, float] = {}
+    previous_running: set[str] = set()
+    claimed_job_ids: set[str] = set()
+    pending_notice_printed = False
+    cancel_requested = False
+    lease_manager = base._build_lease_manager(opts)
+
+    if runtime_control is not None:
+        runtime_control.write_status(ObservedStatus.STARTING)
+
+    while True:
+        failure = base.FAILURE_MONITOR.wait_failure(timeout=0)
+        if failure is not None:
+            failure_meta = job_metadata.get(failure.job_id, {}).copy()
+            base.handle_job_failure(failure, opts.pid_dir, job_metadata, launch_times)
+            _handle_batch_failure(batch_profiler, failure, failure_meta)
+            if runtime_control is not None:
+                runtime_control.write_status(
+                    ObservedStatus.FAILED,
+                    error=f"{failure.job_id} exited with returncode={failure.returncode}",
+                    progress=_build_progress_snapshot(
+                        queue=(),
+                        running_entries=base.load_running(opts.pid_dir),
+                        completed_count=len(completed_versions),
+                        available_gpus=(),
+                    ),
+                )
+            print("❗️ 调度因异常退出而终止。")
+            return
+
+        completed, completed_records, running_entries, question_counts = base._read_scheduler_state(pid_dir=opts.pid_dir)
+        failed_keys: set[CompletedKey] = set()
+        now = base.time.time()
+
+        completed_job_ids = base._reconcile_completed_versions(
+            completed_records=completed_records,
+            completed_versions=completed_versions,
+            job_metadata=job_metadata,
+            launch_times=launch_times,
+            pending_since=pending_since,
+            session_completed=session_completed,
+            cooldown_until=cooldown_until,
+            now=now,
+        )
+        if lease_manager is not None and completed_job_ids:
+            lease_manager.release(tuple(completed_job_ids))
+            claimed_job_ids.difference_update(completed_job_ids)
+
+        # If a job stops without a new score, briefly avoid re-queueing to allow DB writes to land.
+        cooldown_jobs = base._update_cooldown_jobs(
+            previous_running=previous_running,
+            running_entries=running_entries,
+            completed_records=completed_records,
+            cooldown_until=cooldown_until,
+            now=now,
+            dispatch_poll_seconds=opts.dispatch_poll_seconds,
+        )
+        previous_running = set(running_entries.keys())
+        foreign_claimed_job_ids: set[str] = set()
+        if lease_manager is not None:
+            owned_running_jobs = {job_id for job_id in running_entries.keys() if job_id in claimed_job_ids}
+            renewed_job_ids = lease_manager.renew(tuple(sorted(owned_running_jobs)))
+            lost_job_ids = owned_running_jobs - renewed_job_ids
+            if lost_job_ids:
+                claimed_job_ids.difference_update(lost_job_ids)
+                print(f"⚠️  已失去 lease：{', '.join(sorted(lost_job_ids))}")
+                base.log_job_event(
+                    "dispatcher_lease_lost",
+                    "_dispatcher",
+                    jobs=",".join(sorted(lost_job_ids)),
+                )
+            foreign_claimed_job_ids = lease_manager.active_foreign_job_ids()
+
+        queue = base._build_pending_queue(
+            opts,
+            completed=base._completed_for_queue(
+                run_mode=opts.run_mode,
+                completed=completed,
+                session_completed=session_completed,
+            ),
+            failed=failed_keys | skipped_missing_keys,
+            running=tuple(set(running_entries.keys()) | cooldown_jobs | foreign_claimed_job_ids),
+            question_counts=question_counts,
+            job_priority=job_priority,
+        )
+        base._mark_pending_jobs(
+            queue=queue,
+            pending_since=pending_since,
+            job_metadata=job_metadata,
+            now=now,
+        )
+        remote_budgets = base._resolve_remote_concurrency_budgets(opts) if base._dispatch_uses_remote_inference(opts) else {}
+        generated_job_ids = (
+            base._generated_running_job_ids(
+                running_entries=running_entries,
+                job_metadata=job_metadata,
+            )
+            if base._dispatch_uses_remote_inference(opts)
+            else set()
+        )
+        available_resources = base._resolve_available_dispatch_resources(
+            opts,
+            running_entries,
+            generated_job_ids=generated_job_ids,
+            remote_budgets=remote_budgets,
+        )
+        progress = _build_progress_snapshot(
+            queue=queue,
+            running_entries=running_entries,
+            completed_count=len(completed_records),
+            available_gpus=available_resources,
+        )
+        desired_state = runtime_control.desired_state() if runtime_control is not None else DesiredState.RUNNING
+
+        if desired_state is DesiredState.CANCELLED:
+            if runtime_control is not None:
+                runtime_control.write_status(ObservedStatus.CANCELLING, progress=progress)
+            if not cancel_requested:
+                cancel_requested = True
+                base.FAILURE_MONITOR.mark_aborting()
+                base.stop_all_jobs(opts.pid_dir)
+            if running_entries:
+                base.time.sleep(1)
+                continue
+            if lease_manager is not None and claimed_job_ids:
+                lease_manager.release(tuple(sorted(claimed_job_ids)))
+                claimed_job_ids.clear()
+            if runtime_control is not None:
+                runtime_control.write_status(ObservedStatus.CANCELLED, progress=progress)
+            print("🛑 调度已取消")
+            base.log_job_event("dispatcher_cancelled", "_dispatcher", completed=len(completed_records))
+            return
+
+        if not queue:
+            running_count = len(running_entries)
+            if running_count > 0:
+                if runtime_control is not None:
+                    status = ObservedStatus.PAUSING if desired_state is DesiredState.PAUSED else ObservedStatus.RUNNING
+                    runtime_control.write_status(status, progress=progress)
+                if not pending_notice_printed:
+                    print(f"⏳ 所有任务已调度，等待 {running_count} 个任务完成…")
+                    pending_notice_printed = True
+                base.log_job_event(
+                    "dispatcher_wait",
+                    "_dispatcher",
+                    reason="running",
+                    running=running_count,
+                    pending=0,
+                )
+                base.time.sleep(opts.dispatch_poll_seconds)
+                continue
+            if foreign_claimed_job_ids:
+                if runtime_control is not None:
+                    runtime_control.write_status(ObservedStatus.RUNNING, progress=progress)
+                if not pending_notice_printed:
+                    print(f"⏳ 当前节点无可启动任务，等待集群中 {len(foreign_claimed_job_ids)} 个 lease 任务完成…")
+                    pending_notice_printed = True
+                base.log_job_event(
+                    "dispatcher_wait",
+                    "_dispatcher",
+                    reason="cluster_running",
+                    foreign_claims=len(foreign_claimed_job_ids),
+                    pending=0,
+                    running=0,
+                )
+                base.time.sleep(opts.dispatch_poll_seconds)
+                continue
+            print("🎉 所有任务调度完成")
+            base.log_job_event("dispatcher_done", "_dispatcher", completed=len(completed_records))
+            if lease_manager is not None and claimed_job_ids:
+                lease_manager.release(tuple(sorted(claimed_job_ids)))
+                claimed_job_ids.clear()
+            if runtime_control is not None:
+                runtime_control.write_status(ObservedStatus.COMPLETED, progress=progress)
+            break
+
+        pending_notice_printed = False
+        if desired_state is DesiredState.PAUSED:
+            status = ObservedStatus.PAUSING if running_entries else ObservedStatus.PAUSED
+            if runtime_control is not None:
+                runtime_control.write_status(status, progress=progress)
+            base.time.sleep(opts.dispatch_poll_seconds)
+            continue
+        if runtime_control is not None:
+            runtime_control.write_status(ObservedStatus.RUNNING, progress=progress)
+        if not available_resources:
+            running_count = len(running_entries)
+            suffix = f"（当前运行 {running_count} 个任务）" if running_count else ""
+            if base._dispatch_uses_remote_inference(opts) and remote_budgets and any(
+                not budget.launch_allowed for budget in remote_budgets.values()
+            ):
+                print(f"⏳ 远端推理背压中，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
+                wait_reason = "remote_backpressure"
+            elif base._dispatch_uses_remote_inference(opts):
+                print(f"⏳ 远端推理模型槽已占满，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
+                wait_reason = "remote_model_slots_exhausted"
+            else:
+                print(f"⏳ 未检测到空闲 GPU，{opts.dispatch_poll_seconds} 秒后重试{suffix}")
+                wait_reason = "no_gpu"
+            base.log_job_event(
+                "dispatcher_wait",
+                "_dispatcher",
+                reason=wait_reason,
+                pending=len(queue),
+                running=running_count,
+            )
+            base.time.sleep(opts.dispatch_poll_seconds)
+            continue
+
+        _launch_queue_items(
+            opts=opts,
+            queue=queue,
+            available_resources=available_resources,
+            question_counts=question_counts,
+            batch_profiler=batch_profiler,
+            pending_since=pending_since,
+            launch_times=launch_times,
+            job_metadata=job_metadata,
+            lease_manager=lease_manager,
+            claimed_job_ids=claimed_job_ids,
+            skipped_missing_keys=skipped_missing_keys,
+            generated_job_ids=generated_job_ids,
+            remote_budgets=remote_budgets,
+        )
+
+        base.time.sleep(1)
+
+
+def _build_progress_snapshot(
+    *,
+    queue: Sequence[QueueItem],
+    running_entries: Mapping[str, RunningEntry],
+    completed_count: int,
+    available_gpus: Sequence[str],
+) -> SchedulerProgressSnapshot:
+    return SchedulerProgressSnapshot(
+        pending_jobs=len(queue),
+        running_jobs=len(running_entries),
+        completed_jobs=completed_count,
+        failed_jobs=0,
+        queue_head=tuple(item.job_id for item in queue[:8]),
+        active_jobs=tuple(sorted(running_entries.keys())),
+        available_gpus=tuple(available_gpus),
+    )
+
+
+def build_command(
+    job: JobSpec,
+    item: QueueItem,
+    dataset_path: Path,
+    device: str | None,
+    *,
+    batch_size: int | None = None,
+    extra_args: Sequence[str] = (),
+    infer_api_key: str = "",
+    infer_timeout_s: float = 600.0,
+    infer_max_workers: int = 32,
+    infer_protocol: str = "openai",
+    infer_seed_policy: str = "preserve",
+) -> list[str]:
+    base = [DEFAULT_PYTHON, "-m", job.module]
+    args = ["--dataset", str(dataset_path)]
+    if item.is_remote:
+        args.extend(
+            [
+                "--infer-base-url",
+                str(item.infer_base_url or ""),
+                "--infer-model",
+                str(item.infer_model or item.model_name or ""),
+            ]
+        )
+        if infer_api_key:
+            args.extend(["--infer-api-key", infer_api_key])
+        args.extend(["--infer-timeout-s", str(float(infer_timeout_s))])
+        args.extend(["--infer-max-workers", str(int(infer_max_workers))])
+        args.extend(["--infer-protocol", str(infer_protocol or "openai")])
+        args.extend(["--infer-seed-policy", str(infer_seed_policy or "preserve")])
+    else:
+        if item.model_path is None:
+            raise ValueError("local scheduler launch requires model_path")
+        args.extend(["--model-path", str(item.model_path)])
+        if device:
+            args.extend(["--device", device])
+    if batch_size is not None and job.batch_flag:
+        args.extend([job.batch_flag, str(batch_size)])
+    if job.extra_args:
+        args.extend(job.extra_args)
+    if extra_args:
+        args.extend(extra_args)
+    return base + args
+
+
+def _running_job_group_count(running_entries: Mapping[str, RunningEntry], group: RunnerGroup) -> int:
+    count = 0
+    for job_id in running_entries:
+        for spec in base.JOB_CATALOGUE.values():
+            if spec.runner_group is group and job_id.startswith(spec.id_prefix):
+                count += 1
+                break
+    return count
+
+
+def _candidate_exceeds_coding_limit(
+    *,
+    opts: QueueOptions,
+    candidate: QueueItem,
+    active_coding_runners: int,
+) -> bool:
+    if opts.max_active_coding_runners is None:
+        return False
+    limit = max(1, int(opts.max_active_coding_runners))
+    job = base.JOB_CATALOGUE.get(candidate.job_name)
+    return bool(job is not None and job.runner_group is RunnerGroup.CODING and active_coding_runners >= limit)
+
+
+def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.FUNCTION_CALLING:
+        return ()
+    if job.module != "src.eval.function_calling.runner":
+        return ()
+
+    args: list[str] = []
+
+    def _append(flag: str, value: int | None) -> None:
+        if value is not None:
+            args.extend([flag, str(max(1, int(value)))])
+
+    def _append_str(flag: str, value: str | None) -> None:
+        if value:
+            args.extend([flag, str(value)])
+
+    _append_str("--prompt-style", opts.function_prompt_style)
+    if job.name in base._SAMPLE_WORKER_JOB_NAMES:
+        _append("--sample-workers", opts.sample_workers)
+    _append_str("--tool-catalog-format", opts.function_tool_catalog_format)
+    _append("--cot-max-tokens", opts.function_cot_max_tokens)
+    _append("--decision-max-tokens", opts.function_decision_max_tokens)
+    _append("--planning-max-tokens", opts.function_planning_max_tokens)
+    _append("--final-max-tokens", opts.function_final_max_tokens)
+    _append("--answer-max-tokens", opts.function_answer_max_tokens)
+    _append("--history-max-chars", opts.function_history_max_chars)
+    _append("--prompt-max-chars", opts.function_prompt_max_chars)
+    _append_str("--long-doc-mode", opts.function_long_doc_mode)
+    _append_str("--tool-router-mode", opts.function_tool_router_mode)
+    _append("--tool-router-max-tools", opts.function_tool_router_max_tools)
+    _append("--tool-router-trigger-tool-count", opts.function_tool_router_trigger_tool_count)
+    _append("--tool-router-trigger-catalog-chars", opts.function_tool_router_trigger_catalog_chars)
+    _append_str("--candidate-router-mode", opts.function_candidate_router_mode)
+    _append("--candidate-router-chunk-tools", opts.function_candidate_router_chunk_tools)
+    _append("--candidate-router-batch-size", opts.function_candidate_router_batch_size)
+    _append("--candidate-router-prompt-max-chars", opts.function_candidate_router_prompt_max_chars)
+    _append("--candidate-router-context-chars", opts.function_candidate_router_context_chars)
+    _append("--candidate-router-candidate-max-tokens", opts.function_candidate_router_candidate_max_tokens)
+    _append("--candidate-router-aggregate-max-tokens", opts.function_candidate_router_aggregate_max_tokens)
+    _append("--candidate-router-max-candidates", opts.function_candidate_router_max_candidates)
+    _append_str("--candidate-router-tool-schema-mode", opts.function_candidate_router_tool_schema_mode)
+    _append("--candidate-router-evidence-chars", opts.function_candidate_router_evidence_chars)
+    _append("--candidate-router-policy-chars", opts.function_candidate_router_policy_chars)
+    _append("--max-rounds", opts.function_max_rounds)
+    _append("--max-steps", opts.function_max_steps)
+    _append("--max-tool-errors", opts.function_max_tool_errors)
+    return tuple(args)
+
+
+def _coding_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.CODING:
+        return ()
+    if opts.coding_eval_workers is None:
+        return ()
+    return ("--eval-workers", str(max(1, int(opts.coding_eval_workers))))
+
+
+def _clean_param_swap_records(log_dir: Path) -> None:
+    target = (log_dir / "param_swap").resolve()
+    if not target.exists():
+        return
+    import shutil
+
+    shutil.rmtree(target, ignore_errors=True)
+    print(f"🧹 已清理参数搜索记录: {target}")
+
+
+def _allocate_console_log_path(base_dir: Path, rel: Path) -> Path:
+    target_dir = base_dir / rel.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    candidate = target_dir / f"{rel.name}.log"
+    if not candidate.exists():
+        return candidate
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    candidate = target_dir / f"{rel.name}--{timestamp}.log"
+    if not candidate.exists():
+        return candidate
+    attempt = 1
+    while True:
+        numbered = target_dir / f"{rel.name}--{timestamp}-{attempt}.log"
+        if not numbered.exists():
+            return numbered
+        attempt += 1
+
+
+def _handle_batch_failure(batch_profiler: base.BatchProfiler, failure: JobFailure, metadata: Mapping[str, object]) -> None:
+    if not metadata:
+        return
+    job_name = metadata.get("job")
+    model_slug = metadata.get("model_slug")
+    gpu = metadata.get("gpu")
+    if not job_name or not model_slug or gpu is None:
+        return
+    log_path = failure.log_path
+    if not log_path.exists():
+        return
+    if not _log_contains_oom(log_path):
+        return
+    reason = f"runtime oom ({failure.job_id})"
+    batch_profiler.invalidate_cache(str(job_name), str(model_slug), str(gpu), reason=reason)
+    print(f"⚠️  {failure.job_id} 日志包含 OOM，已清理 {job_name}/{model_slug} 在 GPU {gpu} 的批量缓存。")
+
+
+def _log_contains_oom(log_path: Path, *, tail_bytes: int = 65536) -> bool:
+    try:
+        with log_path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes), os.SEEK_SET)
+            chunk = fh.read()
+    except OSError:
+        return False
+    text = chunk.decode("utf-8", errors="ignore").lower()
+    keywords = ("out of memory", "cuda oom", "cuda out of memory", "torch.outofmemoryerror")
+    return any(keyword in text for keyword in keywords)
+
+
+def _backup_run_config(
+    *,
+    model_name: str,
+    model_path: Path | None,
+    infer_base_url: str | None,
+    infer_model: str | None,
+    infer_protocol: str | None,
+    infer_seed_policy: str | None,
+    dataset_slug: str,
+    dataset_path: Path,
+    job_name: str,
+    job_id: str,
+    batch_size: int | None,
+    sample_workers: int | None,
+    infer_max_workers: int | None,
+    budget_reason: str | None,
+    gpu: str | None,
+    log_path: Path,
+) -> Path:
+    benchmark, _ = base.split_benchmark_and_split(dataset_slug)
+    config_path = base.config_path_for_benchmark(benchmark, model_name)
+    model_dir = base.safe_slug(model_name)
+    benchmark_dir = base.safe_slug(benchmark)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    target = base.REPO_ROOT / "config_backup" / model_dir / benchmark_dir / f"{timestamp}.toml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    base_text = ""
+    if config_path.exists():
+        base_text = config_path.read_text(encoding="utf-8")
+
+    run_block = _render_run_block(
+        benchmark=benchmark,
+        dataset_slug=dataset_slug,
+        model_name=model_name,
+        model_path=model_path,
+        infer_base_url=infer_base_url,
+        infer_model=infer_model,
+        infer_protocol=infer_protocol,
+        infer_seed_policy=infer_seed_policy,
+        config_path=config_path,
+        job_name=job_name,
+        job_id=job_id,
+        batch_size=batch_size,
+        sample_workers=sample_workers,
+        infer_max_workers=infer_max_workers,
+        budget_reason=budget_reason,
+        gpu=gpu,
+        dataset_path=dataset_path,
+        log_path=log_path,
+    )
+    separator = "\n\n" if base_text.strip() else ""
+    target.write_text(f"{base_text.rstrip()}{separator}{run_block}", encoding="utf-8")
+    return target
+
+
+def _render_run_block(
+    *,
+    benchmark: str,
+    dataset_slug: str,
+    model_name: str,
+    model_path: Path | None,
+    infer_base_url: str | None,
+    infer_model: str | None,
+    infer_protocol: str | None,
+    infer_seed_policy: str | None,
+    config_path: Path,
+    job_name: str,
+    job_id: str,
+    batch_size: int | None,
+    sample_workers: int | None,
+    infer_max_workers: int | None,
+    budget_reason: str | None,
+    gpu: str | None,
+    dataset_path: Path,
+    log_path: Path,
+) -> str:
+    created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "[run]",
+        f"created_at = {_toml_quote(created_at)}",
+        f"benchmark = {_toml_quote(benchmark)}",
+        f"dataset_slug = {_toml_quote(dataset_slug)}",
+        f"model_name = {_toml_quote(model_name)}",
+        f"config_path = {_toml_quote(str(config_path))}",
+        f"job_name = {_toml_quote(job_name)}",
+        f"job_id = {_toml_quote(job_id)}",
+        f"dataset_path = {_toml_quote(str(dataset_path))}",
+        f"log_path = {_toml_quote(str(log_path))}",
+    ]
+    if model_path is not None:
+        lines.append(f"model_path = {_toml_quote(str(model_path))}")
+    if infer_base_url:
+        lines.append(f"infer_base_url = {_toml_quote(str(infer_base_url))}")
+    if infer_model:
+        lines.append(f"infer_model = {_toml_quote(str(infer_model))}")
+    if infer_protocol:
+        lines.append(f"infer_protocol = {_toml_quote(str(infer_protocol))}")
+    if infer_seed_policy:
+        lines.append(f"infer_seed_policy = {_toml_quote(str(infer_seed_policy))}")
+    if gpu:
+        lines.append(f"gpu = {_toml_quote(gpu)}")
+    if batch_size is not None:
+        lines.append(f"batch_size = {int(batch_size)}")
+    if sample_workers is not None:
+        lines.append(f"sample_workers = {max(1, int(sample_workers))}")
+    if infer_max_workers is not None:
+        lines.append(f"infer_max_workers = {int(infer_max_workers)}")
+    if budget_reason:
+        lines.append(f"remote_budget_reason = {_toml_quote(str(budget_reason))}")
+    return "\n".join(lines) + "\n"
+
+
+def _toml_quote(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+__all__ = [
+    "action_dispatch",
+    "_launch_queue_items",
+    "_build_progress_snapshot",
+    "build_command",
+    "_running_job_group_count",
+    "_candidate_exceeds_coding_limit",
+    "_function_calling_extra_args",
+    "_coding_extra_args",
+    "_clean_param_swap_records",
+    "_allocate_console_log_path",
+    "_handle_batch_failure",
+    "_log_contains_oom",
+    "_backup_run_config",
+    "_render_run_block",
+    "_toml_quote",
+]

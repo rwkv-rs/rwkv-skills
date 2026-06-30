@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.eval.scheduler import actions
+from src.eval.scheduler import actions, actions_base
 from src.eval.scheduler.actions import DispatchOptions, QueueOptions
 from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.cli import build_parser
@@ -39,18 +39,18 @@ def test_action_queue_filters_foreign_cluster_claims(monkeypatch, tmp_path: Path
     captured: dict[str, object] = {}
     lease_manager = _FakeLeaseManager(active_sequences=[{"free_response__claimed"}])
 
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: (set(), {}))
-    monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
-    monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
-    monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)
-    monkeypatch.setattr(actions, "_print_queue_summary", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(actions, "_build_lease_manager", lambda _opts: lease_manager)
+    monkeypatch.setattr(actions_base, "scan_completed_jobs", lambda: (set(), {}))
+    monkeypatch.setattr(actions_base, "load_running", lambda _pid_dir: {})
+    monkeypatch.setattr(actions_base, "derive_question_counts", lambda _records: {})
+    monkeypatch.setattr(actions_base, "sort_queue_items", lambda items, **_kwargs: items)
+    monkeypatch.setattr(actions_base, "_print_queue_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(actions_base, "_build_lease_manager", lambda _opts: lease_manager)
 
     def _fake_build_queue(**kwargs):
         captured["running"] = set(kwargs["running"])
         return []
 
-    monkeypatch.setattr(actions, "build_queue", _fake_build_queue)
+    monkeypatch.setattr(actions_base, "build_queue", _fake_build_queue)
 
     actions.action_queue(
         QueueOptions(
@@ -68,22 +68,22 @@ def test_action_dispatch_waits_for_foreign_cluster_claims(monkeypatch, tmp_path:
     lease_manager = _FakeLeaseManager(active_sequences=[{"job-foreign"}, set()])
     events: list[tuple[str, str, dict[str, object]]] = []
 
-    monkeypatch.setattr(actions, "ensure_dirs", lambda *_args: None)
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: (set(), {}))
-    monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
-    monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
-    monkeypatch.setattr(actions, "_build_lease_manager", lambda _opts: lease_manager)
-    monkeypatch.setattr(actions, "time", type("_T", (), {"time": staticmethod(lambda: 0.0), "sleep": staticmethod(lambda _s: None)}))
-    monkeypatch.setattr(actions.FAILURE_MONITOR, "wait_failure", lambda timeout=0: None)
-    monkeypatch.setattr(actions.FAILURE_MONITOR, "reset", lambda: None)
-    monkeypatch.setattr(actions, "log_job_event", lambda event, job_id, **payload: events.append((event, job_id, payload)))
+    monkeypatch.setattr(actions_base, "ensure_dirs", lambda *_args: None)
+    monkeypatch.setattr(actions_base, "scan_completed_jobs", lambda: (set(), {}))
+    monkeypatch.setattr(actions_base, "load_running", lambda _pid_dir: {})
+    monkeypatch.setattr(actions_base, "derive_question_counts", lambda _records: {})
+    monkeypatch.setattr(actions_base, "_build_lease_manager", lambda _opts: lease_manager)
+    monkeypatch.setattr(actions_base, "time", type("_T", (), {"time": staticmethod(lambda: 0.0), "sleep": staticmethod(lambda _s: None)}))
+    monkeypatch.setattr(actions_base.FAILURE_MONITOR, "wait_failure", lambda timeout=0: None)
+    monkeypatch.setattr(actions_base.FAILURE_MONITOR, "reset", lambda: None)
+    monkeypatch.setattr(actions_base, "log_job_event", lambda event, job_id, **payload: events.append((event, job_id, payload)))
 
     def _fake_build_queue(**kwargs):
         running = set(kwargs["running"])
         return [] if "job-foreign" in running else []
 
-    monkeypatch.setattr(actions, "build_queue", _fake_build_queue)
-    monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)
+    monkeypatch.setattr(actions_base, "build_queue", _fake_build_queue)
+    monkeypatch.setattr(actions_base, "sort_queue_items", lambda items, **_kwargs: items)
 
     opts = DispatchOptions(
         log_dir=tmp_path,

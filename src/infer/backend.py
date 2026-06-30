@@ -155,6 +155,7 @@ class InferenceBackend(Protocol):
         *,
         sampling: SamplingConfig,
         batch_size: int,
+        max_concurrent: int | None = None,
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
@@ -166,6 +167,12 @@ class InferenceBackend(Protocol):
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
+        """生成补全。
+
+        batch_size: 提交/预取批量（每个 benchmark 的组批粒度）。
+        max_concurrent: 在飞请求并发上限；为 None 时回退为 batch_size（与历史行为一致）。
+        实际并发 = min(max_concurrent or batch_size, 后端 max_workers, len(prompts))。
+        """
         ...
 
 
@@ -221,6 +228,7 @@ class RemoteInferenceBackend:
         *,
         sampling: SamplingConfig,
         batch_size: int,
+        max_concurrent: int | None = None,
         progress_desc: str = "Generating",
         probe_only: bool = False,
         on_complete: Callable[[GenerationOutput], None] | None = None,
@@ -256,7 +264,8 @@ class RemoteInferenceBackend:
             elif not has_prompt_seeds:
                 prompt_seeds = None
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
-        max_workers = max(1, min(int(batch_size), int(self.config.max_workers), len(prompts)))
+        inflight_cap = int(max_concurrent) if max_concurrent is not None else int(batch_size)
+        max_workers = max(1, min(inflight_cap, int(self.config.max_workers), len(prompts)))
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

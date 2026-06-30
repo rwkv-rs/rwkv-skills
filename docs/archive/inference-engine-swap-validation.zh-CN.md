@@ -4,7 +4,7 @@
 
 用途：记录本轮远端推理引擎替换到 `nano-vllm-contents` 协议后的分阶段验证、8222 当前服务状态、并发 probe 证据，以及正式测评前的固定参数。本文不记录 API key 或数据库密码。
 
-完成边界审计见：`docs/runbooks/inference-engine-swap-readiness-audit.zh-CN.md`。
+完成边界审计见：`docs/archive/inference-engine-swap-readiness-audit.zh-CN.md`。
 
 ## 范围
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.eval.evaluating import RunMode
-from src.eval.scheduler import actions
+from src.eval.scheduler import actions, actions_base
 from src.eval.scheduler.actions import QueueOptions
 from src.eval.scheduler.state import CompletedKey
 
@@ -31,17 +31,17 @@ def test_action_queue_auto_filters_completed(monkeypatch, tmp_path) -> None:
     completed_key = CompletedKey(job="free_response", model_slug="rwkv", dataset_slug="gsm8k_test", is_cot=True)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: ({completed_key}, {}))
-    monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
-    monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
-    monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)
-    monkeypatch.setattr(actions, "_print_queue_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(actions_base, "scan_completed_jobs", lambda: ({completed_key}, {}))
+    monkeypatch.setattr(actions_base, "load_running", lambda _pid_dir: {})
+    monkeypatch.setattr(actions_base, "derive_question_counts", lambda _records: {})
+    monkeypatch.setattr(actions_base, "sort_queue_items", lambda items, **_kwargs: items)
+    monkeypatch.setattr(actions_base, "_print_queue_summary", lambda *_args, **_kwargs: None)
 
     def _fake_build_queue(**kwargs):
         captured["completed"] = kwargs["completed"]
         return []
 
-    monkeypatch.setattr(actions, "build_queue", _fake_build_queue)
+    monkeypatch.setattr(actions_base, "build_queue", _fake_build_queue)
 
     actions.action_queue(
         QueueOptions(
@@ -59,17 +59,17 @@ def test_action_queue_rerun_ignores_completed_for_queue_building(monkeypatch, tm
     completed_key = CompletedKey(job="free_response", model_slug="rwkv", dataset_slug="gsm8k_test", is_cot=True)
     captured: dict[str, object] = {}
 
-    monkeypatch.setattr(actions, "scan_completed_jobs", lambda: ({completed_key}, {}))
-    monkeypatch.setattr(actions, "load_running", lambda _pid_dir: {})
-    monkeypatch.setattr(actions, "derive_question_counts", lambda _records: {})
-    monkeypatch.setattr(actions, "sort_queue_items", lambda items, **_kwargs: items)
-    monkeypatch.setattr(actions, "_print_queue_summary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(actions_base, "scan_completed_jobs", lambda: ({completed_key}, {}))
+    monkeypatch.setattr(actions_base, "load_running", lambda _pid_dir: {})
+    monkeypatch.setattr(actions_base, "derive_question_counts", lambda _records: {})
+    monkeypatch.setattr(actions_base, "sort_queue_items", lambda items, **_kwargs: items)
+    monkeypatch.setattr(actions_base, "_print_queue_summary", lambda *_args, **_kwargs: None)
 
     def _fake_build_queue(**kwargs):
         captured["completed"] = kwargs["completed"]
         return []
 
-    monkeypatch.setattr(actions, "build_queue", _fake_build_queue)
+    monkeypatch.setattr(actions_base, "build_queue", _fake_build_queue)
 
     actions.action_queue(
         QueueOptions(

@@ -159,14 +159,6 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 
 欢迎根据上述缺口补全实现并更新文档。
 
-## 历史结果迁移
-若已将旧版本 `rwkv-mmlu` / `rwkv-skills` 生成的 JSON 汇总到 `results_old/`，可以通过下述命令一次性迁移到当前 `results/scores/` 布局，避免重复跑全量评测：
-
-```bash
-uv run python -m src.bin.migrate_old_results --source results_old
-# 只想看看会写哪些文件，可加 --dry-run；已有结果但需要覆盖可加 --overwrite
-```
-
 ## C. 仅使用调度器（DB）
 ### C.1 一次性准备
 1. 准备 PostgreSQL 并可连接（写好 .env / 环境变量）  

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from src.bin.param_search_free_response import parse_args as parse_param_search_free_response_args
 from src.bin.param_search_select import parse_args as parse_param_search_select_args
-from src.eval.scheduler import actions, queue
+from src.eval.scheduler import actions, actions_base, action_dispatch, queue
 from src.eval.scheduler.actions import DispatchOptions
 from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.backpressure import (
@@ -250,16 +250,16 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
             infer_model=model_name,
         )
 
-    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
-    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
-    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+    monkeypatch.setattr(actions_base, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(action_dispatch, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(action_dispatch, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
 
     def _fake_launch_job(job_id, _command, **_kwargs):
         model_name = next(item.model_name for item in items if item.job_id == job_id)
         launched.append((job_id, str(model_name)))
         return SimpleNamespace(pid=1000 + len(launched))
 
-    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+    monkeypatch.setattr(actions_base, "launch_job", _fake_launch_job)
 
     opts = DispatchOptions(
         log_dir=tmp_path / "log",
@@ -312,16 +312,16 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
             infer_model="remote-a",
         )
 
-    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
-    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
-    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+    monkeypatch.setattr(actions_base, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(action_dispatch, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(action_dispatch, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
 
     def _fake_launch_job(job_id, _command, **_kwargs):
         child_envs.append(dict(_kwargs.get("env", {})))
         launched.append((job_id, str(_kwargs.get("env", {}).get("RWKV_SKILLS_INFER_MODEL"))))
         return SimpleNamespace(pid=1000 + len(launched))
 
-    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+    monkeypatch.setattr(actions_base, "launch_job", _fake_launch_job)
 
     opts = DispatchOptions(
         log_dir=tmp_path / "log",
@@ -370,16 +370,16 @@ def test_remote_launch_uses_backpressure_budget(monkeypatch, tmp_path: Path) -> 
     )
     captured: dict[str, int | None] = {}
 
-    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
-    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: captured.update(_kwargs))
+    monkeypatch.setattr(actions_base, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(action_dispatch, "_backup_run_config", lambda **_kwargs: captured.update(_kwargs))
 
     def _fake_build_command(*_args, **kwargs):
         captured["batch_size"] = kwargs["batch_size"]
         captured["infer_max_workers"] = kwargs["infer_max_workers"]
         return ["python", "-c", "pass"]
 
-    monkeypatch.setattr(actions, "build_command", _fake_build_command)
-    monkeypatch.setattr(actions, "launch_job", lambda *_args, **_kwargs: SimpleNamespace(pid=1001))
+    monkeypatch.setattr(action_dispatch, "build_command", _fake_build_command)
+    monkeypatch.setattr(actions_base, "launch_job", lambda *_args, **_kwargs: SimpleNamespace(pid=1001))
 
     opts = DispatchOptions(
         log_dir=tmp_path / "log",
@@ -435,15 +435,15 @@ def test_remote_launch_continues_past_empty_model_slot(monkeypatch, tmp_path: Pa
         infer_model="remote-c",
     )
 
-    monkeypatch.setattr(actions, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
-    monkeypatch.setattr(actions, "_backup_run_config", lambda **_kwargs: None)
-    monkeypatch.setattr(actions, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
+    monkeypatch.setattr(actions_base, "locate_dataset", lambda *_args, **_kwargs: dataset_path)
+    monkeypatch.setattr(action_dispatch, "_backup_run_config", lambda **_kwargs: None)
+    monkeypatch.setattr(action_dispatch, "build_command", lambda *_args, **_kwargs: ["python", "-c", "pass"])
 
     def _fake_launch_job(job_id, _command, **_kwargs):
         launched.append(job_id)
         return SimpleNamespace(pid=1000 + len(launched))
 
-    monkeypatch.setattr(actions, "launch_job", _fake_launch_job)
+    monkeypatch.setattr(actions_base, "launch_job", _fake_launch_job)
 
     opts = DispatchOptions(
         log_dir=tmp_path / "log",

@@ -2,7 +2,7 @@
 
 日期：2026-06-07
 
-本文是 `docs/runbooks/inference-engine-swap-validation.zh-CN.md` 的完成边界审计，只记录当前可由代码、测试、远端服务和本地命令直接证明的状态。
+本文是 `docs/archive/inference-engine-swap-validation.zh-CN.md` 的完成边界审计，只记录当前可由代码、测试、远端服务和本地命令直接证明的状态。
 
 ## 目标拆分
 

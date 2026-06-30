@@ -79,7 +79,7 @@ rwkv-skills/
 
 ### 阶段 4 — `src/bin/` 分入口与脚本（中风险）
 - `src/bin/` 仅保留：`run_dashboard`、`run_infer_server`、`run_infer_fleet`、`run_infer_router`、`run_perf_benchmark`、`download_weights`（+ `__init__.py`、`data/`）
-- 其余一次性脚本 `git mv` 到 `scripts/oneoff/`：`migrate_*`、`audit_*`、`*_infer_swap_*`、`param_search_*`、`probe_remote_infer`、`backfill_*`、`convert_*`、`summarize_*`、`validate_*`、`verify_*`、`preflight_*`、`prepare_*`、`clean_old_imports`、`run_function_calling_matrix`、`run_llm_checker`、`run_openai_tool_call_adapter`
+- 其余一次性脚本 `git mv` 到 `scripts/oneoff/`：`param_search_*`、`probe_remote_infer`、`backfill_*`、`run_function_calling_matrix`、`run_llm_checker`、`run_openai_tool_call_adapter`
 - **移动前必做**：`grep -rn "src.bin.<name>" src tests pyproject.toml` 确认无被 import（已初步确认 pyproject 未引用这些）
 - **验证**：6 个入口 `--help` 正常；`pytest -q` 不因路径变动失败
 
