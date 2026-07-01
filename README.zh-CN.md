@@ -4,13 +4,24 @@
 
 面向 RWKV7 的评测脚手架，推理侧接入外部 vLLM-RWKV OpenAI 兼容服务，包含常见评测数据集准备器以及一个 GPU 调度器骨架。
 
-## 目录速览
-- `src/infer`：远端 OpenAI/vLLM 推理客户端、采样配置与约束。
-- `src/bin/run_infer_server.py`：外部 `~/GitHub/vllm-rwkv` checkout 的轻量启动包装器。
-- `src/eval/datasets`：数据结构定义、JSONL 加载器以及各类数据集的准备脚本。
-- `src/eval/evaluators`：多选 / 自由问答 / 指令遵循 / 代码生成（HumanEval、MBPP）评测管线。
-- `src/eval/scheduler`：评测任务排队、GPU 侦测与调度的 CLI（现已附带 multi-choice / free-response / instruction-following / human-eval / mbpp 入口脚本）。
-- `weights`、`data`、`results`（可选）：模型权重、数据集与评测产物的默认存放位置。
+## 项目结构
+前端（`client/`）与后端（`src/`）严格分离；第三方基准数据与评测产物不入源码包。
+
+- `client/`：评测看板前端（React + Vite SPA）；构建产物 `client/dist` 由后端按需托管。
+- `src/`：后端 Python 包
+  - `src/eval/tasks/`：按域组织的评测 runner/pipeline —— `knowledge`、`maths`、`coding`、`instruction_following`、`function_calling`、`agent_bench`。
+  - `src/eval/scheduler`：评测任务排队、GPU/远端 worker 侦测与调度的 CLI。
+  - `src/eval/datasets`：数据结构、JSONL 加载器与各数据集准备器。
+  - `src/eval/{evaluating,evaluators,metrics,results,checkers}`：评测引擎与指标/结果处理。
+  - `src/infer`：远端 OpenAI/vLLM 推理客户端、采样配置与约束。
+  - `src/dashboard/{web,core}`：看板后端（FastAPI web 层 + 框架无关 core 逻辑）。
+  - `src/db`：PostgreSQL 数据层。
+  - `src/plugins/lexical_chunk_router`：词法分块 / 工具路由插件。
+  - `src/bin`：pyproject 注册的 console-script 入口（infer server/fleet/router、dashboard、perf、download-weights）。
+- `assets/agent_bench/`：agent-bench（tau_v1 / tau_v2）第三方基准数据（经 sys.path 加载，不在 `src` 包内，构建时经 force-include 打包）。
+- `configs/`：各 benchmark 的 `.toml` 采样 / 评测配置。
+- `scripts/oneoff/`：一次性 / 运维脚本。
+- `weights`、`data`、`results`（本地、gitignore）：模型权重、数据集与评测产物的默认存放位置。
 
 ## 环境要求
 - Python 3.12+，推荐安装 `uv` 以管理依赖。

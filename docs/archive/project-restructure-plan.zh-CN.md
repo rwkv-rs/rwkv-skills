@@ -1,5 +1,11 @@
 # 项目结构整理计划
 
+> **【已归档 · 已执行】** 本文件是当时的规划草案，作为历史记录保留（文中 `frontend/`、`src/eval/<域>`
+> 等路径为规划时点的旧布局）。实际落地见 README 的「项目结构 / Project structure」小节：
+> `src/space→src/dashboard{web,core}`、Next.js 残留清理、根目录/submodule/bin 收口、
+> `lexical_chunk_router→src/plugins/`、`frontend/→client/`、6 域收进 `src/eval/tasks/`、
+> `agent_bench/data→assets/agent_bench/` 均已完成。
+
 ## 背景与目标
 
 `rwkv-skills` 经历了从 Gradio → Next.js+Rust → FastAPI+Vite 的多轮前端演进，留下了大量结构债：

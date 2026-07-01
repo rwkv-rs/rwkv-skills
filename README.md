@@ -4,13 +4,24 @@ English | [中文](README.zh-CN.md)
 
 An evaluation scaffold for RWKV7 that targets an external vLLM-RWKV OpenAI-compatible inference service, with dataset preppers for common benchmarks and a GPU scheduler skeleton.
 
-## Quick tour
-- `src/infer`: Remote OpenAI/vLLM inference client, sampling configuration, and constraints.
-- `src/bin/run_infer_server.py`: Thin launcher for the external `~/GitHub/vllm-rwkv` checkout.
-- `src/eval/datasets`: Data structures, JSONL loaders, and dataset preparation scripts.
-- `src/eval/evaluators`: Evaluation pipelines for multiple-choice / free-response / instruction-following / code generation (HumanEval, MBPP).
-- `src/eval/scheduler`: A CLI for queueing evaluation jobs, GPU detection, and dispatching (with entry scripts for multi-choice / free-response / instruction-following / human-eval / mbpp).
-- `weights`, `data`, `results` (optional): Default locations for model weights, datasets, and evaluation artifacts.
+## Project structure
+The frontend (`client/`) and backend (`src/`) are strictly separated; third-party benchmark data and evaluation artifacts stay out of the source package.
+
+- `client/`: dashboard frontend (React + Vite SPA); the built `client/dist` is served by the backend when present.
+- `src/`: backend Python package
+  - `src/eval/tasks/`: per-domain evaluation runners/pipelines — `knowledge`, `maths`, `coding`, `instruction_following`, `function_calling`, `agent_bench`.
+  - `src/eval/scheduler`: CLI for queueing eval jobs, GPU/remote-worker detection, and dispatch.
+  - `src/eval/datasets`: data structures, JSONL loaders, and per-dataset preppers.
+  - `src/eval/{evaluating,evaluators,metrics,results,checkers}`: evaluation engine and metric/result handling.
+  - `src/infer`: remote OpenAI/vLLM inference client, sampling configuration, and constraints.
+  - `src/dashboard/{web,core}`: dashboard backend (FastAPI web layer + framework-agnostic core logic).
+  - `src/db`: PostgreSQL data layer.
+  - `src/plugins/lexical_chunk_router`: lexical chunking / tool-routing plugin.
+  - `src/bin`: console-script entry points registered in pyproject (infer server/fleet/router, dashboard, perf, download-weights).
+- `assets/agent_bench/`: agent-bench (tau_v1 / tau_v2) third-party benchmark data (loaded via sys.path, kept out of the `src` package, force-included at build time).
+- `configs/`: per-benchmark `.toml` sampling / evaluation configs.
+- `scripts/oneoff/`: one-off / operational scripts.
+- `weights`, `data`, `results` (local, gitignored): default locations for model weights, datasets, and evaluation artifacts.
 
 ## Requirements
 - Python 3.12+. `uv` is recommended for dependency management.

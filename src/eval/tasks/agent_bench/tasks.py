@@ -16,8 +16,9 @@ from src.eval.tasks.agent_bench.deps import (
 
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parents[3]
-TAU_V1_VENDOR_ROOT = ROOT / "data" / "tau_v1"
-TAU_V2_VENDOR_ROOT = ROOT / "data" / "tau_v2"
+AGENT_BENCH_DATA_ROOT = REPO_ROOT / "assets" / "agent_bench"
+TAU_V1_VENDOR_ROOT = AGENT_BENCH_DATA_ROOT / "tau_v1"
+TAU_V2_VENDOR_ROOT = AGENT_BENCH_DATA_ROOT / "tau_v2"
 TAU_V2_DATA_ROOT = TAU_V2_VENDOR_ROOT / "data"
 TAU_V2_REFERENCE_ROOT = REPO_ROOT / "references" / "tau2-bench"
 _TAU_V2_BENCH_ROOT_ENV_VARS = (

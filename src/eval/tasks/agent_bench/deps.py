@@ -15,9 +15,9 @@ from typing import Callable, TypeVar
 _AUTO_INSTALL_ENV = "RWKV_AGENT_BENCH_AUTO_INSTALL_DEPS"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _PYPROJECT_PATH = _REPO_ROOT / "pyproject.toml"
-_AGENT_BENCH_ROOT = Path(__file__).resolve().parent
-_TAU_V1_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v1"
-_TAU_V2_VENDOR_ROOT = _AGENT_BENCH_ROOT / "data" / "tau_v2"
+_AGENT_BENCH_DATA_ROOT = _REPO_ROOT / "assets" / "agent_bench"
+_TAU_V1_VENDOR_ROOT = _AGENT_BENCH_DATA_ROOT / "tau_v1"
+_TAU_V2_VENDOR_ROOT = _AGENT_BENCH_DATA_ROOT / "tau_v2"
 _TAU_V2_DATA_ROOT = _TAU_V2_VENDOR_ROOT / "data"
 _TAU_V2_REFERENCE_ROOT = _REPO_ROOT / "references" / "tau2-bench"
 _TAU_V2_BENCH_ROOT_ENV_VARS = (

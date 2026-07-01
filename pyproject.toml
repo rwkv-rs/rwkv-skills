@@ -76,6 +76,12 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
+[tool.hatch.build.targets.wheel.force-include]
+assets = "assets"
+
+[tool.hatch.build.targets.sdist.force-include]
+assets = "assets"
+
 [project.optional-dependencies]
 torch-cpu = ["torch>=2.8.0"]
 torch-cu129 = ["torch>=2.8.0"]
