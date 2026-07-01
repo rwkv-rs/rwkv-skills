@@ -1,4 +1,87 @@
-"""Compatibility import path for the standalone lexical_chunk_router package."""
+"""RWKV long-context agent benchmark chunking and tool-routing helpers.
 
-from lexical_chunk_router import *  # noqa: F403
-from lexical_chunk_router import __all__
+The package is RWKV-agent oriented, but it does not depend on one benchmark
+runner, database, scheduler, or inference-server implementation.
+"""
+
+from .long_doc import (
+    EvidenceChunk,
+    LongDocConfig,
+    LongDocCompactionResult,
+    LongDocMode,
+    LongDocMessageCompaction,
+    TextChunk,
+    build_long_doc_router_prompt,
+    chunk_text,
+    compact_messages,
+    compact_text,
+    infer_query_from_messages,
+    normalize_newlines,
+    parse_long_doc_router_response,
+    render_evidence_window,
+    select_evidence_chunks,
+)
+from .rwkv import (
+    JSON_CALL_STOP_SUFFIXES,
+    RouterGeneration,
+    RwkvRouterBackend,
+    assistant_json_prefix,
+    build_rwkv_json_call_prompt,
+    clamp_router_sampling,
+    extract_json_call_object_text,
+    extract_json_call_value_text,
+    normalize_rwkv_text,
+)
+from .tool_router import (
+    ToolRouteResult,
+    ToolRouterConfig,
+    ToolRouterMode,
+    build_tool_router_prompt,
+    normalize_tool_schema,
+    parse_tool_router_response,
+    render_tool_routing_context,
+    route_tools,
+    route_tools_for_context,
+    summarize_tool,
+    tool_catalog_chars,
+    tool_name,
+)
+
+__all__ = [
+    "EvidenceChunk",
+    "JSON_CALL_STOP_SUFFIXES",
+    "LongDocConfig",
+    "LongDocCompactionResult",
+    "LongDocMode",
+    "LongDocMessageCompaction",
+    "RouterGeneration",
+    "RwkvRouterBackend",
+    "TextChunk",
+    "ToolRouteResult",
+    "ToolRouterConfig",
+    "ToolRouterMode",
+    "assistant_json_prefix",
+    "build_long_doc_router_prompt",
+    "build_rwkv_json_call_prompt",
+    "build_tool_router_prompt",
+    "chunk_text",
+    "clamp_router_sampling",
+    "compact_messages",
+    "compact_text",
+    "extract_json_call_object_text",
+    "extract_json_call_value_text",
+    "infer_query_from_messages",
+    "normalize_newlines",
+    "normalize_rwkv_text",
+    "normalize_tool_schema",
+    "parse_long_doc_router_response",
+    "parse_tool_router_response",
+    "render_evidence_window",
+    "render_tool_routing_context",
+    "route_tools",
+    "route_tools_for_context",
+    "select_evidence_chunks",
+    "summarize_tool",
+    "tool_catalog_chars",
+    "tool_name",
+]

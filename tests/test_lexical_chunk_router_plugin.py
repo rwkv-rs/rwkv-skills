@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from lexical_chunk_router import (
+from src.plugins.lexical_chunk_router import (
     LongDocConfig,
     ToolRouterConfig,
     chunk_text,
@@ -11,7 +11,6 @@ from lexical_chunk_router import (
     route_tools,
     summarize_tool,
 )
-from src.plugins import lexical_chunk_router as compat_lexical_chunk_router
 
 
 def _tool(name: str, description: str, *properties: str) -> dict[str, object]:
@@ -176,8 +175,3 @@ def test_plugin_summarize_tool_accepts_openai_function_shape() -> None:
     assert summary["name"] == "book_flight"
     assert summary["required"] == ["origin"]
     assert summary["properties"] == ["destination", "origin"]
-
-
-def test_src_plugins_import_path_remains_compatible() -> None:
-    assert compat_lexical_chunk_router.LongDocConfig is LongDocConfig
-    assert compat_lexical_chunk_router.route_tools is route_tools

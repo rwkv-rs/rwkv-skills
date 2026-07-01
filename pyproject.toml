@@ -74,14 +74,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src", "lexical_chunk_router"]
-include = [
-    "lexical_chunk_router/README.md",
-    "lexical_chunk_router/py.typed",
-]
-exclude = [
-    "src/pyvenv.cfg",
-]
+packages = ["src"]
 
 [project.optional-dependencies]
 torch-cpu = ["torch>=2.8.0"]

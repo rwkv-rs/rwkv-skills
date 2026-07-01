@@ -7,24 +7,22 @@ The package is RWKV-oriented, but it is intentionally independent from one
 project's eval runner, database, scheduler, or inference-server implementation.
 Projects pass their own backend object for model-based routing.
 
-Public API is exported from `lexical_chunk_router.__all__`, and the package ships
-`py.typed` for type-checker visibility.
+Public API is exported from `src.plugins.lexical_chunk_router.__all__`, and the
+package ships `py.typed` for type-checker visibility.
 
 Use it from this repository with:
 
 ```python
-from lexical_chunk_router import LongDocConfig, ToolRouterConfig, compact_text, route_tools
+from src.plugins.lexical_chunk_router import LongDocConfig, ToolRouterConfig, compact_text, route_tools
 ```
 
-For another rwkv-skills-like project, copy the `lexical_chunk_router/` directory
-or install a wheel that includes this package. The old
-`src.plugins.lexical_chunk_router` path in this repository is only a compatibility
-re-export.
+For another rwkv-skills-like project, copy the `src/plugins/lexical_chunk_router/`
+directory or install a wheel that includes this package.
 
 ## Long Document Compaction
 
 ```python
-from lexical_chunk_router import LongDocConfig, compact_text
+from src.plugins.lexical_chunk_router import LongDocConfig, compact_text
 
 result = compact_text(
     long_text,
@@ -38,7 +36,7 @@ trace = result.trace_payload()
 ## Tool Catalog Routing
 
 ```python
-from lexical_chunk_router import ToolRouterConfig, route_tools
+from src.plugins.lexical_chunk_router import ToolRouterConfig, route_tools
 
 route = route_tools(
     tools,
@@ -79,5 +77,4 @@ exports RWKV JSON-call helpers such as `build_rwkv_json_call_prompt`,
 - `enable_domain_hints=True` keeps a small set of tau-style airline/retail
   anchors that worked well in rwkv-skills experiments. Disable it for generic
   projects that only want token overlap scoring.
-- The top-level package is the stable API. `src.plugins.lexical_chunk_router` is
-  compatibility-only and requires the top-level package to be installed.
+- `src.plugins.lexical_chunk_router` is the stable in-repository API.

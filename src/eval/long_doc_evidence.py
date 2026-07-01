@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from lexical_chunk_router import long_doc as lexical_long_doc
-from lexical_chunk_router.rwkv import clamp_router_sampling
+from src.plugins.lexical_chunk_router import long_doc as lexical_long_doc
+from src.plugins.lexical_chunk_router.rwkv import clamp_router_sampling
 
 ALLOWED_ANSWER_FORMATS = frozenset({"scalar_string", "scalar_number_string"})
 LongDocEvidenceMode = Literal["lexical"]

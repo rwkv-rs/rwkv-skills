@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from lexical_chunk_router import tool_router as _tool_router
+from src.plugins.lexical_chunk_router import tool_router as _tool_router
 
 DEFAULT_TOOL_ROUTER_CONTEXT_CHARS = _tool_router.DEFAULT_TOOL_ROUTER_CONTEXT_CHARS
 DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS = _tool_router.DEFAULT_TOOL_ROUTER_DESCRIPTION_CHARS
