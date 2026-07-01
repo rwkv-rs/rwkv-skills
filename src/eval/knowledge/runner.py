@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING
 from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
+from src.eval.common.field_runner import (
+    add_common_runner_args,
+    attempt_stage,
+    resolve_prompt_profile,
+    scoring_stage,
+)
 from src.eval.field_common import (
     build_plan_task_details,
     build_task_sampling_config,
@@ -29,12 +35,9 @@ if TYPE_CHECKING:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV knowledge benchmark runner")
-    parser.add_argument("--dataset", required=True, help="JSONL dataset path")
+    add_common_runner_args(parser, batch_size_default=64, db_write_queue_default=4096)
     add_inference_backend_arguments(parser)
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation/scoring")
-    parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--target-token-format", default=" <LETTER>", help="Token format for answer tokens")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
     parser.add_argument(
         "--cot-mode",
         choices=[mode.value for mode in CoTMode],
@@ -62,12 +65,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         help="pass@k values to compute (default: none; can be set in configs/<benchmark>.toml)",
     )
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
-    )
     return parser.parse_args(argv)
 
 
@@ -75,14 +72,6 @@ def _default_job_name(cot_mode: CoTMode) -> str:
     if cot_mode is CoTMode.NO_COT:
         return "multi_choice_plain"
     return "multi_choice_cot"
-
-
-def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
-    if raw:
-        return raw
-    if job_name.endswith("_naive"):
-        return "naive"
-    return "normal"
 
 
 def _naive_direct_prompt_template() -> str:
@@ -154,7 +143,7 @@ def main(
 
     cot_mode = CoTMode(args.cot_mode)
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", _default_job_name(cot_mode))
-    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
+    prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
     if args.probe_only and cot_mode is not CoTMode.COT:
         raise ValueError("--probe-only is only supported with --cot-mode cot")
     completion_style_remote = require_completion_style_remote_protocol(
@@ -261,7 +250,7 @@ def main(
 
     set_task_env(task_id)
     writer = runtime.create_writer(max_queue=args.db_write_queue)
-    try:
+    with attempt_stage(runtime, writer):
         if cot_mode is CoTMode.COT:
             result = pipeline.run_chain_of_thought(
                 dataset_path=str(dataset_path),
@@ -287,12 +276,9 @@ def main(
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
             )
-    except Exception:
-        runtime.handle_attempt_stage_failure(writer)
-        raise
 
     completions_payloads = runtime.complete_attempt_stage(writer)
-    try:
+    with scoring_stage(runtime):
         metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
         pass_metrics_all = compute_pass_at_k(metrics.rows, k_plan.pass_k)
         avg_metrics_all = compute_avg_at_k(metrics.rows, k_plan.avg_k)
@@ -337,9 +323,6 @@ def main(
             },
         )
         runtime.record_score(score_payload)
-    except Exception as exc:
-        runtime.fail_task(error=str(exc))
-        raise
     _print_done_message(cot_mode, result.sample_count)
     return 0
 

@@ -17,7 +17,7 @@ import uuid
 from src.eval.benchmark_registry import BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
 
-from .actions import DispatchOptions, action_dispatch
+from .actions import DispatchOptions, InferenceConfig, action_dispatch
 from .config import (
     DEFAULT_ADMIN_STATE_DIR,
     DEFAULT_DISPATCH_POLL_SECONDS,
@@ -193,23 +193,25 @@ class SchedulerStartRequest:
             model_name_patterns=model_patterns,
             enable_param_search=self.enable_param_search,
             run_mode=run_mode,
-            infer_base_url=infer_base_url,
-            infer_models=infer_models,
-            infer_api_key=str(self.infer_api_key or ""),
-            infer_timeout_s=float(self.infer_timeout_s),
-            infer_max_workers=int(self.infer_max_workers),
-            infer_worker_profile=infer_worker_profile,
-            infer_protocol=infer_protocol,
-            infer_seed_policy=infer_seed_policy,
-            remote_batch_size=(
-                int(self.remote_batch_size)
-                if self.remote_batch_size is not None
-                else None
+            inference=InferenceConfig(
+                base_url=infer_base_url,
+                models=infer_models,
+                api_key=str(self.infer_api_key or ""),
+                timeout_s=float(self.infer_timeout_s),
+                max_workers=int(self.infer_max_workers),
+                worker_profile=infer_worker_profile,
+                protocol=infer_protocol,
+                seed_policy=infer_seed_policy,
+                remote_batch_size=(
+                    int(self.remote_batch_size)
+                    if self.remote_batch_size is not None
+                    else None
+                ),
+                backpressure=bool(self.infer_backpressure),
+                backpressure_timeout_s=float(self.infer_backpressure_timeout_s),
+                backpressure_pending_high_watermark=int(self.infer_backpressure_pending_high_watermark),
+                budget_min_workers=int(self.infer_budget_min_workers),
             ),
-            infer_backpressure=bool(self.infer_backpressure),
-            infer_backpressure_timeout_s=float(self.infer_backpressure_timeout_s),
-            infer_backpressure_pending_high_watermark=int(self.infer_backpressure_pending_high_watermark),
-            infer_budget_min_workers=int(self.infer_budget_min_workers),
             distributed_claims=bool(self.distributed_claims),
             scheduler_node_id=(str(self.scheduler_node_id or "").strip() or None),
             lease_duration_s=int(self.lease_duration_s),

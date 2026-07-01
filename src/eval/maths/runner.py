@@ -12,6 +12,11 @@ from typing import Mapping
 from typing import Sequence
 
 from src.eval.benchmark_registry import CoTMode
+from src.eval.common.field_runner import (
+    add_common_runner_args,
+    resolve_prompt_profile,
+    scoring_stage,
+)
 from src.eval.field_common import (
     build_plan_task_details,
     build_task_sampling_config,
@@ -70,14 +75,11 @@ def _judge_error_summaries(judge_stats_by_group: Mapping[str, Mapping[str, objec
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV maths benchmark runner")
-    parser.add_argument("--dataset", required=True, help="JSONL dataset path")
+    add_common_runner_args(parser, batch_size_default=64, db_write_queue_default=None)
     add_inference_backend_arguments(parser)
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size for generation")
-    parser.add_argument("--max-samples", type=int, help="Limit source questions for quick runs")
     parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
     parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
     parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--db-write-queue", type=int, help="DB completion write queue max size")
     parser.add_argument(
         "--db-drain-every",
         type=int,
@@ -99,12 +101,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         action="append",
         help="pass@k values to generate for and compute (default: none; can be set in configs/<benchmark>.toml)",
-    )
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="avg@k values to compute from generated samples (default: none; can be set in configs/<benchmark>.toml)",
     )
     parser.add_argument(
         "--judge-mode",
@@ -130,14 +126,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
     return parser.parse_args(argv)
-
-
-def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
-    if raw:
-        return raw
-    if job_name.endswith("_naive"):
-        return "naive"
-    return "normal"
 
 
 def _close_writer_and_mark_failed(
@@ -188,7 +176,7 @@ def main(
     load_env_file(Path(".env"))
     judge_mode = JudgeMode(args.judge_mode)
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", default_job_name(judge_mode))
-    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
+    prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
     model_name = resolve_backend_model_name(args)
@@ -315,7 +303,7 @@ def main(
             raise
 
     completions_payloads = runtime.complete_attempt_stage(writer, timeout_s=close_timeout_s)
-    try:
+    with scoring_stage(runtime):
         evaluation = evaluate_free_response(
             completions_payloads,
             dataset_path=str(dataset_path),
@@ -374,9 +362,6 @@ def main(
             extra={"cot_mode": CoTMode.COT.value, "prompt_profile": prompt_profile},
         )
         runtime.record_score(score_payload)
-    except Exception as exc:
-        runtime.fail_task(error=str(exc))
-        raise
     if judge_mode is JudgeMode.LLM:
         print(f"✅ judge CoT done: {result.sample_count} samples")
     else:

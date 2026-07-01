@@ -58,7 +58,7 @@ def _select_remote_candidate(
                 maybe.job_id,
                 reason="max_active_coding_runners",
                 active_coding_runners=active_coding_runners,
-                max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                max_active_coding_runners=int(opts.coding.max_active_runners or 0),
                 worker_slot=resource,
             )
             skipped_remote_job_ids.add(maybe.job_id)
@@ -113,7 +113,7 @@ def _claim_item_for_resource(
                     candidate.job_id,
                     reason="max_active_coding_runners",
                     active_coding_runners=active_coding_runners,
-                    max_active_coding_runners=int(opts.max_active_coding_runners or 0),
+                    max_active_coding_runners=int(opts.coding.max_active_runners or 0),
                     worker_slot=resource,
                 )
                 continue
@@ -172,11 +172,11 @@ def _launch_queue_items(
     resource_label = "Free slots" if remote_mode else "Idle GPUs"
     print(f"🧮 Pending={len(queue)} | {resource_label}={', '.join(available_resources)}")
     running_now = base.load_running(opts.pid_dir)
-    remote_slots = base.remote_slot_map(opts.infer_models) if remote_mode else {}
+    remote_slots = base.remote_slot_map(opts.inference.models) if remote_mode else {}
     occupied_remote_slots = (
         base._running_remote_slot_slugs(
             running_now,
-            opts.infer_models,
+            opts.inference.models,
             generated_job_ids=generated_job_ids,
         )
         if remote_mode
@@ -297,10 +297,10 @@ def _launch_queue_items(
             env["RWKV_SKILLS_INFER_BASE_URL"] = str(item.infer_base_url or "")
             env["RWKV_SKILLS_INFER_MODEL"] = str(item.infer_model or item.model_name or "")
             env["CUDA_VISIBLE_DEVICES"] = ""
-            if opts.infer_api_key:
-                env["RWKV_SKILLS_INFER_API_KEY"] = opts.infer_api_key
-            env["RWKV_SKILLS_INFER_PROTOCOL"] = str(opts.infer_protocol or "openai")
-            env["RWKV_SKILLS_INFER_SEED_POLICY"] = str(opts.infer_seed_policy or "preserve")
+            if opts.inference.api_key:
+                env["RWKV_SKILLS_INFER_API_KEY"] = opts.inference.api_key
+            env["RWKV_SKILLS_INFER_PROTOCOL"] = str(opts.inference.protocol or "openai")
+            env["RWKV_SKILLS_INFER_SEED_POLICY"] = str(opts.inference.seed_policy or "preserve")
         if opts.disable_checker:
             env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
 
@@ -311,13 +311,13 @@ def _launch_queue_items(
         if item.is_remote and job.batch_flag:
             if item_budget is not None and item_budget.remote_batch_size is not None:
                 batch_size = max(1, int(item_budget.remote_batch_size))
-            elif opts.remote_batch_size is not None:
-                batch_size = max(1, int(opts.remote_batch_size))
+            elif opts.inference.remote_batch_size is not None:
+                batch_size = max(1, int(opts.inference.remote_batch_size))
             if (
-                opts.plain_choice_batch_size is not None
+                opts.inference.plain_choice_batch_size is not None
                 and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
             ):
-                batch_size = max(1, int(opts.plain_choice_batch_size))
+                batch_size = max(1, int(opts.inference.plain_choice_batch_size))
         if not item.is_remote and item.model_path is not None:
             batch_size = batch_profiler.determine_batch_size(
                 job=job,
@@ -333,12 +333,12 @@ def _launch_queue_items(
         extra_args = item.extra_args + _coding_extra_args(opts, job) + _function_calling_extra_args(opts, job)
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
-        infer_timeout_s = opts.infer_timeout_s
+        infer_timeout_s = opts.inference.timeout_s
         if (
-            opts.plain_choice_timeout_s is not None
+            opts.inference.plain_choice_timeout_s is not None
             and item.job_name in {"multi_choice_plain", "multi_choice_plain_naive"}
         ):
-            infer_timeout_s = max(1.0, float(opts.plain_choice_timeout_s))
+            infer_timeout_s = max(1.0, float(opts.inference.plain_choice_timeout_s))
 
         command = build_command(
             job,
@@ -347,33 +347,33 @@ def _launch_queue_items(
             None if item.is_remote else f"cuda:{resource}",
             batch_size=batch_size,
             extra_args=extra_args,
-            infer_api_key=opts.infer_api_key,
+            infer_api_key=opts.inference.api_key,
             infer_timeout_s=infer_timeout_s,
             infer_max_workers=(
                 item_budget.infer_max_workers
                 if item_budget is not None
-                else opts.infer_max_workers
+                else opts.inference.max_workers
             ),
-            infer_protocol=opts.infer_protocol,
-            infer_seed_policy=opts.infer_seed_policy,
+            infer_protocol=opts.inference.protocol,
+            infer_seed_policy=opts.inference.seed_policy,
         )
         _backup_run_config(
             model_name=item.model_name or item.model_slug,
             model_path=item.model_path,
             infer_base_url=item.infer_base_url,
             infer_model=item.infer_model,
-            infer_protocol=opts.infer_protocol,
-            infer_seed_policy=opts.infer_seed_policy,
+            infer_protocol=opts.inference.protocol,
+            infer_seed_policy=opts.inference.seed_policy,
             dataset_slug=dataset_slug,
             dataset_path=dataset_path,
             job_name=item.job_name,
             job_id=item.job_id,
             batch_size=batch_size,
-            sample_workers=opts.sample_workers,
+            sample_workers=opts.inference.sample_workers,
             infer_max_workers=(
                 item_budget.infer_max_workers
                 if item_budget is not None
-                else opts.infer_max_workers
+                else opts.inference.max_workers
             ),
             budget_reason=(item_budget.reason if item_budget is not None else None),
             gpu=(None if item.is_remote else f"cuda:{resource}"),
@@ -398,8 +398,8 @@ def _launch_queue_items(
             meta["infer_base_url"] = str(item.infer_base_url)
             meta["infer_model"] = str(item.infer_model or item.model_name)
             meta["remote_slot"] = resource
-            if opts.sample_workers is not None:
-                meta["sample_workers"] = max(1, int(opts.sample_workers))
+            if opts.inference.sample_workers is not None:
+                meta["sample_workers"] = max(1, int(opts.inference.sample_workers))
             if item_budget is not None:
                 meta["infer_max_workers"] = item_budget.infer_max_workers
                 meta["remote_budget_reason"] = item_budget.reason
@@ -775,9 +775,9 @@ def _candidate_exceeds_coding_limit(
     candidate: QueueItem,
     active_coding_runners: int,
 ) -> bool:
-    if opts.max_active_coding_runners is None:
+    if opts.coding.max_active_runners is None:
         return False
-    limit = max(1, int(opts.max_active_coding_runners))
+    limit = max(1, int(opts.coding.max_active_runners))
     job = base.JOB_CATALOGUE.get(candidate.job_name)
     return bool(job is not None and job.runner_group is RunnerGroup.CODING and active_coding_runners >= limit)
 
@@ -798,45 +798,45 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
         if value:
             args.extend([flag, str(value)])
 
-    _append_str("--prompt-style", opts.function_prompt_style)
+    _append_str("--prompt-style", opts.functions.prompt_style)
     if job.name in base._SAMPLE_WORKER_JOB_NAMES:
-        _append("--sample-workers", opts.sample_workers)
-    _append_str("--tool-catalog-format", opts.function_tool_catalog_format)
-    _append("--cot-max-tokens", opts.function_cot_max_tokens)
-    _append("--decision-max-tokens", opts.function_decision_max_tokens)
-    _append("--planning-max-tokens", opts.function_planning_max_tokens)
-    _append("--final-max-tokens", opts.function_final_max_tokens)
-    _append("--answer-max-tokens", opts.function_answer_max_tokens)
-    _append("--history-max-chars", opts.function_history_max_chars)
-    _append("--prompt-max-chars", opts.function_prompt_max_chars)
-    _append_str("--long-doc-mode", opts.function_long_doc_mode)
-    _append_str("--tool-router-mode", opts.function_tool_router_mode)
-    _append("--tool-router-max-tools", opts.function_tool_router_max_tools)
-    _append("--tool-router-trigger-tool-count", opts.function_tool_router_trigger_tool_count)
-    _append("--tool-router-trigger-catalog-chars", opts.function_tool_router_trigger_catalog_chars)
-    _append_str("--candidate-router-mode", opts.function_candidate_router_mode)
-    _append("--candidate-router-chunk-tools", opts.function_candidate_router_chunk_tools)
-    _append("--candidate-router-batch-size", opts.function_candidate_router_batch_size)
-    _append("--candidate-router-prompt-max-chars", opts.function_candidate_router_prompt_max_chars)
-    _append("--candidate-router-context-chars", opts.function_candidate_router_context_chars)
-    _append("--candidate-router-candidate-max-tokens", opts.function_candidate_router_candidate_max_tokens)
-    _append("--candidate-router-aggregate-max-tokens", opts.function_candidate_router_aggregate_max_tokens)
-    _append("--candidate-router-max-candidates", opts.function_candidate_router_max_candidates)
-    _append_str("--candidate-router-tool-schema-mode", opts.function_candidate_router_tool_schema_mode)
-    _append("--candidate-router-evidence-chars", opts.function_candidate_router_evidence_chars)
-    _append("--candidate-router-policy-chars", opts.function_candidate_router_policy_chars)
-    _append("--max-rounds", opts.function_max_rounds)
-    _append("--max-steps", opts.function_max_steps)
-    _append("--max-tool-errors", opts.function_max_tool_errors)
+        _append("--sample-workers", opts.inference.sample_workers)
+    _append_str("--tool-catalog-format", opts.functions.tool_catalog_format)
+    _append("--cot-max-tokens", opts.functions.cot_max_tokens)
+    _append("--decision-max-tokens", opts.functions.decision_max_tokens)
+    _append("--planning-max-tokens", opts.functions.planning_max_tokens)
+    _append("--final-max-tokens", opts.functions.final_max_tokens)
+    _append("--answer-max-tokens", opts.functions.answer_max_tokens)
+    _append("--history-max-chars", opts.functions.history_max_chars)
+    _append("--prompt-max-chars", opts.functions.prompt_max_chars)
+    _append_str("--long-doc-mode", opts.functions.long_doc_mode)
+    _append_str("--tool-router-mode", opts.functions.tool_router_mode)
+    _append("--tool-router-max-tools", opts.functions.tool_router_max_tools)
+    _append("--tool-router-trigger-tool-count", opts.functions.tool_router_trigger_tool_count)
+    _append("--tool-router-trigger-catalog-chars", opts.functions.tool_router_trigger_catalog_chars)
+    _append_str("--candidate-router-mode", opts.functions.candidate_router_mode)
+    _append("--candidate-router-chunk-tools", opts.functions.candidate_router_chunk_tools)
+    _append("--candidate-router-batch-size", opts.functions.candidate_router_batch_size)
+    _append("--candidate-router-prompt-max-chars", opts.functions.candidate_router_prompt_max_chars)
+    _append("--candidate-router-context-chars", opts.functions.candidate_router_context_chars)
+    _append("--candidate-router-candidate-max-tokens", opts.functions.candidate_router_candidate_max_tokens)
+    _append("--candidate-router-aggregate-max-tokens", opts.functions.candidate_router_aggregate_max_tokens)
+    _append("--candidate-router-max-candidates", opts.functions.candidate_router_max_candidates)
+    _append_str("--candidate-router-tool-schema-mode", opts.functions.candidate_router_tool_schema_mode)
+    _append("--candidate-router-evidence-chars", opts.functions.candidate_router_evidence_chars)
+    _append("--candidate-router-policy-chars", opts.functions.candidate_router_policy_chars)
+    _append("--max-rounds", opts.functions.max_rounds)
+    _append("--max-steps", opts.functions.max_steps)
+    _append("--max-tool-errors", opts.functions.max_tool_errors)
     return tuple(args)
 
 
 def _coding_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
     if job.runner_group is not RunnerGroup.CODING:
         return ()
-    if opts.coding_eval_workers is None:
+    if opts.coding.eval_workers is None:
         return ()
-    return ("--eval-workers", str(max(1, int(opts.coding_eval_workers))))
+    return ("--eval-workers", str(max(1, int(opts.coding.eval_workers))))
 
 
 def _clean_param_swap_records(log_dir: Path) -> None:

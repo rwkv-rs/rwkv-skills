@@ -23,7 +23,10 @@ from src.eval.performance.workload import parse_int_csv
 from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
 from .actions import (
+    CodingConfig,
     DispatchOptions,
+    FunctionCallingConfig,
+    InferenceConfig,
     LogsOptions,
     StatusOptions,
     StopOptions,
@@ -465,78 +468,84 @@ def _dispatch_options_from_args(
         model_name_patterns=model_name_patterns,
         enable_param_search=bool(args.enable_param_search),
         run_mode=run_mode,
-        infer_base_url=infer_base_url,
-        infer_models=infer_models,
-        infer_api_key=str(getattr(args, "infer_api_key", "") or ""),
-        infer_timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
-        infer_max_workers=int(getattr(args, "infer_max_workers", DEFAULT_INFER_MAX_WORKERS)),
-        infer_worker_profile=str(getattr(args, "infer_worker_profile", "fixed") or "fixed"),
-        infer_protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),
-        infer_seed_policy=str(getattr(args, "infer_seed_policy", "preserve") or "preserve"),
-        remote_batch_size=(
-            int(getattr(args, "remote_batch_size"))
-            if getattr(args, "remote_batch_size", None) is not None
-            else None
+        inference=InferenceConfig(
+            base_url=infer_base_url,
+            models=infer_models,
+            api_key=str(getattr(args, "infer_api_key", "") or ""),
+            timeout_s=float(getattr(args, "infer_timeout_s", 600.0)),
+            max_workers=int(getattr(args, "infer_max_workers", DEFAULT_INFER_MAX_WORKERS)),
+            worker_profile=str(getattr(args, "infer_worker_profile", "fixed") or "fixed"),
+            protocol=str(getattr(args, "infer_protocol", "openai") or "openai"),
+            seed_policy=str(getattr(args, "infer_seed_policy", "preserve") or "preserve"),
+            remote_batch_size=(
+                int(getattr(args, "remote_batch_size"))
+                if getattr(args, "remote_batch_size", None) is not None
+                else None
+            ),
+            plain_choice_batch_size=(
+                int(getattr(args, "plain_choice_batch_size"))
+                if getattr(args, "plain_choice_batch_size", None) is not None
+                else None
+            ),
+            plain_choice_timeout_s=(
+                float(getattr(args, "plain_choice_timeout_s"))
+                if getattr(args, "plain_choice_timeout_s", None) is not None
+                else None
+            ),
+            sample_workers=(
+                int(getattr(args, "sample_workers"))
+                if getattr(args, "sample_workers", None) is not None
+                else None
+            ),
+            backpressure=not bool(getattr(args, "disable_infer_backpressure", False)),
+            backpressure_timeout_s=float(getattr(args, "infer_backpressure_timeout_s", 2.0)),
+            backpressure_pending_high_watermark=int(
+                getattr(args, "infer_backpressure_pending_high_watermark", 0)
+            ),
+            budget_min_workers=int(getattr(args, "infer_budget_min_workers", 1)),
         ),
-        plain_choice_batch_size=(
-            int(getattr(args, "plain_choice_batch_size"))
-            if getattr(args, "plain_choice_batch_size", None) is not None
-            else None
+        functions=FunctionCallingConfig(
+            prompt_style=getattr(args, "function_prompt_style", None),
+            tool_catalog_format=getattr(args, "function_tool_catalog_format", None),
+            cot_max_tokens=getattr(args, "function_cot_max_tokens", None),
+            decision_max_tokens=getattr(args, "function_decision_max_tokens", None),
+            planning_max_tokens=getattr(args, "function_planning_max_tokens", None),
+            final_max_tokens=getattr(args, "function_final_max_tokens", None),
+            answer_max_tokens=getattr(args, "function_answer_max_tokens", None),
+            history_max_chars=getattr(args, "function_history_max_chars", None),
+            prompt_max_chars=getattr(args, "function_prompt_max_chars", None),
+            long_doc_mode=getattr(args, "function_long_doc_mode", None),
+            tool_router_mode=getattr(args, "function_tool_router_mode", None),
+            tool_router_max_tools=getattr(args, "function_tool_router_max_tools", None),
+            tool_router_trigger_tool_count=getattr(args, "function_tool_router_trigger_tool_count", None),
+            tool_router_trigger_catalog_chars=getattr(args, "function_tool_router_trigger_catalog_chars", None),
+            candidate_router_mode=getattr(args, "function_candidate_router_mode", None),
+            candidate_router_chunk_tools=getattr(args, "function_candidate_router_chunk_tools", None),
+            candidate_router_batch_size=getattr(args, "function_candidate_router_batch_size", None),
+            candidate_router_prompt_max_chars=getattr(args, "function_candidate_router_prompt_max_chars", None),
+            candidate_router_context_chars=getattr(args, "function_candidate_router_context_chars", None),
+            candidate_router_candidate_max_tokens=getattr(args, "function_candidate_router_candidate_max_tokens", None),
+            candidate_router_aggregate_max_tokens=getattr(args, "function_candidate_router_aggregate_max_tokens", None),
+            candidate_router_max_candidates=getattr(args, "function_candidate_router_max_candidates", None),
+            candidate_router_tool_schema_mode=getattr(args, "function_candidate_router_tool_schema_mode", None),
+            candidate_router_evidence_chars=getattr(args, "function_candidate_router_evidence_chars", None),
+            candidate_router_policy_chars=getattr(args, "function_candidate_router_policy_chars", None),
+            max_rounds=getattr(args, "function_max_rounds", None),
+            max_steps=getattr(args, "function_max_steps", None),
+            max_tool_errors=getattr(args, "function_max_tool_errors", None),
         ),
-        plain_choice_timeout_s=(
-            float(getattr(args, "plain_choice_timeout_s"))
-            if getattr(args, "plain_choice_timeout_s", None) is not None
-            else None
+        coding=CodingConfig(
+            eval_workers=(
+                int(getattr(args, "coding_eval_workers"))
+                if getattr(args, "coding_eval_workers", None) is not None
+                else None
+            ),
+            max_active_runners=(
+                int(getattr(args, "max_active_coding_runners"))
+                if getattr(args, "max_active_coding_runners", None) is not None
+                else None
+            ),
         ),
-        sample_workers=(
-            int(getattr(args, "sample_workers"))
-            if getattr(args, "sample_workers", None) is not None
-            else None
-        ),
-        coding_eval_workers=(
-            int(getattr(args, "coding_eval_workers"))
-            if getattr(args, "coding_eval_workers", None) is not None
-            else None
-        ),
-        max_active_coding_runners=(
-            int(getattr(args, "max_active_coding_runners"))
-            if getattr(args, "max_active_coding_runners", None) is not None
-            else None
-        ),
-        infer_backpressure=not bool(getattr(args, "disable_infer_backpressure", False)),
-        infer_backpressure_timeout_s=float(getattr(args, "infer_backpressure_timeout_s", 2.0)),
-        infer_backpressure_pending_high_watermark=int(
-            getattr(args, "infer_backpressure_pending_high_watermark", 0)
-        ),
-        infer_budget_min_workers=int(getattr(args, "infer_budget_min_workers", 1)),
-        function_prompt_style=getattr(args, "function_prompt_style", None),
-        function_tool_catalog_format=getattr(args, "function_tool_catalog_format", None),
-        function_cot_max_tokens=getattr(args, "function_cot_max_tokens", None),
-        function_decision_max_tokens=getattr(args, "function_decision_max_tokens", None),
-        function_planning_max_tokens=getattr(args, "function_planning_max_tokens", None),
-        function_final_max_tokens=getattr(args, "function_final_max_tokens", None),
-        function_answer_max_tokens=getattr(args, "function_answer_max_tokens", None),
-        function_history_max_chars=getattr(args, "function_history_max_chars", None),
-        function_prompt_max_chars=getattr(args, "function_prompt_max_chars", None),
-        function_long_doc_mode=getattr(args, "function_long_doc_mode", None),
-        function_tool_router_mode=getattr(args, "function_tool_router_mode", None),
-        function_tool_router_max_tools=getattr(args, "function_tool_router_max_tools", None),
-        function_tool_router_trigger_tool_count=getattr(args, "function_tool_router_trigger_tool_count", None),
-        function_tool_router_trigger_catalog_chars=getattr(args, "function_tool_router_trigger_catalog_chars", None),
-        function_candidate_router_mode=getattr(args, "function_candidate_router_mode", None),
-        function_candidate_router_chunk_tools=getattr(args, "function_candidate_router_chunk_tools", None),
-        function_candidate_router_batch_size=getattr(args, "function_candidate_router_batch_size", None),
-        function_candidate_router_prompt_max_chars=getattr(args, "function_candidate_router_prompt_max_chars", None),
-        function_candidate_router_context_chars=getattr(args, "function_candidate_router_context_chars", None),
-        function_candidate_router_candidate_max_tokens=getattr(args, "function_candidate_router_candidate_max_tokens", None),
-        function_candidate_router_aggregate_max_tokens=getattr(args, "function_candidate_router_aggregate_max_tokens", None),
-        function_candidate_router_max_candidates=getattr(args, "function_candidate_router_max_candidates", None),
-        function_candidate_router_tool_schema_mode=getattr(args, "function_candidate_router_tool_schema_mode", None),
-        function_candidate_router_evidence_chars=getattr(args, "function_candidate_router_evidence_chars", None),
-        function_candidate_router_policy_chars=getattr(args, "function_candidate_router_policy_chars", None),
-        function_max_rounds=getattr(args, "function_max_rounds", None),
-        function_max_steps=getattr(args, "function_max_steps", None),
-        function_max_tool_errors=getattr(args, "function_max_tool_errors", None),
         distributed_claims=bool(getattr(args, "distributed_claims", False)),
         scheduler_node_id=(str(getattr(args, "scheduler_node_id", "") or "").strip() or None),
         lease_duration_s=int(getattr(args, "lease_duration_s", 900)),

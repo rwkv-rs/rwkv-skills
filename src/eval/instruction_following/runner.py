@@ -16,6 +16,12 @@ from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
+from src.eval.common.field_runner import (
+    add_common_runner_args,
+    attempt_stage,
+    resolve_prompt_profile,
+    scoring_stage,
+)
 from src.eval.field_common import build_plan_task_details, build_task_sampling_config, resolve_configured_k_plan, set_task_env
 from src.eval.k_values import NumericK, filter_metrics_by_k
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
@@ -43,10 +49,8 @@ _RULE_BASED_JOB_NAME = "instruction_following"
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV instruction-following evaluator")
-    parser.add_argument("--dataset", required=True, help="JSONL dataset path")
+    add_common_runner_args(parser, batch_size_default=128, db_write_queue_default=4096)
     add_inference_backend_arguments(parser)
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size for generation")
-    parser.add_argument("--max-samples", type=int, help="Limit number of samples for quick runs")
     parser.add_argument(
         "--prompt-profile",
         choices=("normal", "naive"),
@@ -55,22 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
     parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
     parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
-    parser.add_argument("--db-write-queue", type=int, default=4096, help="DB completion write queue max size")
-    parser.add_argument(
-        "--avg-k",
-        type=float,
-        action="append",
-        help="avg@k values to compute from generated samples (defaults come from configs/<benchmark>.toml)",
-    )
     return parser.parse_args(argv)
-
-
-def _resolve_prompt_profile(raw: str | None, job_name: str) -> str:
-    if raw:
-        return raw
-    if job_name.endswith("_naive"):
-        return "naive"
-    return "normal"
 
 
 def _ensure_rule_based_dataset(slug: str) -> None:
@@ -139,7 +128,7 @@ def main(
 
     service = EvalDbService()
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", "instruction_following")
-    prompt_profile = _resolve_prompt_profile(args.prompt_profile, job_name)
+    prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
@@ -166,7 +155,7 @@ def main(
 
     set_task_env(task_id)
     writer = runtime.create_writer(max_queue=args.db_write_queue)
-    try:
+    with attempt_stage(runtime, writer):
         result = pipeline.run(
             dataset_path=str(dataset_path),
             sampling=sampling,
@@ -180,11 +169,8 @@ def main(
             skip_keys=skip_keys,
             on_record=writer.enqueue,
         )
-    except Exception:
-        runtime.handle_attempt_stage_failure(writer)
-        raise
     completions_payloads = runtime.complete_attempt_stage(writer)
-    try:
+    with scoring_stage(runtime):
         is_ifbench = canonical_slug(str(slug)).startswith("ifbench")
         metrics = evaluate_instruction_following(
             completions_payloads,
@@ -222,9 +208,6 @@ def main(
             extra={"cot_mode": CoTMode.NO_COT.value, "prompt_profile": prompt_profile},
         )
         runtime.record_score(score_payload)
-    except Exception as exc:
-        runtime.fail_task(error=str(exc))
-        raise
     print(f"✅ instruction-following done: {result.sample_count} samples")
     return 0
 

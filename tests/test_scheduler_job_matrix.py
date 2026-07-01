@@ -18,6 +18,7 @@ from src.eval.scheduler.jobs import (
     locate_dataset,
 )
 from src.eval.scheduler.actions import (
+    FunctionCallingConfig,
     QueueOptions,
     _function_calling_extra_args,
     _running_remote_slot_slugs,
@@ -81,8 +82,10 @@ def test_swe_bench_coding_jobs_do_not_receive_function_prompt_flags(tmp_path: Pa
         log_dir=tmp_path / "logs",
         pid_dir=tmp_path / "pids",
         job_order=tuple(JOB_CATALOGUE.keys()),
-        function_prompt_style="rwkv-official-json",
-        function_tool_catalog_format="json",
+        functions=FunctionCallingConfig(
+            prompt_style="rwkv-official-json",
+            tool_catalog_format="json",
+        ),
     )
 
     assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from src.bin.param_search_free_response import parse_args as parse_param_search_free_response_args
 from src.bin.param_search_select import parse_args as parse_param_search_select_args
 from src.eval.scheduler import actions, actions_base, action_dispatch, queue
-from src.eval.scheduler.actions import DispatchOptions
+from src.eval.scheduler.actions import DispatchOptions, FunctionCallingConfig, InferenceConfig
 from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.backpressure import (
     RemoteConcurrencyBudget,
@@ -176,8 +176,10 @@ def test_remote_dispatch_resources_use_model_slots(tmp_path: Path) -> None:
         pid_dir=tmp_path,
         run_log_dir=tmp_path,
         job_order=("free_response",),
-        infer_base_url="http://127.0.0.1:8081",
-        infer_models=("remote-a", "remote-b"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:8081",
+            models=("remote-a", "remote-b"),
+        ),
     )
     running = {
         "code_human_eval__human_eval_test_nocot_remote_a": RunningEntry(pid=101, gpu=None),
@@ -193,8 +195,10 @@ def test_remote_dispatch_resources_respect_backpressure_without_adding_slots(tmp
         pid_dir=tmp_path,
         run_log_dir=tmp_path,
         job_order=("free_response",),
-        infer_base_url="http://127.0.0.1:8081",
-        infer_models=("remote-a", "remote-b"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:8081",
+            models=("remote-a", "remote-b"),
+        ),
     )
     budgets = {
         "remote_a": RemoteConcurrencyBudget(
@@ -223,8 +227,10 @@ def test_remote_dispatch_resources_support_alias_slots(tmp_path: Path) -> None:
         pid_dir=tmp_path,
         run_log_dir=tmp_path,
         job_order=("free_response",),
-        infer_base_url="http://127.0.0.1:8081",
-        infer_models=("slot-a=remote-a", "slot-b=remote-a"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:8081",
+            models=("slot-a=remote-a", "slot-b=remote-a"),
+        ),
     )
     running = {
         "free_response__gsm8k_test_nocot_remote_a": RunningEntry(pid=101, gpu="model:slot_a"),
@@ -266,8 +272,10 @@ def test_remote_launch_skips_busy_models_with_multiple_slots(monkeypatch, tmp_pa
         pid_dir=tmp_path / "pid",
         run_log_dir=tmp_path / "run",
         job_order=("code_human_eval",),
-        infer_base_url="http://127.0.0.1:19083/v1",
-        infer_models=("remote-a", "remote-b", "remote-c"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:19083/v1",
+            models=("remote-a", "remote-b", "remote-c"),
+        ),
     )
     items = [
         _item("remote-a", "human_eval_test"),
@@ -328,8 +336,10 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
         pid_dir=tmp_path / "pid",
         run_log_dir=tmp_path / "run",
         job_order=("code_human_eval",),
-        infer_base_url="http://127.0.0.1:19083/v1",
-        infer_models=("slot-a=remote-a", "slot-b=remote-a"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:19083/v1",
+            models=("slot-a=remote-a", "slot-b=remote-a"),
+        ),
     )
     items = [_item("human_eval_test"), _item("human_eval_cn_test")]
 
@@ -386,10 +396,12 @@ def test_remote_launch_uses_backpressure_budget(monkeypatch, tmp_path: Path) -> 
         pid_dir=tmp_path / "pid",
         run_log_dir=tmp_path / "run",
         job_order=("code_human_eval",),
-        infer_base_url="http://127.0.0.1:19083/v1",
-        infer_models=("remote-a",),
-        infer_max_workers=64,
-        remote_batch_size=64,
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:19083/v1",
+            models=("remote-a",),
+            max_workers=64,
+            remote_batch_size=64,
+        ),
     )
     budget = RemoteConcurrencyBudget(
         model="remote-a",
@@ -450,8 +462,10 @@ def test_remote_launch_continues_past_empty_model_slot(monkeypatch, tmp_path: Pa
         pid_dir=tmp_path / "pid",
         run_log_dir=tmp_path / "run",
         job_order=("code_human_eval",),
-        infer_base_url="http://127.0.0.1:19083/v1",
-        infer_models=("remote-b", "remote-c"),
+        inference=InferenceConfig(
+            base_url="http://127.0.0.1:19083/v1",
+            models=("remote-b", "remote-c"),
+        ),
     )
     actions.ensure_dirs(opts.log_dir, opts.pid_dir, opts.run_log_dir)
     actions._launch_queue_items(
@@ -484,13 +498,13 @@ def test_scheduler_start_request_builds_remote_dispatch_options() -> None:
     opts = request.to_dispatch_options()
 
     assert opts.model_globs == ()
-    assert opts.infer_base_url == "http://127.0.0.1:8081"
-    assert opts.infer_models == ("remote-demo",)
-    assert opts.infer_api_key == "secret"
-    assert opts.infer_timeout_s == 42.0
-    assert opts.infer_max_workers == 7
-    assert opts.infer_protocol == "vllm"
-    assert opts.infer_backpressure is True
+    assert opts.inference.base_url == "http://127.0.0.1:8081"
+    assert opts.inference.models == ("remote-demo",)
+    assert opts.inference.api_key == "secret"
+    assert opts.inference.timeout_s == 42.0
+    assert opts.inference.max_workers == 7
+    assert opts.inference.protocol == "vllm"
+    assert opts.inference.backpressure is True
 
 
 def test_scheduler_cli_accepts_remote_inference_flags() -> None:
@@ -638,15 +652,19 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
         pid_dir=tmp_path,
         run_log_dir=tmp_path,
         job_order=("function_bfcl_v3",),
-        function_prompt_style="rwkv_official_json",
-        sample_workers=8,
-        function_cot_max_tokens=4096,
-        function_decision_max_tokens=32,
-        function_max_steps=24,
-        function_prompt_max_chars=8192,
-        function_long_doc_mode="off",
-        function_tool_router_mode="lexical",
-        function_tool_router_max_tools=8,
+        inference=InferenceConfig(
+            sample_workers=8,
+        ),
+        functions=FunctionCallingConfig(
+            prompt_style="rwkv_official_json",
+            cot_max_tokens=4096,
+            decision_max_tokens=32,
+            max_steps=24,
+            prompt_max_chars=8192,
+            long_doc_mode="off",
+            tool_router_mode="lexical",
+            tool_router_max_tools=8,
+        ),
     )
 
     assert actions._function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"]) == (

@@ -17,6 +17,9 @@ from .models import MODEL_SELECT_CHOICES  # noqa: F401
 __all__ = [
     "DispatchOptions",
     "QueueOptions",
+    "InferenceConfig",
+    "FunctionCallingConfig",
+    "CodingConfig",
     "StatusOptions",
     "StopOptions",
     "LogsOptions",

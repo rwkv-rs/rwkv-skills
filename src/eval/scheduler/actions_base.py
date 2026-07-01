@@ -67,6 +67,64 @@ _NO_GENERATION_SLOT_RELEASE_JOBS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceConfig:
+    base_url: str | None = None
+    models: tuple[str, ...] = ()
+    api_key: str = ""
+    timeout_s: float = 600.0
+    max_workers: int = DEFAULT_INFER_MAX_WORKERS
+    worker_profile: str = "fixed"
+    protocol: str = "openai"
+    seed_policy: str = "preserve"
+    remote_batch_size: int | None = None
+    plain_choice_batch_size: int | None = None
+    plain_choice_timeout_s: float | None = None
+    sample_workers: int | None = None
+    backpressure: bool = True
+    backpressure_timeout_s: float = 2.0
+    backpressure_pending_high_watermark: int = 0
+    budget_min_workers: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionCallingConfig:
+    prompt_style: str | None = None
+    tool_catalog_format: str | None = None
+    cot_max_tokens: int | None = None
+    decision_max_tokens: int | None = None
+    planning_max_tokens: int | None = None
+    final_max_tokens: int | None = None
+    answer_max_tokens: int | None = None
+    history_max_chars: int | None = None
+    prompt_max_chars: int | None = None
+    long_doc_mode: str | None = None
+    tool_router_mode: str | None = None
+    tool_router_max_tools: int | None = None
+    tool_router_trigger_tool_count: int | None = None
+    tool_router_trigger_catalog_chars: int | None = None
+    candidate_router_mode: str | None = None
+    candidate_router_chunk_tools: int | None = None
+    candidate_router_batch_size: int | None = None
+    candidate_router_prompt_max_chars: int | None = None
+    candidate_router_context_chars: int | None = None
+    candidate_router_candidate_max_tokens: int | None = None
+    candidate_router_aggregate_max_tokens: int | None = None
+    candidate_router_max_candidates: int | None = None
+    candidate_router_tool_schema_mode: str | None = None
+    candidate_router_evidence_chars: int | None = None
+    candidate_router_policy_chars: int | None = None
+    max_rounds: int | None = None
+    max_steps: int | None = None
+    max_tool_errors: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CodingConfig:
+    eval_workers: int | None = None
+    max_active_runners: int | None = None
+
+
 @dataclass(slots=True)
 class QueueOptions:
     log_dir: Path
@@ -82,52 +140,9 @@ class QueueOptions:
     model_name_patterns: tuple[re.Pattern[str], ...] = ()
     enable_param_search: bool = False
     run_mode: RunMode = RunMode.AUTO
-    infer_base_url: str | None = None
-    infer_models: tuple[str, ...] = ()
-    infer_api_key: str = ""
-    infer_timeout_s: float = 600.0
-    infer_max_workers: int = DEFAULT_INFER_MAX_WORKERS
-    infer_worker_profile: str = "fixed"
-    infer_protocol: str = "openai"
-    infer_seed_policy: str = "preserve"
-    remote_batch_size: int | None = None
-    plain_choice_batch_size: int | None = None
-    plain_choice_timeout_s: float | None = None
-    sample_workers: int | None = None
-    infer_backpressure: bool = True
-    infer_backpressure_timeout_s: float = 2.0
-    infer_backpressure_pending_high_watermark: int = 0
-    infer_budget_min_workers: int = 1
-    coding_eval_workers: int | None = None
-    max_active_coding_runners: int | None = None
-    function_prompt_style: str | None = None
-    function_tool_catalog_format: str | None = None
-    function_cot_max_tokens: int | None = None
-    function_decision_max_tokens: int | None = None
-    function_planning_max_tokens: int | None = None
-    function_final_max_tokens: int | None = None
-    function_answer_max_tokens: int | None = None
-    function_history_max_chars: int | None = None
-    function_prompt_max_chars: int | None = None
-    function_long_doc_mode: str | None = None
-    function_tool_router_mode: str | None = None
-    function_tool_router_max_tools: int | None = None
-    function_tool_router_trigger_tool_count: int | None = None
-    function_tool_router_trigger_catalog_chars: int | None = None
-    function_candidate_router_mode: str | None = None
-    function_candidate_router_chunk_tools: int | None = None
-    function_candidate_router_batch_size: int | None = None
-    function_candidate_router_prompt_max_chars: int | None = None
-    function_candidate_router_context_chars: int | None = None
-    function_candidate_router_candidate_max_tokens: int | None = None
-    function_candidate_router_aggregate_max_tokens: int | None = None
-    function_candidate_router_max_candidates: int | None = None
-    function_candidate_router_tool_schema_mode: str | None = None
-    function_candidate_router_evidence_chars: int | None = None
-    function_candidate_router_policy_chars: int | None = None
-    function_max_rounds: int | None = None
-    function_max_steps: int | None = None
-    function_max_tool_errors: int | None = None
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
+    functions: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
+    coding: CodingConfig = field(default_factory=CodingConfig)
     distributed_claims: bool = False
     scheduler_node_id: str | None = None
     lease_duration_s: int = 900
@@ -236,8 +251,8 @@ def _build_pending_queue(
         max_param_b=opts.max_param_b,
         enable_param_search=opts.enable_param_search,
         model_name_patterns=opts.model_name_patterns,
-        infer_base_url=opts.infer_base_url,
-        infer_models=opts.infer_models,
+        infer_base_url=opts.inference.base_url,
+        infer_models=opts.inference.models,
     )
     return sort_queue_items(pending, question_counts=question_counts, job_priority=job_priority)
 
@@ -330,7 +345,7 @@ def _mark_pending_jobs(
 
 
 def _dispatch_uses_remote_inference(opts: QueueOptions) -> bool:
-    return bool(str(opts.infer_base_url or "").strip() and opts.infer_models)
+    return bool(str(opts.inference.base_url or "").strip() and opts.inference.models)
 
 
 def _distributed_claims_enabled(opts: QueueOptions) -> bool:
@@ -349,29 +364,29 @@ def _build_lease_manager(opts: QueueOptions) -> SchedulerLeaseManager | None:
 def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteConcurrencyBudget]:
     if not _dispatch_uses_remote_inference(opts):
         return {}
-    if not opts.infer_backpressure:
+    if not opts.inference.backpressure:
         budgets = static_remote_concurrency_budgets(
-            infer_models=opts.infer_models,
-            default_infer_max_workers=opts.infer_max_workers,
-            default_remote_batch_size=opts.remote_batch_size,
+            infer_models=opts.inference.models,
+            default_infer_max_workers=opts.inference.max_workers,
+            default_remote_batch_size=opts.inference.remote_batch_size,
             reason="static_backpressure_disabled",
-            infer_worker_profile=opts.infer_worker_profile,
+            infer_worker_profile=opts.inference.worker_profile,
         )
         _log_remote_budgets(budgets)
         return budgets
     try:
         signals = fetch_remote_backpressure(
-            base_url=str(opts.infer_base_url or ""),
-            api_key=opts.infer_api_key,
-            timeout_s=float(opts.infer_backpressure_timeout_s),
+            base_url=str(opts.inference.base_url or ""),
+            api_key=opts.inference.api_key,
+            timeout_s=float(opts.inference.backpressure_timeout_s),
         )
     except RemoteBackpressureError as exc:
         budgets = static_remote_concurrency_budgets(
-            infer_models=opts.infer_models,
-            default_infer_max_workers=opts.infer_max_workers,
-            default_remote_batch_size=opts.remote_batch_size,
+            infer_models=opts.inference.models,
+            default_infer_max_workers=opts.inference.max_workers,
+            default_remote_batch_size=opts.inference.remote_batch_size,
             reason="static_backpressure_unavailable",
-            infer_worker_profile=opts.infer_worker_profile,
+            infer_worker_profile=opts.inference.worker_profile,
         )
         for budget in budgets.values():
             budget.error = str(exc)
@@ -379,13 +394,13 @@ def _resolve_remote_concurrency_budgets(opts: QueueOptions) -> dict[str, RemoteC
         _log_remote_budgets(budgets)
         return budgets
     budgets = compute_remote_concurrency_budgets(
-        infer_models=opts.infer_models,
+        infer_models=opts.inference.models,
         backpressure=signals,
-        default_infer_max_workers=opts.infer_max_workers,
-        default_remote_batch_size=opts.remote_batch_size,
-        pending_high_watermark=opts.infer_backpressure_pending_high_watermark,
-        min_infer_max_workers=opts.infer_budget_min_workers,
-        infer_worker_profile=opts.infer_worker_profile,
+        default_infer_max_workers=opts.inference.max_workers,
+        default_remote_batch_size=opts.inference.remote_batch_size,
+        pending_high_watermark=opts.inference.backpressure_pending_high_watermark,
+        min_infer_max_workers=opts.inference.budget_min_workers,
+        infer_worker_profile=opts.inference.worker_profile,
     )
     _log_remote_budgets(budgets)
     return budgets
@@ -420,13 +435,13 @@ def _resolve_available_dispatch_resources(
     if _dispatch_uses_remote_inference(opts):
         occupied_slot_slugs = _running_remote_slot_slugs(
             running_entries,
-            opts.infer_models,
+            opts.inference.models,
             generated_job_ids=generated_job_ids,
         )
         budgets = remote_budgets or {}
         return [
             f"model:{slot.slot_slug}"
-            for slot in parse_remote_model_slots(opts.infer_models)
+            for slot in parse_remote_model_slots(opts.inference.models)
             if slot.slot_slug not in occupied_slot_slugs
             and (slot.slot_slug not in budgets or budgets[slot.slot_slug].launch_allowed)
         ]
@@ -604,6 +619,9 @@ def _write_stdout(text: str) -> bool:
 
 __all__ = [
     "QueueOptions",
+    "InferenceConfig",
+    "FunctionCallingConfig",
+    "CodingConfig",
     "DispatchOptions",
     "StatusOptions",
     "StopOptions",
