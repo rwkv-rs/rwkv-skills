@@ -22,5 +22,5 @@ Artifacts are written under `out/parallel_candidate_router/<timestamp>/`:
 - `<model>/score.json`
 
 The shared JSON/tool-call parsing and schema contract lives in
-`src/eval/function_calling/tool_call_contract.py`. Experiment-only logic should
+`src/eval/tasks/function_calling/tool_call_contract.py`. Experiment-only logic should
 stay in this package.

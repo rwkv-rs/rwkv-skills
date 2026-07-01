@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.knowledge import runner as knowledge_runner
+from src.eval.tasks.knowledge import runner as knowledge_runner
 
 
 def test_knowledge_runner_parser_accepts_all_modes() -> None:

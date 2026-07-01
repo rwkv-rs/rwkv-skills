@@ -785,7 +785,7 @@ def _candidate_exceeds_coding_limit(
 def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
     if job.runner_group is not RunnerGroup.FUNCTION_CALLING:
         return ()
-    if job.module != "src.eval.function_calling.runner":
+    if job.module != "src.eval.tasks.function_calling.runner":
         return ()
 
     args: list[str] = []

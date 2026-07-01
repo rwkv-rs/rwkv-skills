@@ -6,7 +6,7 @@ from typing import Any
 
 from src.eval.datasets.data_prepper.data_utils import iter_hf_dataset
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
-from src.eval.function_calling.longbench import (
+from src.eval.tasks.function_calling.longbench import (
     LONG_BENCH_DATASETS,
     LONG_BENCH_QA_DATASETS,
     load_longbench_rows_from_source,

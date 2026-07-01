@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-import src.eval.function_calling.complexfuncbench as complexfuncbench_module
-from src.eval.function_calling.complexfuncbench import (
+import src.eval.tasks.function_calling.complexfuncbench as complexfuncbench_module
+from src.eval.tasks.function_calling.complexfuncbench import (
     AgentObservation,
     AgentStepResult,
     _trim_stop_suffixes,
@@ -13,7 +13,7 @@ from src.eval.function_calling.complexfuncbench import (
     parse_complexfuncbench_calls,
     run_complexfuncbench_local_episode,
 )
-from src.eval.function_calling.tool_router import ToolRoutingConfig
+from src.eval.tasks.function_calling.tool_router import ToolRoutingConfig
 
 
 def _official_row() -> dict:

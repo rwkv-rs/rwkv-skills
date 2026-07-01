@@ -7,8 +7,8 @@ from typing import Any
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 from src.eval.datasets.runtime import download_git_repo
-from src.eval.function_calling.bfcl_exec import load_bfcl_exec_rows_from_sources
-from src.eval.function_calling.simple_tool_call import load_bfcl_ast_rows_from_sources
+from src.eval.tasks.function_calling.bfcl_exec import load_bfcl_exec_rows_from_sources
+from src.eval.tasks.function_calling.simple_tool_call import load_bfcl_ast_rows_from_sources
 from src.eval.scheduler.config import REPO_ROOT
 
 from .common import OfficialRowsDatasetSpec, first_complete_source_root

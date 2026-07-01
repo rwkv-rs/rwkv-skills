@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from src.eval.benchmark_registry import CoTMode
-from src.eval.coding import runner as coding_runner
+from src.eval.tasks.coding import runner as coding_runner
 
 
 def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.maths.common import build_llm_judge
+from src.eval.tasks.maths.common import build_llm_judge
 
 
 def test_build_llm_judge_uses_timeout_env(monkeypatch) -> None:

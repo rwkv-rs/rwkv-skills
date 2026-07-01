@@ -5,15 +5,15 @@ import types
 from src.eval.evaluating import RunContext, RunMode, TaskExecutionState
 from src.eval.execution_plan import AttemptKey
 from src.eval.scheduler.config import DBConfig
-from src.eval.function_calling import browsecomp_plus as browsecomp_plus_module
-from src.eval.function_calling import common as function_calling_common
-from src.eval.function_calling.browsecomp import (
+from src.eval.tasks.function_calling import browsecomp_plus as browsecomp_plus_module
+from src.eval.tasks.function_calling import common as function_calling_common
+from src.eval.tasks.function_calling.browsecomp import (
     BrowseCompJudgeConfig,
     BrowseCompJudgeOutcome,
     build_browsecomp_answer_prompt,
 )
-from src.eval.function_calling.browsecomp_plus import BrowseCompPlusRecord, build_browsecomp_plus_budgeted_prompt
-from src.eval.function_calling.common import (
+from src.eval.tasks.function_calling.browsecomp_plus import BrowseCompPlusRecord, build_browsecomp_plus_budgeted_prompt
+from src.eval.tasks.function_calling.common import (
     FunctionCallingRunContext,
     attach_function_calling_context_metadata,
     build_pending_attempts,
@@ -23,27 +23,27 @@ from src.eval.function_calling.common import (
     prepare_function_calling_run,
     repeat_probe_entries,
 )
-from src.eval.function_calling.context_budget import normalize_rwkv_text
-from src.eval.function_calling.final_answer import (
+from src.eval.tasks.function_calling.context_budget import normalize_rwkv_text
+from src.eval.tasks.function_calling.final_answer import (
     build_final_answer_json_call_prompt,
     parse_final_answer_call,
     render_final_answer_call,
 )
-from src.eval.function_calling.rwkv_prompt import build_rwkv_json_call_prompt, extract_json_call_value_text
-from src.eval.function_calling.mcp_bench import (
+from src.eval.tasks.function_calling.rwkv_prompt import build_rwkv_json_call_prompt, extract_json_call_value_text
+from src.eval.tasks.function_calling.mcp_bench import (
     McpBenchItem,
     McpBenchTaskSpec,
     build_final_answer_prompt,
     build_planning_json_call_prompt,
     parse_planning_decision,
 )
-from src.eval.function_calling.simple_tool_call import (
+from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
     build_simple_tool_call_prompt,
 )
 from src.infer.sampling import SamplingConfig
-from src.eval.function_calling.tool_router import ToolRoutingConfig
+from src.eval.tasks.function_calling.tool_router import ToolRoutingConfig
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 
 

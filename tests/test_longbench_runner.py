@@ -4,8 +4,8 @@ import json
 import types
 from pathlib import Path
 
-from src.eval.function_calling import longbench as longbench_module
-from src.eval.function_calling.longbench import (
+from src.eval.tasks.function_calling import longbench as longbench_module
+from src.eval.tasks.function_calling.longbench import (
     LongBenchRecord,
     MAX_LONGBENCH_GENERATION_BATCH_SIZE,
     _run_longbench,
@@ -14,7 +14,7 @@ from src.eval.function_calling.longbench import (
     normalize_longbench_answer,
     score_longbench_answer,
 )
-from src.eval.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
+from src.eval.tasks.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput, SamplingConfig
 

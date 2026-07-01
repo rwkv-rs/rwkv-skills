@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from src.eval.agent_bench.tasks import (
+from src.eval.tasks.agent_bench.tasks import (
     TAU_V2_DATA_ROOT,
     load_tau_v2_tasks,
     require_tau_v3_source,

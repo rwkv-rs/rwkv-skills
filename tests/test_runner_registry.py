@@ -66,7 +66,7 @@ def test_knowledge_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.KNOWLEDGE]
     }
-    assert knowledge_modules == {"src.eval.knowledge.runner"}
+    assert knowledge_modules == {"src.eval.tasks.knowledge.runner"}
 
 
 def test_maths_runners_share_unified_module() -> None:
@@ -74,7 +74,7 @@ def test_maths_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.MATHS]
     }
-    assert maths_modules == {"src.eval.maths.runner"}
+    assert maths_modules == {"src.eval.tasks.maths.runner"}
 
 
 def test_coding_runners_share_unified_module() -> None:
@@ -82,7 +82,7 @@ def test_coding_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.CODING]
     }
-    assert coding_modules == {"src.eval.coding.runner"}
+    assert coding_modules == {"src.eval.tasks.coding.runner"}
 
 
 def test_human_eval_job_includes_all_nocot_variants() -> None:
@@ -102,7 +102,7 @@ def test_instruction_following_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.INSTRUCTION_FOLLOWING]
     }
-    assert modules == {"src.eval.instruction_following.runner"}
+    assert modules == {"src.eval.tasks.instruction_following.runner"}
 
 
 def test_function_calling_runners_share_unified_module() -> None:
@@ -110,4 +110,4 @@ def test_function_calling_runners_share_unified_module() -> None:
         runner.module
         for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]
     }
-    assert modules == {"src.eval.function_calling.runner"}
+    assert modules == {"src.eval.tasks.function_calling.runner"}

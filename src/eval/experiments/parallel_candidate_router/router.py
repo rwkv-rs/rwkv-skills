@@ -16,20 +16,20 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.eval.agent_bench.tau_official import (
+from src.eval.tasks.agent_bench.tau_official import (
     RESPOND_TOOL_NAME,
     _compact_tool_schema,
     _minimal_tool_schema,
     _tau_airline_reservation_criteria_from_user_text,
     _tau_airline_reservation_match_score,
 )
-from src.eval.function_calling.context_budget import normalize_rwkv_text, truncate_text
-from src.eval.function_calling.rwkv_prompt import (
+from src.eval.tasks.function_calling.context_budget import normalize_rwkv_text, truncate_text
+from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     assistant_json_prefix,
     build_rwkv_json_call_prompt,
 )
-from src.eval.function_calling.tool_call_contract import (
+from src.eval.tasks.function_calling.tool_call_contract import (
     allowed_arguments_by_tool_name,
     normalize_argument_aliases,
     normalize_tool_schema,

@@ -103,8 +103,8 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 评测脚本在配置好 API_KEY/JUDGE_MODEL 时默认会运行 LLM wrong-answer checker；如需关闭，可在 dispatch 时附上 `--disable-checker`。
 可以用 `--only-datasets aime24 aime25` 这类参数仅重测指定 benchmark（名称即可，不需要 `_test` 后缀），也可以用 `--skip-datasets mmlu` 排除特定集合。若想只跑部分模型，无需填写完整路径，可使用 `--model-regex '^rwkv7-.*7\\.2b$'` 等正则过滤模型文件名，配合默认的权重 glob 即可。
 默认模型 glob 在 `src/eval/scheduler/config.py` 中配置（仅指向仓库内 `weights/rwkv7-*.pth`，请按需覆盖）。调度器现在直接派发到 field runner：
-`src.eval.knowledge.runner`、`src.eval.maths.runner`、`src.eval.coding.runner`、`src.eval.instruction_following.runner`、`src.eval.function_calling.runner`。
-数学答案可能等价但文本不完全一致的正式 math free-response benchmark 会自动走 `src.eval.maths.runner --judge-mode llm`，其余 free-response 走 `src.eval.maths.runner --judge-mode exact`。
+`src.eval.tasks.knowledge.runner`、`src.eval.tasks.maths.runner`、`src.eval.tasks.coding.runner`、`src.eval.tasks.instruction_following.runner`、`src.eval.tasks.function_calling.runner`。
+数学答案可能等价但文本不完全一致的正式 math free-response benchmark 会自动走 `src.eval.tasks.maths.runner --judge-mode llm`，其余 free-response 走 `src.eval.tasks.maths.runner --judge-mode exact`。
 采样参数的网格搜索通过 param-search 流程完成：
 - runner job 会把完整网格每个 trial 的 completions/eval/scores 写到 `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`。
 - selector job 会统计 `results/param_search/scores/...`（默认综合 `gsm8k_test` + `hendrycks_math_test`，其中 `math` 会自动映射到 `hendrycks_math_test`），并把唯一最佳格点复制/写入到不带后缀的 `{benchmark}` 产物路径。
@@ -115,7 +115,7 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 - 数据集准备：`prepare_dataset("human_eval", Path("data"))` 会下载官方 `HumanEval.jsonl.gz` 并写出 `data/human_eval/test.jsonl`。
 - 直接运行 CLI：
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/human_eval/test.jsonl \
     --benchmark-kind human_eval \
@@ -129,7 +129,7 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 - 数据集准备：`prepare_dataset("mbpp", Path("data"))` 会使用 EvalPlus 版本的 MBPP+，并将 prompt 中的 4 空格转换为制表符。
 - 运行 CLI：
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/mbpp/test.jsonl \
     --benchmark-kind mbpp \
@@ -143,7 +143,7 @@ rwkv-skills-scheduler dispatch --run-log-dir results/logs
 - 数据集准备：`prepare_dataset("livecodebench", Path("data"))` 会下载 LiveCodeBench release_v6（lite）并写出 `data/livecodebench/test.jsonl`（可用 `RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG` 覆盖版本）。
 - 运行 CLI：
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
     --benchmark-kind livecodebench \

@@ -107,9 +107,9 @@ By default the evaluator scripts run the LLM wrong-answer checker when configure
 You can re-run only specific benchmarks with `--only-datasets aime24 aime25` (names only; no `_test` suffix), or exclude sets with `--skip-datasets mmlu`. To run only a subset of models, you can filter filenames via `--model-regex '^rwkv7-.*7\\.2b$'` while keeping the default weight glob.
 
 The default model glob is configured in `src/eval/scheduler/config.py` (it only points to `weights/rwkv7-*.pth` within the repo; override as needed). Scheduler jobs now dispatch directly to the field runners:
-`src.eval.knowledge.runner`, `src.eval.maths.runner`, `src.eval.coding.runner`, `src.eval.instruction_following.runner`, `src.eval.function_calling.runner`.
+`src.eval.tasks.knowledge.runner`, `src.eval.tasks.maths.runner`, `src.eval.tasks.coding.runner`, `src.eval.tasks.instruction_following.runner`, `src.eval.tasks.function_calling.runner`.
 
-Formal maths free-response sets whose answers may be mathematically equivalent without textually matching are automatically dispatched to `src.eval.maths.runner --judge-mode llm`; other free-response tasks use `src.eval.maths.runner --judge-mode exact`.
+Formal maths free-response sets whose answers may be mathematically equivalent without textually matching are automatically dispatched to `src.eval.tasks.maths.runner --judge-mode llm`; other free-response tasks use `src.eval.tasks.maths.runner --judge-mode exact`.
 
 Sampling-parameter grid search is handled via the param-search workflow:
 - Runner jobs write *all* trial artifacts under `results/param_search/{completions,eval,scores}/{model}/{benchmark}/trial_*.{jsonl,json}`.
@@ -121,7 +121,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("human_eval", Path("data"))` downloads the official `HumanEval.jsonl.gz` and writes `data/human_eval/test.jsonl`.
 - Run via CLI:
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/human_eval/test.jsonl \
     --benchmark-kind human_eval \
@@ -135,7 +135,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("mbpp", Path("data"))` uses the EvalPlus variant MBPP+ and converts 4-space indentation in prompts into tabs.
 - Run via CLI:
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/mbpp/test.jsonl \
     --benchmark-kind mbpp \
@@ -149,7 +149,7 @@ When evaluating the latest 2.9B model, the scheduler automatically runs param-se
 - Dataset prep: `prepare_dataset("livecodebench", Path("data"))` downloads the LiveCodeBench release_v6 (lite) split and writes `data/livecodebench/test.jsonl` (override with `RWKV_SKILLS_LIVECODEBENCH_VERSION_TAG`).
 - Run via CLI:
   ```bash
-  uv run python -m src.eval.coding.runner \
+  uv run python -m src.eval.tasks.coding.runner \
     --model-path weights/rwkv7-*.pth \
     --dataset data/livecodebench/test.jsonl \
     --benchmark-kind livecodebench \

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from src.eval.datasets.runtime import UrlDownloadFile, download_url_files
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
-from src.eval.function_calling import (
+from src.eval.tasks.function_calling import (
     BrowseCompRecord,
     load_browsecomp_rows_from_csv,
     load_browsecomp_zh_rows_from_xlsx,

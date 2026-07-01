@@ -8,7 +8,7 @@ import types
 
 from src.eval.datasets.data_prepper.data_manager import prepare_dataset
 from src.eval.datasets.runtime import read_jsonl_items
-from src.eval.function_calling.complexfuncbench import (
+from src.eval.tasks.function_calling.complexfuncbench import (
     AgentObservation,
     COMPLEXFUNCBENCH_FINAL_SCHEMA,
     ComplexFuncBenchOfficialEnv,
@@ -19,8 +19,8 @@ from src.eval.function_calling.complexfuncbench import (
     parse_complexfuncbench_tool_calls,
     summarize_complexfuncbench_official_payloads,
 )
-from src.eval.function_calling import complexfuncbench as complexfuncbench_module
-from src.eval.function_calling.tool_router import ToolRoutingConfig, route_tools_for_prompt
+from src.eval.tasks.function_calling import complexfuncbench as complexfuncbench_module
+from src.eval.tasks.function_calling.tool_router import ToolRoutingConfig, route_tools_for_prompt
 
 
 def _official_source_row() -> dict:

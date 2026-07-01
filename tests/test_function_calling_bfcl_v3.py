@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import src.eval.function_calling.bfcl_v3 as bfcl_v3_mod
+import src.eval.tasks.function_calling.bfcl_v3 as bfcl_v3_mod
 from src.eval.concurrent_runner import run_episodes
 from src.eval.execution_plan import AttemptKey
-from src.eval.function_calling import bfcl_v3_runner
-from src.eval.function_calling.bfcl_v3 import (
+from src.eval.tasks.function_calling import bfcl_v3_runner
+from src.eval.tasks.function_calling.bfcl_v3 import (
     BfclTaskRecord,
     BfclTurn,
     BfclToolCallExpectation,
@@ -40,8 +40,8 @@ from src.eval.function_calling.bfcl_v3 import (
     render_bfcl_state_delta,
     start_bfcl_runtime,
 )
-from src.eval.function_calling.context_budget import trim_history, trim_message_history
-from src.eval.function_calling.tau_bench import TauToolCall
+from src.eval.tasks.function_calling.context_budget import trim_history, trim_message_history
+from src.eval.tasks.function_calling.tau_bench import TauToolCall
 from src.infer.constraints import build_bfcl_tool_call_constraint
 
 

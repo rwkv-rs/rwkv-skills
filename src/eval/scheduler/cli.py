@@ -14,11 +14,11 @@ load_env_file(Path(".env"))
 
 from src.eval.benchmark_registry import ALL_BENCHMARKS, BENCHMARK_ALIASES, BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
-from src.eval.function_calling.rwkv_prompt import (
+from src.eval.tasks.function_calling.rwkv_prompt import (
     FUNCTION_PROMPT_STYLE_CHOICES,
     FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
 )
-from src.eval.function_calling.tool_router import TOOL_ROUTER_MODE_CHOICES
+from src.eval.tasks.function_calling.tool_router import TOOL_ROUTER_MODE_CHOICES
 from src.eval.performance.workload import parse_int_csv
 from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 

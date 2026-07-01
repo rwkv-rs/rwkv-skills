@@ -719,7 +719,7 @@ def _build_runner_argv(
         _append_flag(argv, "--judge-api-key", runner_cfg.judge_api_key)
         _append_flag(argv, "--judge-base-url", runner_cfg.judge_base_url)
         _append_flag(argv, "--judge-max-workers", runner_cfg.judge_max_workers)
-    elif group is RunnerGroup.CODING or runner.module == "src.eval.coding.runner":
+    elif group is RunnerGroup.CODING or runner.module == "src.eval.tasks.coding.runner":
         _append_flag(argv, "--benchmark-kind", runner_cfg.benchmark_kind or _coding_benchmark_kind(runner.name))
         _append_flag(argv, "--max-tokens", runner_cfg.max_tokens)
         _append_flag(argv, "--temperature", runner_cfg.temperature)

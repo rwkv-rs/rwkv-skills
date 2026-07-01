@@ -94,7 +94,7 @@ def test_resolve_run_config_dispatches_to_field_runner(monkeypatch, tmp_path: Pa
     resolved = main_module.resolve_run_config(config)
 
     assert resolved.runner.name == "multi_choice_cot"
-    assert resolved.module == "src.eval.knowledge.runner"
+    assert resolved.module == "src.eval.tasks.knowledge.runner"
     assert resolved.dataset_slug == "mmlu_test"
     assert resolved.env["RWKV_SKILLS_JOB_NAME"] == "multi_choice_cot"
     assert resolved.env["RWKV_EVAL_RUN_MODE"] == "resume"
@@ -139,7 +139,7 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     resolved = main_module.resolve_run_config(config)
 
     assert resolved.runner.name == "function_bfcl_v3"
-    assert resolved.module == "src.eval.function_calling.runner"
+    assert resolved.module == "src.eval.tasks.function_calling.runner"
     assert "--avg-k" in resolved.argv
     assert "1.0" in resolved.argv
     assert "--prompt-style" in resolved.argv
@@ -192,7 +192,7 @@ def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypat
     resolved = main_module.resolve_run_config(config)
 
     assert resolved.runner.name == "code_swe_bench"
-    assert resolved.module == "src.eval.coding.runner"
+    assert resolved.module == "src.eval.tasks.coding.runner"
     assert "--long-doc-mode" in resolved.argv
     assert "lexical" in resolved.argv
     assert "--long-doc-max-evidence-chars" in resolved.argv
@@ -225,7 +225,7 @@ def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypa
     resolved = main_module.resolve_run_config(config)
 
     assert resolved.runner.name == "function_longcodebench"
-    assert resolved.module == "src.eval.function_calling.runner"
+    assert resolved.module == "src.eval.tasks.function_calling.runner"
     assert "--benchmark-kind" in resolved.argv
     assert "longcodebench" in resolved.argv
     assert "--answer-max-tokens" in resolved.argv
@@ -400,7 +400,7 @@ path = "weights/model.pth"
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["job"] == "instruction_following"
-    assert payload["module"] == "src.eval.instruction_following.runner"
+    assert payload["module"] == "src.eval.tasks.instruction_following.runner"
     assert payload["dataset_slug"] == "ifeval_test"
 
 

@@ -6,7 +6,7 @@ from typing import Any
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 from src.eval.datasets.runtime import download_hf_repo
-from src.eval.function_calling.browsecomp_plus import (
+from src.eval.tasks.function_calling.browsecomp_plus import (
     DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT,
     OFFICIAL_BROWSECOMP_PLUS_SOURCE,
     browsecomp_plus_index_path,

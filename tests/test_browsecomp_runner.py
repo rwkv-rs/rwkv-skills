@@ -4,12 +4,12 @@ import json
 import types
 from pathlib import Path
 
-from src.eval.function_calling import browsecomp as browsecomp_module
-from src.eval.function_calling.browsecomp import (
+from src.eval.tasks.function_calling import browsecomp as browsecomp_module
+from src.eval.tasks.function_calling.browsecomp import (
     BrowseCompJudgeOutcome,
     _run_browsecomp,
 )
-from src.eval.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
+from src.eval.tasks.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 

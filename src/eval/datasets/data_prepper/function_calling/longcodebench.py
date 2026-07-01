@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
-from src.eval.function_calling.longcodebench import (
+from src.eval.tasks.function_calling.longcodebench import (
     LONGCODEBENCH_HF_REPO,
     LONGCODEQA_ARCHIVE,
     load_longcodeqa_rows_from_source,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from src.eval.knowledge.pipeline import MultipleChoicePipeline
+from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
 from src.infer.sampling import GenerationOutput
 from src.infer.sampling import SamplingConfig

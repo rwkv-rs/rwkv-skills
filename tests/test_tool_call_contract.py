@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.eval.function_calling.tool_call_contract import (
+from src.eval.tasks.function_calling.tool_call_contract import (
     allowed_arguments_by_tool_name,
     normalize_tool_call_arguments,
     parse_tool_call_text,

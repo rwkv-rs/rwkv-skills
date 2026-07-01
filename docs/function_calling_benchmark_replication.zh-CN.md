@@ -43,14 +43,14 @@
 | runner 注册和 job 映射 | `src/eval/runner_registry.py` |
 | scheduler job catalog | `src/eval/scheduler/jobs.py` |
 | scheduler CLI | `src/eval/scheduler/cli.py` |
-| function-calling 统一入口 | `src/eval/function_calling/runner.py` |
-| function-calling 公共运行逻辑 | `src/eval/function_calling/common.py` |
-| RWKV 官方 JSON prompt 格式 | `src/eval/function_calling/rwkv_prompt.py` |
-| 简单 tool-call prompt / decode / eval | `src/eval/function_calling/simple_tool_call.py` |
-| APIBank 真实执行 | `src/eval/function_calling/api_bank.py` |
-| BFCL exec 真实执行 | `src/eval/function_calling/bfcl_exec.py` |
-| ToolAlpaca simulator / real HTTP | `src/eval/function_calling/toolalpaca.py` |
-| ToolAlpaca 源数据解析 | `src/eval/function_calling/toolalpaca_source.py` |
+| function-calling 统一入口 | `src/eval/tasks/function_calling/runner.py` |
+| function-calling 公共运行逻辑 | `src/eval/tasks/function_calling/common.py` |
+| RWKV 官方 JSON prompt 格式 | `src/eval/tasks/function_calling/rwkv_prompt.py` |
+| 简单 tool-call prompt / decode / eval | `src/eval/tasks/function_calling/simple_tool_call.py` |
+| APIBank 真实执行 | `src/eval/tasks/function_calling/api_bank.py` |
+| BFCL exec 真实执行 | `src/eval/tasks/function_calling/bfcl_exec.py` |
+| ToolAlpaca simulator / real HTTP | `src/eval/tasks/function_calling/toolalpaca.py` |
+| ToolAlpaca 源数据解析 | `src/eval/tasks/function_calling/toolalpaca_source.py` |
 | 数据准备入口 | `src/eval/datasets/data_prepper/data_manager.py` |
 | APIBank 数据准备 | `src/eval/datasets/data_prepper/function_calling/api_bank.py` |
 | BFCL 数据准备 | `src/eval/datasets/data_prepper/function_calling/bfcl_small.py` |
@@ -117,8 +117,8 @@ ToolAlpaca 的 `tools[*].metadata` 必须保留 OpenAPI 路由信息：
 
 当前 function-calling 只支持 `rwkv_official_json`，实现路径：
 
-- `src/eval/function_calling/rwkv_prompt.py`
-- `src/eval/function_calling/simple_tool_call.py::build_simple_tool_call_prompt`
+- `src/eval/tasks/function_calling/rwkv_prompt.py`
+- `src/eval/tasks/function_calling/simple_tool_call.py::build_simple_tool_call_prompt`
 
 关键格式：
 
@@ -140,7 +140,7 @@ Assistant: <think>
 - 输出必须是一个 JSON object 或 JSON array。
 - 单工具调用输出 `{"name": "...", "arguments": {...}}`。
 - 多工具调用输出 `[{"name": "...", "arguments": {...}}, ...]`。
-- 停止后缀来自 `src/eval/function_calling/rwkv_prompt.py::JSON_CALL_STOP_SUFFIXES`：
+- 停止后缀来自 `src/eval/tasks/function_calling/rwkv_prompt.py::JSON_CALL_STOP_SUFFIXES`：
 
 ````text
 \n```
@@ -169,8 +169,8 @@ API-Bank date convention: if a month/day or relative date has no explicit year a
 
 涉及文件：
 
-- runner：`src/eval/function_calling/api_bank.py`
-- prompt/decode 公共层：`src/eval/function_calling/simple_tool_call.py`
+- runner：`src/eval/tasks/function_calling/api_bank.py`
+- prompt/decode 公共层：`src/eval/tasks/function_calling/simple_tool_call.py`
 - 数据准备：`src/eval/datasets/data_prepper/function_calling/api_bank.py`
 - registry：`src/eval/benchmark_registry.py`
 - 本地数据：`data/apibank_level1/test.jsonl`、`data/apibank_level2/test.jsonl`
@@ -197,7 +197,7 @@ $API_BANK_SOURCE_ROOT/lv1-lv2-samples/level-1-given-desc
 
 真实执行方式：
 
-- `ApiBankSandbox` 在 `src/eval/function_calling/api_bank.py`。
+- `ApiBankSandbox` 在 `src/eval/tasks/function_calling/api_bank.py`。
 - 动态 import 官方 `apis/*.py`。
 - 读取 `$API_BANK_SOURCE_ROOT/init_database/*.json`。
 - 对模型生成的 API name / arguments 调用官方 API class。
@@ -209,8 +209,8 @@ $API_BANK_SOURCE_ROOT/lv1-lv2-samples/level-1-given-desc
 
 涉及文件：
 
-- runner / sandbox：`src/eval/function_calling/bfcl_exec.py`
-- prompt/decode 公共层：`src/eval/function_calling/simple_tool_call.py`
+- runner / sandbox：`src/eval/tasks/function_calling/bfcl_exec.py`
+- prompt/decode 公共层：`src/eval/tasks/function_calling/simple_tool_call.py`
 - 数据准备：`src/eval/datasets/data_prepper/function_calling/bfcl_small.py`
 - 本地数据：
   - `data/bfcl_exec_simple/test.jsonl`
@@ -244,7 +244,7 @@ BFCL_V4_SOURCE_ROOT=/path/to/gorilla/berkeley-function-call-leaderboard/bfcl_eva
 
 真实执行方式：
 
-- `BfclExecSandbox` 在 `src/eval/function_calling/bfcl_exec.py`。
+- `BfclExecSandbox` 在 `src/eval/tasks/function_calling/bfcl_exec.py`。
 - reference 和 model output 都会被渲染为 Python 风格调用字符串。
 - sandbox 执行 `expected_executable_calls` 得到 reference result。
 - sandbox 执行模型 decoded calls 得到 actual result。
@@ -263,8 +263,8 @@ BFCL_V4_SOURCE_ROOT=/path/to/gorilla/berkeley-function-call-leaderboard/bfcl_eva
 
 涉及文件：
 
-- runner / sandbox：`src/eval/function_calling/toolalpaca.py`
-- 源数据解析：`src/eval/function_calling/toolalpaca_source.py`
+- runner / sandbox：`src/eval/tasks/function_calling/toolalpaca.py`
+- 源数据解析：`src/eval/tasks/function_calling/toolalpaca_source.py`
 - 数据准备：`src/eval/datasets/data_prepper/function_calling/toolalpaca.py`
 - 本地数据：
   - `data/toolalpaca_eval_simulated/test.jsonl`
@@ -325,7 +325,7 @@ CURRENCYBEACON_API_KEY=...
 CURRENCY_BEACON_API_KEY=...
 ```
 
-这些 key 的注入逻辑在 `src/eval/function_calling/toolalpaca.py`：
+这些 key 的注入逻辑在 `src/eval/tasks/function_calling/toolalpaca.py`：
 
 - `_TOOLALPACA_AUTH_ENV_BY_API`
 - `_inject_toolalpaca_auth_placeholders`
@@ -519,7 +519,7 @@ scripts/schema.sql
 单 dataset 调试命令：
 
 ```bash
-.venv/bin/python -m src.eval.function_calling.runner \
+.venv/bin/python -m src.eval.tasks.function_calling.runner \
   --dataset data/bfcl_exec_simple/test.jsonl \
   --infer-base-url http://127.0.0.1:19081 \
   --infer-model rwkv7-g1f-13.3b-20260415-ctx8192 \
@@ -673,12 +673,12 @@ AND (
 另一个项目如果不想复刻完整 scheduler，最少需要复制这些模块的行为：
 
 1. 数据准备：`src/eval/datasets/data_prepper/function_calling/*.py`
-2. prompt 和 decode：`src/eval/function_calling/rwkv_prompt.py`、`src/eval/function_calling/simple_tool_call.py`
+2. prompt 和 decode：`src/eval/tasks/function_calling/rwkv_prompt.py`、`src/eval/tasks/function_calling/simple_tool_call.py`
 3. evaluator：
-   - `src/eval/function_calling/api_bank.py`
-   - `src/eval/function_calling/bfcl_exec.py`
-   - `src/eval/function_calling/toolalpaca.py`
-   - `src/eval/function_calling/toolalpaca_source.py`
+   - `src/eval/tasks/function_calling/api_bank.py`
+   - `src/eval/tasks/function_calling/bfcl_exec.py`
+   - `src/eval/tasks/function_calling/toolalpaca.py`
+   - `src/eval/tasks/function_calling/toolalpaca_source.py`
 4. 远端推理协议：`src/infer/backend.py::RemoteInferenceBackend`
 5. DB schema：`scripts/schema.sql`
 6. scheduler job 命名：

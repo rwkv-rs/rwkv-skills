@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.coding.pipeline import (
+from src.eval.tasks.coding.pipeline import (
     _format_lcb_cot_prompt,
     _format_lcb_final_prompt,
     _format_prompt,

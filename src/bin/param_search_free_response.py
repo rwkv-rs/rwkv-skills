@@ -11,8 +11,8 @@ from typing import Sequence
 
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.evaluating import run_checker_for_task
-from src.eval.maths.common import count_free_answer_records
-from src.eval.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
+from src.eval.tasks.maths.common import count_free_answer_records
+from src.eval.tasks.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
 from src.eval.metrics.free_response import attach_strategy_task_ids, build_grouped_metrics_payload, evaluate_free_response
 from src.eval.param_search.cot_grid import COT_GRID, grid_size, iter_cot_sampling_grid
 from src.eval.results.payloads import make_score_payload

@@ -16,8 +16,8 @@ from typing import Sequence
 from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
 from src.eval.evaluating import run_checker_for_task
 from src.eval.env_config import load_env_file
-from src.eval.maths.common import build_llm_judge, count_free_answer_records
-from src.eval.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
+from src.eval.tasks.maths.common import build_llm_judge, count_free_answer_records
+from src.eval.tasks.maths.pipeline import DEFAULT_FINAL_PROMPT, FreeResponsePipeline
 from src.eval.metrics.free_response import (
     attach_strategy_task_ids,
     build_grouped_metrics_payload,

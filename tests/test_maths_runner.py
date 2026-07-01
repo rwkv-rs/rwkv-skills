@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.maths import runner as maths_runner
+from src.eval.tasks.maths import runner as maths_runner
 
 
 def test_maths_runner_parser_accepts_judge_mode() -> None:

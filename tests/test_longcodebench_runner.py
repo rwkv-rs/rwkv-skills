@@ -5,8 +5,8 @@ import types
 import zipfile
 from pathlib import Path
 
-from src.eval.function_calling import longcodebench as longcodebench_module
-from src.eval.function_calling.longcodebench import (
+from src.eval.tasks.function_calling import longcodebench as longcodebench_module
+from src.eval.tasks.function_calling.longcodebench import (
     LongCodeQARecord,
     _run_longcodebench,
     build_longcodeqa_budgeted_prompt,
@@ -14,7 +14,7 @@ from src.eval.function_calling.longcodebench import (
     normalize_longcodeqa_answer,
     score_longcodeqa_answer,
 )
-from src.eval.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
+from src.eval.tasks.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput, SamplingConfig
 

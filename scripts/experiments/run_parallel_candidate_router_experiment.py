@@ -13,7 +13,7 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 from zoneinfo import ZoneInfo
 
-from src.eval.agent_bench.tau_official import (
+from src.eval.tasks.agent_bench.tau_official import (
     DEFAULT_TAU_PROMPT_MAX_CHARS,
     RWKVTauOfficialAgent,
     TauOfficialRuntime,
@@ -21,7 +21,7 @@ from src.eval.agent_bench.tau_official import (
     _build_tau_tool_facts_message,
     _tau_messages_to_prompt_messages,
 )
-from src.eval.agent_bench.tasks import require_tau_v3_source
+from src.eval.tasks.agent_bench.tasks import require_tau_v3_source
 from src.eval.env_config import (
     apply_openai_env,
     load_env_file,
@@ -33,8 +33,8 @@ from src.eval.experiments.parallel_candidate_router import (
     ParallelCandidateRouterConfig,
     route_parallel_candidate_tool_call,
 )
-from src.eval.function_calling.tau_bench import TauManifestRecord, load_tau_manifest_records
-from src.eval.function_calling.tau_runner import (
+from src.eval.tasks.function_calling.tau_bench import TauManifestRecord, load_tau_manifest_records
+from src.eval.tasks.function_calling.tau_runner import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOOL_ERRORS,
     DEFAULT_TAU_HISTORY_MAX_CHARS,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from src.eval.coding.swe_bench import (
+from src.eval.tasks.coding.swe_bench import (
     build_swebench_prompt,
     build_swebench_prompt_with_trace,
     extract_swebench_patch,

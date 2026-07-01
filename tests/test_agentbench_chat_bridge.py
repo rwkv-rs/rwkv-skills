@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.eval.agent_bench.chat_bridge import RWKVChatBridge
+from src.eval.tasks.agent_bench.chat_bridge import RWKVChatBridge
 
 
 class _FakeEngine:

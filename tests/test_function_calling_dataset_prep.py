@@ -6,7 +6,7 @@ import zipfile
 
 from src.eval.datasets.data_prepper.data_manager import available_function_calling_datasets, prepare_dataset
 from src.eval.datasets.runtime import read_jsonl_items
-from src.eval.function_calling import BrowseCompRecord, McpBenchItem, McpBenchTaskSpec
+from src.eval.tasks.function_calling import BrowseCompRecord, McpBenchItem, McpBenchTaskSpec
 
 
 _MCP_BENCH_SPLIT_FILES = (

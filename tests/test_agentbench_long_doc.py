@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.function_calling.agentbench import build_agentbench_prompt
+from src.eval.tasks.function_calling.agentbench import build_agentbench_prompt
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 
 

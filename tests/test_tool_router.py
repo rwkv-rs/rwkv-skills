@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.eval.function_calling.tool_router import (
+from src.eval.tasks.function_calling.tool_router import (
     ToolRoutingConfig,
     parse_tool_router_response,
     route_tools_for_prompt,

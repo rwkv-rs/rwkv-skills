@@ -5,7 +5,7 @@ from pathlib import Path
 
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
 from src.eval.datasets.runtime import CallableRowsDatasetSpec, DatasetPrepareContext, download_git_repo
-from src.eval.function_calling.complexfuncbench import (
+from src.eval.tasks.function_calling.complexfuncbench import (
     DEFAULT_COMPLEXFUNC_MAX_ROWS,
     load_complexfuncbench_rows_from_source,
     require_complexfuncbench_official_root,

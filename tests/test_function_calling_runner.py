@@ -6,18 +6,18 @@ from types import SimpleNamespace
 import pytest
 
 from src.eval.evaluating import RunContext, RunMode
-from src.eval.function_calling import (
+from src.eval.tasks.function_calling import (
     BfclTaskRecord,
     BfclToolExecutionResult,
     BfclTurn,
     build_bfcl_user_block,
     start_bfcl_runtime,
 )
-from src.eval.function_calling import bfcl_v3_runner
-from src.eval.function_calling.bfcl_v3 import build_bfcl_system_prompt
-from src.eval.function_calling import runner as function_calling_runner
-from src.eval.function_calling import runner_common
-from src.eval.function_calling.rwkv_prompt import RWKV_OFFICIAL_JSON_PROMPT_STYLE
+from src.eval.tasks.function_calling import bfcl_v3_runner
+from src.eval.tasks.function_calling.bfcl_v3 import build_bfcl_system_prompt
+from src.eval.tasks.function_calling import runner as function_calling_runner
+from src.eval.tasks.function_calling import runner_common
+from src.eval.tasks.function_calling.rwkv_prompt import RWKV_OFFICIAL_JSON_PROMPT_STYLE
 
 
 def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:

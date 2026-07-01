@@ -41,28 +41,28 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["code_swe_bench_naive"].runner_group is RunnerGroup.CODING
     assert JOB_CATALOGUE["code_swe_bench_naive"].domain == "code"
     assert JOB_CATALOGUE["function_mcp_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
-    assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.knowledge.runner"
-    assert JOB_CATALOGUE["multi_choice_cot"].module == "src.eval.knowledge.runner"
-    assert JOB_CATALOGUE["free_response"].module == "src.eval.maths.runner"
-    assert JOB_CATALOGUE["free_response_judge"].module == "src.eval.maths.runner"
-    assert JOB_CATALOGUE["code_human_eval"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["code_swe_bench_naive"].module == "src.eval.coding.runner"
-    assert JOB_CATALOGUE["instruction_following"].module == "src.eval.instruction_following.runner"
-    assert JOB_CATALOGUE["instruction_following_naive"].module == "src.eval.instruction_following.runner"
-    assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_longcodebench"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_bfcl_v3"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_bfcl_ast"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_bfcl_exec"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_toolalpaca"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_complexfuncbench"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.function_calling.runner"
-    assert JOB_CATALOGUE["function_tau3_bench"].module == "src.eval.function_calling.runner"
+    assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.tasks.knowledge.runner"
+    assert JOB_CATALOGUE["multi_choice_cot"].module == "src.eval.tasks.knowledge.runner"
+    assert JOB_CATALOGUE["free_response"].module == "src.eval.tasks.maths.runner"
+    assert JOB_CATALOGUE["free_response_judge"].module == "src.eval.tasks.maths.runner"
+    assert JOB_CATALOGUE["code_human_eval"].module == "src.eval.tasks.coding.runner"
+    assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.tasks.coding.runner"
+    assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.tasks.coding.runner"
+    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.tasks.coding.runner"
+    assert JOB_CATALOGUE["code_swe_bench_naive"].module == "src.eval.tasks.coding.runner"
+    assert JOB_CATALOGUE["instruction_following"].module == "src.eval.tasks.instruction_following.runner"
+    assert JOB_CATALOGUE["instruction_following_naive"].module == "src.eval.tasks.instruction_following.runner"
+    assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_longcodebench"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_bfcl_v3"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_bfcl_ast"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_bfcl_exec"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_toolalpaca"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_complexfuncbench"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau_bench"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau2_bench"].module == "src.eval.tasks.function_calling.runner"
+    assert JOB_CATALOGUE["function_tau3_bench"].module == "src.eval.tasks.function_calling.runner"
     assert JOB_CATALOGUE["multi_choice_plain"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["multi_choice_cot"].extra_args == ("--cot-mode", "cot")
     assert JOB_CATALOGUE["multi_choice_plain"].batch_flag == "--batch-size"
@@ -89,7 +89,7 @@ def test_swe_bench_coding_jobs_do_not_receive_function_prompt_flags(tmp_path: Pa
     )
 
     assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.coding.runner"
+    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.tasks.coding.runner"
     assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench"]) == ()
     assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench_naive"]) == ()
     assert "--prompt-style" in _function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"])

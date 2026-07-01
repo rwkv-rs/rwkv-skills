@@ -12,8 +12,8 @@ from typing import Sequence
 from src.db.async_writer import CompletionWriteWorker
 from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
-from src.eval.agent_bench.chat_bridge import RWKVChatBridge
-from src.eval.agent_bench.deps import ensure_tau_v2_runtime_dependencies
+from src.eval.tasks.agent_bench.chat_bridge import RWKVChatBridge
+from src.eval.tasks.agent_bench.deps import ensure_tau_v2_runtime_dependencies
 from src.eval.evaluating import prepare_task_execution, run_checker_for_task
 from src.eval.env_config import (
     OpenAIModelConfig,
@@ -22,12 +22,12 @@ from src.eval.env_config import (
     resolve_judge_model_config,
     resolve_required_user_model_config,
 )
-from src.eval.agent_bench.envs import TauV2Env
-from src.eval.agent_bench.judge import NLAssertionJudge
-from src.eval.agent_bench.metrics import compute_agent_metrics
-from src.eval.agent_bench.payloads import completion_to_eval_payload, episode_to_completion_payload
-from src.eval.agent_bench.runtime import run_tau_v2_episodes
-from src.eval.agent_bench.tasks import infer_domain_from_slug, load_manifest
+from src.eval.tasks.agent_bench.envs import TauV2Env
+from src.eval.tasks.agent_bench.judge import NLAssertionJudge
+from src.eval.tasks.agent_bench.metrics import compute_agent_metrics
+from src.eval.tasks.agent_bench.payloads import completion_to_eval_payload, episode_to_completion_payload
+from src.eval.tasks.agent_bench.runtime import run_tau_v2_episodes
+from src.eval.tasks.agent_bench.tasks import infer_domain_from_slug, load_manifest
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict

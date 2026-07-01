@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 import uvicorn
 
-from src.eval.function_calling.rwkv_prompt import extract_json_call_value_text
+from src.eval.tasks.function_calling.rwkv_prompt import extract_json_call_value_text
 from src.infer.backend import normalize_api_base
 
 

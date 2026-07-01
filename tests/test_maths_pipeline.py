@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from src.eval.maths.pipeline import FREE_RESPONSE_STOP_TOKENS, FreeResponsePipeline
+from src.eval.tasks.maths.pipeline import FREE_RESPONSE_STOP_TOKENS, FreeResponsePipeline
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 

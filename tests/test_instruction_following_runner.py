@@ -4,7 +4,7 @@ import zipfile
 
 import pytest
 
-from src.eval.instruction_following import runner as instruction_following_runner
+from src.eval.tasks.instruction_following import runner as instruction_following_runner
 from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
 from src.eval.metrics.instruction_following.ifbench_official import instructions_util as ifbench_util
 

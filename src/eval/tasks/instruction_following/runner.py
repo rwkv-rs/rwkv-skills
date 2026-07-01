@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+"""Field-oriented instruction-following runner aligned with rwkv-rs datasets."""
+
+import argparse
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING
+from typing import Sequence
+
+from dataclasses import replace
+
+from src.db.database import init_db
+from src.db.eval_db_service import EvalDbService
+from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
+from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
+from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
+from src.eval.common.field_runner import (
+    add_common_runner_args,
+    attempt_stage,
+    resolve_prompt_profile,
+    scoring_stage,
+)
+from src.eval.field_common import build_plan_task_details, build_task_sampling_config, resolve_configured_k_plan, set_task_env
+from src.eval.k_values import NumericK, filter_metrics_by_k
+from src.eval.metrics.instruction_following.metrics import evaluate_instruction_following
+from src.eval.results.payloads import make_score_payload
+from src.eval.results.schema import sampling_config_to_dict
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.job_env import ensure_job_id
+from src.eval.evaluating import prepare_task_execution
+from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
+from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
+from src.infer.backend import (
+    add_inference_backend_arguments,
+    build_inference_backend_from_args,
+    resolve_backend_model_name,
+    validate_inference_backend_args,
+)
+
+if TYPE_CHECKING:
+    from src.eval.evaluating.contracts import RunContext, TaskSpec
+
+DEFAULT_AVG_K: tuple[NumericK, ...] = ()
+IFEVAL_AVG_K: tuple[NumericK, ...] = ()
+_RULE_BASED_JOB_NAME = "instruction_following"
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="RWKV instruction-following evaluator")
+    add_common_runner_args(parser, batch_size_default=128, db_write_queue_default=4096)
+    add_inference_backend_arguments(parser)
+    parser.add_argument(
+        "--prompt-profile",
+        choices=("normal", "naive"),
+        help="Prompt profile: normal and naive are recorded separately; naive keeps the raw instruction input.",
+    )
+    parser.add_argument("--enable-think", action="store_true", help="Append <think for think-style prompting")
+    parser.add_argument("--stop-token", action="append", type=int, help="Extra stop tokens (can repeat)")
+    parser.add_argument("--ban-token", action="append", type=int, help="Tokens to ban (can repeat)")
+    return parser.parse_args(argv)
+
+
+def _ensure_rule_based_dataset(slug: str) -> None:
+    metadata = resolve_benchmark_metadata(slug)
+    if _RULE_BASED_JOB_NAME in metadata.scheduler_jobs:
+        return
+    raise ValueError(
+        f"dataset {slug!r} is registered as instruction-following data, "
+        "but it does not have a rule-based instruction-following scorer"
+    )
+
+
+def _should_run_checker(slug: str) -> bool:
+    canonical = canonical_slug(str(slug))
+    return not (canonical.startswith("ifeval") or canonical.startswith("ifbench"))
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    run_context: "RunContext | None" = None,
+    task_spec: "TaskSpec | None" = None,
+) -> int:
+    del task_spec
+    args = parse_args(argv)
+    validate_inference_backend_args(args)
+
+    from src.eval.evaluating import TaskRunController, TaskRunState
+    from src.eval.tasks.instruction_following.pipeline import InstructionFollowingPipeline
+
+    dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
+    slug = infer_dataset_slug_from_path(str(dataset_path))
+    _ensure_rule_based_dataset(slug)
+    model_name = resolve_backend_model_name(args)
+    dataset_records = JsonlInstructionFollowingLoader(str(dataset_path)).load()
+    default_avg_k = IFEVAL_AVG_K if canonical_slug(str(slug)).startswith("ifeval") else DEFAULT_AVG_K
+    k_plan = resolve_configured_k_plan(
+        slug=slug,
+        model_name=model_name,
+        dataset_len=len(dataset_records),
+        args=args,
+        default_avg_k=default_avg_k,
+    )
+    plan = k_plan.plan
+    attempt_keys = build_attempt_keys(plan, max_pass_k=1)
+    backend = build_inference_backend_from_args(args)
+    pipeline = InstructionFollowingPipeline(backend)
+    avg_k_final = k_plan.avg_k
+    report_avg_k = k_plan.report_avg_k
+    samples_per_prompt = max(plan.repeat_count, 1)
+    records = dataset_records
+    expected_count = plan_attempt_count(plan, max_pass_k=1)
+
+    sampling = resolve_sampling_config(
+        slug,
+        model_name,
+        fallback_templates="instruction_following_default",
+    )
+    if sampling is None:
+        raise ValueError(f"缺少采样配置: {slug} ({model_name})")
+    if args.stop_token:
+        sampling = replace(sampling, stop_tokens=tuple(args.stop_token))
+    ban_tokens = tuple(args.ban_token) if args.ban_token else None
+
+    init_db(DEFAULT_DB_CONFIG)
+
+    service = EvalDbService()
+    job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", "instruction_following")
+    prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
+    task_state = prepare_task_execution(
+        service=service,
+        dataset=str(slug),
+        model=model_name,
+        is_param_search=False,
+        job_name=job_name,
+        run_mode=(run_context.run_mode if run_context is not None else None),
+        sampling_config=build_task_sampling_config(
+            cot_mode=CoTMode.NO_COT,
+            avg_k=plan.avg_k,
+            sampling_config={"stage1": sampling_config_to_dict(sampling)},
+            effective_sample_count=plan.effective_sample_count,
+            prompt_profile=prompt_profile,
+        ),
+    )
+    task_run = TaskRunState.from_task_execution(
+        execution_state=task_state,
+        attempt_keys=attempt_keys,
+        expected_attempt_count=expected_count,
+    )
+    runtime = TaskRunController(service=service, state=task_run)
+    task_id = task_run.task_id
+    skip_keys = task_state.skip_keys
+
+    set_task_env(task_id)
+    writer = runtime.create_writer(max_queue=args.db_write_queue)
+    with attempt_stage(runtime, writer):
+        result = pipeline.run(
+            dataset_path=str(dataset_path),
+            sampling=sampling,
+            batch_size=max(1, args.batch_size),
+            record_indices=plan.sample_indices,
+            enable_think=bool(args.enable_think),
+            stop_tokens=sampling.stop_tokens,
+            ban_tokens=ban_tokens,
+            samples_per_prompt=samples_per_prompt,
+            attempt_keys=attempt_keys,
+            skip_keys=skip_keys,
+            on_record=writer.enqueue,
+        )
+    completions_payloads = runtime.complete_attempt_stage(writer)
+    with scoring_stage(runtime):
+        is_ifbench = canonical_slug(str(slug)).startswith("ifbench")
+        metrics = evaluate_instruction_following(
+            completions_payloads,
+            dataset_path=str(dataset_path),
+            dataset_slug=str(slug),
+            strict=not is_ifbench,
+            avg_k=avg_k_final,
+        )
+        avg_payload = filter_metrics_by_k(metrics.avg_at_k, report_avg_k, "avg@") or (metrics.avg_at_k or {})
+        runtime.ingest_eval_payloads(metrics.payloads or [])
+        if _should_run_checker(str(slug)):
+            runtime.run_checker(model_name=model_name)
+        score_payload = make_score_payload(
+            slug,
+            is_cot=False,
+            model_name=model_name,
+            metrics={
+                "prompt_accuracy": metrics.prompt_accuracy,
+                "instruction_accuracy": metrics.instruction_accuracy,
+                **avg_payload,
+            },
+            samples=metrics.samples,
+            task=job_name,
+            task_details={
+                "tier0_accuracy": metrics.tier0_accuracy,
+                "tier1_accuracy": metrics.tier1_accuracy,
+                "scoring_mode": "loose" if is_ifbench else "strict",
+                **build_plan_task_details(
+                    plan,
+                    cot_mode=CoTMode.NO_COT.value,
+                    prompt_profile=prompt_profile,
+                ),
+                **({"avg_curve": metrics.avg_at_k} if metrics.avg_at_k and avg_payload != metrics.avg_at_k else {}),
+            },
+            extra={"cot_mode": CoTMode.NO_COT.value, "prompt_profile": prompt_profile},
+        )
+        runtime.record_score(score_payload)
+    print(f"✅ instruction-following done: {result.sample_count} samples")
+    return 0
+
+
+__all__ = ["main", "parse_args"]
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
