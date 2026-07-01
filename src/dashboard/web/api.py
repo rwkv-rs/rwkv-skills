@@ -4,7 +4,7 @@ Data sources (no Rust backend, no raw SQL in this layer):
   * leaderboard scores  ->  ``results/space/score_index.jsonl`` via ``load_scores``
   * eval records/context ->  the project's ``EvalDbService`` (Postgres)
 
-The built React SPA (``frontend/dist``) is served as static files when present.
+The built React SPA (``client/dist``) is served as static files when present.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from ..core.selection import _compute_choices, _prepare_selection
 from .serialize import serialize_leaderboard, serialize_selection
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_SPA_DIST = _REPO_ROOT / "frontend" / "dist"
+_SPA_DIST = _REPO_ROOT / "client" / "dist"
 
 
 class _ScoreCache:

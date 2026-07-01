@@ -10,8 +10,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_FRONTEND_DIR = _REPO_ROOT / "frontend"
-_SCRIPT = _FRONTEND_DIR / "scripts" / "capture-page.mjs"
+_CLIENT_DIR = _REPO_ROOT / "client"
+_SCRIPT = _CLIENT_DIR / "scripts" / "capture-page.mjs"
 _OUTPUT_DIR = _REPO_ROOT / "tmp" / "dashboard-screenshots"
 _DEFAULT_URL = "http://127.0.0.1:5173/"
 
@@ -57,7 +57,7 @@ def capture_page(*, url: Any = None, width: Any = None, height: Any = None) -> d
             str(viewport_width),
             str(viewport_height),
         ],
-        cwd=str(_FRONTEND_DIR),
+        cwd=str(_CLIENT_DIR),
         capture_output=True,
         text=True,
         timeout=120,

@@ -3,7 +3,7 @@ from __future__ import annotations
 """Launch the RWKV Skills evaluation dashboard (FastAPI API + React SPA).
 
 Serves the JSON API (leaderboard, eval records, context) and, when the React
-SPA has been built (``frontend/dist``), the static single-page app from the
+SPA has been built (``client/dist``), the static single-page app from the
 same origin. In development run the Vite dev server separately (it proxies
 ``/api`` back to this server).
 """

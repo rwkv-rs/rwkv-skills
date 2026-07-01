@@ -39,16 +39,16 @@ cp .env.example .env            # fill in PG_* connection settings
 rwkv-skills-dashboard           # or: python -m src.bin.run_dashboard --reload
 
 # 2. Frontend (development) — Vite dev server on :5173, proxies /api -> :7860
-cd frontend
+cd client
 pnpm install
 pnpm dev
 ```
 
 Open `http://localhost:5173` in development. For a single-origin deployment, build the SPA and let
-FastAPI serve it from `frontend/dist`:
+FastAPI serve it from `client/dist`:
 
 ```bash
-cd frontend && pnpm build      # emits frontend/dist
+cd client && pnpm build      # emits client/dist
 rwkv-skills-dashboard          # now serves API + SPA together on :7860
 ```
 

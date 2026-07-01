@@ -38,16 +38,16 @@ cp .env.example .env            # 填写 PG_* 连接信息
 rwkv-skills-dashboard           # 或：python -m src.bin.run_dashboard --reload
 
 # 2. 前端（开发模式）—— Vite 开发服务器在 :5173，将 /api 代理到 :7860
-cd frontend
+cd client
 pnpm install
 pnpm dev
 ```
 
 开发模式下访问 `http://localhost:5173`。若要单源部署，先构建 SPA，再让 FastAPI 从
-`frontend/dist` 提供静态资源：
+`client/dist` 提供静态资源：
 
 ```bash
-cd frontend && pnpm build      # 产出 frontend/dist
+cd client && pnpm build      # 产出 client/dist
 rwkv-skills-dashboard          # 此时在 :7860 同时提供 API 与 SPA
 ```
 

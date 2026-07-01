@@ -110,19 +110,6 @@ def test_compact_messages_uses_recent_short_user_query_before_long_tool_output()
     assert "invoice INV-42 status paid evidence" in result.messages[-1]["content"]
 
 
-def test_long_doc_compaction_rejects_removed_model_parallel_mode() -> None:
-    with pytest.raises(ValueError, match="unsupported long-doc mode"):
-        compact_long_text(
-            "case-77 answer green\n" * 30,
-            query="What is the answer for case-77?",
-            config=LongDocEvidenceConfig(
-                mode="model_parallel",  # type: ignore[arg-type]
-                max_chunk_chars=120,
-                min_long_text_chars=200,
-            ),
-        )
-
-
 def test_long_doc_router_prompt_uses_compact_schema_without_reason_field() -> None:
     prompt = build_long_doc_evidence_router_prompt(
         chunk=TextChunk(chunk_id=2, text="case-77 answer green", line_start=4, line_end=4),

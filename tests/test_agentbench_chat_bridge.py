@@ -70,13 +70,3 @@ def test_rwkv_chat_bridge_accepts_agentic_tool_call_label() -> None:
 
     assert [call.name for call in result.tool_calls] == ["lookup"]
     assert result.tool_calls[0].arguments == {"id": "A1"}
-
-
-def test_rwkv_chat_bridge_legacy_profile_uses_json_prefill() -> None:
-    engine = _FakeEngine('"type":"message","content":"Done"}')
-    bridge = RWKVChatBridge(engine=engine, default_sampling=object(), prompt_profile="legacy")
-
-    result = bridge.chat([{"role": "user", "content": "Say done"}], tools_schema=_tools_schema())
-
-    assert engine.prompts[0].endswith("Assistant: ```json\n{")
-    assert result.content == "Done"

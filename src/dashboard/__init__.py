@@ -7,7 +7,7 @@ Split into two layers so the framework-agnostic logic stays testable and reusabl
 ``core`` – pure leaderboard logic (data, metrics, selection, tables, charts,
            domains, constants, vocab, score_index, eval_records).
 
-The React/Vite SPA lives separately under ``frontend/``.
+The React/Vite SPA lives separately under ``client/``.
 """
 
 __all__: list[str] = []

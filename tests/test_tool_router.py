@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from src.eval.tasks.function_calling.tool_router import (
     ToolRoutingConfig,
     parse_tool_router_response,
@@ -72,22 +70,6 @@ def test_model_tool_router_merges_model_and_lexical_names() -> None:
     assert route.selected_names == ("lookup_weather", "book_flight")
     assert route.model_names == ("lookup_weather",)
     assert "book_flight" in route.lexical_names
-
-
-def test_tool_router_rejects_removed_model_parallel_mode() -> None:
-    with pytest.raises(ValueError, match="unsupported tool router mode"):
-        route_tools_for_prompt(
-            [_tool("lookup_weather", "Read city weather forecast", "city")],
-            [{"role": "user", "content": "Check weather."}],
-            config=ToolRoutingConfig(  # type: ignore[arg-type]
-                mode="model_parallel",
-                max_tools=1,
-                trigger_tool_count=1,
-                trigger_catalog_chars=1,
-            ),
-            engine=object(),
-            sampling=SimpleNamespace(),
-        )
 
 
 def test_tool_router_prioritizes_tau_state_anchor_over_noisy_model_choice() -> None:

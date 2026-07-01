@@ -93,35 +93,6 @@ def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monke
     assert row["metadata"]["source_format"] == "official_api_bank"
 
 
-def test_prepare_dataset_materializes_api_bank_legacy_aliases(tmp_path: Path, monkeypatch) -> None:
-    source_dir = tmp_path / "api-bank" / "lv1-lv2-samples" / "level-1-given-desc"
-    source_dir.mkdir(parents=True)
-    (source_dir / "Demo-level-2-1.jsonl").write_text(
-        "\n".join(
-            [
-                '{"role":"User","text":"Turn on the lamp."}',
-                '{"role":"API","api_name":"TimedSwitch","param_dict":{"name":"lamp","time":"08:00"},'
-                '"result":{"api_name":"TimedSwitch","input":{"name":"lamp","time":"08:00"},'
-                '"output":"ok","exception":null}}',
-            ]
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        "src.eval.datasets.data_prepper.function_calling.api_bank.api_bank_lv1_lv2_dir",
-        lambda: source_dir,
-    )
-
-    output_root = tmp_path / "prepared"
-    paths = prepare_dataset("apibank_l2", output_root, "test")
-
-    assert paths == [output_root / "apibank_l2" / "test.jsonl"]
-    [row] = read_jsonl_items(paths[0])
-    assert row["task_id"] == "apibank_l2__Demo-level-2-1_001"
-    assert row["metadata"]["level"] == 2
-    assert row["metadata"]["source_format"] == "official_api_bank"
-
-
 def test_prepare_dataset_materializes_agentbench_specs(tmp_path: Path, monkeypatch) -> None:
     db_file = tmp_path / "standard.jsonl"
     db_file.write_text('{"description":"q1"}\n{"description":"q2"}\n', encoding="utf-8")

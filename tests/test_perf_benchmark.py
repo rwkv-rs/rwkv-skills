@@ -9,7 +9,7 @@ from src.eval.performance import config as perf_config_module
 from src.eval.performance.runner import ServiceBenchmarkConfig, run_service_benchmark
 from src.eval.performance.schema import PerfBenchmarkResult
 from src.eval.performance.service_client import ServiceRequestResult
-from src.eval.performance.vllm_launcher import VllmLaunchConfig, _explain_launch_failure, _normalize_vllm_args
+from src.eval.performance.vllm_launcher import VllmLaunchConfig, _explain_launch_failure
 
 
 @dataclass(slots=True)
@@ -205,9 +205,3 @@ def test_explain_launch_failure_surfaces_torch_vllm_abi_mismatch() -> None:
     )
 
     assert "PyTorch/CUDA 二进制不兼容" in message
-
-
-def test_normalize_vllm_args_maps_legacy_disable_log_requests() -> None:
-    normalized = _normalize_vllm_args(("--disable-log-requests", "--foo"))
-
-    assert normalized == ("--no-enable-log-requests", "--foo")

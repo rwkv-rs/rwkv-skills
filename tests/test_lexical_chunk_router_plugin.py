@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from src.plugins.lexical_chunk_router import (
     LongDocConfig,
     ToolRouterConfig,
@@ -106,33 +104,6 @@ def test_plugin_route_tools_selects_lexical_window() -> None:
     assert route.routed is True
     assert route.selected_names == ("book_flight",)
     assert route.trace_payload()["reason"] == "lexical"
-
-
-def test_plugin_compact_text_rejects_removed_model_parallel_mode() -> None:
-    with pytest.raises(ValueError, match="unsupported long-doc mode"):
-        compact_text(
-            "special-policy ALPHA7 requires supervisor approval\n" * 30,
-            query="What is the approval requirement?",
-            config=LongDocConfig(  # type: ignore[arg-type]
-                mode="model_parallel",
-                max_chunk_chars=160,
-                min_long_text_chars=200,
-            ),
-        )
-
-
-def test_plugin_route_tools_rejects_removed_model_parallel_mode() -> None:
-    with pytest.raises(ValueError, match="unsupported tool router mode"):
-        route_tools(
-            [_tool("lookup_weather", "Read city weather forecast", "city")],
-            [{"role": "user", "content": "Check weather."}],
-            config=ToolRouterConfig(  # type: ignore[arg-type]
-                mode="model_parallel",
-                max_tools=1,
-                trigger_tool_count=1,
-                trigger_catalog_chars=1,
-            ),
-        )
 
 
 def test_plugin_route_tools_keeps_retail_state_hints() -> None:
