@@ -173,10 +173,9 @@ def _serialize_detail_delta(
         row_keys.update(latest_map.keys())
         row_keys.update(prev_map.keys())
 
-    scored_rows: list[tuple[float, tuple[Any, ...], dict[str, Any]]] = []
+    scored_rows: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     for row_key in row_keys:
         cells: list[dict[str, Any]] = []
-        deltas: list[float] = []
         all_percents: list[float] = []
         sample_counts: list[int] = []
         for item in lineages:
@@ -185,8 +184,6 @@ def _serialize_detail_delta(
             latest_pct = _score_to_percent(latest_point.score) if latest_point else None
             prev_pct = _score_to_percent(prev_point.score) if prev_point else None
             delta = latest_pct - prev_pct if latest_pct is not None and prev_pct is not None else None
-            if delta is not None:
-                deltas.append(delta)
             for pct in (latest_pct, prev_pct):
                 if pct is not None:
                     all_percents.append(pct)
@@ -231,10 +228,8 @@ def _serialize_detail_delta(
         best = max(all_percents, default=None)
         if best is None or best < MIN_VISIBLE_PERCENT:
             continue
-        avg_delta = sum(deltas) / len(deltas) if deltas else float("-inf")
         scored_rows.append(
             (
-                avg_delta,
                 _detail_sort_key(row_key),
                 {
                     "benchmark_name": row_key[0],
@@ -246,8 +241,8 @@ def _serialize_detail_delta(
             )
         )
 
-    scored_rows.sort(key=lambda item: (-item[0], item[1]))
-    return [row for _, _, row in scored_rows]
+    scored_rows.sort(key=lambda item: item[0])
+    return [row for _, row in scored_rows]
 
 
 # ---------------------------------------------------------------------------

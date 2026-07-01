@@ -444,7 +444,7 @@ def _build_benchmark_detail_delta_table(
         row_keys.update(latest_map.keys())
         row_keys.update(prev_map.keys())
 
-    rows_with_meta: list[tuple[float, tuple[Any, ...], list[Any], dict[int, TableCellMeta]]] = []
+    rows_with_meta: list[tuple[tuple[Any, ...], list[Any], dict[int, TableCellMeta]]] = []
     for row_key in row_keys:
         max_score = _max_percent(
             [
@@ -471,7 +471,6 @@ def _build_benchmark_detail_delta_table(
         ]
         sample_count = max(all_samples) if all_samples else 0
         row = [row_key[0], str(sample_count) if sample_count else "—", row_key[1], row_key[2]]
-        delta_values: list[float] = []
         row_cell_meta: dict[int, TableCellMeta] = {}
         for item in lineages:
             latest_point = latest_by_param.get(item.param, {}).get(row_key)
@@ -483,7 +482,6 @@ def _build_benchmark_detail_delta_table(
             prev_n = _score_to_percent(prev_score)
             if latest_n is not None and prev_n is not None:
                 delta_value = latest_n - prev_n
-                delta_values.append(delta_value)
 
             prev_col_idx = len(row)
             latest_col_idx = prev_col_idx + 1
@@ -537,13 +535,12 @@ def _build_benchmark_detail_delta_table(
                     clickable=latest_entry.task_id is not None,
                 )
 
-        avg_delta = sum(delta_values) / len(delta_values) if delta_values else float("-inf")
-        rows_with_meta.append((avg_delta, _detail_sort_key(row_key), row, row_cell_meta))
+        rows_with_meta.append((_detail_sort_key(row_key), row, row_cell_meta))
 
-    ordered = sorted(rows_with_meta, key=lambda item: (-item[0], item[1]))
-    rows = [row for _, _, row, _ in ordered]
+    ordered = sorted(rows_with_meta, key=lambda item: item[0])
+    rows = [row for _, row, _ in ordered]
     cell_meta: dict[tuple[int, int], TableCellMeta] = {}
-    for row_idx, (_, _, _, row_cells) in enumerate(ordered):
+    for row_idx, (_, _, row_cells) in enumerate(ordered):
         for col_idx, meta in row_cells.items():
             cell_meta[(row_idx, col_idx)] = meta
 
