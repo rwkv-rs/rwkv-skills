@@ -20,13 +20,8 @@ class GpuProfile:
 
 @dataclass(frozen=True, slots=True)
 class InferAutoConfig:
-    max_batch_size: int
-    batch_collect_ms: int
     max_num_seqs: int
     max_num_batched_tokens: int
-    rwkv_prefill_token_budget: int
-    rwkv_prefill_max_batch_size: int
-    max_state_slots: int
     gpu_memory_utilization: float
     model_params_b: float | None
     gpu_total_memory_mb: int | None
@@ -91,13 +86,8 @@ def choose_infer_auto_config(
         f"model_params_b={params_b if params_b is not None else 'unknown'}, tier={tier}"
     )
     return InferAutoConfig(
-        max_batch_size=spec["max_batch_size"],
-        batch_collect_ms=spec["batch_collect_ms"],
         max_num_seqs=spec["max_num_seqs"],
         max_num_batched_tokens=spec["max_num_batched_tokens"],
-        rwkv_prefill_token_budget=spec["rwkv_prefill_token_budget"],
-        rwkv_prefill_max_batch_size=spec["rwkv_prefill_max_batch_size"],
-        max_state_slots=spec["max_state_slots"],
         gpu_memory_utilization=spec["gpu_memory_utilization"],
         model_params_b=params_b,
         gpu_total_memory_mb=memory_mb,
@@ -131,53 +121,28 @@ def _adjust_tier_for_model_size(tier: int, *, params_b: float | None) -> int:
 def _tier_spec(tier: int) -> dict[str, int | float]:
     specs: tuple[dict[str, int | float], ...] = (
         {
-            "max_batch_size": 128,
-            "batch_collect_ms": 25,
             "max_num_seqs": 256,
             "max_num_batched_tokens": 8192,
-            "rwkv_prefill_token_budget": 2048,
-            "rwkv_prefill_max_batch_size": 128,
-            "max_state_slots": 2048,
             "gpu_memory_utilization": 0.90,
         },
         {
-            "max_batch_size": 256,
-            "batch_collect_ms": 35,
             "max_num_seqs": 512,
             "max_num_batched_tokens": 16384,
-            "rwkv_prefill_token_budget": 4096,
-            "rwkv_prefill_max_batch_size": 256,
-            "max_state_slots": 4096,
             "gpu_memory_utilization": 0.94,
         },
         {
-            "max_batch_size": 512,
-            "batch_collect_ms": 50,
             "max_num_seqs": 1024,
             "max_num_batched_tokens": 24576,
-            "rwkv_prefill_token_budget": 4096,
-            "rwkv_prefill_max_batch_size": 512,
-            "max_state_slots": 6144,
             "gpu_memory_utilization": 0.96,
         },
         {
-            "max_batch_size": 768,
-            "batch_collect_ms": 50,
             "max_num_seqs": -1,
             "max_num_batched_tokens": 32768,
-            "rwkv_prefill_token_budget": 8192,
-            "rwkv_prefill_max_batch_size": 768,
-            "max_state_slots": -1,
             "gpu_memory_utilization": 0.97,
         },
         {
-            "max_batch_size": 1024,
-            "batch_collect_ms": 50,
             "max_num_seqs": -1,
             "max_num_batched_tokens": 32768,
-            "rwkv_prefill_token_budget": 8192,
-            "rwkv_prefill_max_batch_size": 1024,
-            "max_state_slots": -1,
             "gpu_memory_utilization": 0.98,
         },
     )
