@@ -33,6 +33,7 @@ from src.eval.tasks.function_calling.tool_router import (
     TOOL_ROUTER_MODE_CHOICES,
 )
 from src.eval.tasks.function_calling.parallel_candidate_router import ParallelCandidateRouterConfig
+from src.eval.tasks.function_calling.agent_loop import _run_agent_loop
 from src.eval.tasks.function_calling.agentbench import _run_agentbench
 from src.eval.tasks.function_calling.api_bank import _run_api_bank
 from src.eval.tasks.function_calling.bfcl_ast import _run_bfcl_ast
@@ -356,6 +357,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--agentbench-controller-url",
         help="AgentBench/AgentRL controller API URL, default AGENTBENCH_CONTROLLER_URL or http://127.0.0.1:5020/api",
     )
+    parser.add_argument(
+        "--agent-loop-command-timeout-s",
+        type=float,
+        default=60.0,
+        help="Per-command timeout for agent-loop shell sandbox executors",
+    )
+    parser.add_argument(
+        "--agent-loop-max-output-chars",
+        type=int,
+        default=8000,
+        help="Character cap for tool outputs fed back into the agent-loop prompt",
+    )
+    parser.add_argument(
+        "--agent-loop-workspace-root",
+        help="Root directory for agent-loop subprocess sandbox workspaces (default: system temp)",
+    )
     return parser.parse_args(argv)
 
 
@@ -366,6 +383,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         raise ValueError(f"dataset {dataset_slug!r} 不是 function-calling benchmark，无法用 function_calling runner 运行。")
 
     job_names = frozenset(metadata.scheduler_jobs)
+    if "function_agent_loop" in job_names:
+        return FunctionCallingBenchmarkKind.AGENT_LOOP
     if "function_agent_tool_call" in job_names:
         return FunctionCallingBenchmarkKind.AGENT_TOOL_CALL
     if "function_browsecomp_plus" in job_names:
@@ -441,6 +460,8 @@ def main(
     _normalize_sample_worker_args(args)
     run = _resolve_run(args)
     _validate_sample_worker_benchmark(args, run)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.AGENT_LOOP:
+        return _run_agent_loop(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.AGENT_TOOL_CALL:
         return _run_simple_tool_call(
             args,

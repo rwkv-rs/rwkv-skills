@@ -35,6 +35,7 @@ from src.eval.tasks.function_calling.runner_common import (
 )
 from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
+    assistant_json_prefix,
     build_rwkv_json_call_prompt,
     coerce_json_function_call_payloads,
     extract_json_call_value_text,
@@ -159,7 +160,12 @@ def load_bfcl_ast_rows_from_sources(
     return rows
 
 
-def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_chars: int) -> str:
+def build_simple_tool_call_prompt(
+    record: SimpleToolCallRecord,
+    *,
+    history_max_chars: int,
+    prefill_object: bool = False,
+) -> str:
     date_instructions = [
         "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date.",
     ]
@@ -175,16 +181,11 @@ def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_c
             [
                 "Tools:",
                 _render_tool_catalog(record.tools),
-                "Output JSON schema:",
-                _render_output_schema(),
-                "Return exactly one JSON value that validates against the schema.",
-                "For one tool call, return one JSON object.",
+                "Return only a JSON function call.",
+                'The JSON shape is {"name":"tool_name","arguments":{...}}.',
                 "For multiple required tool calls, return a JSON array containing every required call in execution order; do not stop after the first call.",
-                "Each arguments object must contain only final argument values for that tool.",
-                *date_instructions,
-                "Do not copy tool schemas, descriptions, type/items/properties/required/default fields, or wrapper objects like {\"type\":...,\"value\":...} into arguments.",
                 "Use only listed tool names.",
-                "Return no prose, no markdown, and no extra text outside the JSON value.",
+                *date_instructions,
             ]
         )
     )
@@ -192,6 +193,7 @@ def build_simple_tool_call_prompt(record: SimpleToolCallRecord, *, history_max_c
         system_prompt,
         [{"role": "user", "content": normalize_rwkv_text(record.instruction)}],
         history_max_chars=history_max_chars,
+        assistant_prefix=assistant_json_prefix(prefill_object=prefill_object),
     )
 
 
@@ -903,29 +905,6 @@ def _render_tool_catalog(tools: Sequence[Mapping[str, Any]]) -> str:
             }
         )
     return json.dumps(rendered_tools, ensure_ascii=False, indent=2, sort_keys=False)
-
-
-def _render_output_schema() -> str:
-    tool_call_schema = {
-        "type": "object",
-        "required": ["name", "arguments"],
-        "additionalProperties": False,
-        "properties": {
-            "name": {"type": "string"},
-            "arguments": {"type": "object"},
-        },
-    }
-    schema = {
-        "oneOf": [
-            tool_call_schema,
-            {
-                "type": "array",
-                "items": tool_call_schema,
-                "minItems": 1,
-            },
-        ]
-    }
-    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
 
 
 def _read_json_or_jsonl_items(path: Path) -> list[Any]:

@@ -106,12 +106,13 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert '"required": [' in prompt
     assert prompt.index('"name": "translate_text"') < prompt.index('"arguments": {')
     assert '"parameters"' not in prompt
-    assert "Output JSON schema:" in prompt
-    assert '"oneOf": [' in prompt
+    assert "Return only a JSON function call." in prompt
+    assert 'The JSON shape is {"name":"tool_name","arguments":{...}}.' in prompt
     assert "return a JSON array containing every required call" in prompt
-    assert "Do not copy tool schemas" in prompt
+    assert "Output JSON schema:" not in prompt
     assert "Available tools:" not in prompt
-    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json\n{' in prompt
+    assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json' in prompt
+    assert prompt.endswith("Assistant: ```json\n")
     assert "<think>" not in prompt
 
 

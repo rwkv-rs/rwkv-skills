@@ -3,7 +3,6 @@ from __future__ import annotations
 """Prepare answer-key or tool-call rows as RWKVC agent JSON-call datasets."""
 
 import json
-import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -11,6 +10,12 @@ from typing import Any
 
 from src.eval.benchmark_sources import AGENT_TOOL_CALL_BENCHMARK_SOURCES
 from src.eval.datasets.data_prepper.prepper_registry import FUNCTION_CALLING_REGISTRY
+from src.eval.datasets.data_prepper.source_files import (
+    load_hf_rows,
+    per_dataset_source_env,
+    read_source_rows,
+    resolve_source_path,
+)
 from src.eval.datasets.runtime import MaterializingDatasetSpec
 from src.eval.scheduler.config import REPO_ROOT
 from src.eval.tasks.function_calling.simple_tool_call import (
@@ -121,80 +126,17 @@ class AgentToolCallDatasetSpec(MaterializingDatasetSpec):
 
 
 def _resolve_source_path(dataset_name: str, split: str) -> Path:
-    env_path = os.environ.get(_per_dataset_source_env(dataset_name))
-    if env_path:
-        return _first_existing_or_default(_source_candidates(Path(env_path).expanduser(), dataset_name, split))
-
-    root_raw = os.environ.get(_SOURCE_ROOT_ENV) or os.environ.get(_LEGACY_SOURCE_ROOT_ENV)
-    root = Path(root_raw).expanduser() if root_raw else REPO_ROOT / "data" / "agent_tool_call_sources"
-    return _first_existing_or_default(_source_candidates(root, dataset_name, split))
-
-
-def _source_candidates(base: Path, dataset_name: str, split: str) -> tuple[Path, ...]:
-    if base.suffix.lower() in {".jsonl", ".json"}:
-        return (base,)
-    return (
-        base / dataset_name / f"{split}.jsonl",
-        base / dataset_name / f"{split}.json",
-        base / dataset_name / "test.jsonl",
-        base / dataset_name / "test.json",
-        base / f"{dataset_name}_{split}.jsonl",
-        base / f"{dataset_name}_{split}.json",
-        base / f"{dataset_name}.jsonl",
-        base / f"{dataset_name}.json",
+    return resolve_source_path(
+        dataset_name,
+        split,
+        env_prefix="RWKV_AGENT_TOOL_CALL_SOURCE",
+        root_envs=(_SOURCE_ROOT_ENV, _LEGACY_SOURCE_ROOT_ENV),
+        default_root=REPO_ROOT / "data" / "agent_tool_call_sources",
     )
 
 
-def _first_existing_or_default(candidates: Sequence[Path]) -> Path:
-    for path in candidates:
-        if path.exists():
-            return path.resolve()
-    return candidates[0].resolve()
-
-
-def _read_source_rows(path: Path) -> list[Mapping[str, Any]]:
-    if path.suffix.lower() == ".jsonl":
-        rows: list[Mapping[str, Any]] = []
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                raw = line.strip()
-                if not raw:
-                    continue
-                payload = json.loads(raw)
-                if not isinstance(payload, Mapping):
-                    raise ValueError(f"{path}: JSONL rows must be objects")
-                rows.append(payload)
-        return rows
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, Mapping)]
-    if isinstance(payload, Mapping):
-        for key in ("rows", "examples", "instances", "data", "tasks", "items"):
-            rows = payload.get(key)
-            if isinstance(rows, list):
-                return [row for row in rows if isinstance(row, Mapping)]
-        return [payload]
-    raise ValueError(f"unsupported agent tool-call source format: {path}")
-
-
-def _load_hf_rows(source: str, split: str) -> list[Mapping[str, Any]]:
-    dataset_id = _hf_dataset_id(source)
-    if not dataset_id:
-        raise FileNotFoundError(f"missing Hugging Face dataset id: {source!r}")
-    try:
-        from datasets import load_dataset  # pyright: ignore[reportMissingImports, reportAttributeAccessIssue]
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
-        raise ModuleNotFoundError("Install `datasets` to prepare Hugging Face-backed agent benchmarks") from exc
-    dataset = load_dataset(dataset_id, split=split)
-    return [dict(row) for row in dataset]
-
-
-def _hf_dataset_id(source: str) -> str:
-    marker = "huggingface.co/datasets/"
-    if marker in source:
-        return source.split(marker, 1)[1].strip("/")
-    return source.strip()
+_read_source_rows = read_source_rows
+_load_hf_rows = load_hf_rows
 
 
 def _normalize_source_row(
@@ -413,8 +355,7 @@ def _record_to_payload(record: SimpleToolCallRecord) -> dict[str, Any]:
 
 
 def _per_dataset_source_env(dataset_name: str) -> str:
-    suffix = re.sub(r"[^A-Z0-9]+", "_", dataset_name.upper()).strip("_")
-    return f"RWKV_AGENT_TOOL_CALL_SOURCE_{suffix}"
+    return per_dataset_source_env("RWKV_AGENT_TOOL_CALL_SOURCE", dataset_name)
 
 
 def _dataset_info(dataset_name: str) -> dict[str, str | None]:

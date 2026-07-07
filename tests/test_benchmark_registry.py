@@ -127,9 +127,10 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
 
     assert agent_tool_call.field is BenchmarkField.FUNCTION_CALLING
     assert agent_tool_call.cot_modes == (CoTMode.COT,)
-    assert agent_tool_call.scheduler_jobs == ("function_agent_tool_call",)
-    assert terminal_bench.scheduler_jobs == ("function_agent_tool_call",)
-    assert matharena_apex.scheduler_jobs == ("function_agent_tool_call",)
+    assert agent_tool_call.scheduler_jobs == ("function_agent_loop",)
+    assert terminal_bench.scheduler_jobs == ("function_agent_loop",)
+    assert matharena_apex.field is BenchmarkField.MATHS
+    assert matharena_apex.scheduler_jobs == ("free_response", "free_response_naive")
     assert browsecomp.field is BenchmarkField.FUNCTION_CALLING
     assert browsecomp.cot_modes == (CoTMode.COT,)
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)

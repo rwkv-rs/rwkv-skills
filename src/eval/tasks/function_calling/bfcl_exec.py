@@ -185,6 +185,7 @@ def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) ->
             metadata=record.metadata,
         ),
         history_max_chars=history_max_chars,
+        prefill_object=True,
     )
     if _force_bfcl_exec_array_prefix(record):
         prompt += "[\n"
