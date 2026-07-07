@@ -76,6 +76,8 @@ def build_agent_loop_verifier(kind: str, args: Any) -> AgentLoopVerifier:
         return LlmRubricJudgeVerifier(args)
     if kind == "terminal_bench_official":
         return TerminalBenchOfficialVerifier()
+    if kind == "repo_tests_official":
+        return RepoTestsOfficialVerifier()
     if kind == "widesearch_official":
         return WideSearchOfficialVerifier()
     if kind == "mcp_atlas_official":
@@ -117,6 +119,12 @@ def preflight_agent_loop_runtime(records: Sequence["AgentLoopRecord"], args: Any
                 elif not (Path(runtime_root).expanduser() / ".venv" / "bin" / "python").is_file():
                     errors.append(f"mcp_worker runtime not provisioned under {runtime_root}; {_DOCS_HINT}")
                 break
+        elif kind == "web_search":
+            from src.eval.tasks.function_calling.agent_loop_executors import WebSearchExecutor
+
+            config_error = WebSearchExecutor.config_error()
+            if config_error:
+                errors.append(f"{config_error}; {_DOCS_HINT}")
         elif kind != "manifest_replay":
             errors.append(f"unknown agent-loop executor kind: {kind!r}")
 
@@ -304,6 +312,65 @@ class TerminalBenchOfficialVerifier:
                 "stderr_tail": proc.stderr[-2000:],
             },
         )
+
+
+class RepoTestsOfficialVerifier:
+    """Runs the benchmark's own programmatic test command (DeepSWE/NL2Repo style).
+
+    These benchmarks ship a per-task test command (e.g. pytest) as the official
+    verifier; the command runs against the episode's final workspace/container
+    state and the exit code decides pass/fail.
+    """
+
+    def preflight(self, records: Sequence["AgentLoopRecord"], args: Any) -> list[str]:
+        errors: list[str] = []
+        for record in records:
+            if not _repo_test_command(record):
+                errors.append(
+                    f"{record.task_id}: repo_tests_official verifier requires verifier.config.test_command "
+                    f"(or metadata.test_command) from the official task definition; {_DOCS_HINT}"
+                )
+                break
+        return errors
+
+    def verify(
+        self,
+        record: "AgentLoopRecord",
+        *,
+        final_answer: str,
+        trace: Sequence[Mapping[str, Any]],
+        executor_snapshot: Mapping[str, Any],
+    ) -> AgentLoopVerdict:
+        test_command = _repo_test_command(record)
+        if not test_command:
+            raise ValueError("repo_tests_official verifier requires a test_command")
+        timeout_s = float(record.verifier.config.get("test_timeout_s") or 900.0)
+        container_id = str(executor_snapshot.get("container_id") or "")
+        workspace = str(executor_snapshot.get("workspace") or "")
+        if container_id:
+            argv = ["docker", "exec", container_id, "bash", "-lc", test_command]
+            cwd = None
+        elif workspace:
+            argv = ["bash", "-lc", test_command]
+            cwd = workspace
+        else:
+            raise ValueError("repo_tests_official verifier requires a shell_sandbox executor snapshot")
+        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
+        passed = proc.returncode == 0
+        return AgentLoopVerdict(
+            reward=1.0 if passed else 0.0,
+            is_passed=passed,
+            fail_reason="" if passed else f"official task tests failed (exit {proc.returncode})",
+            details={
+                "test_command": test_command,
+                "stdout_tail": proc.stdout[-2000:],
+                "stderr_tail": proc.stderr[-2000:],
+            },
+        )
+
+
+def _repo_test_command(record: "AgentLoopRecord") -> str:
+    return str(record.verifier.config.get("test_command") or record.metadata.get("test_command") or "").strip()
 
 
 class WideSearchOfficialVerifier:

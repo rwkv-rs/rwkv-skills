@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+BENCHMARK_DOMAINS: tuple[str, ...] = ("knowledge", "math", "code", "agent")
+
+
 @dataclass(frozen=True, slots=True)
 class RequestedBenchmarkSource:
     display_name: str
@@ -14,6 +17,11 @@ class RequestedBenchmarkSource:
     source_kind: str
     source_url: str | None
     scheduler_job: str
+    domain: str
+
+    def __post_init__(self) -> None:
+        if self.domain not in BENCHMARK_DOMAINS:
+            raise ValueError(f"{self.benchmark_name}: unknown benchmark domain {self.domain!r}")
 
 
 REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
@@ -25,6 +33,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/swe-bench/SWE-bench",
         "code_swe_bench",
+        domain="code",
     ),
     RequestedBenchmarkSource(
         "SWE-bench Verified",
@@ -34,6 +43,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/swe-bench/SWE-bench",
         "code_swe_bench",
+        domain="code",
     ),
     RequestedBenchmarkSource(
         "SWE-bench Pro",
@@ -43,6 +53,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/scaleapi/SWE-bench_Pro-os",
         "code_swe_bench",
+        domain="code",
     ),
     RequestedBenchmarkSource(
         "Terminal-Bench 2.1",
@@ -52,6 +63,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/harbor-framework/terminal-bench-2-1",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "NL2Repo",
@@ -61,6 +73,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/multimodal-art-projection/NL2RepoBench",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "DeepSWE",
@@ -70,6 +83,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/datacurve-ai/deep-swe",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-Backend 2.0",
@@ -79,6 +93,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-SWE Max",
@@ -88,6 +103,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-CompanyBench",
@@ -97,6 +113,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "BrowseComp",
@@ -106,6 +123,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/openai/simple-evals",
         "function_browsecomp",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "WideSearch",
@@ -115,6 +133,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/ByteDance-Seed/WideSearch",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "DeepSearchQA",
@@ -124,6 +143,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "hf_dataset",
         "https://huggingface.co/datasets/google/deepsearchqa",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "MCP Atlas",
@@ -133,6 +153,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/scaleapi/mcp-atlas",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Toolathlon",
@@ -142,6 +163,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/hkust-nlp/Toolathlon",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "APEX-Agents",
@@ -151,6 +173,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/Mercor-Intelligence/archipelago",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "ClawEval",
@@ -160,6 +183,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/claw-eval/claw-eval",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "WildClawBench",
@@ -169,6 +193,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/InternLM/WildClawBench",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "SkillsBench",
@@ -178,6 +203,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/benchflow-ai/skillsbench",
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "e-bench",
@@ -187,6 +213,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-FinModelBench",
@@ -196,6 +223,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "ProdBench",
@@ -205,6 +233,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-SkillsWorld",
@@ -214,6 +243,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "HLE",
@@ -223,15 +253,27 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/centerforaisafety/hle",
         "free_response",
+        domain="knowledge",
+    ),
+    RequestedBenchmarkSource(
+        "HLE with tools",
+        "hle_with_tools",
+        "hle_with_tools_test",
+        "agent_loop",
+        "hf_dataset",
+        "https://huggingface.co/datasets/cais/hle",
+        "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "Hy-Euler pro",
         "hy_euler_pro",
         "hy_euler_pro_test",
-        "free_answer",
+        "agent_loop",
         "internal",
         None,
-        "free_response",
+        "function_agent_loop",
+        domain="agent",
     ),
     RequestedBenchmarkSource(
         "GPQA Diamond",
@@ -241,24 +283,27 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/idavidrein/gpqa",
         "multi_choice_cot",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "FrontierScience-Research",
         "frontierscience_research",
         "frontierscience_research_test",
-        "agent_loop",
+        "free_answer",
         "official_page",
         "https://openai.com/index/frontierscience/",
-        "function_agent_loop",
+        "free_response_judge",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "FrontierScience-Olympiad",
         "frontierscience_olympiad",
         "frontierscience_olympiad_test",
-        "agent_loop",
+        "free_answer",
         "official_page",
         "https://openai.com/index/frontierscience/",
-        "function_agent_loop",
+        "free_response_judge",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "USAMO 2026",
@@ -268,6 +313,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/eth-sri/matharena",
         "free_response_judge",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "MathArena Apex",
@@ -277,6 +323,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/eth-sri/matharena",
         "free_response",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "ArxivMath",
@@ -286,6 +333,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/eth-sri/matharena",
         "free_response",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "HorizonMath",
@@ -295,6 +343,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/ewang26/HorizonMath",
         "free_response",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "Hy-Math",
@@ -304,6 +353,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "internal",
         None,
         "free_response",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "PHYBench",
@@ -313,6 +363,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/phybench-official/phybench",
         "free_response_judge",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "CMT-Benchmark",
@@ -322,6 +373,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/JamesRoggeveen/cmt_benchmark_data",
         "free_response_judge",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "IMOAnswerBench",
@@ -331,6 +383,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/google-deepmind/superhuman",
         "free_response",
+        domain="math",
     ),
     RequestedBenchmarkSource(
         "SuperChem",
@@ -340,6 +393,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/catalystforyou/SUPERChem_eval",
         "free_response_judge",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "CL-bench",
@@ -349,6 +403,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/Tencent-Hunyuan/CL-bench",
         "free_response_judge",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "CL-bench life",
@@ -358,6 +413,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "github",
         "https://github.com/Tencent-Hunyuan/CL-bench",
         "free_response_judge",
+        domain="knowledge",
     ),
     RequestedBenchmarkSource(
         "AA-LCR",
@@ -367,6 +423,7 @@ REQUESTED_BENCHMARK_SOURCES: tuple[RequestedBenchmarkSource, ...] = (
         "hf_dataset",
         "https://huggingface.co/datasets/ArtificialAnalysis/AA-LCR",
         "free_response_judge",
+        domain="knowledge",
     ),
 )
 
@@ -387,10 +444,17 @@ REQUESTED_BENCHMARKS_BY_NAME: dict[str, RequestedBenchmarkSource] = {
     item.benchmark_name: item for item in REQUESTED_BENCHMARK_SOURCES
 }
 
+BENCHMARKS_BY_DOMAIN: dict[str, tuple[RequestedBenchmarkSource, ...]] = {
+    domain: tuple(item for item in REQUESTED_BENCHMARK_SOURCES if item.domain == domain)
+    for domain in BENCHMARK_DOMAINS
+}
+
 
 __all__ = [
     "AGENT_LOOP_BENCHMARK_SOURCES",
     "AGENT_TOOL_CALL_BENCHMARK_SOURCES",
+    "BENCHMARKS_BY_DOMAIN",
+    "BENCHMARK_DOMAINS",
     "FREE_ANSWER_BENCHMARK_SOURCES",
     "REQUESTED_BENCHMARKS_BY_NAME",
     "REQUESTED_BENCHMARK_SOURCES",

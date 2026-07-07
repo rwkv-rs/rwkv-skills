@@ -42,6 +42,7 @@ _REQUESTED_DISPLAY_NAMES = {
     "ProdBench",
     "Hy-SkillsWorld",
     "HLE",
+    "HLE with tools",
     "Hy-Euler pro",
     "GPQA Diamond",
     "FrontierScience-Research",
@@ -148,6 +149,86 @@ def test_agent_tool_call_benchmarks_have_function_call_sampling_fallback() -> No
     assert sampling is not None
     assert sampling.max_generate_tokens == 2048
     assert sampling.top_k == 200
+
+
+def test_benchmark_domains_partition_the_requested_set() -> None:
+    from src.eval.benchmark_sources import BENCHMARKS_BY_DOMAIN, BENCHMARK_DOMAINS
+
+    assert set(BENCHMARK_DOMAINS) == {"knowledge", "math", "code", "agent"}
+    partitioned = [item.benchmark_name for items in BENCHMARKS_BY_DOMAIN.values() for item in items]
+    assert sorted(partitioned) == sorted(item.benchmark_name for item in REQUESTED_BENCHMARK_SOURCES)
+
+    assert {item.benchmark_name for item in BENCHMARKS_BY_DOMAIN["code"]} == {
+        "swe_bench_multilingual",
+        "swe_bench_verified",
+        "swe_bench_pro",
+    }
+    assert {item.benchmark_name for item in BENCHMARKS_BY_DOMAIN["agent"]} == {
+        "terminal_bench_2_1",
+        "nl2repo",
+        "deepswe",
+        "browsecomp",
+        "widesearch",
+        "deepsearchqa",
+        "mcp_atlas",
+        "toolathlon",
+        "apex_agents",
+        "claweval",
+        "wildclawbench",
+        "skillsbench",
+        "hle_with_tools",
+        "hy_backend_2_0",
+        "hy_swe_max",
+        "hy_companybench",
+        "e_bench",
+        "hy_finmodelbench",
+        "prodbench",
+        "hy_skillsworld",
+        "hy_euler_pro",
+    }
+    assert {item.benchmark_name for item in BENCHMARKS_BY_DOMAIN["math"]} == {
+        "usamo_2026",
+        "matharena_apex",
+        "arxivmath",
+        "horizonmath",
+        "hy_math",
+        "imoanswerbench",
+        "phybench",
+        "cmt_benchmark",
+    }
+    assert {item.benchmark_name for item in BENCHMARKS_BY_DOMAIN["knowledge"]} == {
+        "hle",
+        "gpqa_diamond",
+        "frontierscience_research",
+        "frontierscience_olympiad",
+        "superchem",
+        "cl_bench",
+        "cl_bench_life",
+        "aa_lcr",
+    }
+
+    integrations_by_domain = {
+        "agent": {"agent_loop", "function_browsecomp"},
+        "code": {"coding_swe_bench"},
+        "math": {"free_answer"},
+        "knowledge": {"free_answer", "multiple_choice"},
+    }
+    for item in REQUESTED_BENCHMARK_SOURCES:
+        assert item.integration in integrations_by_domain[item.domain], item.benchmark_name
+
+
+def test_dashboard_groups_agent_domain_separately() -> None:
+    from src.dashboard.core.domains import DOMAIN_AGENT, DOMAIN_FUNCTION_CALL, domain_for_benchmark_field
+
+    assert domain_for_benchmark_field(BenchmarkField.FUNCTION_CALLING, dataset_slug="widesearch_test") == DOMAIN_AGENT
+    assert (
+        domain_for_benchmark_field(BenchmarkField.FUNCTION_CALLING, dataset_slug="hle_with_tools_test")
+        == DOMAIN_AGENT
+    )
+    assert (
+        domain_for_benchmark_field(BenchmarkField.FUNCTION_CALLING, dataset_slug="bfcl_v3_test")
+        == DOMAIN_FUNCTION_CALL
+    )
 
 
 def test_free_answer_prepper_normalizes_qa_rubric_and_message_rows() -> None:

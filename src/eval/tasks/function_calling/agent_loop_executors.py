@@ -9,9 +9,11 @@ returns a JSON-serializable outcome that is fed back to the model as
 """
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -22,6 +24,31 @@ from src.eval.tasks.function_calling.context_budget import truncate_text
 
 DEFAULT_COMMAND_TIMEOUT_S = 60.0
 DEFAULT_MAX_OUTPUT_CHARS = 8000
+
+WEB_SEARCH_API_URL_ENV = "RWKV_WEB_SEARCH_API_URL"
+WEB_SEARCH_API_KEY_ENV = "RWKV_WEB_SEARCH_API_KEY"
+WEB_SEARCH_API_KEY_HEADER_ENV = "RWKV_WEB_SEARCH_API_KEY_HEADER"
+
+_WEB_SEARCH_TOOLS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "web_search",
+        "description": "Search the web and return result snippets as JSON.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "fetch_url",
+        "description": "Fetch a URL and return its text content (truncated).",
+        "parameters": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+)
 
 _SHELL_TOOLS: tuple[dict[str, Any], ...] = (
     {
@@ -312,6 +339,75 @@ class ShellSandboxExecutor:
             self._container_id = None
 
 
+class WebSearchExecutor:
+    """Live web-search tools for browsing-style agent benchmarks.
+
+    The search backend is a generic JSON POST endpoint configured in .env
+    (RWKV_WEB_SEARCH_API_URL / RWKV_WEB_SEARCH_API_KEY, Serper-style
+    X-API-KEY header by default), so providers can be swapped later.
+    """
+
+    def __init__(self, *, max_output_chars: int = DEFAULT_MAX_OUTPUT_CHARS, request_timeout_s: float = 30.0) -> None:
+        self._max_output_chars = int(max_output_chars)
+        self._timeout_s = float(request_timeout_s)
+        self._calls: list[dict[str, Any]] = []
+
+    @staticmethod
+    def config_error() -> str | None:
+        if not os.environ.get(WEB_SEARCH_API_URL_ENV) or not os.environ.get(WEB_SEARCH_API_KEY_ENV):
+            return (
+                f"web_search executor requires {WEB_SEARCH_API_URL_ENV} and {WEB_SEARCH_API_KEY_ENV} in .env"
+            )
+        return None
+
+    def open(self) -> tuple[dict[str, Any], ...]:
+        error = self.config_error()
+        if error:
+            raise ValueError(error)
+        return _WEB_SEARCH_TOOLS
+
+    def execute(self, name: str, arguments: Mapping[str, Any]) -> AgentLoopStepOutcome:
+        self._calls.append({"name": name, "arguments": dict(arguments)})
+        try:
+            if name == "web_search":
+                query = str(arguments.get("query") or "").strip()
+                if not query:
+                    return AgentLoopStepOutcome(ok=False, error="web_search call missing query")
+                return AgentLoopStepOutcome(ok=True, output=self._search(query))
+            if name == "fetch_url":
+                url = str(arguments.get("url") or "").strip()
+                if not url.startswith(("http://", "https://")):
+                    return AgentLoopStepOutcome(ok=False, error=f"fetch_url requires an http(s) url: {url!r}")
+                return AgentLoopStepOutcome(ok=True, output=self._fetch(url))
+            return AgentLoopStepOutcome(ok=False, error=f"unsupported web tool: {name}")
+        except Exception as exc:  # noqa: BLE001 - network errors are step failures
+            return AgentLoopStepOutcome(ok=False, error=str(exc))
+
+    def _search(self, query: str) -> str:
+        request = urllib.request.Request(
+            os.environ[WEB_SEARCH_API_URL_ENV],
+            data=json.dumps({"q": query}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                os.environ.get(WEB_SEARCH_API_KEY_HEADER_ENV) or "X-API-KEY": os.environ[WEB_SEARCH_API_KEY_ENV],
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
+            return truncate_text(response.read().decode("utf-8", errors="replace"), self._max_output_chars)
+
+    def _fetch(self, url: str) -> str:
+        request = urllib.request.Request(url, headers={"User-Agent": "rwkv-skills-agent-loop/1.0"})
+        with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
+            return truncate_text(response.read().decode("utf-8", errors="replace"), self._max_output_chars)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"calls": list(self._calls)}
+
+    def close(self) -> None:
+        return None
+
+
 class McpWorkerExecutor:
     """Bridges agent-loop tool calls onto the MCP-Bench subprocess worker."""
 
@@ -381,6 +477,10 @@ __all__ = [
     "ManifestReplayExecutor",
     "McpWorkerExecutor",
     "ShellSandboxExecutor",
+    "WEB_SEARCH_API_KEY_ENV",
+    "WEB_SEARCH_API_KEY_HEADER_ENV",
+    "WEB_SEARCH_API_URL_ENV",
+    "WebSearchExecutor",
     "mcp_call_to_worker",
     "shell_call_to_command",
     "step_outcome_to_function_output",

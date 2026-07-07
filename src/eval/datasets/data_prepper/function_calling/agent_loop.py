@@ -55,15 +55,16 @@ _AGENT_LOOP_PROFILES: dict[str, AgentLoopProfile] = {
         executor_config={"backend": "docker"},
         verifier_kind="terminal_bench_official",
     ),
+    # Repo agents graded by the task's own programmatic test command (pytest etc.).
     "deepswe": AgentLoopProfile(
         executor_kind="shell_sandbox",
         executor_config={"backend": "docker"},
-        verifier_kind="unsupported_official",
+        verifier_kind="repo_tests_official",
     ),
     "nl2repo": AgentLoopProfile(
         executor_kind="shell_sandbox",
-        executor_config={"backend": "docker"},
-        verifier_kind="unsupported_official",
+        executor_config={"backend": "subprocess"},
+        verifier_kind="repo_tests_official",
     ),
     # Search agents: recorded search-tool outputs, official/LLM judging.
     "widesearch": AgentLoopProfile(verifier_kind="widesearch_official"),
@@ -76,10 +77,10 @@ _AGENT_LOOP_PROFILES: dict[str, AgentLoopProfile] = {
     "claweval": AgentLoopProfile(executor_kind="shell_sandbox", verifier_kind="unsupported_official"),
     "wildclawbench": AgentLoopProfile(executor_kind="shell_sandbox", verifier_kind="unsupported_official"),
     "skillsbench": AgentLoopProfile(executor_kind="shell_sandbox", verifier_kind="unsupported_official"),
-    # No downloadable dataset; rows must be provided locally and judge-graded.
-    "frontierscience_research": AgentLoopProfile(verifier_kind="llm_rubric_judge"),
-    "frontierscience_olympiad": AgentLoopProfile(verifier_kind="llm_rubric_judge"),
+    # Tool-augmented expert QA: recorded/row-provided tools, official-style LLM judging.
+    "hle_with_tools": AgentLoopProfile(verifier_kind="llm_rubric_judge"),
     # Internal benchmarks: classify each row from its format.
+    "hy_euler_pro": AgentLoopProfile(),
     "hy_backend_2_0": AgentLoopProfile(),
     "hy_swe_max": AgentLoopProfile(),
     "hy_companybench": AgentLoopProfile(),

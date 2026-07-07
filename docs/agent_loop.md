@@ -65,9 +65,17 @@ Assistant: ```json
 | mcp_atlas | mcp_worker | mcp_atlas_official(官方 score_claims.py claim-coverage) | `RWKV_MCP_ATLAS_ROOT`;`JUDGE_MODEL/JUDGE_API_KEY[/JUDGE_BASE_URL]`;executor.config.runtime_root |
 | toolathlon | mcp_worker | toolathlon_official(官方逐任务 evaluator) | `RWKV_TOOLATHLON_ROOT`;docker/podman;行 verifier.config.evaluator_command |
 | deepsearchqa | manifest_replay | llm_rubric_judge | `JUDGE_MODEL/JUDGE_API_KEY` |
-| deepswe / nl2repo / claweval / wildclawbench / skillsbench / apex_agents | shell_sandbox | unsupported_official(v1 preflight 报错并给出 clone/配置指引) | 待接入官方 harness |
-| frontierscience_* | manifest_replay | llm_rubric_judge | 官方无公开数据;本地源 + judge |
-| 内部 hy_* / e_bench / prodbench | 按行格式自动分类 | expected_tool_calls 或 llm_rubric_judge | 本地源 |
+| hle_with_tools | manifest_replay(行内提供工具) | llm_rubric_judge | HF `cais/hle`;`JUDGE_MODEL/JUDGE_API_KEY` |
+| deepswe | shell_sandbox(docker) | repo_tests_official(行内 test_command,官方程序化 verifier) | docker;行 verifier.config.test_command |
+| nl2repo | shell_sandbox(subprocess 工作区) | repo_tests_official(pytest 等) | 行 verifier.config.test_command |
+| claweval / wildclawbench / skillsbench / apex_agents | shell_sandbox | unsupported_official(v1 preflight 报错并给出 clone/配置指引) | 待接入官方 harness |
+| 内部 hy_* / e_bench / prodbench / hy_euler_pro | 按行格式自动分类 | expected_tool_calls 或 llm_rubric_judge | 本地源 |
+
+实时浏览模式:行内把 executor 换成 `{"kind": "web_search"}` 即注入 `web_search`/`fetch_url` 工具,
+后端为 .env 配置的通用 JSON 搜索端点(`RWKV_WEB_SEARCH_API_URL` / `RWKV_WEB_SEARCH_API_KEY`,
+Serper 风格 X-API-KEY);未配置时 preflight 报错。离线 manifest 回放不需要任何 API。
+
+域分类总表见 `docs/benchmark_taxonomy.md`(frontierscience_* 属 knowledge 域,走 free_response_judge,不在本通道)。
 
 judge 端点从 `.env` 读取(`JUDGE_MODEL` / `JUDGE_API_KEY` / `JUDGE_BASE_URL`),也可用 `--judge-model/--judge-api-key/--judge-base-url` 覆盖。
 

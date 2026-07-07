@@ -243,6 +243,16 @@ def test_prepper_normalization_applies_profiles_and_row_overrides() -> None:
     assert normalized["verifier"]["kind"] == "expected_tool_calls"
     assert normalized["expected_tool_calls"][0]["name"] == "final_answer"
 
+    euler_row = {"id": "eu-1", "question": "Project Euler #1?", "answer": "233168"}
+    normalized = normalize_agent_loop_row(euler_row, dataset_name="hy_euler_pro", index=0, source_path="src.jsonl")
+    assert normalized["executor"]["kind"] == "manifest_replay"
+    assert normalized["verifier"]["kind"] == "expected_tool_calls"
+
+    hle_row = {"id": "hle-1", "question": "Expert question?", "answer": "expert answer"}
+    normalized = normalize_agent_loop_row(hle_row, dataset_name="hle_with_tools", index=0, source_path="src.jsonl")
+    assert normalized["verifier"]["kind"] == "llm_rubric_judge"
+    assert normalized["verifier"]["config"]["reference_answer"] == "expert answer"
+
     override_row = {
         "task_id": "tb-1",
         "instruction": "Fix it.",
@@ -277,3 +287,81 @@ def test_agent_loop_prompt_uses_trained_multi_turn_format() -> None:
     assert "\n\nUser: Function output:\n" in prompt
     assert 'Assistant: ```json\n{"name":"search"' in prompt
     assert prompt.rstrip().endswith("Assistant: ```json")
+
+
+def test_repo_tests_official_verifier_runs_task_tests_in_workspace(tmp_path: Path) -> None:
+    record = AgentLoopRecord(
+        task_id="repo-1",
+        instruction="Create hello.txt containing hello.",
+        tools=(),
+        executor=ExecutorSpec(kind="shell_sandbox", config={"backend": "subprocess"}),
+        verifier=VerifierSpec(
+            kind="repo_tests_official",
+            config={"test_command": "grep -q hello hello.txt"},
+        ),
+        metadata={"source_benchmark": "nl2repo"},
+    )
+    executor = ShellSandboxExecutor(backend="subprocess", workspace_root=str(tmp_path))
+    executor.open()
+    executor.execute("write_file", {"path": "hello.txt", "content": "hello world"})
+    verifier = build_agent_loop_verifier("repo_tests_official", SimpleNamespace())
+    assert verifier.preflight([record], SimpleNamespace()) == []
+
+    verdict = verifier.verify(record, final_answer="done", trace=[], executor_snapshot=executor.snapshot())
+    assert verdict.is_passed is True
+
+    failing = AgentLoopRecord(
+        task_id="repo-2",
+        instruction="x",
+        tools=(),
+        executor=record.executor,
+        verifier=VerifierSpec(kind="repo_tests_official", config={"test_command": "grep -q missing hello.txt"}),
+        metadata={},
+    )
+    verdict = verifier.verify(failing, final_answer="", trace=[], executor_snapshot=executor.snapshot())
+    assert verdict.is_passed is False
+    executor.close()
+
+
+def test_repo_tests_official_preflight_requires_test_command() -> None:
+    record = AgentLoopRecord(
+        task_id="repo-3",
+        instruction="x",
+        tools=(),
+        executor=ExecutorSpec(kind="shell_sandbox", config={"backend": "subprocess"}),
+        verifier=VerifierSpec(kind="repo_tests_official"),
+        metadata={},
+    )
+    verifier = build_agent_loop_verifier("repo_tests_official", SimpleNamespace())
+    errors = verifier.preflight([record], SimpleNamespace())
+    assert errors and "test_command" in errors[0]
+
+
+def test_web_search_executor_requires_env_configuration(monkeypatch) -> None:
+    from src.eval.tasks.function_calling.agent_loop_executors import (
+        WEB_SEARCH_API_KEY_ENV,
+        WEB_SEARCH_API_URL_ENV,
+        WebSearchExecutor,
+    )
+
+    monkeypatch.delenv(WEB_SEARCH_API_URL_ENV, raising=False)
+    monkeypatch.delenv(WEB_SEARCH_API_KEY_ENV, raising=False)
+    assert WebSearchExecutor.config_error() is not None
+
+    record = AgentLoopRecord(
+        task_id="web-1",
+        instruction="Search it.",
+        tools=(),
+        executor=ExecutorSpec(kind="web_search"),
+        verifier=VerifierSpec(kind="llm_rubric_judge"),
+        metadata={},
+    )
+    monkeypatch.setenv("JUDGE_MODEL", "judge-model")
+    monkeypatch.setenv("JUDGE_API_KEY", "judge-key")
+    with pytest.raises(ValueError) as excinfo:
+        preflight_agent_loop_runtime([record], SimpleNamespace(judge_model=None, judge_api_key=None, judge_base_url=None))
+    assert "RWKV_WEB_SEARCH_API_URL" in str(excinfo.value)
+
+    monkeypatch.setenv(WEB_SEARCH_API_URL_ENV, "https://example.test/search")
+    monkeypatch.setenv(WEB_SEARCH_API_KEY_ENV, "k")
+    assert WebSearchExecutor.config_error() is None

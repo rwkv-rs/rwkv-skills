@@ -322,23 +322,27 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
         "hy_skillsworld",
         scheduler_jobs=_AGENT_LOOP_JOBS,
     ),
-    canonical_slug("frontierscience_research"): _function_calling(
-        "frontierscience_research",
-        scheduler_jobs=_AGENT_LOOP_JOBS,
-    ),
-    canonical_slug("frontierscience_olympiad"): _function_calling(
-        "frontierscience_olympiad",
+    canonical_slug("hle_with_tools"): _function_calling(
+        "hle_with_tools",
         scheduler_jobs=_AGENT_LOOP_JOBS,
     ),
     # Free-answer benchmarks (math/science/long-context): official form is a free
     # response graded by an answer parser (free_response) or an LLM judge
     # (free_response_judge), matching each benchmark's official grading.
+    canonical_slug("frontierscience_research"): _math(
+        "frontierscience_research",
+        scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS,
+    ),
+    canonical_slug("frontierscience_olympiad"): _math(
+        "frontierscience_olympiad",
+        scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS,
+    ),
     canonical_slug("usamo_2026"): _math("usamo_2026", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
     canonical_slug("matharena_apex"): _math("matharena_apex"),
     canonical_slug("arxivmath"): _math("arxivmath"),
     canonical_slug("horizonmath"): _math("horizonmath"),
     canonical_slug("hy_math"): _math("hy_math"),
-    canonical_slug("hy_euler_pro"): _math("hy_euler_pro"),
+    canonical_slug("hy_euler_pro"): _function_calling("hy_euler_pro", scheduler_jobs=_AGENT_LOOP_JOBS),
     canonical_slug("imoanswerbench"): _math("imoanswerbench"),
     canonical_slug("phybench"): _math("phybench", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
     canonical_slug("cmt_benchmark"): _math("cmt_benchmark", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),

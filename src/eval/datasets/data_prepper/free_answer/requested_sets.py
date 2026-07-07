@@ -60,12 +60,14 @@ _REQUESTED_FREE_ANSWER_SPECS: dict[str, RequestedFreeAnswerSpec] = {
         # MathArena family: official grading is automatic final-answer parsing;
         # USAMO 2026 is proof-based and officially judge-graded.
         RequestedFreeAnswerSpec("usamo_2026", hf_dataset_id="MathArena/usamo_2026"),
-        RequestedFreeAnswerSpec("matharena_apex", hf_dataset_id="MathArena/apex"),
+        RequestedFreeAnswerSpec("matharena_apex", hf_dataset_id="MathArena/apex_2025"),
         RequestedFreeAnswerSpec("arxivmath", hf_dataset_id="MathArena/arxivmath"),
         RequestedFreeAnswerSpec("horizonmath"),
         RequestedFreeAnswerSpec("hy_math"),
-        RequestedFreeAnswerSpec("hy_euler_pro"),
         RequestedFreeAnswerSpec("imoanswerbench"),
+        # Science QA without a downloadable dataset (local sources + LLM judge).
+        RequestedFreeAnswerSpec("frontierscience_research"),
+        RequestedFreeAnswerSpec("frontierscience_olympiad"),
         # Science QA (officially judge/EED graded).
         RequestedFreeAnswerSpec("phybench", hf_dataset_id="Eureka-Lab/PHYBench"),
         RequestedFreeAnswerSpec("cmt_benchmark"),

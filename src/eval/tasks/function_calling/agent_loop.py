@@ -31,6 +31,7 @@ from src.eval.tasks.function_calling.agent_loop_executors import (
     ManifestReplayExecutor,
     McpWorkerExecutor,
     ShellSandboxExecutor,
+    WebSearchExecutor,
     step_outcome_to_function_output,
 )
 from src.eval.tasks.function_calling.agent_loop_verifiers import (
@@ -160,6 +161,12 @@ def build_agent_loop_executor(record: AgentLoopRecord, args: "argparse.Namespace
             runtime_root=str(config.get("runtime_root") or ""),
             worker_script=(str(config.get("worker_script")) if config.get("worker_script") else None),
             servers=tuple(str(item) for item in config.get("servers") or ()),
+        )
+    if kind == "web_search":
+        return WebSearchExecutor(
+            max_output_chars=int(
+                config.get("max_output_chars") or getattr(args, "agent_loop_max_output_chars", None) or DEFAULT_MAX_OUTPUT_CHARS
+            ),
         )
     raise ValueError(f"unknown agent-loop executor kind: {kind!r}")
 

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from src.eval.benchmark_registry import BenchmarkField
+from src.eval.benchmark_registry import BenchmarkField, resolve_benchmark_metadata
+from src.eval.benchmark_sources import REQUESTED_BENCHMARKS_BY_NAME
 from src.eval.scheduler.dataset_utils import canonical_slug
 
 
@@ -14,13 +15,24 @@ DOMAIN_CODING = "coding系列"
 DOMAIN_INSTRUCTION_FOLLOWING = "instruction following系列"
 DOMAIN_FUNCTION_CALL = "function_call系列"
 DOMAIN_FUNCTION_CALL_LEGACY = "function_call"
+DOMAIN_AGENT = "agent系列"
 
 KNOWLEDGE_GROUP_DOMAINS = frozenset({DOMAIN_MMLU, DOMAIN_MULTI_CHOICE, DOMAIN_OTHER})
 MULTI_CHOICE_DOMAINS = frozenset({DOMAIN_MMLU, DOMAIN_MULTI_CHOICE})
 MATH_DOMAINS = frozenset({DOMAIN_MATH})
 CODING_DOMAINS = frozenset({DOMAIN_CODING})
 INSTRUCTION_FOLLOWING_DOMAINS = frozenset({DOMAIN_INSTRUCTION_FOLLOWING})
-FUNCTION_CALL_DOMAINS = frozenset({DOMAIN_FUNCTION_CALL, DOMAIN_FUNCTION_CALL_LEGACY})
+FUNCTION_CALL_DOMAINS = frozenset({DOMAIN_FUNCTION_CALL, DOMAIN_FUNCTION_CALL_LEGACY, DOMAIN_AGENT})
+AGENT_DOMAINS = frozenset({DOMAIN_AGENT})
+
+
+def _is_agent_domain_slug(slug: str) -> bool:
+    try:
+        benchmark_name = resolve_benchmark_metadata(slug).name
+    except Exception:  # noqa: BLE001 - unknown slugs keep the generic label
+        return False
+    source = REQUESTED_BENCHMARKS_BY_NAME.get(benchmark_name)
+    return source is not None and source.domain == "agent"
 
 
 def domain_for_benchmark_field(field: BenchmarkField, *, dataset_slug: str) -> str:
@@ -34,7 +46,7 @@ def domain_for_benchmark_field(field: BenchmarkField, *, dataset_slug: str) -> s
     if field is BenchmarkField.INSTRUCTION_FOLLOWING:
         return DOMAIN_INSTRUCTION_FOLLOWING
     if field is BenchmarkField.FUNCTION_CALLING:
-        return DOMAIN_FUNCTION_CALL
+        return DOMAIN_AGENT if _is_agent_domain_slug(slug) else DOMAIN_FUNCTION_CALL
     return DOMAIN_OTHER
 
 
@@ -62,8 +74,14 @@ def is_function_call_domain(domain: str | None) -> bool:
     return bool(domain) and domain in FUNCTION_CALL_DOMAINS
 
 
+def is_agent_domain(domain: str | None) -> bool:
+    return bool(domain) and domain in AGENT_DOMAINS
+
+
 __all__ = [
+    "AGENT_DOMAINS",
     "CODING_DOMAINS",
+    "DOMAIN_AGENT",
     "DOMAIN_CODING",
     "DOMAIN_FUNCTION_CALL",
     "DOMAIN_FUNCTION_CALL_LEGACY",
@@ -78,6 +96,7 @@ __all__ = [
     "MATH_DOMAINS",
     "MULTI_CHOICE_DOMAINS",
     "domain_for_benchmark_field",
+    "is_agent_domain",
     "is_coding_domain",
     "is_function_call_domain",
     "is_instruction_following_domain",
