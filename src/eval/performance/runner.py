@@ -14,7 +14,7 @@ from src.eval.performance.schema import (
     ServiceRequestRecord,
     summarize_values,
 )
-from src.eval.performance.service_client import OpenAIChatServiceClient
+from src.eval.performance.service_client import BaseServiceClient, build_service_client
 from src.eval.performance.tokenizers import BenchmarkTokenizer
 from src.eval.performance.workload import build_prompt_for_target_tokens, repeat_prompts
 
@@ -45,10 +45,9 @@ class ServiceBenchmarkConfig:
     hardware_metadata: dict[str, Any]
 
 
-def _build_client(config: ServiceBenchmarkConfig) -> OpenAIChatServiceClient:
-    if config.protocol != "openai-chat":
-        raise ValueError(f"暂不支持的协议: {config.protocol}")
-    return OpenAIChatServiceClient(
+def _build_client(config: ServiceBenchmarkConfig) -> BaseServiceClient:
+    return build_service_client(
+        protocol=config.protocol,
         base_url=config.base_url,
         model=config.model,
         api_key=config.api_key,
@@ -98,7 +97,7 @@ def _summarize_point(point: PerfPointResult) -> dict[str, Any]:
 
 def _measure_run(
     *,
-    client: OpenAIChatServiceClient,
+    client: BaseServiceClient,
     config: ServiceBenchmarkConfig,
     prompts: list[str],
     prompt_token_count: int,
@@ -192,7 +191,7 @@ def _measure_run(
 
 def _run_point(
     *,
-    client: OpenAIChatServiceClient,
+    client: BaseServiceClient,
     config: ServiceBenchmarkConfig,
     point_kind: str,
     ctx_len: int,

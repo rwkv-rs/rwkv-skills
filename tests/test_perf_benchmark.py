@@ -3,12 +3,20 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from src.bin import run_perf_benchmark as perf_cli
 from src.eval.performance import config as perf_config_module
 from src.eval.performance.runner import ServiceBenchmarkConfig, run_service_benchmark
 from src.eval.performance.schema import PerfBenchmarkResult
-from src.eval.performance.service_client import ServiceRequestResult
+from src.eval.performance.service_client import (
+    OpenAIChatServiceClient,
+    OpenAICompletionsServiceClient,
+    ServiceRequestResult,
+    build_service_client,
+)
 from src.eval.performance.vllm_launcher import VllmLaunchConfig, _explain_launch_failure
 
 
@@ -205,3 +213,73 @@ def test_explain_launch_failure_surfaces_torch_vllm_abi_mismatch() -> None:
     )
 
     assert "PyTorch/CUDA 二进制不兼容" in message
+
+
+def test_build_service_client_dispatches_on_protocol() -> None:
+    chat = build_service_client(protocol="openai-chat", base_url="http://127.0.0.1:8000", model="m")
+    completions = build_service_client(protocol="completions", base_url="http://127.0.0.1:8000", model="m")
+
+    assert isinstance(chat, OpenAIChatServiceClient)
+    assert isinstance(completions, OpenAICompletionsServiceClient)
+
+
+def test_build_service_client_rejects_unknown_protocol() -> None:
+    with pytest.raises(ValueError):
+        build_service_client(protocol="grpc", base_url="http://127.0.0.1:8000", model="m")
+
+
+def test_parse_args_accepts_completions_protocol() -> None:
+    args = perf_cli.parse_args(
+        ["--base-url", "http://127.0.0.1:8000", "--model", "m", "--protocol", "completions"]
+    )
+
+    assert args.protocol == "completions"
+
+
+class _FakeCompletions:
+    def __init__(self, chunks) -> None:
+        self._chunks = chunks
+        self.last_kwargs: dict | None = None
+
+    def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        return iter(self._chunks)
+
+
+class _FakeOpenAI:
+    def __init__(self, chunks) -> None:
+        self.completions = _FakeCompletions(chunks)
+
+
+def _completion_chunk(*, text=None, finish_reason=None):
+    return SimpleNamespace(choices=[SimpleNamespace(text=text, finish_reason=finish_reason)])
+
+
+def test_completions_client_streams_text_and_measures_ttft(monkeypatch) -> None:
+    chunks = [
+        _completion_chunk(text="Hello"),
+        _completion_chunk(text=" world"),
+        _completion_chunk(finish_reason="stop"),
+    ]
+    client = OpenAICompletionsServiceClient(base_url="http://127.0.0.1:8000", model="m")
+    fake = _FakeOpenAI(chunks)
+    monkeypatch.setattr(client, "_client", lambda: fake)
+
+    result = client.benchmark_one(
+        request_index=3,
+        prompt="hi",
+        max_tokens=8,
+        temperature=0.0,
+        top_p=1.0,
+        seed=None,
+    )
+
+    assert result.request_index == 3
+    assert result.text == "Hello world"
+    assert result.finish_reason == "stop"
+    assert result.ttft_s > 0.0
+    assert result.e2el_s >= result.ttft_s
+    # Raw completions path sends the prompt directly (no chat messages) and streams.
+    assert fake.completions.last_kwargs["prompt"] == "hi"
+    assert fake.completions.last_kwargs["stream"] is True
+    assert "messages" not in fake.completions.last_kwargs

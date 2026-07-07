@@ -1,0 +1,35 @@
+# Prefill-bound profile for the production RWKV service (raw completions).
+# Low concurrency + short output isolates prefill (sequential WKV) cost vs
+# context length: read ttft_s / input_tps across ctx_lens.
+# Point the base_url at the forwarded prod router (see the engine-profile runbook).
+
+[service]
+base_url = "http://127.0.0.1:19083/v1"
+model = "rwkv7-g1f-2.9b-20260420-ctx8192"
+protocol = "completions"
+engine_name = "vllm-rwkv"
+precision = "fp16"
+stack_name = "vllm-rwkv-service"
+
+[tokenizer]
+type = "rwkv"
+
+[workload]
+ctx_lens = [512, 1024, 2048, 4096, 8192]
+concurrency_levels = [1, 2, 4]
+output_tokens = 8
+warmup_runs = 1
+measure_runs = 3
+temperature = 0.0
+top_p = 1.0
+timeout_s = 1800.0
+seed = 42
+skip_batch_size_matrix = true
+
+[hardware]
+# Benchmark host is local; service runs on remote 8222. Do NOT set gpu_index
+# (NVML would sample the wrong machine). Peak VRAM is read from batch-metrics instead.
+hardware_label = "remote-8222-gpu"
+
+[vllm]
+launch = false

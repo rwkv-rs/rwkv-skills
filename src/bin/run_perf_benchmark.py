@@ -46,9 +46,9 @@ def _build_parser(defaults: dict[str, object] | None = None) -> argparse.Argumen
     )
     parser.add_argument(
         "--protocol",
-        choices=("openai-chat",),
+        choices=("openai-chat", "completions"),
         default=_arg_default(resolved_defaults, "protocol", "openai-chat"),
-        help="Service protocol",
+        help="Service protocol: openai-chat (applies chat template) or completions (raw prompt, matches production eval)",
     )
     parser.add_argument(
         "--stack-name",
