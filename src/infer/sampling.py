@@ -2,7 +2,9 @@ from __future__ import annotations
 
 """Sampling primitives shared across all inference / evaluation pipelines."""
 
+import json
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 # RWKV world 词表（rwkv_vocab_v20230424）中前 256 个 token 为单字节，token id == byte + 1。
 # 这里豁免重复惩罚的是：空格(33→0x20)、制表符(10→0x09)、数字 '0'-'9'(49-58→0x30-0x39)，
@@ -91,6 +93,40 @@ class GenerationOutput:
 
 
 @dataclass(slots=True)
+class ChatToolCall:
+    """OpenAI-compatible tool call returned by chat-native inference."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+    raw_payload: dict[str, Any] = field(default_factory=dict)
+
+    def as_openai_tool_call(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": json.dumps(self.arguments, ensure_ascii=False, separators=(",", ":")),
+            },
+        }
+
+
+@dataclass(slots=True)
+class ToolCallGenerationOutput:
+    """A chat completion result that preserves native tool-call structure."""
+
+    prompt_index: int
+    messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    content: str
+    tool_calls: list[ChatToolCall]
+    finish_reason: str
+    raw_message: dict[str, Any] = field(default_factory=dict)
+    response_source: str = "content"
+
+
+@dataclass(slots=True)
 class GeneratedTokenCandidate:
     token_id: int | None
     text: str
@@ -113,9 +149,11 @@ class GeneratedTextDelta:
     tokens: list[GeneratedToken] = field(default_factory=list)
 
 __all__ = [
+    "ChatToolCall",
     "GeneratedTextDelta",
     "GeneratedToken",
     "GeneratedTokenCandidate",
     "GenerationOutput",
     "SamplingConfig",
+    "ToolCallGenerationOutput",
 ]

@@ -11,8 +11,15 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
+from src.bin.run_infer_server import (
+    DEFAULT_VLLM_RWKV_BRANCH,
+    DEFAULT_VLLM_RWKV_PATH,
+    _VLLM_RWKV_UPDATE_MODES,
+    update_vllm_rwkv_checkout,
+)
 from src.eval.scheduler.process import list_idle_gpus
 
 
@@ -80,6 +87,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--api-key", default="", help="Bearer token required by each infer service")
     parser.add_argument("--vllm-rwkv-path", help="Path to the vllm-rwkv source checkout")
     parser.add_argument("--vllm-python", help="Python executable used to launch vllm-rwkv")
+    parser.add_argument(
+        "--vllm-rwkv-update",
+        choices=_VLLM_RWKV_UPDATE_MODES,
+        default=os.environ.get("VLLM_RWKV_UPDATE", "off").strip().lower(),
+        help=(
+            "Update the local vllm-rwkv checkout once before launching the fleet. "
+            "off is the server-safe default for vendored uploads; pull is best-effort; "
+            "pull-strict aborts on failure."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-rwkv-branch",
+        default=os.environ.get("VLLM_RWKV_BRANCH", DEFAULT_VLLM_RWKV_BRANCH),
+        help="Remote branch used by --vllm-rwkv-update pull/pull-strict",
+    )
+    parser.add_argument(
+        "--tokenizer-mode",
+        help="vLLM tokenizer mode passed to each infer service; RWKV7 raw checkpoints should use rwkv",
+    )
+    parser.add_argument(
+        "--disable-auto-tool-choice",
+        action="store_true",
+        help="Disable vLLM auto tool choice in each infer service.",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        help="vLLM tool-call parser passed to each infer service; use empty string to omit the explicit flag.",
+    )
     parser.add_argument(
         "--infer-auto-config",
         choices=("off", "balanced", "throughput"),
@@ -211,6 +246,11 @@ def build_command(
     api_key: str,
     vllm_rwkv_path: str | None = None,
     vllm_python: str | None = None,
+    vllm_rwkv_update: str | None = None,
+    vllm_rwkv_branch: str | None = None,
+    tokenizer_mode: str | None = None,
+    disable_auto_tool_choice: bool = False,
+    tool_call_parser: str | None = None,
     infer_auto_config: str | None = None,
     log_level: str = "info",
     max_model_len: int | None = None,
@@ -243,6 +283,16 @@ def build_command(
         command.extend(["--vllm-rwkv-path", str(vllm_rwkv_path)])
     if vllm_python:
         command.extend(["--vllm-python", str(vllm_python)])
+    if vllm_rwkv_update:
+        command.extend(["--vllm-rwkv-update", str(vllm_rwkv_update)])
+    if vllm_rwkv_branch:
+        command.extend(["--vllm-rwkv-branch", str(vllm_rwkv_branch)])
+    if tokenizer_mode is not None:
+        command.extend(["--tokenizer-mode", str(tokenizer_mode)])
+    if disable_auto_tool_choice:
+        command.append("--disable-auto-tool-choice")
+    if tool_call_parser is not None:
+        command.extend(["--tool-call-parser", str(tool_call_parser)])
     if api_key:
         command.extend(["--api-key", api_key])
     if max_model_len is not None:
@@ -288,6 +338,11 @@ def launch_service(
     api_key: str,
     vllm_rwkv_path: str | None,
     vllm_python: str | None,
+    vllm_rwkv_update: str | None,
+    vllm_rwkv_branch: str | None,
+    tokenizer_mode: str | None,
+    disable_auto_tool_choice: bool,
+    tool_call_parser: str | None,
     infer_auto_config: str | None,
     log_level: str,
     max_model_len: int | None,
@@ -304,6 +359,11 @@ def launch_service(
         api_key=api_key,
         vllm_rwkv_path=vllm_rwkv_path,
         vllm_python=vllm_python,
+        vllm_rwkv_update=vllm_rwkv_update,
+        vllm_rwkv_branch=vllm_rwkv_branch,
+        tokenizer_mode=tokenizer_mode,
+        disable_auto_tool_choice=disable_auto_tool_choice,
+        tool_call_parser=tool_call_parser,
         infer_auto_config=infer_auto_config,
         log_level=log_level,
         max_model_len=max_model_len,
@@ -437,6 +497,18 @@ def terminate_running(services: Sequence[RunningInferService], router: RunningIn
     _terminate_pids(pids)
 
 
+def update_vllm_rwkv_checkout_once(args: argparse.Namespace) -> bool:
+    mode = str(args.vllm_rwkv_update or "off").strip().lower()
+    if mode == "off":
+        return False
+    update_args = SimpleNamespace(
+        vllm_rwkv_update=mode,
+        vllm_rwkv_path=str(args.vllm_rwkv_path or DEFAULT_VLLM_RWKV_PATH),
+        vllm_rwkv_branch=str(args.vllm_rwkv_branch or DEFAULT_VLLM_RWKV_BRANCH),
+    )
+    return update_vllm_rwkv_checkout(update_args)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     model_paths = tuple(Path(path).expanduser().resolve() for path in args.model_paths)
@@ -449,6 +521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_batch_size=int(args.max_batch_size),
         max_batch_sizes=args.max_batch_sizes,
     )
+    update_vllm_rwkv_checkout_once(args)
     pending_paths = list(model_paths)
     pending_names = list(model_names)
     pending_batch_sizes = list(max_batch_sizes)
@@ -498,6 +571,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     api_key=str(args.api_key or ""),
                     vllm_rwkv_path=args.vllm_rwkv_path,
                     vllm_python=args.vllm_python,
+                    vllm_rwkv_update="off",
+                    vllm_rwkv_branch=args.vllm_rwkv_branch,
+                    tokenizer_mode=args.tokenizer_mode,
+                    disable_auto_tool_choice=bool(args.disable_auto_tool_choice),
+                    tool_call_parser=args.tool_call_parser,
                     infer_auto_config=args.infer_auto_config,
                     log_level=str(args.log_level),
                     max_model_len=args.max_model_len,

@@ -26,8 +26,11 @@ _bootstrap_cuda_visible_devices(sys.argv[1:])
 from src.infer.auto_config import AutoConfigMode, GpuProfile, choose_infer_auto_config, detect_visible_gpu_profile
 
 
-DEFAULT_VLLM_RWKV_PATH = Path.home() / "GitHub" / "vllm-rwkv"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_VLLM_RWKV_PATH = PROJECT_ROOT / "vendor" / "vllm-rwkv"
+DEFAULT_VLLM_RWKV_BRANCH = "feat/rwkv-faster3a"
 _AUTO_CONFIG_MODES = ("off", "balanced", "throughput")
+_VLLM_RWKV_UPDATE_MODES = ("off", "pull", "pull-strict")
 _AUTO_CONFIG_DEFAULTS = {
     "max_num_seqs": 512,
     "max_num_batched_tokens": 16384,
@@ -46,6 +49,10 @@ def _default_vllm_rwkv_path() -> str:
 
 def _default_vllm_python() -> str:
     return os.environ.get("VLLM_PYTHON", sys.executable)
+
+
+def _default_vllm_rwkv_update() -> str:
+    return os.environ.get("VLLM_RWKV_UPDATE", "off").strip().lower()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -67,6 +74,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--vllm-python",
         default=_default_vllm_python(),
         help="Python executable used to launch vllm-rwkv",
+    )
+    parser.add_argument(
+        "--vllm-rwkv-update",
+        choices=_VLLM_RWKV_UPDATE_MODES,
+        default=_default_vllm_rwkv_update(),
+        help=(
+            "Update the local vllm-rwkv checkout before launch. "
+            "off is the server-safe default for vendored uploads; pull is best-effort; "
+            "pull-strict aborts on failure."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-rwkv-branch",
+        default=os.environ.get("VLLM_RWKV_BRANCH", DEFAULT_VLLM_RWKV_BRANCH),
+        help="Remote branch used by --vllm-rwkv-update pull/pull-strict",
+    )
+    parser.add_argument(
+        "--tokenizer-mode",
+        default=os.environ.get("VLLM_TOKENIZER_MODE", "rwkv"),
+        help="vLLM tokenizer mode; RWKV7 raw checkpoints should use rwkv",
+    )
+    parser.add_argument(
+        "--disable-auto-tool-choice",
+        action="store_true",
+        help="Do not pass vLLM --enable-auto-tool-choice.",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        default=os.environ.get("VLLM_TOOL_CALL_PARSER", "rwkv"),
+        help="vLLM tool call parser used when auto tool choice is enabled; empty disables the explicit parser flag.",
     )
     parser.add_argument("--model-name", help="Public model name exposed by the OpenAI-compatible API")
     parser.add_argument(
@@ -191,6 +228,8 @@ def build_vllm_command(args: argparse.Namespace) -> list[str]:
         "--tensor-parallel-size",
         str(int(args.tensor_parallel_size)),
     ]
+    if str(args.tokenizer_mode or "").strip():
+        command.extend(["--tokenizer-mode", str(args.tokenizer_mode)])
     if args.model_name:
         command.extend(["--served-model-name", str(args.model_name)])
     if args.api_key:
@@ -201,6 +240,11 @@ def build_vllm_command(args: argparse.Namespace) -> list[str]:
         command.extend(["--max-num-batched-tokens", str(int(args.max_num_batched_tokens))])
     if bool(args.enforce_eager):
         command.append("--enforce-eager")
+    if not bool(args.disable_auto_tool_choice):
+        command.append("--enable-auto-tool-choice")
+        tool_call_parser = str(args.tool_call_parser or "").strip()
+        if tool_call_parser:
+            command.extend(["--tool-call-parser", tool_call_parser])
     if str(args.log_level or "").strip():
         command.extend(["--uvicorn-log-level", str(args.log_level)])
     command.extend(str(item) for item in (args.extra_vllm_arg or ()))
@@ -222,11 +266,40 @@ def build_vllm_env(args: argparse.Namespace, *, base_env: Mapping[str, str] | No
     return env
 
 
+def update_vllm_rwkv_checkout(args: argparse.Namespace) -> bool:
+    mode = str(args.vllm_rwkv_update or "off").strip().lower()
+    if mode == "off":
+        return False
+    checkout = Path(str(args.vllm_rwkv_path)).expanduser().resolve()
+    git_dir = checkout / ".git"
+    if not git_dir.exists():
+        message = f"vllm-rwkv checkout is not a git repository: {checkout}"
+        if mode == "pull-strict":
+            raise RuntimeError(message)
+        _LOG.warning("%s; continuing without update", message)
+        return False
+    branch = str(args.vllm_rwkv_branch or DEFAULT_VLLM_RWKV_BRANCH).strip()
+    command = ["git", "-C", str(checkout), "pull", "--ff-only", "origin", branch]
+    _LOG.info("updating vllm-rwkv checkout: %s", " ".join(command))
+    result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=120)
+    if result.returncode == 0:
+        if result.stdout.strip():
+            _LOG.info("vllm-rwkv update: %s", result.stdout.strip())
+        return True
+    detail = (result.stderr or result.stdout or "").strip()
+    message = f"vllm-rwkv update failed with code {result.returncode}: {detail}"
+    if mode == "pull-strict":
+        raise RuntimeError(message)
+    _LOG.warning("%s; continuing with existing checkout", message)
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
     if bool(getattr(args, "infer_auto_config_applied", False)):
         _LOG.info("applied infer auto config: %s", args.infer_auto_config_reason)
+    update_vllm_rwkv_checkout(args)
     command = build_vllm_command(args)
     env = build_vllm_env(args)
     _LOG.info("launching vllm-rwkv: %s", " ".join(command))

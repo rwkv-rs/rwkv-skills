@@ -89,6 +89,11 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
         api_key="secret",
         vllm_rwkv_path="/opt/vllm-rwkv",
         vllm_python="/opt/vllm/bin/python",
+        vllm_rwkv_update="off",
+        vllm_rwkv_branch="feat/rwkv-faster3a",
+        tokenizer_mode="rwkv",
+        disable_auto_tool_choice=False,
+        tool_call_parser="rwkv",
         infer_auto_config="off",
         log_level="warning",
         max_model_len=8192,
@@ -105,6 +110,11 @@ def test_build_command_targets_visible_cuda_zero(tmp_path: Path) -> None:
     assert "--engine-mode" not in command
     assert command[command.index("--vllm-rwkv-path") + 1] == "/opt/vllm-rwkv"
     assert command[command.index("--vllm-python") + 1] == "/opt/vllm/bin/python"
+    assert command[command.index("--vllm-rwkv-update") + 1] == "off"
+    assert command[command.index("--vllm-rwkv-branch") + 1] == "feat/rwkv-faster3a"
+    assert command[command.index("--tokenizer-mode") + 1] == "rwkv"
+    assert command[command.index("--tool-call-parser") + 1] == "rwkv"
+    assert "--disable-auto-tool-choice" not in command
     assert command[command.index("--port") + 1] == "18081"
     assert "--max-batch-size" not in command
     assert command[command.index("--infer-auto-config") + 1] == "off"

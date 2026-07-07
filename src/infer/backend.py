@@ -8,13 +8,13 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Protocol, Sequence
+from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
 import httpx
 from tqdm import tqdm
 
 from .constraints import DecodeConstraint
-from .sampling import GeneratedTextDelta, GenerationOutput, SamplingConfig
+from .sampling import ChatToolCall, GeneratedTextDelta, GenerationOutput, SamplingConfig, ToolCallGenerationOutput
 
 
 class RemoteHTTPError(RuntimeError):
@@ -175,6 +175,23 @@ class InferenceBackend(Protocol):
         """
         ...
 
+    def generate_tool_calls(
+        self,
+        message_batches: Sequence[Sequence[Mapping[str, Any]]],
+        tools_batches: Sequence[Sequence[Mapping[str, Any]] | None],
+        *,
+        sampling: SamplingConfig,
+        batch_size: int,
+        max_concurrent: int | None = None,
+        progress_desc: str = "Generating tool calls",
+        tool_choice: object = "auto",
+        parallel_tool_calls: bool | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
+        show_progress: bool = True,
+    ) -> list[ToolCallGenerationOutput]:
+        """Generate chat-native tool-call decisions with OpenAI-compatible tools."""
+        ...
+
 
 @dataclass(slots=True, frozen=True)
 class RemoteInferenceConfig:
@@ -293,6 +310,63 @@ class RemoteInferenceBackend:
             _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
 
+    def generate_tool_calls(
+        self,
+        message_batches: Sequence[Sequence[Mapping[str, Any]]],
+        tools_batches: Sequence[Sequence[Mapping[str, Any]] | None],
+        *,
+        sampling: SamplingConfig,
+        batch_size: int,
+        max_concurrent: int | None = None,
+        progress_desc: str = "Generating tool calls",
+        tool_choice: object = "auto",
+        parallel_tool_calls: bool | None = None,
+        prompt_seeds: Sequence[int | None] | None = None,
+        show_progress: bool = True,
+    ) -> list[ToolCallGenerationOutput]:
+        if self.config.protocol == "completions":
+            raise NotImplementedError("completion-style remote infer does not support native chat tool calls")
+        if not message_batches:
+            return []
+        if len(tools_batches) != len(message_batches):
+            raise ValueError("tools_batches length must match message_batches length")
+        if prompt_seeds is not None and len(prompt_seeds) != len(message_batches):
+            raise ValueError("prompt_seeds length must match message_batches length")
+        omit_prompt_seeds = self.config.protocol == "vllm" or self.config.seed_policy == "omit"
+        if prompt_seeds is not None:
+            has_prompt_seeds = any(seed is not None for seed in prompt_seeds)
+            if has_prompt_seeds and omit_prompt_seeds:
+                prompt_seeds = None
+            elif not has_prompt_seeds:
+                prompt_seeds = None
+
+        outputs: list[ToolCallGenerationOutput | None] = [None] * len(message_batches)
+        inflight_cap = int(max_concurrent) if max_concurrent is not None else int(batch_size)
+        max_workers = max(1, min(inflight_cap, int(self.config.max_workers), len(message_batches)))
+        progress = tqdm(total=len(message_batches), desc=progress_desc, unit=" request", disable=not show_progress)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._generate_tool_call_one,
+                        prompt_index,
+                        message_batch,
+                        tools_batch or (),
+                        sampling,
+                        tool_choice,
+                        parallel_tool_calls,
+                        None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
+                    ): prompt_index
+                    for prompt_index, (message_batch, tools_batch) in enumerate(zip(message_batches, tools_batches))
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    output = future.result()
+                    outputs[output.prompt_index] = output
+                    _safe_tqdm_update(progress, 1)
+        finally:
+            _safe_tqdm_close(progress)
+        return [output for output in outputs if output is not None]
+
     def shutdown(self) -> None:
         with self._http_client_lock:
             client = self._http_client
@@ -361,6 +435,49 @@ class RemoteInferenceBackend:
             token_ids=[],
             text=text,
             finish_reason=_normalize_remote_finish_reason(choice0.get("finish_reason")),
+        )
+
+    def _generate_tool_call_one(
+        self,
+        prompt_index: int,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        sampling: SamplingConfig,
+        tool_choice: object,
+        parallel_tool_calls: bool | None,
+        seed: int | None,
+    ) -> ToolCallGenerationOutput:
+        payload = _chat_tool_payload_from_sampling(
+            model=self.model_name,
+            messages=messages,
+            tools=tools,
+            sampling=sampling,
+            seed=seed,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+        response = self._post_json(self.config.chat_completions_url(), payload)
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("remote infer response missing choices")
+        choice0 = choices[0]
+        if not isinstance(choice0, dict):
+            raise RuntimeError("remote infer response choice format is invalid")
+        message = choice0.get("message")
+        if not isinstance(message, dict):
+            raise RuntimeError("remote infer response missing chat message")
+        content = _extract_chat_message_content(message)
+        tool_calls = _extract_chat_message_tool_calls(message)
+        response_source = "tool_calls" if tool_calls else ("content" if content else "empty")
+        return ToolCallGenerationOutput(
+            prompt_index=prompt_index,
+            messages=[dict(item) for item in messages],
+            tools=[dict(item) for item in tools],
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=_normalize_remote_finish_reason(choice0.get("finish_reason")),
+            raw_message=dict(message),
+            response_source=response_source,
         )
 
     def _post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:
@@ -532,6 +649,35 @@ def _chat_payload_from_completion_payload(
     return chat_payload
 
 
+def _chat_tool_payload_from_sampling(
+    *,
+    model: str,
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    sampling: SamplingConfig,
+    seed: int | None,
+    tool_choice: object,
+    parallel_tool_calls: bool | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": [dict(message) for message in messages],
+        "tools": [dict(tool) for tool in tools],
+        "tool_choice": tool_choice,
+        "max_tokens": int(sampling.max_generate_tokens),
+        "temperature": float(sampling.temperature),
+        "top_p": float(sampling.top_p),
+        "presence_penalty": float(sampling.alpha_presence),
+        "frequency_penalty": float(sampling.alpha_frequency),
+        "stream": False,
+    }
+    if seed is not None:
+        payload["seed"] = int(seed)
+    if parallel_tool_calls is not None:
+        payload["parallel_tool_calls"] = bool(parallel_tool_calls)
+    return payload
+
+
 def _extract_completion_choice_text(choice: dict[str, object]) -> str:
     text = choice.get("text")
     if isinstance(text, str):
@@ -543,9 +689,15 @@ def _extract_chat_choice_text(choice: dict[str, object]) -> str:
     message = choice.get("message")
     if not isinstance(message, dict):
         raise RuntimeError("remote infer response missing chat message")
+    return _extract_chat_message_content(message)
+
+
+def _extract_chat_message_content(message: Mapping[str, object]) -> str:
     content = message.get("content")
     if isinstance(content, str):
         return content
+    if content is None and message.get("tool_calls"):
+        return ""
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -555,6 +707,53 @@ def _extract_chat_choice_text(choice: dict[str, object]) -> str:
                 parts.append(str(item["text"]))
         return "".join(parts)
     raise RuntimeError("remote infer chat message content format is invalid")
+
+
+def _extract_chat_message_tool_calls(message: Mapping[str, object]) -> list[ChatToolCall]:
+    raw_tool_calls = message.get("tool_calls")
+    if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes, bytearray)):
+        return []
+    tool_calls: list[ChatToolCall] = []
+    for index, raw_call in enumerate(raw_tool_calls):
+        if not isinstance(raw_call, Mapping):
+            continue
+        function_payload = raw_call.get("function")
+        if not isinstance(function_payload, Mapping):
+            function_payload = raw_call.get("function_call")
+        if not isinstance(function_payload, Mapping):
+            continue
+        name = str(function_payload.get("name") or raw_call.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = _coerce_chat_tool_arguments(function_payload.get("arguments"))
+        tool_calls.append(
+            ChatToolCall(
+                id=str(raw_call.get("id") or f"call_{index}"),
+                name=name,
+                arguments=arguments,
+                raw_payload=dict(raw_call),
+            )
+        )
+    return tool_calls
+
+
+def _coerce_chat_tool_arguments(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("remote infer tool call arguments must be a JSON object") from exc
+        if not isinstance(parsed, Mapping):
+            raise RuntimeError("remote infer tool call arguments must be a JSON object")
+        return dict(parsed)
+    raise RuntimeError("remote infer tool call arguments must be a JSON object")
 
 
 def _normalize_remote_finish_reason(finish_reason: object) -> str:

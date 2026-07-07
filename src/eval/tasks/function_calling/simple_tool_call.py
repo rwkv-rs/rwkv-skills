@@ -26,9 +26,11 @@ from src.eval.tasks.function_calling.parallel_candidate_router import (
     ParallelCandidateRouterConfig,
     route_parallel_candidate_tool_call,
 )
+from src.eval.tasks.function_calling.native_tool_calls import (
+    run_native_tool_call_decision,
+)
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
-    _looks_like_template_leak,
     _resolve_function_calling_plan,
     _resolve_function_calling_sample_limit,
     _resolve_job_name,
@@ -166,17 +168,24 @@ def build_simple_tool_call_prompt(
     history_max_chars: int,
     prefill_object: bool = False,
 ) -> str:
-    date_instructions = [
-        "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date.",
+    system_prompt = _simple_tool_call_system_prompt(record)
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        [{"role": "user", "content": normalize_rwkv_text(record.instruction)}],
+        history_max_chars=history_max_chars,
+        assistant_prefix=assistant_json_prefix(prefill_object=prefill_object),
+    )
+
+
+def build_simple_tool_call_messages(record: SimpleToolCallRecord) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": _simple_tool_call_native_system_prompt(record)},
+        {"role": "user", "content": normalize_rwkv_text(record.instruction)},
     ]
-    if str(record.metadata.get("source_format") or "").strip() in {
-        "official_api_bank",
-        "official_apibank",
-    }:
-        date_instructions.append(
-            "API-Bank date convention: if a month/day or relative date has no explicit year and the conversation does not state today's date, use year 2023."
-        )
-    system_prompt = normalize_rwkv_text(
+
+
+def _simple_tool_call_system_prompt(record: SimpleToolCallRecord) -> str:
+    return normalize_rwkv_text(
         "\n".join(
             [
                 "Tools:",
@@ -185,16 +194,38 @@ def build_simple_tool_call_prompt(
                 'The JSON shape is {"name":"tool_name","arguments":{...}}.',
                 "For multiple required tool calls, return a JSON array containing every required call in execution order; do not stop after the first call.",
                 "Use only listed tool names.",
-                *date_instructions,
+                *_simple_tool_call_date_instructions(record),
             ]
         )
     )
-    return build_rwkv_json_call_prompt(
-        system_prompt,
-        [{"role": "user", "content": normalize_rwkv_text(record.instruction)}],
-        history_max_chars=history_max_chars,
-        assistant_prefix=assistant_json_prefix(prefill_object=prefill_object),
+
+
+def _simple_tool_call_native_system_prompt(record: SimpleToolCallRecord) -> str:
+    return normalize_rwkv_text(
+        "\n".join(
+            [
+                "Use the provided tools when a function call is needed.",
+                "Call only provided tool names and supply valid JSON arguments that match the tool schema.",
+                "For multiple required tool calls, return every required call in execution order.",
+                "If no tool is needed, answer directly.",
+                *_simple_tool_call_date_instructions(record),
+            ]
+        )
     )
+
+
+def _simple_tool_call_date_instructions(record: SimpleToolCallRecord) -> list[str]:
+    instructions = [
+        "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date.",
+    ]
+    if str(record.metadata.get("source_format") or "").strip() in {
+        "official_api_bank",
+        "official_apibank",
+    }:
+        instructions.append(
+            "API-Bank date convention: if a month/day or relative date has no explicit year and the conversation does not state today's date, use year 2023."
+        )
+    return instructions
 
 
 def decode_simple_tool_call_response(response: str) -> list[dict[str, Any]]:
@@ -326,6 +357,8 @@ def _run_simple_tool_call(
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     batch_size = max(1, int(args.batch_size or 16))
     candidate_router_mode = _simple_candidate_router_mode(args)
+    if not callable(getattr(run.engine, "generate_tool_calls", None)):
+        raise NotImplementedError("simple tool-call evaluation requires an inference backend with generate_tool_calls")
     candidate_router_config = (
         _simple_candidate_router_config_from_args(args) if candidate_router_mode == "parallel" else None
     )
@@ -333,19 +366,20 @@ def _run_simple_tool_call(
 
     if args.probe_only:
         repeated = repeat_probe_entries(selected_entries, batch_size=batch_size)
-        prompts = [
-            build_simple_tool_call_prompt(record, history_max_chars=history_max_chars)
-            for _index, record in repeated
-        ]
-        run.engine.generate(
-            prompts,
-            sampling=tool_sampling,
-            batch_size=len(prompts),
-            progress_desc="ToolCall-Probe",
-            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
-            prompt_seeds=[sample_repeat_seed(index, 0, stage=1) for index, _record in repeated],
-        )
-        print(f"probe-only run completed: {len(prompts)} prompt(s)")
+        probe_count = 0
+        for index, record in repeated:
+            run_native_tool_call_decision(
+                engine=run.engine,
+                messages=build_simple_tool_call_messages(record),
+                tools=record.tools,
+                sampling=tool_sampling,
+                progress_desc="ToolCall-Native-Probe",
+                prompt_seed=sample_repeat_seed(index, 0, stage=1),
+                parallel_tool_calls=True,
+                context_label="tool-call selection",
+            )
+            probe_count += 1
+        print(f"probe-only run completed: {probe_count} prompt(s)")
         return 0
 
     job_name = _resolve_job_name(default_job_name, run_context=run_context)
@@ -401,31 +435,47 @@ def _run_simple_tool_call(
                             prompt_seed=prompt_seed,
                             progress_desc=f"ToolCall-CandidateRouter sample {key.sample_index}",
                         )
-                    else:
-                        prompt = build_simple_tool_call_prompt(record, history_max_chars=history_max_chars)
-                        output = run.engine.generate(
-                            [prompt],
+                    elif record.tools:
+                        decision = run_native_tool_call_decision(
+                            engine=run.engine,
+                            messages=build_simple_tool_call_messages(record),
+                            tools=record.tools,
                             sampling=tool_sampling,
-                            batch_size=1,
-                            progress_desc=f"ToolCall sample {key.sample_index}",
-                            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                            prompt_seeds=[prompt_seed],
-                        )[0]
-                        completion = output.text
-                        finish_reason = output.finish_reason
+                            progress_desc=f"ToolCall-Native sample {key.sample_index}",
+                            prompt_seed=prompt_seed,
+                            parallel_tool_calls=True,
+                            context_label="tool-call selection",
+                        )
+                        prompt = decision.prompt
+                        completion = decision.completion
+                        finish_reason = decision.finish_reason
+                        decoded_calls = decision.decoded_calls
+                        parse_error = decision.parse_error
+                        trace_entry = decision.trace
+                    else:
+                        messages = build_simple_tool_call_messages(record)
+                        prompt = json.dumps(
+                            {"messages": messages, "tools": [], "tool_choice": "auto"},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        completion = json.dumps(
+                            {"role": "assistant", "content": "", "tool_calls": []},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        finish_reason = "stop"
                         parse_error = None
                         decoded_calls = []
-                        try:
-                            if _looks_like_template_leak(completion):
-                                raise ValueError("decision stage leaked internal template/control tokens")
-                            decoded_calls = decode_simple_tool_call_response(completion)
-                        except Exception as exc:  # noqa: BLE001
-                            parse_error = str(exc)
                         trace_entry = {
-                            "decision_completion": completion,
-                            "decision_stop_reason": finish_reason,
-                            "decoded_calls": decoded_calls,
-                            "parse_error": parse_error or "",
+                            "tool_call_io": "openai-tools",
+                            "request": {"messages": messages, "tools": [], "tool_choice": "auto"},
+                            "assistant_message": {"role": "assistant", "content": "", "tool_calls": []},
+                            "response_source": "no_tools",
+                            "decoded_calls": [],
+                            "parse_error": "",
                         }
                     evaluation = evaluator(record, decoded_calls, parse_error=parse_error)
                     stage = StageRecord(prompt=prompt, completion=completion, stop_reason=finish_reason)

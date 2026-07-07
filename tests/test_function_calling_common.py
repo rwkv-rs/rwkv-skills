@@ -41,6 +41,7 @@ from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
     _auto_candidate_router_config,
+    build_simple_tool_call_messages,
     build_simple_tool_call_prompt,
 )
 from src.infer.sampling import SamplingConfig
@@ -114,6 +115,44 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json' in prompt
     assert prompt.endswith("Assistant: ```json\n")
     assert "<think>" not in prompt
+
+
+def test_simple_tool_call_native_messages_keep_tools_out_of_prompt() -> None:
+    record = SimpleToolCallRecord(
+        task_id="demo",
+        instruction="What is the weather in Paris?",
+        tools=(
+            {
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        ),
+        expected_tool_calls=(),
+        metadata={},
+    )
+
+    messages = build_simple_tool_call_messages(record)
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": (
+                "Use the provided tools when a function call is needed.\n"
+                "Call only provided tool names and supply valid JSON arguments that match the tool schema.\n"
+                "For multiple required tool calls, return every required call in execution order.\n"
+                "If no tool is needed, answer directly.\n"
+                "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date."
+            ),
+        },
+        {"role": "user", "content": "What is the weather in Paris?"},
+    ]
+    assert "get_weather" not in messages[0]["content"]
+    assert '"parameters"' not in messages[0]["content"]
 
 
 def test_api_bank_prompt_documents_missing_year_convention() -> None:

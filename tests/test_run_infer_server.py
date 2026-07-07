@@ -21,6 +21,11 @@ def test_parse_args_uses_vllm_rwkv_defaults(monkeypatch) -> None:
 
     assert not hasattr(args, "engine_mode")
     assert args.vllm_rwkv_path == str(run_infer_server.DEFAULT_VLLM_RWKV_PATH)
+    assert args.vllm_rwkv_update == "off"
+    assert args.vllm_rwkv_branch == run_infer_server.DEFAULT_VLLM_RWKV_BRANCH
+    assert args.tokenizer_mode == "rwkv"
+    assert args.tool_call_parser == "rwkv"
+    assert args.disable_auto_tool_choice is False
     assert args.max_num_seqs == 512
     assert args.max_num_batched_tokens == 16384
     assert args.gpu_memory_utilization == 0.9
@@ -71,8 +76,33 @@ def test_build_vllm_command_maps_server_flags() -> None:
     assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.97"
     assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    assert command[command.index("--tokenizer-mode") + 1] == "rwkv"
+    assert "--enable-auto-tool-choice" in command
+    assert command[command.index("--tool-call-parser") + 1] == "rwkv"
     assert "--enforce-eager" in command
     assert "--trust-remote-code" in command
+
+
+def test_build_vllm_command_can_disable_native_tool_flags() -> None:
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            "/models/rwkv-demo.pth",
+            "--infer-auto-config",
+            "off",
+            "--tokenizer-mode",
+            "",
+            "--disable-auto-tool-choice",
+            "--tool-call-parser",
+            "",
+        ]
+    )
+
+    command = run_infer_server.build_vllm_command(args)
+
+    assert "--tokenizer-mode" not in command
+    assert "--enable-auto-tool-choice" not in command
+    assert "--tool-call-parser" not in command
 
 
 def test_build_vllm_env_prepends_reference_checkout(tmp_path: Path) -> None:
@@ -148,6 +178,8 @@ def test_main_runs_vllm_subprocess(monkeypatch) -> None:
             "demo",
             "--infer-auto-config",
             "off",
+            "--vllm-rwkv-update",
+            "off",
             "--cuda-visible-devices",
             "2",
         ]
@@ -166,4 +198,45 @@ def test_main_runs_vllm_subprocess(monkeypatch) -> None:
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert captured["check"] is False
+
+
+def test_update_vllm_rwkv_checkout_pulls_reference_branch(monkeypatch, tmp_path: Path) -> None:
+    checkout = tmp_path / "vllm-rwkv"
+    (checkout / ".git").mkdir(parents=True)
+    captured: dict[str, object] = {}
+
+    def _fake_run(command, *, text, capture_output, check, timeout):  # noqa: ANN001
+        captured["command"] = command
+        captured["text"] = text
+        captured["capture_output"] = capture_output
+        captured["check"] = check
+        captured["timeout"] = timeout
+        return SimpleNamespace(returncode=0, stdout="Already up to date.\n", stderr="")
+
+    monkeypatch.setattr(run_infer_server.subprocess, "run", _fake_run)
+    args = run_infer_server.parse_args(
+        [
+            "--model-path",
+            "/models/rwkv-demo.pth",
+            "--infer-auto-config",
+            "off",
+            "--vllm-rwkv-path",
+            str(checkout),
+            "--vllm-rwkv-update",
+            "pull",
+        ]
+    )
+
+    assert run_infer_server.update_vllm_rwkv_checkout(args) is True
+    assert captured["command"] == [
+        "git",
+        "-C",
+        str(checkout.resolve()),
+        "pull",
+        "--ff-only",
+        "origin",
+        run_infer_server.DEFAULT_VLLM_RWKV_BRANCH,
+    ]
+    assert captured["capture_output"] is True
     assert captured["check"] is False
