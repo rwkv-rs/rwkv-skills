@@ -123,6 +123,7 @@ INSTRUCTION_FOLLOWING_DATASET_SLUGS: Final[tuple[str, ...]] = tuple(
 HUMAN_EVAL_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_human_eval")
 MBPP_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_mbpp")
 LCB_CODE_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("code_livecodebench")
+FUNCTION_AGENT_TOOL_CALL_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_agent_tool_call")
 FUNCTION_BROWSECOMP_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_browsecomp")
 FUNCTION_BROWSECOMP_PLUS_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_browsecomp_plus")
 FUNCTION_COMPLEXFUNCBENCH_SLUGS: Final[tuple[str, ...]] = _job_dataset_slugs("function_complexfuncbench")

@@ -21,9 +21,19 @@ _DATASETS = {
         "hf_dataset": "princeton-nlp/SWE-bench_Lite",
         "harness_dataset": "princeton-nlp/SWE-bench_Lite",
     },
+    "swe_bench_multilingual": {
+        "hf_dataset": None,
+        "harness_dataset": "swe-bench/SWE-bench_Multilingual",
+        "source_repo_url": "https://github.com/swe-bench/SWE-bench",
+    },
     "swe_bench_verified": {
         "hf_dataset": "princeton-nlp/SWE-bench_Verified",
         "harness_dataset": "princeton-nlp/SWE-bench_Verified",
+    },
+    "swe_bench_pro": {
+        "hf_dataset": None,
+        "harness_dataset": "scaleapi/SWE-bench_Pro-os",
+        "source_repo_url": "https://github.com/scaleapi/SWE-bench_Pro-os",
     },
     "swe_bench_lite_oracle": {
         "hf_dataset": "princeton-nlp/SWE-bench_Lite_oracle",
@@ -37,10 +47,22 @@ _DATASETS = {
 _REQUIRED_FIELDS = ("task_id", "prompt", "instance_id")
 
 
-def _load_swebench_rows(dataset_name: str, split: str) -> list[Mapping[str, Any]]:
-    source_override = os.environ.get("RWKV_SKILLS_SWEBENCH_SOURCE", "").strip()
+def _source_env_name(alias: str) -> str:
+    suffix = "".join(ch if ch.isalnum() else "_" for ch in alias.upper()).strip("_")
+    return f"RWKV_SKILLS_SWEBENCH_SOURCE_{suffix}"
+
+
+def _load_swebench_rows(dataset_name: str | None, split: str, *, alias: str) -> list[Mapping[str, Any]]:
+    source_override = (
+        os.environ.get(_source_env_name(alias), "").strip()
+        or os.environ.get("RWKV_SKILLS_SWEBENCH_SOURCE", "").strip()
+    )
     if source_override:
         return _load_local_rows(Path(source_override).expanduser())
+    if not dataset_name:
+        raise FileNotFoundError(
+            f"{alias} has no built-in HF dataset id. Set {_source_env_name(alias)}=<json/jsonl file or dir>."
+        )
 
     configure_hf_home()
     try:
@@ -148,11 +170,12 @@ class SweBenchDatasetSpec(MaterializingDatasetSpec):
         return None
 
     def load_records(self) -> Iterable[dict[str, Any]]:
-        rows = _load_swebench_rows(str(self._spec["hf_dataset"]), self.split)
+        hf_dataset = self._spec.get("hf_dataset")
+        rows = _load_swebench_rows(str(hf_dataset) if hf_dataset else None, self.split, alias=self._name)
         return [
             _normalize_swebench_row(
                 row,
-                source_dataset=str(self._spec["hf_dataset"]),
+                source_dataset=str(hf_dataset or self._spec.get("source_repo_url") or self._name),
                 harness_dataset=str(self._spec["harness_dataset"]),
             )
             for row in rows
@@ -160,8 +183,9 @@ class SweBenchDatasetSpec(MaterializingDatasetSpec):
 
     def manifest_extra(self) -> dict[str, Any]:
         return {
-            "dataset_id": self._spec["hf_dataset"],
+            "dataset_id": self._spec.get("hf_dataset"),
             "harness_dataset_name": self._spec["harness_dataset"],
+            "source_repo_url": self._spec.get("source_repo_url"),
             "source_split": self.split,
         }
 
@@ -176,7 +200,9 @@ def _register(name: str):
 
 prepare_swe_bench_spec = _register("swe_bench")
 prepare_swe_bench_lite_spec = _register("swe_bench_lite")
+prepare_swe_bench_multilingual_spec = _register("swe_bench_multilingual")
 prepare_swe_bench_verified_spec = _register("swe_bench_verified")
+prepare_swe_bench_pro_spec = _register("swe_bench_pro")
 prepare_swe_bench_lite_oracle_spec = _register("swe_bench_lite_oracle")
 prepare_swe_bench_lite_bm25_13k_spec = _register("swe_bench_lite_bm25_13k")
 
@@ -185,7 +211,9 @@ __all__ = [
     "SweBenchDatasetSpec",
     "prepare_swe_bench_spec",
     "prepare_swe_bench_lite_spec",
+    "prepare_swe_bench_multilingual_spec",
     "prepare_swe_bench_verified_spec",
+    "prepare_swe_bench_pro_spec",
     "prepare_swe_bench_lite_oracle_spec",
     "prepare_swe_bench_lite_bm25_13k_spec",
 ]

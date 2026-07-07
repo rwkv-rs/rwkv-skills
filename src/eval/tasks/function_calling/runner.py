@@ -48,6 +48,7 @@ from src.eval.tasks.function_calling.runner_common import (
     FunctionCallingBenchmarkKind,
     ResolvedFunctionCallingRun,
 )
+from src.eval.tasks.function_calling.simple_tool_call import _run_simple_tool_call
 from src.eval.tasks.function_calling.tau_runner import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOOL_ERRORS,
@@ -236,9 +237,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidate-router-mode",
-        choices=("off", "parallel"),
+        choices=("off", "auto", "parallel"),
         default="off",
-        help="BFCL v3 candidate-layer router mode; parallel splits the tool table into shards before aggregation",
+        help=(
+            "Candidate-layer router mode; auto is used by generic agent tool-call benchmarks for long contexts, "
+            "parallel always splits the tool table into shards before aggregation"
+        ),
     )
     parser.add_argument(
         "--candidate-router-chunk-tools",
@@ -362,6 +366,8 @@ def _infer_benchmark_kind(dataset_arg: str) -> FunctionCallingBenchmarkKind:
         raise ValueError(f"dataset {dataset_slug!r} 不是 function-calling benchmark，无法用 function_calling runner 运行。")
 
     job_names = frozenset(metadata.scheduler_jobs)
+    if "function_agent_tool_call" in job_names:
+        return FunctionCallingBenchmarkKind.AGENT_TOOL_CALL
     if "function_browsecomp_plus" in job_names:
         return FunctionCallingBenchmarkKind.BROWSECOMP_PLUS
     if "function_browsecomp" in job_names:
@@ -435,6 +441,13 @@ def main(
     _normalize_sample_worker_args(args)
     run = _resolve_run(args)
     _validate_sample_worker_benchmark(args, run)
+    if run.benchmark_kind is FunctionCallingBenchmarkKind.AGENT_TOOL_CALL:
+        return _run_simple_tool_call(
+            args,
+            run,
+            default_job_name="function_agent_tool_call",
+            run_context=run_context,
+        )
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP_PLUS:
         return _run_browsecomp_plus(args, run, run_context=run_context)
     if run.benchmark_kind is FunctionCallingBenchmarkKind.BROWSECOMP:

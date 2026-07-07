@@ -40,6 +40,7 @@ from src.eval.tasks.function_calling.mcp_bench import (
 from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
+    _auto_candidate_router_config,
     build_simple_tool_call_prompt,
 )
 from src.infer.sampling import SamplingConfig
@@ -127,6 +128,45 @@ def test_api_bank_prompt_documents_missing_year_convention() -> None:
 
     assert "API-Bank date convention" in prompt
     assert "use year 2023" in prompt
+
+
+def test_simple_tool_call_auto_candidate_router_triggers_for_long_context() -> None:
+    args = types.SimpleNamespace(
+        candidate_router_chunk_tools=2,
+        candidate_router_batch_size=4,
+        candidate_router_context_chars=400,
+        candidate_router_prompt_max_chars=8192,
+        candidate_router_candidate_max_tokens=128,
+        candidate_router_aggregate_max_tokens=128,
+        candidate_router_max_candidates=8,
+        candidate_router_tool_schema_mode="compact",
+        candidate_router_evidence_chars=120,
+        candidate_router_policy_chars=600,
+        disable_candidate_router_grounding=False,
+    )
+    record = SimpleToolCallRecord(
+        task_id="long",
+        instruction="Find the answer.\n" + ("context " * 100),
+        tools=(
+            {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        ),
+        expected_tool_calls=(),
+        metadata={},
+    )
+    small = SimpleToolCallRecord(
+        task_id="small",
+        instruction="Find the answer.",
+        tools=record.tools,
+        expected_tool_calls=(),
+        metadata={},
+    )
+
+    assert _auto_candidate_router_config(args, record) is not None
+    assert _auto_candidate_router_config(args, small) is None
 
 
 def test_function_calling_sampling_removes_raw_role_stop_tokens() -> None:

@@ -99,6 +99,20 @@ def test_function_calling_runner_parser_accepts_benchmark_kind() -> None:
     assert candidate_router_config.batch_size == 4
 
 
+def test_function_calling_runner_parser_accepts_candidate_router_auto_for_generic_agent() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "widesearch_test.jsonl",
+            "--candidate-router-mode",
+            "auto",
+        ]
+    )
+
+    assert args.candidate_router_mode == "auto"
+    assert bfcl_v3_runner._candidate_router_config_from_args(args) is None
+
+
 def test_function_calling_runner_falls_back_for_local_sample_workers() -> None:
     args = function_calling_runner.parse_args(
         [
@@ -499,6 +513,35 @@ def test_function_calling_runner_main_dispatches_simple_tool_call_runner(monkeyp
 
     assert rc == 0
     assert called == [("function_bfcl_ast", "bfcl_simple_python_test")]
+
+
+def test_function_calling_runner_main_dispatches_agent_tool_call_runner(monkeypatch) -> None:
+    called: list[tuple[str, str]] = []
+    resolved = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.AGENT_TOOL_CALL,
+        dataset_path=Path("/tmp/widesearch_test.jsonl"),
+        dataset_slug="widesearch_test",
+        benchmark_name="widesearch",
+        dataset_split="test",
+        model_name="demo-model",
+        engine=None,  # type: ignore[arg-type]
+    )
+
+    monkeypatch.setattr(function_calling_runner, "validate_inference_backend_args", lambda _args: None)
+    monkeypatch.setattr(function_calling_runner, "_resolve_run", lambda _args: resolved)
+    monkeypatch.setattr(
+        function_calling_runner,
+        "_run_simple_tool_call",
+        lambda _args, _run, *, default_job_name, run_context=None: called.append(
+            (default_job_name, _run.dataset_slug)
+        )
+        or 0,
+    )
+
+    rc = function_calling_runner.main(["--dataset", "widesearch_test.jsonl"])
+
+    assert rc == 0
+    assert called == [("function_agent_tool_call", "widesearch_test")]
 
 
 def test_function_calling_runner_main_dispatches_bfcl_exec(monkeypatch) -> None:

@@ -71,6 +71,7 @@ _LIVECODEBENCH_JOBS = ("code_livecodebench",)
 _LIVECODEBENCH_NAIVE_JOBS = ("code_livecodebench", "code_livecodebench_naive")
 _SWE_BENCH_JOBS = ("code_swe_bench", "code_swe_bench_naive")
 _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following", "instruction_following_naive")
+_AGENT_TOOL_CALL_JOBS = ("function_agent_tool_call",)
 _BROWSECOMP_JOBS = ("function_browsecomp",)
 _COMPLEXFUNCBENCH_JOBS = ("function_complexfuncbench",)
 _LONGBENCH_JOBS = ("function_longbench",)
@@ -269,7 +270,9 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("livecodebench"): _coding_livecodebench("livecodebench"),
     canonical_slug("swe_bench"): _coding_swe_bench("swe_bench"),
     canonical_slug("swe_bench_lite"): _coding_swe_bench("swe_bench_lite"),
+    canonical_slug("swe_bench_multilingual"): _coding_swe_bench("swe_bench_multilingual"),
     canonical_slug("swe_bench_verified"): _coding_swe_bench("swe_bench_verified"),
+    canonical_slug("swe_bench_pro"): _coding_swe_bench("swe_bench_pro"),
     canonical_slug("swe_bench_lite_oracle"): _coding_swe_bench("swe_bench_lite_oracle"),
     canonical_slug("swe_bench_lite_bm25_13k"): _coding_swe_bench("swe_bench_lite_bm25_13k"),
     # Instruction following
@@ -283,8 +286,77 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("wmt24pp"): _instruction_following("wmt24pp", scheduler_jobs=()),
     canonical_slug("flores200"): _instruction_following("flores200", default_split="devtest", scheduler_jobs=()),
     # Function calling
+    canonical_slug("terminal_bench_2_1"): _function_calling(
+        "terminal_bench_2_1",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("nl2repo"): _function_calling("nl2repo", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("deepswe"): _function_calling("deepswe", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("hy_backend_2_0"): _function_calling(
+        "hy_backend_2_0",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("hy_swe_max"): _function_calling("hy_swe_max", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("hy_companybench"): _function_calling(
+        "hy_companybench",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
     canonical_slug("browsecomp"): _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),
     canonical_slug("browsecomp_zh"): _function_calling("browsecomp_zh", scheduler_jobs=_BROWSECOMP_JOBS),
+    canonical_slug("widesearch"): _function_calling("widesearch", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("deepsearchqa"): _function_calling("deepsearchqa", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("mcp_atlas"): _function_calling("mcp_atlas", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("toolathlon"): _function_calling("toolathlon", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("apex_agents"): _function_calling("apex_agents", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("claweval"): _function_calling("claweval", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("wildclawbench"): _function_calling("wildclawbench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("skillsbench"): _function_calling("skillsbench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("e_bench"): _function_calling("e_bench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("hy_finmodelbench"): _function_calling(
+        "hy_finmodelbench",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("prodbench"): _function_calling("prodbench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("hy_skillsworld"): _function_calling(
+        "hy_skillsworld",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("hy_euler_pro"): _function_calling(
+        "hy_euler_pro",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("frontierscience_research"): _function_calling(
+        "frontierscience_research",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("frontierscience_olympiad"): _function_calling(
+        "frontierscience_olympiad",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("usamo_2026"): _function_calling("usamo_2026", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("matharena_apex"): _function_calling(
+        "matharena_apex",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("arxivmath"): _function_calling("arxivmath", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("horizonmath"): _function_calling("horizonmath", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("hy_math"): _function_calling("hy_math", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("phybench"): _function_calling("phybench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("cmt_benchmark"): _function_calling(
+        "cmt_benchmark",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("imoanswerbench"): _function_calling(
+        "imoanswerbench",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("superchem"): _function_calling("superchem", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("cl_bench"): _function_calling("cl_bench", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
+    canonical_slug("cl_bench_life"): _function_calling(
+        "cl_bench_life",
+        scheduler_jobs=_AGENT_TOOL_CALL_JOBS,
+    ),
+    canonical_slug("aa_lcr"): _function_calling("aa_lcr", scheduler_jobs=_AGENT_TOOL_CALL_JOBS),
     canonical_slug("browsecomp_plus"): _function_calling(
         "browsecomp_plus",
         scheduler_jobs=_BROWSECOMP_PLUS_JOBS,
@@ -391,6 +463,12 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
 }
 
 BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
+    canonical_slug("swe_bench_all"): (
+        canonical_slug("swe_bench"),
+        canonical_slug("swe_bench_multilingual"),
+        canonical_slug("swe_bench_verified"),
+        canonical_slug("swe_bench_pro"),
+    ),
     canonical_slug("gpqa"): (
         canonical_slug("gpqa_main"),
         canonical_slug("gpqa_extended"),
@@ -398,6 +476,24 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     canonical_slug("arena_hard"): (canonical_slug("arena_hard_v2"),),
     canonical_slug("longcodebench"): (canonical_slug("longcodeqa"),),
+    canonical_slug("terminal_bench"): (canonical_slug("terminal_bench_2_1"),),
+    canonical_slug("terminal_bench_2.1"): (canonical_slug("terminal_bench_2_1"),),
+    canonical_slug("deep_swe"): (canonical_slug("deepswe"),),
+    canonical_slug("apex_agent"): (canonical_slug("apex_agents"),),
+    canonical_slug("apex_agents"): (canonical_slug("apex_agents"),),
+    canonical_slug("apex-agents"): (canonical_slug("apex_agents"),),
+    canonical_slug("apex-agent"): (canonical_slug("apex_agents"),),
+    canonical_slug("frontierscience"): (
+        canonical_slug("frontierscience_research"),
+        canonical_slug("frontierscience_olympiad"),
+    ),
+    canonical_slug("matharena"): (
+        canonical_slug("usamo_2026"),
+        canonical_slug("matharena_apex"),
+        canonical_slug("arxivmath"),
+    ),
+    canonical_slug("cl-bench"): (canonical_slug("cl_bench"),),
+    canonical_slug("cl-bench_life"): (canonical_slug("cl_bench_life"),),
     canonical_slug("apibank"): (
         canonical_slug("apibank_l1"),
         canonical_slug("apibank_l2"),

@@ -86,15 +86,22 @@ def test_mbpp_family_is_legacy_no_cot_only() -> None:
 
 def test_swe_bench_family_is_coding_cot_only_with_naive_variant() -> None:
     metadata = resolve_benchmark_metadata("swe_bench_lite_test")
+    multilingual = resolve_benchmark_metadata("swe_bench_multilingual_test")
+    pro = resolve_benchmark_metadata("swe_bench_pro_test")
 
     assert metadata.field is BenchmarkField.CODING
     assert metadata.cot_modes == (CoTMode.COT,)
     assert metadata.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
     assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
     assert not supports_cot_mode("swe_bench_lite_test", CoTMode.NO_COT)
+    assert multilingual.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
+    assert pro.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
 
 
 def test_function_calling_benchmarks_are_cot_only() -> None:
+    agent_tool_call = resolve_benchmark_metadata("widesearch_test")
+    terminal_bench = resolve_benchmark_metadata("terminal_bench_2_1_test")
+    matharena_apex = resolve_benchmark_metadata("matharena_apex_test")
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     complexfuncbench = resolve_benchmark_metadata("complexfuncbench_official_test")
     complexfuncbench_subset = resolve_benchmark_metadata("complexfuncbench_subset_test")
@@ -118,6 +125,11 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     tau3_bench = resolve_benchmark_metadata("tau3_bench_banking_knowledge_base")
     tau3_mock = resolve_benchmark_metadata("tau3_bench_mock_long_context_base")
 
+    assert agent_tool_call.field is BenchmarkField.FUNCTION_CALLING
+    assert agent_tool_call.cot_modes == (CoTMode.COT,)
+    assert agent_tool_call.scheduler_jobs == ("function_agent_tool_call",)
+    assert terminal_bench.scheduler_jobs == ("function_agent_tool_call",)
+    assert matharena_apex.scheduler_jobs == ("function_agent_tool_call",)
     assert browsecomp.field is BenchmarkField.FUNCTION_CALLING
     assert browsecomp.cot_modes == (CoTMode.COT,)
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)
@@ -195,6 +207,12 @@ def test_instruction_following_data_only_benchmarks_do_not_use_ifeval_scorer() -
 
 
 def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
+    assert expand_benchmark_alias("swe_bench_all") == (
+        "swe_bench",
+        "swe_bench_multilingual",
+        "swe_bench_verified",
+        "swe_bench_pro",
+    )
     assert expand_benchmark_alias("gpqa") == (
         "gpqa_main",
         "gpqa_extended",
@@ -220,6 +238,12 @@ def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
         "apibank_level1",
         "apibank_level2",
     )
+    assert expand_benchmark_alias("terminal_bench") == ("terminal_bench_2_1",)
+    assert expand_benchmark_alias("frontierscience") == (
+        "frontierscience_research",
+        "frontierscience_olympiad",
+    )
+    assert expand_benchmark_alias("matharena") == ("usamo_2026", "matharena_apex", "arxivmath")
 
 
 def test_simpleqa_defaults_to_cot_only_maths() -> None:

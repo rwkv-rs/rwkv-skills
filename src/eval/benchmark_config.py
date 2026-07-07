@@ -284,16 +284,19 @@ def _split_stage_table(
     return direct or None, nested
 
 
-def _merge_templates(table: Mapping[str, Any]) -> dict[str, Any]:
+def _merge_templates(table: Mapping[str, Any], *, _seen: tuple[str, ...] = ()) -> dict[str, Any]:
     templates = _extract_template_names(table)
     if not templates:
         return dict(table)
     template_tables = _load_template_tables()
     merged: dict[str, Any] = {}
     for name in templates:
+        normalized_name = name.lower()
+        if normalized_name in _seen:
+            continue
         template = _select_table(template_tables, name)
         if template:
-            merged.update(template)
+            merged.update(_merge_templates(template, _seen=(*_seen, normalized_name)))
     for key, value in table.items():
         if key in {"template", "templates"}:
             continue

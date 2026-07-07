@@ -40,6 +40,7 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["code_swe_bench"].domain == "code"
     assert JOB_CATALOGUE["code_swe_bench_naive"].runner_group is RunnerGroup.CODING
     assert JOB_CATALOGUE["code_swe_bench_naive"].domain == "code"
+    assert JOB_CATALOGUE["function_agent_tool_call"].runner_group is RunnerGroup.FUNCTION_CALLING
     assert JOB_CATALOGUE["function_mcp_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
     assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.tasks.knowledge.runner"
     assert JOB_CATALOGUE["multi_choice_cot"].module == "src.eval.tasks.knowledge.runner"
@@ -52,6 +53,7 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["code_swe_bench_naive"].module == "src.eval.tasks.coding.runner"
     assert JOB_CATALOGUE["instruction_following"].module == "src.eval.tasks.instruction_following.runner"
     assert JOB_CATALOGUE["instruction_following_naive"].module == "src.eval.tasks.instruction_following.runner"
+    assert JOB_CATALOGUE["function_agent_tool_call"].module == "src.eval.tasks.function_calling.runner"
     assert JOB_CATALOGUE["function_browsecomp"].module == "src.eval.tasks.function_calling.runner"
     assert JOB_CATALOGUE["function_longcodebench"].module == "src.eval.tasks.function_calling.runner"
     assert JOB_CATALOGUE["function_mcp_bench"].module == "src.eval.tasks.function_calling.runner"
@@ -70,9 +72,14 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["free_response"].extra_args == ("--judge-mode", "exact")
     assert JOB_CATALOGUE["free_response_judge"].extra_args == ("--judge-mode", "llm")
     assert JOB_CATALOGUE["code_mbpp"].extra_args == ("--cot-mode", "no_cot")
+    assert JOB_CATALOGUE["function_agent_tool_call"].extra_args == ("--candidate-router-mode", "auto")
     assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
+    assert canonical_slug("swe_bench_multilingual_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
+    assert canonical_slug("swe_bench_pro_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
     assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench_naive"].dataset_slugs
+    assert canonical_slug("widesearch_test") in JOB_CATALOGUE["function_agent_tool_call"].dataset_slugs
     assert detect_job_from_dataset(canonical_slug("swe_bench_lite_test"), is_cot=True) == "code_swe_bench"
+    assert detect_job_from_dataset(canonical_slug("widesearch_test"), is_cot=True) == "function_agent_tool_call"
     assert JOB_CATALOGUE["instruction_following"].extra_args == ()
     assert JOB_CATALOGUE["instruction_following_naive"].extra_args == ("--prompt-profile", "naive")
 
@@ -263,6 +270,7 @@ def test_locate_dataset_can_refresh_registered_default_artifact_when_requested(
 
 
 def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
+    assert "function_agent_tool_call" in JOB_CATALOGUE
     assert "function_browsecomp" in JOB_CATALOGUE
     assert "function_longbench" in JOB_CATALOGUE
     assert "function_longcodebench" in JOB_CATALOGUE
@@ -278,6 +286,7 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert "function_tau2_bench" in JOB_CATALOGUE
     assert "function_tau3_bench" in JOB_CATALOGUE
 
+    agent_tool_call_slugs = JOB_CATALOGUE["function_agent_tool_call"].dataset_slugs
     browsecomp_slugs = JOB_CATALOGUE["function_browsecomp"].dataset_slugs
     longbench_slugs = JOB_CATALOGUE["function_longbench"].dataset_slugs
     longcodebench_slugs = JOB_CATALOGUE["function_longcodebench"].dataset_slugs
@@ -293,6 +302,11 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     tau2_slugs = JOB_CATALOGUE["function_tau2_bench"].dataset_slugs
     tau3_slugs = JOB_CATALOGUE["function_tau3_bench"].dataset_slugs
 
+    assert canonical_slug("widesearch_test") in agent_tool_call_slugs
+    assert canonical_slug("mcp_atlas_test") in agent_tool_call_slugs
+    assert canonical_slug("terminal_bench_2_1_test") in agent_tool_call_slugs
+    assert canonical_slug("matharena_apex_test") in agent_tool_call_slugs
+    assert canonical_slug("aa_lcr_test") in agent_tool_call_slugs
     assert canonical_slug("browsecomp_test") in browsecomp_slugs
     assert canonical_slug("browsecomp_zh_test") in browsecomp_slugs
     assert canonical_slug("longbench_test") in longbench_slugs
@@ -335,6 +349,8 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("tau3_bench_mock_base") in tau3_slugs
     assert canonical_slug("tau3_bench_mock_long_context_base") in tau3_slugs
 
+    assert detect_job_from_dataset(canonical_slug("widesearch_test"), is_cot=True) == "function_agent_tool_call"
+    assert detect_job_from_dataset(canonical_slug("mcp_atlas_test"), is_cot=True) == "function_agent_tool_call"
     assert detect_job_from_dataset(canonical_slug("browsecomp_test"), is_cot=True) == "function_browsecomp"
     assert detect_job_from_dataset(canonical_slug("longbench_qa_test"), is_cot=True) == "function_longbench"
     assert detect_job_from_dataset(canonical_slug("longbench_qa_balanced_test"), is_cot=True) == "function_longbench"

@@ -58,6 +58,21 @@ def test_resolve_sampling_config_supports_fallback_templates() -> None:
     assert config.stop_tokens == (0, 261, 6884, 21214, 24281)
 
 
+def test_resolve_sampling_config_expands_nested_template_aliases() -> None:
+    config = resolve_sampling_config(
+        "unknown_function_benchmark_test",
+        "rwkv7-g1a-2.9b",
+        stage="tool",
+        fallback_templates="function_call_default",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 2048
+    assert config.temperature == 1.0
+    assert config.top_k == 200
+    assert config.top_p == 0.0
+
+
 def test_parse_table_accepts_rwkv_rs_sampling_aliases() -> None:
     config = benchmark_config._parse_table(  # type: ignore[attr-defined]
         {

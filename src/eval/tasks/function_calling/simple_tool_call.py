@@ -22,6 +22,10 @@ from src.eval.tasks.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.tasks.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text, truncate_text
+from src.eval.tasks.function_calling.parallel_candidate_router import (
+    ParallelCandidateRouterConfig,
+    route_parallel_candidate_tool_call,
+)
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
@@ -43,6 +47,11 @@ if TYPE_CHECKING:
 
 _MAX_TOOL_DESCRIPTION_CHARS = 700
 _MAX_TOOL_SCHEMA_CHARS = 1200
+_GENERIC_CANDIDATE_ROUTER_POLICY = (
+    "Select exactly one JSON function call for the user request. "
+    "Use only the provided tools and include final argument values only."
+)
+_AUTO_CANDIDATE_ROUTER_MIN_TOOLS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,7 +315,7 @@ def _run_simple_tool_call(
         run.dataset_slug,
         run.model_name,
         stage="tool",
-        fallback_templates="instruction_following_default",
+        fallback_templates="function_call_default",
     )
     if tool_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
@@ -314,6 +323,10 @@ def _run_simple_tool_call(
     sampling_payload = normalize_sampling_config_by_stage([(1, tool_sampling)])
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     batch_size = max(1, int(args.batch_size or 16))
+    candidate_router_mode = _simple_candidate_router_mode(args)
+    candidate_router_config = (
+        _simple_candidate_router_config_from_args(args) if candidate_router_mode == "parallel" else None
+    )
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
 
     if args.probe_only:
@@ -364,25 +377,56 @@ def _run_simple_tool_call(
             try:
                 pending = build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
                 for key, record in pending:
-                    prompt = build_simple_tool_call_prompt(record, history_max_chars=history_max_chars)
-                    output = run.engine.generate(
-                        [prompt],
-                        sampling=tool_sampling,
-                        batch_size=1,
-                        progress_desc=f"ToolCall sample {key.sample_index}",
-                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                        prompt_seeds=[sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)],
-                    )[0]
-                    parse_error: str | None = None
-                    decoded_calls: list[dict[str, Any]] = []
-                    try:
-                        if _looks_like_template_leak(output.text):
-                            raise ValueError("decision stage leaked internal template/control tokens")
-                        decoded_calls = decode_simple_tool_call_response(output.text)
-                    except Exception as exc:  # noqa: BLE001
-                        parse_error = str(exc)
+                    prompt_seed = sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)
+                    trace_entry: dict[str, Any]
+                    active_candidate_router_config = candidate_router_config
+                    if active_candidate_router_config is None and candidate_router_mode == "auto":
+                        active_candidate_router_config = _auto_candidate_router_config(args, record)
+                    if active_candidate_router_config is not None and record.tools:
+                        (
+                            prompt,
+                            completion,
+                            finish_reason,
+                            decoded_calls,
+                            parse_error,
+                            trace_entry,
+                        ) = _run_candidate_routed_simple_tool_call(
+                            args,
+                            run,
+                            record,
+                            tool_sampling=tool_sampling,
+                            config=active_candidate_router_config,
+                            prompt_seed=prompt_seed,
+                            progress_desc=f"ToolCall-CandidateRouter sample {key.sample_index}",
+                        )
+                    else:
+                        prompt = build_simple_tool_call_prompt(record, history_max_chars=history_max_chars)
+                        output = run.engine.generate(
+                            [prompt],
+                            sampling=tool_sampling,
+                            batch_size=1,
+                            progress_desc=f"ToolCall sample {key.sample_index}",
+                            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                            prompt_seeds=[prompt_seed],
+                        )[0]
+                        completion = output.text
+                        finish_reason = output.finish_reason
+                        parse_error = None
+                        decoded_calls = []
+                        try:
+                            if _looks_like_template_leak(completion):
+                                raise ValueError("decision stage leaked internal template/control tokens")
+                            decoded_calls = decode_simple_tool_call_response(completion)
+                        except Exception as exc:  # noqa: BLE001
+                            parse_error = str(exc)
+                        trace_entry = {
+                            "decision_completion": completion,
+                            "decision_stop_reason": finish_reason,
+                            "decoded_calls": decoded_calls,
+                            "parse_error": parse_error or "",
+                        }
                     evaluation = evaluator(record, decoded_calls, parse_error=parse_error)
-                    stage = StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason)
+                    stage = StageRecord(prompt=prompt, completion=completion, stop_reason=finish_reason)
                     payload = SampleRecord(
                         benchmark_name=run.benchmark_name,
                         dataset_split=run.dataset_split,
@@ -404,14 +448,7 @@ def _run_simple_tool_call(
                         "fail_reason": evaluation.fail_reason,
                         "cot_mode": CoTMode.COT.value,
                     }
-                    payload["agent_trace"] = [
-                        {
-                            "decision_completion": output.text,
-                            "decision_stop_reason": output.finish_reason,
-                            "decoded_calls": decoded_calls,
-                            "parse_error": parse_error or "",
-                        }
-                    ]
+                    payload["agent_trace"] = [trace_entry]
                     payload["task_id"] = record.task_id
                     payload["domain"] = "function_call"
                     payload["instruction"] = record.instruction
@@ -449,6 +486,137 @@ def _run_simple_tool_call(
         raise
     print(f"{default_job_name} done: {len(completions_payloads)} samples")
     return 0
+
+
+def _simple_candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig | None:
+    mode = _simple_candidate_router_mode(args)
+    if mode in {"off", "auto"}:
+        return None
+    if mode != "parallel":
+        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off, auto, or parallel")
+    return _candidate_router_config_from_args(args)
+
+
+def _simple_candidate_router_mode(args: argparse.Namespace) -> str:
+    return str(getattr(args, "candidate_router_mode", "off") or "off").strip().lower()
+
+
+def _candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig:
+    defaults = ParallelCandidateRouterConfig()
+    schema_mode = str(
+        getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode
+    )
+    return ParallelCandidateRouterConfig(
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
+        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
+        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
+        prompt_max_chars=_positive_int(
+            getattr(args, "candidate_router_prompt_max_chars", None),
+            defaults.prompt_max_chars,
+        ),
+        candidate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_candidate_max_tokens", None),
+            defaults.candidate_max_tokens,
+        ),
+        aggregate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_aggregate_max_tokens", None),
+            defaults.aggregate_max_tokens,
+        ),
+        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), defaults.max_candidates),
+        tool_schema_mode=schema_mode,
+        include_respond=False,
+        fallback_to_highest_confidence=defaults.fallback_to_highest_confidence,
+        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), defaults.evidence_chars),
+        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), defaults.policy_chars),
+        ground_identifier_arguments=not bool(getattr(args, "disable_candidate_router_grounding", False)),
+    )
+
+
+def _auto_candidate_router_config(
+    args: argparse.Namespace,
+    record: SimpleToolCallRecord,
+) -> ParallelCandidateRouterConfig | None:
+    if not record.tools:
+        return None
+    config = _candidate_router_config_from_args(args)
+    tool_count = len(record.tools)
+    instruction_chars = len(record.instruction)
+    facts_chars = len(_candidate_router_facts_text(record) or "")
+    tool_schema_chars = len(json.dumps(record.tools, ensure_ascii=False, sort_keys=True))
+    if tool_count >= max(_AUTO_CANDIDATE_ROUTER_MIN_TOOLS, int(config.chunk_tools) * 2):
+        return config
+    if instruction_chars + facts_chars > int(config.context_chars):
+        return config
+    if tool_schema_chars > max(1, int(config.prompt_max_chars) // 2):
+        return config
+    return None
+
+
+def _positive_int(raw: object, default: int) -> int:
+    if raw is None:
+        return int(default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+    return max(1, value)
+
+
+def _run_candidate_routed_simple_tool_call(
+    args: argparse.Namespace,
+    run: ResolvedFunctionCallingRun,
+    record: SimpleToolCallRecord,
+    *,
+    tool_sampling: Any,
+    config: ParallelCandidateRouterConfig,
+    prompt_seed: int,
+    progress_desc: str,
+) -> tuple[str, str, str, list[dict[str, Any]], str | None, dict[str, Any]]:
+    del args
+    messages = [{"role": "user", "content": normalize_rwkv_text(record.instruction)}]
+    route = route_parallel_candidate_tool_call(
+        tools=record.tools,
+        messages=messages,
+        domain_policy=_GENERIC_CANDIDATE_ROUTER_POLICY,
+        domain=run.benchmark_name,
+        facts_text=_candidate_router_facts_text(record),
+        engine=run.engine,
+        sampling=tool_sampling,
+        config=config,
+        progress_desc=progress_desc,
+        prompt_seed=prompt_seed,
+    )
+    selected = route.selected
+    decoded_calls: list[dict[str, Any]] = []
+    parse_error: str | None = None
+    if selected is None:
+        parse_error = str(route.aggregate_error or "candidate router did not select a tool call")
+        decision_text = ""
+    else:
+        decoded_calls = [{"name": selected.name, "arguments": dict(selected.arguments)}]
+        decision_text = json.dumps(decoded_calls[0], ensure_ascii=False, sort_keys=True)
+    completion = route.aggregate_completion or decision_text
+    finish_reason = route.aggregate_finish_reason or ("candidate_router_empty" if selected is None else "stop")
+    trace_entry = {
+        "decision_completion": completion,
+        "decision_text": decision_text,
+        "decision_stop_reason": finish_reason,
+        "decoded_calls": decoded_calls,
+        "parse_error": parse_error or "",
+        "candidate_router": route.trace_payload(include_prompts=True),
+    }
+    return route.aggregate_prompt, completion, finish_reason, decoded_calls, parse_error, trace_entry
+
+
+def _candidate_router_facts_text(record: SimpleToolCallRecord) -> str | None:
+    for key in ("facts_text", "facts", "context", "source_context", "document", "documents", "policy"):
+        raw = record.metadata.get(key)
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, str):
+            return truncate_text(normalize_rwkv_text(raw), 4000)
+        return truncate_text(json.dumps(raw, ensure_ascii=False, sort_keys=True), 4000)
+    return None
 
 
 def _normalize_tool_expectation(raw: Any) -> ToolCallExpectation:

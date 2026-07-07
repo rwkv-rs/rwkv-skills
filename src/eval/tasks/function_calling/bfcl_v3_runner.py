@@ -279,10 +279,10 @@ def _trace_tool_calls(tool_calls: Sequence[TauToolCall]) -> list[dict[str, objec
 
 def _candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig | None:
     mode = str(getattr(args, "candidate_router_mode", "off") or "off").strip().lower()
-    if mode == "off":
+    if mode in {"off", "auto"}:
         return None
     if mode != "parallel":
-        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off or parallel")
+        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off, auto, or parallel")
     defaults = ParallelCandidateRouterConfig()
     tool_schema_mode = str(
         getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode

@@ -43,6 +43,10 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "apibank_level2" in names
     assert "agentbench_db" in names
     assert "agentbench_kg" in names
+    assert "widesearch" in names
+    assert "mcp_atlas" in names
+    assert "terminal_bench_2_1" in names
+    assert "aa_lcr" in names
     assert "bfcl_simple_python" in names
     assert "bfcl_exec_multiple_ast" in names
     assert "bfcl_exec_multiple" in names
@@ -56,6 +60,108 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "tau3_bench_banking_knowledge" in names
     assert "tau3_bench_mock" in names
     assert "tau3_bench_mock_long_context" in names
+
+
+def test_prepare_dataset_materializes_agent_tool_call_answer_rows(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "sources"
+    source_dir = source_root / "widesearch"
+    source_dir.mkdir(parents=True)
+    (source_dir / "test.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "wide-1",
+                "question": "Who wrote The Left Hand of Darkness?",
+                "answer": ["Ursula K. Le Guin", "Ursula Le Guin"],
+                "context": "Use the provided search tools if needed.",
+                "topic": "books",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_AGENT_TOOL_CALL_SOURCE_ROOT", str(source_root))
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("widesearch", output_root, "test")
+
+    assert paths == [output_root / "widesearch" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "wide-1"
+    assert row["instruction"].startswith("Context:\nUse the provided search tools")
+    assert row["tools"][0]["name"] == "final_answer"
+    assert row["expected_tool_calls"] == [
+        {
+            "name": "final_answer",
+            "arguments": {"answer": "Ursula K. Le Guin"},
+            "argument_options": {"answer": ["Ursula K. Le Guin", "Ursula Le Guin"]},
+        }
+    ]
+    assert row["metadata"]["source_format"] == "rwkvc_agent_tool_call"
+    assert row["metadata"]["source_benchmark"] == "widesearch"
+
+
+def test_prepare_dataset_materializes_agent_tool_call_explicit_manifest(tmp_path: Path, monkeypatch) -> None:
+    source_file = tmp_path / "mcp_atlas.jsonl"
+    source_file.write_text(
+        json.dumps(
+            {
+                "task_id": "atlas-1",
+                "instruction": "Find the weather in Tokyo.",
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    }
+                ],
+                "expected_tool_calls": [
+                    {
+                        "name": "get_weather",
+                        "arguments": {"location": "Tokyo"},
+                        "argument_options": {"location": ["Tokyo", "Tokyo, Japan"]},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_AGENT_TOOL_CALL_SOURCE_MCP_ATLAS", str(source_file))
+
+    paths = prepare_dataset("mcp_atlas", tmp_path / "prepared", "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["tools"][0]["name"] == "get_weather"
+    assert row["expected_tool_calls"][0]["name"] == "get_weather"
+    assert row["metadata"]["source_benchmark"] == "mcp_atlas"
+
+
+def test_prepare_dataset_materializes_agent_tool_call_hf_source(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("RWKV_AGENT_TOOL_CALL_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("RWKV_AGENT_TOOL_CALL_SOURCE_DEEPSEARCHQA", raising=False)
+    monkeypatch.setattr(
+        "src.eval.datasets.data_prepper.function_calling.agent_tool_call._load_hf_rows",
+        lambda source, split: [
+            {
+                "id": f"{source}:{split}:0",
+                "question": "Find the cited answer.",
+                "answer": "reference value",
+            }
+        ],
+    )
+
+    paths = prepare_dataset("deepsearchqa", tmp_path / "prepared", "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "https://huggingface.co/datasets/google/deepsearchqa:test:0"
+    assert row["expected_tool_calls"][0]["name"] == "final_answer"
+    assert row["expected_tool_calls"][0]["arguments"] == {"answer": "reference value"}
+    assert row["metadata"]["source_benchmark"] == "deepsearchqa"
+    assert row["metadata"]["source_path"] == "https://huggingface.co/datasets/google/deepsearchqa"
 
 
 def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monkeypatch) -> None:
