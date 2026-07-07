@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-"""Launch the RWKV Skills evaluation dashboard (FastAPI API + React SPA).
+"""Launch the RWKV Skills dashboard API.
 
-Serves the JSON API (leaderboard, eval records, context) and, when the React
-SPA has been built (``client/dist``), the static single-page app from the
-same origin. In development run the Vite dev server separately (it proxies
-``/api`` back to this server).
+Serves the JSON API (leaderboard, eval records, context). The frontend is a
+Next.js app under ``client/``; run it with ``pnpm dev``/``pnpm start`` and
+let Next rewrite ``/api`` requests back to this FastAPI process.
 """
 
 import argparse

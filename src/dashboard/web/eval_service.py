@@ -10,14 +10,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from src.db.eval_db_service import EvalDbService
-
 from ..core.constants import EVAL_PAGE_SIZE
-from ..core.score_index import resolve_score_index_path, write_score_index_entries
 from ..core.vocab import token_id_to_display
+from .store import DashboardStore
 
 
-def rebuild_score_index_from_db(*, include_param_search: bool = False) -> int:
+def _store_or_default(store: DashboardStore | None = None) -> DashboardStore:
+    return store or DashboardStore()
+
+
+def rebuild_score_index_from_db(
+    *,
+    include_param_search: bool = False,
+    store: DashboardStore | None = None,
+) -> int:
     """Rebuild ``score_index.jsonl`` from the latest DB scores.
 
     The leaderboard reader (``load_scores``) consumes the jsonl unchanged; this
@@ -26,11 +32,9 @@ def rebuild_score_index_from_db(*, include_param_search: bool = False) -> int:
     parses (dataset/model/cot/task/task_id/metrics/samples/problems/created_at/
     log_path/task_details/is_param_search). Returns the number of entries written.
     """
-    rows = EvalDbService().list_latest_scores_for_space(
+    return _store_or_default(store).rebuild_score_index_from_db(
         include_param_search=include_param_search,
     )
-    _, count = write_score_index_entries(rows)
-    return count
 
 
 def _extract_context_object(value: Any) -> dict[str, Any] | None:
@@ -75,10 +79,11 @@ def load_eval_records(
     only_wrong: bool = False,
     limit: int = EVAL_PAGE_SIZE,
     offset: int = 0,
+    store: DashboardStore | None = None,
 ) -> dict[str, Any]:
     """Return one page of eval records for a task (no full context payload)."""
 
-    records = EvalDbService().list_eval_records_for_space(
+    records = _store_or_default(store).list_eval_records_for_space(
         task_id=str(task_id),
         only_wrong=only_wrong,
         limit=limit + 1,  # fetch one extra to detect has_more
@@ -104,6 +109,7 @@ def load_eval_context(
     sample_index: int,
     repeat_index: int,
     pass_index: int = 0,
+    store: DashboardStore | None = None,
 ) -> dict[str, Any]:
     """Return the full structured context for a single attempt (modal payload)."""
 
@@ -115,7 +121,8 @@ def load_eval_context(
         "errors": [],
     }
     try:
-        context_value = EvalDbService().get_eval_context_for_space(
+        resolved_store = _store_or_default(store)
+        context_value = resolved_store.get_eval_context_for_space(
             task_id=str(task_id),
             sample_index=sample_index,
             repeat_index=repeat_index,
@@ -150,7 +157,7 @@ def load_eval_context(
     sampling_config = context_obj.get("sampling_config")
     if not isinstance(sampling_config, dict) or not sampling_config:
         try:
-            task_bundle = EvalDbService().get_task_bundle(task_id=str(task_id))
+            task_bundle = resolved_store.get_task_bundle(task_id=str(task_id))
         except Exception as exc:  # noqa: BLE001
             task_bundle = None
             event["errors"].append(f"read_task_sampling_failed:{exc}")

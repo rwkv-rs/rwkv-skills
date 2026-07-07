@@ -14,12 +14,11 @@ import json
 from datetime import datetime
 from typing import Any
 
-from src.db.eval_db_service import EvalDbService
-
 from ..core.boards import BOARD_NAIVE, BOARD_NORMAL, is_naive_meta
 from ..core.metrics import _display_metric_from_context, _score_to_percent
 from ..core.vocab import token_id_to_display
 from .eval_service import _extract_context_object
+from .store import DashboardStore
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -63,15 +62,19 @@ def _sampling_summary(sampling_config: Any) -> str:
     return " ".join(parts)
 
 
-def score_history_options() -> dict[str, Any]:
-    pairs = EvalDbService().list_score_history_pairs()
+def _store_or_default(store: DashboardStore | None = None) -> DashboardStore:
+    return store or DashboardStore()
+
+
+def score_history_options(*, store: DashboardStore | None = None) -> dict[str, Any]:
+    pairs = _store_or_default(store).list_score_history_pairs()
     models = sorted({str(p["model"]) for p in pairs})
     benchmarks = sorted({str(p["dataset"]) for p in pairs})
     return {"models": models, "benchmarks": benchmarks, "pairs": pairs}
 
 
-def score_history(*, model: str, benchmark: str) -> dict[str, Any]:
-    rows = EvalDbService().list_score_history(model=model, dataset=benchmark)
+def score_history(*, model: str, benchmark: str, store: DashboardStore | None = None) -> dict[str, Any]:
+    rows = _store_or_default(store).list_score_history(model=model, dataset=benchmark)
     points: list[dict[str, Any]] = []
     for row in rows:
         metric_name, percent = _metric_percent(row.get("metrics"), sampling_config=row.get("sampling_config"))
@@ -125,8 +128,8 @@ def _stop_token_rows(stop_tokens: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def score_history_detail(*, task_id: int) -> dict[str, Any]:
-    detail = EvalDbService().get_score_history_detail(task_id=str(task_id))
+def score_history_detail(*, task_id: int, store: DashboardStore | None = None) -> dict[str, Any]:
+    detail = _store_or_default(store).get_score_history_detail(task_id=str(task_id))
     if detail is None:
         return {"found": False, "task_id": task_id}
 

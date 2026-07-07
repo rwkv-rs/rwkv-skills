@@ -1,8 +1,8 @@
 """FastAPI admin layer for the RWKV Skills evaluation scheduler.
 
 Wraps the existing :class:`SchedulerAdminController` (draft / start / pause /
-resume / cancel / snapshot) and exposes it under ``/api/admin/*`` so the React
-SPA can drive evaluation runs from the same origin as the dashboard. Two
+resume / cancel / snapshot) and exposes it under ``/api/admin/*`` so the Next
+frontend can drive evaluation runs through the FastAPI JSON API. Two
 gap-fillers are added on top of the controller:
 
   * ``/api/admin/eval/options`` — valid choices for the start form (jobs,
@@ -138,8 +138,8 @@ def _options_payload() -> dict[str, Any]:
 def register_admin_routes(app: FastAPI) -> None:
     """Mount the ``/api/admin/*`` routes onto an existing FastAPI app.
 
-    Must be called before the SPA catch-all (``/{full_path:path}``) is mounted
-    so the admin routes take precedence.
+    Kept as an explicit registration helper so tests and alternative app
+    factories can share the same route wiring.
     """
 
     @app.get("/api/admin/health")

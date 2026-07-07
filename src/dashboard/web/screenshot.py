@@ -13,7 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CLIENT_DIR = _REPO_ROOT / "client"
 _SCRIPT = _CLIENT_DIR / "scripts" / "capture-page.mjs"
 _OUTPUT_DIR = _REPO_ROOT / "tmp" / "dashboard-screenshots"
-_DEFAULT_URL = "http://127.0.0.1:5173/"
+_DEFAULT_URL = "http://127.0.0.1:3000/"
 
 
 def _local_url(raw_url: Any) -> str:

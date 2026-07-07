@@ -7,7 +7,7 @@ An evaluation scaffold for RWKV7 that targets an external vLLM-RWKV OpenAI-compa
 ## Project structure
 The frontend (`client/`) and backend (`src/`) are strictly separated; third-party benchmark data and evaluation artifacts stay out of the source package.
 
-- `client/`: dashboard frontend (React + Vite SPA); the built `client/dist` is served by the backend when present.
+- `client/`: dashboard frontend (Next.js + React); `/api/*` is proxied to the FastAPI backend by Next rewrites.
 - `src/`: backend Python package
   - `src/eval/tasks/`: per-domain evaluation runners/pipelines — `knowledge`, `maths`, `coding`, `instruction_following`, `function_calling`, `agent_bench`.
   - `src/eval/scheduler`: CLI for queueing eval jobs, GPU/remote-worker detection, and dispatch.
@@ -37,30 +37,31 @@ uv pip install -e .
 ```
 For other CUDA/CPU builds, use `--extra torch-cu126` / `--extra torch-cpu`, etc.
 
-## Evaluation dashboard (FastAPI + React/Vite)
+## Evaluation dashboard (FastAPI + Next.js)
 The dashboard is a self-contained FastAPI backend that reuses this project's Python data layer
-(`src/dashboard`, `EvalDbService`) plus a React 19 + Vite + TypeScript single-page app. There is no
-external Rust/Next.js service: the API reads the leaderboard score index from
+(`src/dashboard`, `EvalDbService`) plus a Next.js + React 19 + TypeScript frontend. There is no
+external Rust service: the API reads the leaderboard score index from
 `results/space/score_index.jsonl` and pulls eval records / completion context directly from the
 `PG_*` Postgres database.
 
 ```bash
-# 1. Backend — serves the JSON API (and the built SPA) on :7860
+# 1. Backend - serves the JSON API on :7860
 cp .env.example .env            # fill in PG_* connection settings
 rwkv-skills-dashboard           # or: python -m src.bin.run_dashboard --reload
 
-# 2. Frontend (development) — Vite dev server on :5173, proxies /api -> :7860
+# 2. Frontend (development) - Next.js server on :3000, rewrites /api -> :7860
 cd client
 pnpm install
 pnpm dev
 ```
 
-Open `http://localhost:5173` in development. For a single-origin deployment, build the SPA and let
-FastAPI serve it from `client/dist`:
+Open `http://localhost:3000` in development. Set `SCOREBOARD_API_BASE_URL` when the FastAPI backend
+is not on `http://127.0.0.1:7860`:
 
 ```bash
-cd client && pnpm build      # emits client/dist
-rwkv-skills-dashboard          # now serves API + SPA together on :7860
+cd client
+SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
+SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
 ```
 
 The dashboard also includes an **admin panel** (the "管理面板" tab) that drives the eval scheduler:

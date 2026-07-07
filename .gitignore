@@ -10,11 +10,12 @@ wheels/
 .venv
 /.idea
 
-# Node/Vite frontend
+# Node/Next frontend
 node_modules/
 coverage/
 *.tsbuildinfo
 client/dist/
+client/.next/
 .env.local
 .env.development.local
 .env.test.local

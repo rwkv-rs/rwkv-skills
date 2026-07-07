@@ -29,9 +29,9 @@
 
 html,
 body,
-#root {
+main {
   margin: 0;
-  height: 100%;
+  min-height: 100%;
 }
 
 body {
@@ -638,7 +638,8 @@ table.pivot.bench-table tbody tr:hover .axis-kmetric {
   display: flex;
   gap: 4px;
 }
-.page-nav-btn {
+.page-nav-btn,
+.page-nav a {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   color: var(--text-dim);
@@ -647,11 +648,13 @@ table.pivot.bench-table tbody tr:hover .axis-kmetric {
   font-weight: 500;
   border-radius: var(--radius-sm);
 }
-.page-nav-btn:hover {
+.page-nav-btn:hover,
+.page-nav a:hover {
   color: var(--text);
   border-color: var(--border-strong);
 }
-.page-nav-btn.active {
+.page-nav-btn.active,
+.page-nav a.active {
   background: var(--accent-soft);
   border-color: var(--accent);
   color: var(--text);

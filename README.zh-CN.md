@@ -7,7 +7,7 @@
 ## 项目结构
 前端（`client/`）与后端（`src/`）严格分离；第三方基准数据与评测产物不入源码包。
 
-- `client/`：评测看板前端（React + Vite SPA）；构建产物 `client/dist` 由后端按需托管。
+- `client/`：评测看板前端（Next.js + React）；`/api/*` 通过 Next rewrites 代理到 FastAPI 后端。
 - `src/`：后端 Python 包
   - `src/eval/tasks/`：按域组织的评测 runner/pipeline —— `knowledge`、`maths`、`coding`、`instruction_following`、`function_calling`、`agent_bench`。
   - `src/eval/scheduler`：评测任务排队、GPU/远端 worker 侦测与调度的 CLI。
@@ -37,29 +37,30 @@ uv pip install -e .
 ```
 如需其他 CUDA/CPU 发行版，请改用 `--extra torch-cu126` / `--extra torch-cpu` 等。
 
-## 评测看板（FastAPI + React/Vite）
+## 评测看板（FastAPI + Next.js）
 看板由一个自包含的 FastAPI 后端（复用本项目的 Python 数据层 `src/dashboard`、`EvalDbService`）
-与 React 19 + Vite + TypeScript 单页应用组成，不再依赖任何外部 Rust/Next.js 服务：API 直接从
+与 Next.js + React 19 + TypeScript 前端组成，不再依赖任何外部 Rust 服务：API 直接从
 `results/space/score_index.jsonl` 读取排行榜分数索引，并从 `PG_*` 指定的 Postgres 数据库拉取
 评测记录与补全上下文。
 
 ```bash
-# 1. 后端 —— 在 :7860 提供 JSON API（以及已构建的 SPA）
+# 1. 后端 - 在 :7860 提供 JSON API
 cp .env.example .env            # 填写 PG_* 连接信息
 rwkv-skills-dashboard           # 或：python -m src.bin.run_dashboard --reload
 
-# 2. 前端（开发模式）—— Vite 开发服务器在 :5173，将 /api 代理到 :7860
+# 2. 前端（开发模式）- Next.js 服务在 :3000，将 /api 代理到 :7860
 cd client
 pnpm install
 pnpm dev
 ```
 
-开发模式下访问 `http://localhost:5173`。若要单源部署，先构建 SPA，再让 FastAPI 从
-`client/dist` 提供静态资源：
+开发模式下访问 `http://localhost:3000`。如果 FastAPI 后端不在 `http://127.0.0.1:7860`，
+用 `SCOREBOARD_API_BASE_URL` 指定 API 地址：
 
 ```bash
-cd client && pnpm build      # 产出 client/dist
-rwkv-skills-dashboard          # 此时在 :7860 同时提供 API 与 SPA
+cd client
+SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
+SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
 ```
 
 看板还内置**管理面板**（"管理面板"页签）用于驱动评测调度器：启动 / 暂停 / 恢复 / 取消任务，

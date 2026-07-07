@@ -1,3 +1,5 @@
+"use client";
+
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type CellMeta, type EvalRecord } from "../api";
