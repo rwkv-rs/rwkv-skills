@@ -2,30 +2,20 @@ from __future__ import annotations
 
 """HTTP/admin control shell for the scheduler."""
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass
 import html
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-import re
 import threading
 import time
 from typing import Any, Callable, cast
 import uuid
 
-from src.eval.benchmark_registry import BenchmarkField
-from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
-
-from .actions import DispatchOptions, InferenceConfig, action_dispatch
+from .actions import DispatchOptions, action_dispatch
 from .config import (
     DEFAULT_ADMIN_STATE_DIR,
-    DEFAULT_DISPATCH_POLL_SECONDS,
-    DEFAULT_GPU_IDLE_MAX_MEM,
-    DEFAULT_LOG_DIR,
-    DEFAULT_MODEL_GLOBS,
-    DEFAULT_PID_DIR,
-    DEFAULT_RUN_LOG_DIR,
 )
 from .control import (
     DesiredState,
@@ -34,16 +24,7 @@ from .control import (
     SchedulerRuntimeControl,
     SchedulerRuntimeFile,
 )
-from .dataset_utils import canonical_slug, canonicalize_benchmark_list
-from .jobs import JOB_CATALOGUE, JOB_ORDER
-from .models import MODEL_SELECT_CHOICES
-from .remote_slots import INFER_WORKER_PROFILE_CHOICES
-from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
-
-
-_KNOWN_DATASET_SLUGS: tuple[str, ...] = tuple(
-    sorted({canonical_slug(slug) for spec in JOB_CATALOGUE.values() for slug in spec.dataset_slugs})
-)
+from .launch_config import SchedulerLaunchRequest
 
 
 class SchedulerAdminError(RuntimeError):
@@ -56,172 +37,7 @@ class SchedulerAdminError(RuntimeError):
         self.message = message
 
 
-@dataclass(slots=True)
-class SchedulerStartRequest:
-    log_dir: str = str(DEFAULT_LOG_DIR)
-    pid_dir: str = str(DEFAULT_PID_DIR)
-    run_log_dir: str = str(DEFAULT_RUN_LOG_DIR)
-    models: list[str] = field(default_factory=lambda: list(DEFAULT_MODEL_GLOBS))
-    infer_base_url: str = ""
-    infer_models: list[str] = field(default_factory=list)
-    infer_api_key: str = ""
-    infer_timeout_s: float = 600.0
-    infer_max_workers: int = 32
-    infer_worker_profile: str = "fixed"
-    infer_protocol: str = "openai"
-    infer_seed_policy: str = "preserve"
-    remote_batch_size: int | None = None
-    infer_backpressure: bool = True
-    infer_backpressure_timeout_s: float = 2.0
-    infer_backpressure_pending_high_watermark: int = 0
-    infer_budget_min_workers: int = 1
-    distributed_claims: bool = False
-    scheduler_node_id: str = ""
-    lease_duration_s: int = 900
-    model_regex: list[str] = field(default_factory=list)
-    model_select: str = "latest-data"
-    min_param_b: float | None = None
-    max_param_b: float | None = None
-    only_jobs: list[str] = field(default_factory=list)
-    skip_jobs: list[str] = field(default_factory=list)
-    job_order: list[str] = field(default_factory=list)
-    domains: list[str] = field(default_factory=list)
-    benchmark_fields: list[str] = field(default_factory=list)
-    extra_benchmarks: list[str] = field(default_factory=list)
-    only_datasets: list[str] = field(default_factory=list)
-    skip_datasets: list[str] = field(default_factory=list)
-    enable_param_search: bool = False
-    run_mode: str = RunMode.AUTO.value
-    dispatch_poll_seconds: int = DEFAULT_DISPATCH_POLL_SECONDS
-    gpu_idle_max_mem: int = DEFAULT_GPU_IDLE_MAX_MEM
-    skip_missing_dataset: bool = False
-    clean_param_swap: bool = False
-    batch_cache: str | None = None
-    overwrite: bool = False
-    disable_checker: bool = False
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> "SchedulerStartRequest":
-        allowed = {field_name for field_name in cls.__dataclass_fields__}
-        unknown = sorted(set(payload) - allowed)
-        if unknown:
-            raise ValueError(f"unknown fields: {', '.join(unknown)}")
-        return cls(**payload)
-
-    def copy(self) -> "SchedulerStartRequest":
-        return replace(
-            self,
-            models=list(self.models),
-            infer_models=list(self.infer_models),
-            model_regex=list(self.model_regex),
-            only_jobs=list(self.only_jobs),
-            skip_jobs=list(self.skip_jobs),
-            job_order=list(self.job_order),
-            domains=list(self.domains),
-            benchmark_fields=list(self.benchmark_fields),
-            extra_benchmarks=list(self.extra_benchmarks),
-            only_datasets=list(self.only_datasets),
-            skip_datasets=list(self.skip_datasets),
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    def to_dispatch_options(self) -> DispatchOptions:
-        if self.model_select not in MODEL_SELECT_CHOICES:
-            raise ValueError(f"unknown model_select={self.model_select!r}")
-        infer_protocol = str(self.infer_protocol or "openai")
-        if infer_protocol not in REMOTE_INFERENCE_PROTOCOL_CHOICES:
-            raise ValueError(f"unknown infer_protocol={infer_protocol!r}")
-        infer_seed_policy = str(self.infer_seed_policy or "preserve")
-        if infer_seed_policy == "omit-for-contents":
-            infer_seed_policy = "omit"
-        if infer_seed_policy not in {"preserve", "omit"}:
-            raise ValueError(f"unknown infer_seed_policy={infer_seed_policy!r}")
-        infer_worker_profile = str(self.infer_worker_profile or "fixed")
-        if infer_worker_profile not in INFER_WORKER_PROFILE_CHOICES:
-            raise ValueError(f"unknown infer_worker_profile={infer_worker_profile!r}")
-
-        job_list = _resolve_job_list(self.only_jobs, self.skip_jobs, self.domains)
-        if not job_list:
-            raise ValueError("no schedulable jobs remain after filtering")
-
-        skip_dataset_slugs = _canonicalize_slugs(self.skip_datasets)
-        benchmark_fields = tuple(BenchmarkField(value) for value in self.benchmark_fields)
-        selected: set[str] = set()
-        if benchmark_fields or self.extra_benchmarks:
-            selected.update(
-                collect_benchmark_dataset_slugs(
-                    fields=benchmark_fields,
-                    extra_benchmark_names=tuple(self.extra_benchmarks),
-                )
-            )
-        selected.update(_canonicalize_slugs(self.only_datasets))
-        only_dataset_slugs = tuple(sorted(selected))
-        model_patterns = _compile_model_patterns(self.model_regex)
-        job_priority = _resolve_job_priority(self.job_order, job_list)
-
-        explicit = self.run_mode
-        if self.overwrite and explicit not in (RunMode.AUTO.value, RunMode.RERUN.value):
-            raise ValueError("--overwrite only supports run_mode auto/rerun")
-        run_mode = RunMode.RERUN if self.overwrite else RunMode.parse(explicit)
-
-        infer_base_url = str(self.infer_base_url or "").strip() or None
-        infer_models = tuple(str(item).strip() for item in self.infer_models if str(item).strip())
-        if infer_base_url or infer_models:
-            if not infer_base_url:
-                raise ValueError("remote inference mode requires infer_base_url")
-            if not infer_models:
-                raise ValueError("remote inference mode requires infer_models")
-            model_globs: tuple[str, ...] = ()
-        else:
-            model_globs = tuple(self.models)
-
-        batch_cache_path = Path(self.batch_cache) if self.batch_cache else None
-        return DispatchOptions(
-            log_dir=Path(self.log_dir),
-            pid_dir=Path(self.pid_dir),
-            run_log_dir=Path(self.run_log_dir),
-            job_order=job_list,
-            job_priority=job_priority,
-            model_select=self.model_select,
-            min_param_b=self.min_param_b,
-            max_param_b=self.max_param_b,
-            skip_dataset_slugs=skip_dataset_slugs,
-            model_globs=model_globs,
-            only_dataset_slugs=only_dataset_slugs,
-            model_name_patterns=model_patterns,
-            enable_param_search=self.enable_param_search,
-            run_mode=run_mode,
-            inference=InferenceConfig(
-                base_url=infer_base_url,
-                models=infer_models,
-                api_key=str(self.infer_api_key or ""),
-                timeout_s=float(self.infer_timeout_s),
-                max_workers=int(self.infer_max_workers),
-                worker_profile=infer_worker_profile,
-                protocol=infer_protocol,
-                seed_policy=infer_seed_policy,
-                remote_batch_size=(
-                    int(self.remote_batch_size)
-                    if self.remote_batch_size is not None
-                    else None
-                ),
-                backpressure=bool(self.infer_backpressure),
-                backpressure_timeout_s=float(self.infer_backpressure_timeout_s),
-                backpressure_pending_high_watermark=int(self.infer_backpressure_pending_high_watermark),
-                budget_min_workers=int(self.infer_budget_min_workers),
-            ),
-            distributed_claims=bool(self.distributed_claims),
-            scheduler_node_id=(str(self.scheduler_node_id or "").strip() or None),
-            lease_duration_s=int(self.lease_duration_s),
-            dispatch_poll_seconds=int(self.dispatch_poll_seconds),
-            gpu_idle_max_mem=int(self.gpu_idle_max_mem),
-            skip_missing_dataset=self.skip_missing_dataset,
-            clean_param_swap=self.clean_param_swap,
-            batch_cache_path=batch_cache_path,
-            disable_checker=self.disable_checker,
-        )
+SchedulerStartRequest = SchedulerLaunchRequest
 
 
 @dataclass(slots=True)
@@ -572,48 +388,6 @@ def serve_scheduler_admin(
     server = SchedulerAdminHttpServer((host, int(port)), controller, api_key=api_key)
     print(f"🌐 Scheduler admin listening on http://{host}:{port}")
     server.serve_forever()
-
-
-def _resolve_job_list(
-    include: list[str],
-    exclude: list[str],
-    domains: list[str],
-) -> tuple[str, ...]:
-    order = list(JOB_ORDER)
-    if domains:
-        allowed_domains = set(domains)
-        order = [job for job in order if JOB_CATALOGUE[job].domain in allowed_domains]
-    if include:
-        allowed_jobs = set(include)
-        order = [job for job in order if job in allowed_jobs]
-    if exclude:
-        blocked_jobs = set(exclude)
-        order = [job for job in order if job not in blocked_jobs]
-    return tuple(order)
-
-
-def _canonicalize_slugs(slugs: list[str]) -> tuple[str, ...]:
-    if not slugs:
-        return tuple()
-    return canonicalize_benchmark_list(slugs, known_slugs=_KNOWN_DATASET_SLUGS)
-
-
-def _compile_model_patterns(patterns: list[str]) -> tuple[re.Pattern[str], ...]:
-    compiled: list[re.Pattern[str]] = []
-    for raw in patterns:
-        compiled.append(re.compile(raw))
-    return tuple(compiled)
-
-
-def _resolve_job_priority(priority: list[str], available: tuple[str, ...]) -> tuple[str, ...] | None:
-    if not priority:
-        return None
-    allowed = set(available)
-    ordered: list[str] = []
-    for job in priority:
-        if job in allowed and job not in ordered:
-            ordered.append(job)
-    return tuple(ordered) if ordered else None
 
 
 def _progress_from_runtime(runtime: SchedulerRuntimeFile | None) -> SchedulerProgressSnapshot:

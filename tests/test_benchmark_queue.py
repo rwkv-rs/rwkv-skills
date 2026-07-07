@@ -20,6 +20,7 @@ def _prepare_single_latest_model(monkeypatch, tmp_path: Path) -> Path:
 def test_detect_job_from_dataset_prioritizes_judge_and_agent_benchmarks() -> None:
     assert jobs.detect_job_from_dataset("math_500_test", True) == "free_response_judge"
     assert jobs.detect_job_from_dataset("hendrycks_math_test", True) == "free_response"
+    assert jobs.detect_job_from_dataset("widesearch_test", True) == "function_agent_tool_call"
     assert jobs.detect_job_from_dataset("bfcl_v3_test", True) == "function_bfcl_v3"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_ast_test", True) == "function_bfcl_ast"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_test", True) == "function_bfcl_exec"
@@ -134,3 +135,16 @@ def test_cli_supports_rwkv_rs_style_benchmark_selection_flags() -> None:
     assert args.run_mode == "rerun"
     assert args.benchmark_fields == ["knowledge"]
     assert args.extra_benchmarks == ["gsm8k"]
+
+
+def test_cli_accepts_function_candidate_router_auto() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "dispatch",
+            "--function-candidate-router-mode",
+            "auto",
+        ]
+    )
+
+    assert args.function_candidate_router_mode == "auto"

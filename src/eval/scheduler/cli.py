@@ -49,8 +49,15 @@ from .config import (
     DEFAULT_PID_DIR,
     DEFAULT_RUN_LOG_DIR,
 )
+from .db_bootstrap import bootstrap_db_schema, check_db_schema, render_db_schema_report
 from .dataset_utils import canonical_slug, canonicalize_benchmark_list
 from .jobs import JOB_CATALOGUE, JOB_ORDER
+from .launch_config import (
+    DEFAULT_PROFILE_NAME,
+    SchedulerLaunchRequest,
+    launch_request_to_json,
+    load_launch_profile,
+)
 from .models import MODEL_SELECT_CHOICES
 from .remote_slots import INFER_WORKER_PROFILE_CHOICES
 from .remote_profiler import DEFAULT_REMOTE_PROBE_PROMPT, probe_remote_inference, write_remote_probe_result
@@ -77,6 +84,20 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_parser = sub.add_parser("dispatch", help="根据 GPU 空闲情况调度任务")
     _add_job_filters(dispatch_parser)
     _add_dispatch_options(dispatch_parser)
+
+    run_parser = sub.add_parser("run", help="按 configs/scheduler/*.toml profile 预检并启动调度器")
+    run_parser.add_argument("--profile", default=DEFAULT_PROFILE_NAME, help="scheduler profile 名称或 TOML 路径")
+    run_parser.add_argument("--run-mode", choices=_RUN_MODE_CHOICES, help="覆盖 profile 中的 run_mode")
+    run_parser.add_argument("--dry-run", action="store_true", help="只解析 profile、预检 DB 并输出队列，不启动任务")
+    run_parser.add_argument("--print-config", action="store_true", help="打印解析后的 profile 配置")
+    run_parser.add_argument("--no-bootstrap-db", action="store_true", help="DB schema 缺失时只报错，不自动应用 scripts/schema.sql")
+
+    doctor_parser = sub.add_parser("doctor", help="检查 profile 和评测数据库 schema")
+    doctor_parser.add_argument("--profile", default=DEFAULT_PROFILE_NAME, help="scheduler profile 名称或 TOML 路径")
+    doctor_parser.add_argument("--json", action="store_true", help="以 JSON 输出诊断结果")
+
+    bootstrap_parser = sub.add_parser("bootstrap-db", help="幂等应用 scripts/schema.sql 初始化评测数据库")
+    bootstrap_parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
 
     status_parser = sub.add_parser("status", help="查看正在运行的任务")
     status_parser.add_argument("--pid-dir", default=str(DEFAULT_PID_DIR), help="PID 文件目录")
@@ -330,7 +351,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--function-candidate-router-mode",
-        choices=("off", "parallel"),
+        choices=("off", "auto", "parallel"),
         help="function-calling runner 的 --candidate-router-mode",
     )
     parser.add_argument(
@@ -744,6 +765,125 @@ def _run_probe_infer(parser: argparse.ArgumentParser, args: argparse.Namespace) 
     return 0
 
 
+def _load_request_for_profile_command(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> SchedulerLaunchRequest:
+    try:
+        request = load_launch_profile(getattr(args, "profile", DEFAULT_PROFILE_NAME))
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+    request = request.copy()
+    if getattr(args, "run_mode", None):
+        request.run_mode = str(args.run_mode)
+        request.overwrite = False
+    return request
+
+
+def _run_doctor(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    request = _load_request_for_profile_command(parser, args)
+    config_error: str | None = None
+    try:
+        opts = request.to_dispatch_options()
+    except Exception as exc:  # noqa: BLE001 - compact CLI diagnostic
+        config_error = f"{type(exc).__name__}: {exc}"
+        opts = None
+    db_report = check_db_schema()
+    payload = {
+        "profile": request.profile,
+        "config_ok": config_error is None,
+        "config_error": config_error,
+        "db": db_report.to_dict(),
+    }
+    if opts is not None:
+        payload["dispatch"] = _dispatch_options_summary(opts)
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(f"profile={request.profile}")
+        if config_error:
+            print(f"config_ok=false\nconfig_error={config_error}")
+        else:
+            print("config_ok=true")
+            assert opts is not None
+            print(
+                "dispatch="
+                f"jobs:{len(opts.job_order)} datasets:{len(opts.only_dataset_slugs) or 'all'} "
+                f"remote:{bool(opts.inference.base_url)}"
+            )
+        print(render_db_schema_report(db_report))
+    return 0 if config_error is None and db_report.ok else 1
+
+
+def _run_bootstrap_db(args: argparse.Namespace) -> int:
+    report = bootstrap_db_schema()
+    if getattr(args, "json", False):
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(render_db_schema_report(report))
+    return 0 if report.ok else 1
+
+
+def _run_profile_dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    request = _load_request_for_profile_command(parser, args)
+    try:
+        opts = request.to_dispatch_options()
+    except Exception as exc:  # noqa: BLE001
+        parser.error(str(exc))
+
+    if getattr(args, "print_config", False):
+        print(launch_request_to_json(request))
+
+    schema_ok = _ensure_db_schema_for_run(bootstrap=not bool(getattr(args, "no_bootstrap_db", False)))
+    if not schema_ok:
+        return 1
+
+    opts.log_dir.mkdir(parents=True, exist_ok=True)
+    resolved_path = opts.log_dir / "resolved_config.json"
+    resolved_path.write_text(launch_request_to_json(request) + "\n", encoding="utf-8")
+    print(f"resolved_config={resolved_path}")
+
+    if getattr(args, "dry_run", False):
+        action_queue(opts)
+        return 0
+    action_dispatch(opts)
+    return 0
+
+
+def _ensure_db_schema_for_run(*, bootstrap: bool) -> bool:
+    report = check_db_schema()
+    if report.ok:
+        print(render_db_schema_report(report))
+        return True
+    print(render_db_schema_report(report))
+    if not bootstrap:
+        return False
+    print("bootstrap_db=applying scripts/schema.sql")
+    report = bootstrap_db_schema()
+    print(render_db_schema_report(report))
+    return report.ok
+
+
+def _dispatch_options_summary(opts: DispatchOptions) -> dict[str, object]:
+    return {
+        "log_dir": str(opts.log_dir),
+        "pid_dir": str(opts.pid_dir),
+        "run_log_dir": str(opts.run_log_dir),
+        "run_mode": opts.run_mode.value,
+        "jobs": list(opts.job_order),
+        "job_priority": list(opts.job_priority or ()),
+        "only_datasets": list(opts.only_dataset_slugs),
+        "skip_datasets": list(opts.skip_dataset_slugs),
+        "model_globs": list(opts.model_globs),
+        "infer_base_url": opts.inference.base_url,
+        "infer_models": list(opts.inference.models),
+        "infer_protocol": opts.inference.protocol,
+        "infer_max_workers": opts.inference.max_workers,
+        "remote_batch_size": opts.inference.remote_batch_size,
+        "disable_checker": opts.disable_checker,
+    }
+
+
 __all__ = ["build_parser", "main"]
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -752,6 +892,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = args.command
     if command == "probe-infer":
         return _run_probe_infer(parser, args)
+    if command == "doctor":
+        return _run_doctor(parser, args)
+    if command == "bootstrap-db":
+        return _run_bootstrap_db(args)
+    if command == "run":
+        return _run_profile_dispatch(parser, args)
 
     job_list = _resolve_job_list(
         getattr(args, "only_jobs", None),
