@@ -20,6 +20,7 @@ __all__ = [
     "InferenceConfig",
     "FunctionCallingConfig",
     "CodingConfig",
+    "MathConfig",
     "StatusOptions",
     "StopOptions",
     "LogsOptions",

@@ -96,6 +96,7 @@ class FunctionCallingConfig:
     planning_max_tokens: int | None = None
     final_max_tokens: int | None = None
     answer_max_tokens: int | None = None
+    judge_max_workers: int | None = None
     history_max_chars: int | None = None
     prompt_max_chars: int | None = None
     long_doc_mode: str | None = None
@@ -117,12 +118,20 @@ class FunctionCallingConfig:
     max_rounds: int | None = None
     max_steps: int | None = None
     max_tool_errors: int | None = None
+    complexfuncbench_disable_response_eval: bool = False
+    complexfuncbench_offline_compare: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class CodingConfig:
     eval_workers: int | None = None
     max_active_runners: int | None = None
+    swebench_max_prompt_chars: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MathConfig:
+    judge_max_workers: int | None = None
 
 
 @dataclass(slots=True)
@@ -143,6 +152,7 @@ class QueueOptions:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     functions: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
     coding: CodingConfig = field(default_factory=CodingConfig)
+    math: MathConfig = field(default_factory=MathConfig)
     distributed_claims: bool = False
     scheduler_node_id: str | None = None
     lease_duration_s: int = 900
@@ -622,6 +632,7 @@ __all__ = [
     "InferenceConfig",
     "FunctionCallingConfig",
     "CodingConfig",
+    "MathConfig",
     "DispatchOptions",
     "StatusOptions",
     "StopOptions",

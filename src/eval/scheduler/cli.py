@@ -28,6 +28,7 @@ from .actions import (
     FunctionCallingConfig,
     InferenceConfig,
     LogsOptions,
+    MathConfig,
     StatusOptions,
     StopOptions,
     action_dispatch,
@@ -141,7 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     probe_parser.add_argument("--prompt", default=DEFAULT_REMOTE_PROBE_PROMPT, help="探测 prompt")
     probe_parser.add_argument("--max-tokens", type=int, default=16, help="每个请求生成 token 数")
-    probe_parser.add_argument("--temperature", type=float, default=0.0, help="探测 temperature")
+    probe_parser.add_argument("--temperature", type=float, default=1e-5, help="探测 temperature")
     probe_parser.add_argument("--top-p", type=float, default=0.8, help="探测 top-p")
     probe_parser.add_argument("--top-k", type=int, default=50, help="探测 top-k")
     probe_parser.add_argument("--stop-suffix", help="可选文本停止后缀，nano contents 会映射为 stop_tokens")
@@ -283,7 +284,13 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--sample-workers", type=int, help="runner 侧 episode 并发数；当前透传给 function-calling runner")
     parser.add_argument("--coding-eval-workers", type=int, help="coding runner 本地评测并发数；透传为 --eval-workers")
+    parser.add_argument(
+        "--coding-swebench-max-prompt-chars",
+        type=int,
+        help="SWE-Bench coding runner 的完整 prompt 字符预算；透传为 --swebench-max-prompt-chars",
+    )
     parser.add_argument("--max-active-coding-runners", type=int, help="最多同时运行的 coding runner 数；空出的远端槽可调度非 coding 任务")
+    parser.add_argument("--math-judge-max-workers", type=int, help="maths free_response_judge 的 --judge-max-workers")
     parser.add_argument(
         "--disable-infer-backpressure",
         action="store_true",
@@ -322,6 +329,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--function-planning-max-tokens", type=int, help="function-calling runner 的 --planning-max-tokens")
     parser.add_argument("--function-final-max-tokens", type=int, help="function-calling runner 的 --final-max-tokens")
     parser.add_argument("--function-answer-max-tokens", type=int, help="function-calling runner 的 --answer-max-tokens")
+    parser.add_argument("--function-judge-max-workers", type=int, help="BrowseComp judge 的 --judge-max-workers")
     parser.add_argument("--function-history-max-chars", type=int, help="function-calling runner 的 --history-max-chars")
     parser.add_argument("--function-prompt-max-chars", type=int, help="function-calling runner 的 --prompt-max-chars")
     parser.add_argument(
@@ -407,6 +415,16 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--function-max-rounds", type=int, help="function-calling runner 的 --max-rounds")
     parser.add_argument("--function-max-steps", type=int, help="function-calling runner 的 --max-steps")
     parser.add_argument("--function-max-tool-errors", type=int, help="function-calling runner 的 --max-tool-errors")
+    parser.add_argument(
+        "--function-complexfuncbench-disable-response-eval",
+        action="store_true",
+        help="透传给 ComplexFuncBench runner，关闭官方 GPT response eval",
+    )
+    parser.add_argument(
+        "--function-complexfuncbench-offline-compare",
+        action="store_true",
+        help="透传给 ComplexFuncBench runner，使用离线比较避免 RapidAPI/GPT 等外部调用",
+    )
     parser.add_argument("--distributed-claims", action="store_true", help="启用 PostgreSQL claim/lease，允许多个 scheduler 节点协同")
     parser.add_argument("--scheduler-node-id", help="当前 scheduler 节点标识；默认取主机名")
     parser.add_argument("--lease-duration-s", type=int, default=900, help="claim/lease 有效期秒数")
@@ -533,6 +551,7 @@ def _dispatch_options_from_args(
             planning_max_tokens=getattr(args, "function_planning_max_tokens", None),
             final_max_tokens=getattr(args, "function_final_max_tokens", None),
             answer_max_tokens=getattr(args, "function_answer_max_tokens", None),
+            judge_max_workers=getattr(args, "function_judge_max_workers", None),
             history_max_chars=getattr(args, "function_history_max_chars", None),
             prompt_max_chars=getattr(args, "function_prompt_max_chars", None),
             long_doc_mode=getattr(args, "function_long_doc_mode", None),
@@ -554,6 +573,12 @@ def _dispatch_options_from_args(
             max_rounds=getattr(args, "function_max_rounds", None),
             max_steps=getattr(args, "function_max_steps", None),
             max_tool_errors=getattr(args, "function_max_tool_errors", None),
+            complexfuncbench_disable_response_eval=bool(
+                getattr(args, "function_complexfuncbench_disable_response_eval", False)
+            ),
+            complexfuncbench_offline_compare=bool(
+                getattr(args, "function_complexfuncbench_offline_compare", False)
+            ),
         ),
         coding=CodingConfig(
             eval_workers=(
@@ -564,6 +589,18 @@ def _dispatch_options_from_args(
             max_active_runners=(
                 int(getattr(args, "max_active_coding_runners"))
                 if getattr(args, "max_active_coding_runners", None) is not None
+                else None
+            ),
+            swebench_max_prompt_chars=(
+                int(getattr(args, "coding_swebench_max_prompt_chars"))
+                if getattr(args, "coding_swebench_max_prompt_chars", None) is not None
+                else None
+            ),
+        ),
+        math=MathConfig(
+            judge_max_workers=(
+                int(getattr(args, "math_judge_max_workers"))
+                if getattr(args, "math_judge_max_workers", None) is not None
                 else None
             ),
         ),
@@ -749,7 +786,7 @@ def _run_probe_infer(parser: argparse.ArgumentParser, args: argparse.Namespace) 
         candidates=candidates,
         prompt=str(getattr(args, "prompt", DEFAULT_REMOTE_PROBE_PROMPT)),
         max_tokens=int(getattr(args, "max_tokens", 16)),
-        temperature=float(getattr(args, "temperature", 0.0)),
+        temperature=float(getattr(args, "temperature", 1e-5)),
         top_p=float(getattr(args, "top_p", 0.8)),
         top_k=int(getattr(args, "top_k", 50)),
         stop_suffix=getattr(args, "stop_suffix", None),

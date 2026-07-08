@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from src.bin.param_search_free_response import parse_args as parse_param_search_free_response_args
 from src.bin.param_search_select import parse_args as parse_param_search_select_args
 from src.eval.scheduler import actions, actions_base, action_dispatch, queue
-from src.eval.scheduler.actions import DispatchOptions, FunctionCallingConfig, InferenceConfig
+from src.eval.scheduler.actions import DispatchOptions, FunctionCallingConfig, InferenceConfig, MathConfig
 from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.backpressure import (
     RemoteConcurrencyBudget,
@@ -528,6 +528,8 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "2",
             "--infer-budget-min-workers",
             "3",
+            "--coding-swebench-max-prompt-chars",
+            "18000",
         ]
     )
 
@@ -539,6 +541,7 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_backpressure_timeout_s == 1.5
     assert args.infer_backpressure_pending_high_watermark == 2
     assert args.infer_budget_min_workers == 3
+    assert args.coding_swebench_max_prompt_chars == 18000
 
 
 def test_scheduler_slot_expansion_preserves_explicit_slots() -> None:
@@ -624,6 +627,10 @@ def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:
             "32000",
             "--function-prompt-max-chars",
             "8192",
+            "--function-judge-max-workers",
+            "1",
+            "--math-judge-max-workers",
+            "2",
             "--sample-workers",
             "8",
             "--function-long-doc-mode",
@@ -640,6 +647,8 @@ def test_scheduler_cli_accepts_function_calling_runner_overrides() -> None:
     assert args.function_prompt_style == "rwkv_official_json"
     assert args.function_history_max_chars == 32000
     assert args.function_prompt_max_chars == 8192
+    assert args.function_judge_max_workers == 1
+    assert args.math_judge_max_workers == 2
     assert args.sample_workers == 8
     assert args.function_long_doc_mode == "off"
     assert args.function_tool_router_mode == "model"
@@ -661,6 +670,7 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
             decision_max_tokens=32,
             max_steps=24,
             prompt_max_chars=8192,
+            judge_max_workers=1,
             long_doc_mode="off",
             tool_router_mode="lexical",
             tool_router_max_tools=8,
@@ -691,6 +701,26 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
     assert "--prompt-style" in mcp_args
     assert "--sample-workers" not in mcp_args
     assert actions._function_calling_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
+    browsecomp_args = actions._function_calling_extra_args(opts, JOB_CATALOGUE["function_browsecomp"])
+    assert "--judge-max-workers" in browsecomp_args
+    assert "1" in browsecomp_args
+
+
+def test_maths_extra_args_only_apply_to_llm_judge_jobs(tmp_path: Path) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("free_response_judge",),
+        math=MathConfig(judge_max_workers=2),
+    )
+
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_judge"]) == (
+        "--judge-max-workers",
+        "2",
+    )
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["function_browsecomp"]) == ()
 
 
 def test_param_search_scripts_accept_remote_inference_args() -> None:

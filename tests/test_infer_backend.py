@@ -180,7 +180,13 @@ def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatc
 
     outputs = backend.generate(
         ["hello"],
-        sampling=SamplingConfig(max_generate_tokens=3, temperature=0.0, top_p=1.0, top_k=17),
+        sampling=SamplingConfig(
+            max_generate_tokens=3,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=17,
+            alpha_frequency=0.0,
+        ),
         batch_size=1,
         show_progress=False,
     )
@@ -189,3 +195,37 @@ def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatc
     assert calls[0][0] == "http://127.0.0.1:19082/v1/completions"
     assert calls[0][1]["prompt"] == "hello"
     assert calls[0][1]["top_k"] == 17
+    assert calls[0][1]["repetition_penalty"] == 1e-5
+
+
+def test_completions_generation_maps_frequency_to_rwkv_repetition_penalty(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19082/v1",
+            model="demo",
+            protocol="completions",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:  # noqa: ANN001
+        calls.append((url, payload))
+        return {"choices": [{"text": "ok", "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", _fake_post_json)
+
+    backend.generate(
+        ["hello"],
+        sampling=SamplingConfig(
+            max_generate_tokens=3,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=17,
+            alpha_frequency=0.2,
+        ),
+        batch_size=1,
+        show_progress=False,
+    )
+
+    assert "frequency_penalty" not in calls[0][1]
+    assert calls[0][1]["repetition_penalty"] == 0.2

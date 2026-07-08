@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from src.eval.benchmark_registry import CoTMode
-from src.eval.execution_plan import AvgKExecutionPlan, avg_k_metric_key
+from src.eval.execution_plan import AvgKExecutionPlan, avg_k_metric_key, build_avg_k_execution_plan
 from src.eval.k_values import NumericK, max_generation_k
 from src.eval.metrics.at_k import compute_avg_at_k
 
@@ -85,11 +85,14 @@ def resolve_configured_k_plan(
     sample_indices = tuple(range(max(0, sample_count)))
     samples_per_task = max(max_generation_k(pass_k), max_generation_k(avg_k), 1)
     plan_avg_k = _primary_avg_k(avg_k, samples_per_task)
-    plan = AvgKExecutionPlan(
-        avg_k=float(plan_avg_k),
-        repeat_count=samples_per_task,
-        sample_indices=sample_indices,
-    )
+    if avg_k:
+        plan = build_avg_k_execution_plan(str(slug), sample_count, avg_k=float(plan_avg_k))
+    else:
+        plan = AvgKExecutionPlan(
+            avg_k=float(plan_avg_k),
+            repeat_count=samples_per_task,
+            sample_indices=sample_indices,
+        )
     return ConfiguredKPlan(
         pass_k=tuple(pass_k),
         avg_k=tuple(avg_k),

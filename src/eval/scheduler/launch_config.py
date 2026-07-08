@@ -19,7 +19,7 @@ from src.eval.benchmark_registry import BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
 from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
-from .actions_base import CodingConfig, DispatchOptions, FunctionCallingConfig, InferenceConfig
+from .actions_base import CodingConfig, DispatchOptions, FunctionCallingConfig, InferenceConfig, MathConfig
 from .config import (
     DEFAULT_ADMIN_STATE_DIR,
     DEFAULT_DISPATCH_POLL_SECONDS,
@@ -99,6 +99,8 @@ class SchedulerLaunchRequest:
     disable_checker: bool = False
     coding_eval_workers: int | None = None
     max_active_coding_runners: int | None = None
+    coding_swebench_max_prompt_chars: int | None = None
+    math_judge_max_workers: int | None = None
     function_prompt_style: str | None = None
     function_tool_catalog_format: str | None = None
     function_cot_max_tokens: int | None = None
@@ -106,6 +108,7 @@ class SchedulerLaunchRequest:
     function_planning_max_tokens: int | None = None
     function_final_max_tokens: int | None = None
     function_answer_max_tokens: int | None = None
+    function_judge_max_workers: int | None = None
     function_history_max_chars: int | None = None
     function_prompt_max_chars: int | None = None
     function_long_doc_mode: str | None = None
@@ -268,6 +271,7 @@ class SchedulerLaunchRequest:
                 planning_max_tokens=self.function_planning_max_tokens,
                 final_max_tokens=self.function_final_max_tokens,
                 answer_max_tokens=self.function_answer_max_tokens,
+                judge_max_workers=self.function_judge_max_workers,
                 history_max_chars=self.function_history_max_chars,
                 prompt_max_chars=self.function_prompt_max_chars,
                 long_doc_mode=self.function_long_doc_mode,
@@ -299,6 +303,18 @@ class SchedulerLaunchRequest:
                 max_active_runners=(
                     int(self.max_active_coding_runners)
                     if self.max_active_coding_runners is not None
+                    else None
+                ),
+                swebench_max_prompt_chars=(
+                    int(self.coding_swebench_max_prompt_chars)
+                    if self.coding_swebench_max_prompt_chars is not None
+                    else None
+                ),
+            ),
+            math=MathConfig(
+                judge_max_workers=(
+                    int(self.math_judge_max_workers)
+                    if self.math_judge_max_workers is not None
                     else None
                 ),
             ),
@@ -483,6 +499,10 @@ def _flatten_profile_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "coding": {
             "eval_workers": "coding_eval_workers",
             "max_active_runners": "max_active_coding_runners",
+            "swebench_max_prompt_chars": "coding_swebench_max_prompt_chars",
+        },
+        "math": {
+            "judge_max_workers": "math_judge_max_workers",
         },
         "function_calling": {
             "prompt_style": "function_prompt_style",
@@ -492,6 +512,7 @@ def _flatten_profile_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
             "planning_max_tokens": "function_planning_max_tokens",
             "final_max_tokens": "function_final_max_tokens",
             "answer_max_tokens": "function_answer_max_tokens",
+            "judge_max_workers": "function_judge_max_workers",
             "history_max_chars": "function_history_max_chars",
             "prompt_max_chars": "function_prompt_max_chars",
             "long_doc_mode": "function_long_doc_mode",

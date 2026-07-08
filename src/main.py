@@ -197,6 +197,7 @@ class RunnerSection:
     long_doc_min_chars: int | None = None
     long_doc_max_evidence_chunks: int | None = None
     long_doc_max_evidence_chars: int | None = None
+    swebench_max_prompt_chars: int | None = None
     tool_router_mode: str | None = None
     tool_router_max_tools: int | None = None
     tool_router_trigger_tool_count: int | None = None
@@ -272,6 +273,10 @@ class RunnerSection:
             long_doc_max_evidence_chars=_maybe_int(
                 payload.get("long_doc_max_evidence_chars"),
                 field_name="runner.long_doc_max_evidence_chars",
+            ),
+            swebench_max_prompt_chars=_maybe_int(
+                payload.get("swebench_max_prompt_chars"),
+                field_name="runner.swebench_max_prompt_chars",
             ),
             tool_router_mode=_maybe_str(payload.get("tool_router_mode")),
             tool_router_max_tools=_maybe_int(payload.get("tool_router_max_tools"), field_name="runner.tool_router_max_tools"),
@@ -734,6 +739,7 @@ def _build_runner_argv(
         _append_flag(argv, "--long-doc-min-chars", runner_cfg.long_doc_min_chars)
         _append_flag(argv, "--long-doc-max-evidence-chunks", runner_cfg.long_doc_max_evidence_chunks)
         _append_flag(argv, "--long-doc-max-evidence-chars", runner_cfg.long_doc_max_evidence_chars)
+        _append_flag(argv, "--swebench-max-prompt-chars", runner_cfg.swebench_max_prompt_chars)
     elif group is RunnerGroup.INSTRUCTION_FOLLOWING:
         if runner_cfg.enable_think:
             argv.append("--enable-think")

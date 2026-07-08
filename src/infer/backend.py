@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,6 +29,13 @@ _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
 DEFAULT_PREFILL_CHUNK_SIZE = 16
 DEFAULT_REMOTE_MAX_WORKERS = 128
+_CONTEXT_LENGTH_ERROR_RE = re.compile(
+    r"maximum context length is (?P<context>\d+) tokens.*?"
+    r"requested (?P<requested>\d+) output tokens.*?"
+    r"prompt contains at least (?P<prompt>\d+) input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+_CONTEXT_LENGTH_RETRY_MARGIN_TOKENS = 16
 
 RemoteInferenceProtocol = Literal["openai", "vllm", "completions"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit"]
@@ -78,6 +86,29 @@ def _safe_tqdm_close(progress: tqdm) -> None:
 
 def _is_retryable_remote_http_error(exc: RemoteHTTPError) -> bool:
     return int(exc.status_code) in _RETRYABLE_REMOTE_HTTP_STATUS_CODES
+
+
+def _context_retry_max_tokens(exc: RemoteHTTPError, current_max_tokens: object) -> int | None:
+    if int(exc.status_code) != 400:
+        return None
+    match = _CONTEXT_LENGTH_ERROR_RE.search(str(exc.detail))
+    if match is None:
+        return None
+    try:
+        current = int(current_max_tokens) if current_max_tokens is not None else 0
+        context_limit = int(match.group("context"))
+        prompt_tokens = int(match.group("prompt"))
+    except (TypeError, ValueError):
+        return None
+    if current <= 1:
+        return None
+    budget = context_limit - prompt_tokens - _CONTEXT_LENGTH_RETRY_MARGIN_TOKENS
+    if budget < 1:
+        budget = max(1, context_limit - prompt_tokens - 1)
+    next_max = max(1, min(current - 1, budget))
+    if next_max >= current:
+        next_max = max(1, current // 2)
+    return next_max if next_max < current else None
 
 
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
@@ -399,28 +430,28 @@ class RemoteInferenceBackend:
             include_private_fields=include_private_fields,
         )
         if self.config.protocol == "vllm":
-            response = self._post_json(self.config.chat_completions_url(), chat_payload)
+            response = self._post_json_with_context_retry(self.config.chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
-            response = self._post_json(self.config.completions_url(), payload)
+            response = self._post_json_with_context_retry(self.config.completions_url(), payload)
             is_chat_response = False
         elif self.config.prefer_chat_completions:
             try:
-                response = self._post_json(self.config.chat_completions_url(), chat_payload)
+                response = self._post_json_with_context_retry(self.config.chat_completions_url(), chat_payload)
                 is_chat_response = True
             except RemoteHTTPError as exc:
                 if exc.status_code not in {404, 405}:
                     raise
-                response = self._post_json(self.config.completions_url(), payload)
+                response = self._post_json_with_context_retry(self.config.completions_url(), payload)
                 is_chat_response = False
         else:
             try:
-                response = self._post_json(self.config.completions_url(), payload)
+                response = self._post_json_with_context_retry(self.config.completions_url(), payload)
                 is_chat_response = False
             except RemoteHTTPError as exc:
                 if exc.status_code not in {404, 405}:
                     raise
-                response = self._post_json(self.config.chat_completions_url(), chat_payload)
+                response = self._post_json_with_context_retry(self.config.chat_completions_url(), chat_payload)
                 is_chat_response = True
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -456,7 +487,7 @@ class RemoteInferenceBackend:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
-        response = self._post_json(self.config.chat_completions_url(), payload)
+        response = self._post_json_with_context_retry(self.config.chat_completions_url(), payload)
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
             raise RuntimeError("remote infer response missing choices")
@@ -479,6 +510,21 @@ class RemoteInferenceBackend:
             raw_message=dict(message),
             response_source=response_source,
         )
+
+    def _post_json_with_context_retry(self, url: str, payload: dict[str, object]) -> dict[str, object]:
+        request_payload = dict(payload)
+        last_context_error: RemoteHTTPError | None = None
+        for _ in range(4):
+            try:
+                return self._post_json(url, request_payload)
+            except RemoteHTTPError as exc:
+                next_max_tokens = _context_retry_max_tokens(exc, request_payload.get("max_tokens"))
+                if next_max_tokens is None:
+                    raise
+                last_context_error = exc
+                request_payload["max_tokens"] = next_max_tokens
+        assert last_context_error is not None
+        raise last_context_error
 
     def _post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:
         started = time.perf_counter()
@@ -578,14 +624,17 @@ def _completion_payload_from_sampling(
     prefill_chunk_size: int,
     include_private_fields: bool,
 ) -> dict[str, object]:
+    def nonzero(value: float) -> float:
+        value = float(value)
+        return 1e-5 if value == 0.0 else value
+
     payload: dict[str, object] = {
         "model": model,
         "prompt": prompt,
         "max_tokens": int(sampling.max_generate_tokens),
-        "temperature": float(sampling.temperature),
-        "top_p": float(sampling.top_p),
-        "presence_penalty": float(sampling.alpha_presence),
-        "frequency_penalty": float(sampling.alpha_frequency),
+        "temperature": nonzero(sampling.temperature),
+        "top_p": nonzero(sampling.top_p),
+        "presence_penalty": nonzero(sampling.alpha_presence),
     }
     if seed is not None:
         payload["seed"] = int(seed)
@@ -595,8 +644,8 @@ def _completion_payload_from_sampling(
         payload.update(
             {
                 "top_k": int(sampling.top_k),
-                "repetition_penalty": float(sampling.alpha_frequency),
-                "penalty_decay": float(sampling.alpha_decay),
+                "repetition_penalty": nonzero(sampling.alpha_frequency),
+                "penalty_decay": nonzero(sampling.alpha_decay),
                 "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
                 "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
                 "pad_zero": bool(sampling.pad_zero),
@@ -617,7 +666,7 @@ def _chat_payload_from_completion_payload(
         "model": payload["model"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": payload["max_tokens"],
-        "temperature": float(payload.get("temperature", 0.0) or 0.0),
+        "temperature": float(payload.get("temperature", 1e-5) or 1e-5),
         "stream": False,
     }
     if "top_p" in payload:

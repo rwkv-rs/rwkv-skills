@@ -18,8 +18,10 @@ from src.eval.scheduler.jobs import (
     locate_dataset,
 )
 from src.eval.scheduler.actions import (
+    CodingConfig,
     FunctionCallingConfig,
     QueueOptions,
+    _coding_extra_args,
     _function_calling_extra_args,
     _running_remote_slot_slugs,
 )
@@ -103,6 +105,23 @@ def test_swe_bench_coding_jobs_do_not_receive_function_prompt_flags(tmp_path: Pa
     assert "--prompt-style" in _function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"])
 
 
+def test_swe_bench_coding_jobs_receive_prompt_budget(tmp_path: Path) -> None:
+    opts = QueueOptions(
+        log_dir=tmp_path / "logs",
+        pid_dir=tmp_path / "pids",
+        job_order=tuple(JOB_CATALOGUE.keys()),
+        coding=CodingConfig(eval_workers=2, swebench_max_prompt_chars=18000),
+    )
+
+    assert _coding_extra_args(opts, JOB_CATALOGUE["code_swe_bench"]) == (
+        "--eval-workers",
+        "2",
+        "--swebench-max-prompt-chars",
+        "18000",
+    )
+    assert "--swebench-max-prompt-chars" not in _coding_extra_args(opts, JOB_CATALOGUE["code_human_eval"])
+
+
 def test_generated_remote_jobs_do_not_occupy_model_slots() -> None:
     running = {
         "code_swe_bench__swe_bench_lite_test_cot_rwkv7_g1": RunningEntry(pid=1, gpu=None),
@@ -159,10 +178,17 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     assert complex_spec.split == "test"
     assert complex_subset_spec.dataset == "complexfuncbench_subset"
     assert complex_subset_spec.split == "test"
+    assert DATASET_PREP_SPECS[canonical_slug("swe_bench_multilingual_test")].dataset == "swe_bench_multilingual"
+    assert DATASET_PREP_SPECS[canonical_slug("swe_bench_pro_test")].dataset == "swe_bench_pro"
+    assert DATASET_PREP_SPECS[canonical_slug("terminal_bench_2_1_test")].dataset == "terminal_bench_2_1"
+    assert DATASET_PREP_SPECS[canonical_slug("hle_with_tools_test")].dataset == "hle_with_tools"
     assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
     assert canonical_slug("tau3_bench_banking_knowledge_base") in CODE_DATASET_SLUGS
     assert canonical_slug("complexfuncbench_official_test") in CODE_DATASET_SLUGS
     assert canonical_slug("complexfuncbench_subset_test") in CODE_DATASET_SLUGS
+    assert canonical_slug("terminal_bench_2_1_test") not in JOB_CATALOGUE["function_bfcl_v3"].dataset_slugs
+    assert detect_job_from_dataset(canonical_slug("terminal_bench_2_1_test"), is_cot=False) is None
+    assert detect_job_from_dataset(canonical_slug("terminal_bench_2_1_test"), is_cot=True) == "function_agent_loop"
 
 
 def test_locate_dataset_prefers_existing_registered_artifact_without_source_prepare(

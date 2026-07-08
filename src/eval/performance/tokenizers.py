@@ -5,8 +5,6 @@ import importlib
 from pathlib import Path
 from typing import Protocol, Sequence
 
-from transformers import AutoTokenizer
-
 
 class BenchmarkTokenizer(Protocol):
     def encode(self, text: str) -> list[int]:  # pragma: no cover - protocol
@@ -52,6 +50,8 @@ class HfTokenizerAdapter:
 
     @classmethod
     def load(cls, reference: str) -> "HfTokenizerAdapter":
+        from transformers import AutoTokenizer
+
         tokenizer = AutoTokenizer.from_pretrained(reference, trust_remote_code=True)
         return cls(reference=reference, tokenizer=tokenizer)
 

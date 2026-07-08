@@ -82,7 +82,7 @@ def probe_remote_inference(
     candidates: Sequence[int] = DEFAULT_REMOTE_CONCURRENCY_CANDIDATES,
     prompt: str = DEFAULT_REMOTE_PROBE_PROMPT,
     max_tokens: int = 16,
-    temperature: float = 0.0,
+    temperature: float = 1e-5,
     top_p: float = 0.8,
     top_k: int = 50,
     stop_suffix: str | None = None,

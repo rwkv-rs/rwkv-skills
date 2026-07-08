@@ -177,6 +177,7 @@ def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypat
                 "cot_mode": "cot",
                 "long_doc_mode": "lexical",
                 "long_doc_max_evidence_chars": 3000,
+                "swebench_max_prompt_chars": 18000,
             },
         }
     )
@@ -197,6 +198,8 @@ def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypat
     assert "lexical" in resolved.argv
     assert "--long-doc-max-evidence-chars" in resolved.argv
     assert "3000" in resolved.argv
+    assert "--swebench-max-prompt-chars" in resolved.argv
+    assert "18000" in resolved.argv
 
 
 def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypatch, tmp_path: Path) -> None:

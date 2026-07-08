@@ -10,6 +10,7 @@ from typing import Any
 # 这里豁免重复惩罚的是：空格(33→0x20)、制表符(10→0x09)、数字 '0'-'9'(49-58→0x30-0x39)，
 # 避免对空白与数字的正常重复施加 presence/frequency penalty。
 DEFAULT_NO_PENALTY_TOKEN_IDS = (33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58)
+MIN_NONZERO_SAMPLING_FLOAT = 1e-5
 
 
 @dataclass(slots=True)
@@ -59,7 +60,7 @@ class SamplingConfig:
         top_p = float(self.top_p)
         temperature = float(self.temperature)
         if temperature <= 0.0:
-            temperature = 0.001
+            temperature = MIN_NONZERO_SAMPLING_FLOAT
         else:
             temperature = min(temperature, 1000.0)
 
@@ -69,7 +70,7 @@ class SamplingConfig:
             top_p = 1.0
         if top_p == 0.0:
             top_k = 1
-            top_p = 1.0
+            top_p = MIN_NONZERO_SAMPLING_FLOAT
 
         return replace(
             self,

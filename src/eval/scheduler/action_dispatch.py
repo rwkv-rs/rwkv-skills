@@ -330,7 +330,7 @@ def _launch_queue_items(
                 dataset_questions=questions,
             )
 
-        extra_args = item.extra_args + _coding_extra_args(opts, job) + _function_calling_extra_args(opts, job)
+        extra_args = item.extra_args + _coding_extra_args(opts, job) + _maths_extra_args(opts, job) + _function_calling_extra_args(opts, job)
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
         infer_timeout_s = opts.inference.timeout_s
@@ -807,6 +807,8 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
     _append("--planning-max-tokens", opts.functions.planning_max_tokens)
     _append("--final-max-tokens", opts.functions.final_max_tokens)
     _append("--answer-max-tokens", opts.functions.answer_max_tokens)
+    if job.name == "function_browsecomp":
+        _append("--judge-max-workers", opts.functions.judge_max_workers)
     _append("--history-max-chars", opts.functions.history_max_chars)
     _append("--prompt-max-chars", opts.functions.prompt_max_chars)
     _append_str("--long-doc-mode", opts.functions.long_doc_mode)
@@ -828,15 +830,32 @@ def _function_calling_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str,
     _append("--max-rounds", opts.functions.max_rounds)
     _append("--max-steps", opts.functions.max_steps)
     _append("--max-tool-errors", opts.functions.max_tool_errors)
+    if opts.functions.complexfuncbench_disable_response_eval:
+        args.append("--complexfuncbench-disable-response-eval")
+    if opts.functions.complexfuncbench_offline_compare:
+        args.append("--complexfuncbench-offline-compare")
     return tuple(args)
 
 
 def _coding_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
     if job.runner_group is not RunnerGroup.CODING:
         return ()
-    if opts.coding.eval_workers is None:
+    args: list[str] = []
+    if opts.coding.eval_workers is not None:
+        args.extend(["--eval-workers", str(max(1, int(opts.coding.eval_workers)))])
+    if job.name in {"code_swe_bench", "code_swe_bench_naive"} and opts.coding.swebench_max_prompt_chars is not None:
+        args.extend(["--swebench-max-prompt-chars", str(max(1, int(opts.coding.swebench_max_prompt_chars)))])
+    return tuple(args)
+
+
+def _maths_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.MATHS:
         return ()
-    return ("--eval-workers", str(max(1, int(opts.coding.eval_workers))))
+    if job.name != "free_response_judge":
+        return ()
+    if opts.math.judge_max_workers is None:
+        return ()
+    return ("--judge-max-workers", str(max(1, int(opts.math.judge_max_workers))))
 
 
 def _clean_param_swap_records(log_dir: Path) -> None:
@@ -1026,6 +1045,7 @@ __all__ = [
     "_candidate_exceeds_coding_limit",
     "_function_calling_extra_args",
     "_coding_extra_args",
+    "_maths_extra_args",
     "_clean_param_swap_records",
     "_allocate_console_log_path",
     "_handle_batch_failure",
