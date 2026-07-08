@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from src.eval.evaluating import RunContext, RunMode
 from src.eval.tasks.function_calling import (
     BfclTaskRecord,
@@ -847,7 +845,8 @@ def test_run_bfcl_generation_step_uses_official_json_prompt_style() -> None:
     assert call["prompt_stop_suffixes"] == [list(bfcl_v3_runner.BFCL_DECISION_STOP_SUFFIXES)]
     prompt = str(call["prompts"][0])
     assert prompt.startswith("System: Tools:")
-    assert "\n\nUser: Find A1\n\nAssistant: ```json\n{" in prompt
+    assert "\n\nUser: Find A1\n\nAssistant: ```json" in prompt
+    assert not prompt.endswith("{")
     assert "<think>" not in prompt
 
 

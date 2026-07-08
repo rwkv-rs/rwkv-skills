@@ -229,7 +229,7 @@ def test_parse_rubric_judge_verdict_accepts_json_and_fallback() -> None:
 def test_prepper_normalization_applies_profiles_and_row_overrides() -> None:
     qa_row = {"id": "w-1", "question": "Q?", "answer": "A"}
     normalized = normalize_agent_loop_row(qa_row, dataset_name="widesearch", index=0, source_path="src.jsonl")
-    assert normalized["executor"]["kind"] == "manifest_replay"
+    assert normalized["executor"]["kind"] == "web_search"
     assert normalized["verifier"]["kind"] == "widesearch_official"
     assert normalized["metadata"]["source_format"] == "rwkvc_agent_loop"
 

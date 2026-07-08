@@ -260,7 +260,7 @@ def prepare_function_calling_run(
         is_param_search=False,
         job_name=resolved_job_name,
         sampling_config=build_task_sampling_config(
-            cot_mode=CoTMode.COT,
+            cot_mode=CoTMode.NO_COT,
             avg_k=avg_k,
             sampling_config=sampling_payload,
             effective_sample_count=effective_sample_count,

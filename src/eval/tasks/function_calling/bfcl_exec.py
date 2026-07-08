@@ -176,7 +176,7 @@ def normalize_bfcl_exec_manifest_row(
 
 
 def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) -> str:
-    prompt = build_simple_tool_call_prompt(
+    return build_simple_tool_call_prompt(
         SimpleToolCallRecord(
             task_id=record.task_id,
             instruction=record.instruction,
@@ -187,9 +187,6 @@ def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) ->
         history_max_chars=history_max_chars,
         prefill_object=True,
     )
-    if _force_bfcl_exec_array_prefix(record):
-        prompt += "[\n"
-    return prompt
 
 
 def render_bfcl_exec_call(call: Mapping[str, Any]) -> str:
@@ -793,7 +790,7 @@ def _run_bfcl_exec(
                     payload["agent_info"] = {
                         **dict(evaluation.details),
                         "fail_reason": evaluation.fail_reason,
-                        "cot_mode": CoTMode.COT.value,
+                        "cot_mode": CoTMode.NO_COT.value,
                     }
                     payload["agent_trace"] = [
                         {
@@ -826,14 +823,14 @@ def _run_bfcl_exec(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=plan.sample_size,
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
-                extra={"cot_mode": CoTMode.COT.value, "history_max_chars": history_max_chars},
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                extra={"cot_mode": CoTMode.NO_COT.value, "history_max_chars": history_max_chars},
             ),
         )
     except Exception as exc:

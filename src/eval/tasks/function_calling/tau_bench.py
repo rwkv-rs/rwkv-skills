@@ -7,9 +7,8 @@ from typing import Any, Mapping, Sequence
 
 from .rwkv_prompt import (
     build_rwkv_json_call_prompt,
-    coerce_json_function_call_payload,
-    extract_json_call_value_text,
 )
+from .tool_call_contract import parse_tool_call_text
 
 from .context_budget import normalize_rwkv_text as _normalize_rwkv_text
 
@@ -167,18 +166,17 @@ def parse_tool_call_or_final_answer(response: str) -> TauDecision:
     if not response.strip():
         raise ValueError("model returned empty response")
 
-    candidate = extract_json_call_value_text(response)
-    payload = coerce_json_function_call_payload(json.loads(candidate), context_label="tool call")
-    name = str(payload["name"]).strip()
+    call = parse_tool_call_text(response, context_label="tool call", recover_partial=True)
+    name = call.name
     if not name:
-        raise ValueError(f"tool call missing name: {candidate}")
+        raise ValueError("tool call missing name")
     requestor = "assistant"
     if "." in name:
         prefix, unprefixed = name.split(".", 1)
         if prefix in {"assistant", "user"} and unprefixed.strip():
             requestor = prefix
             name = unprefixed.strip()
-    arguments = payload["arguments"]
+    arguments = call.arguments
     if name == "final_answer":
         return TauDecision(is_tool_call=False, final_answer=str(arguments.get("answer") or "").strip())
     return TauDecision(

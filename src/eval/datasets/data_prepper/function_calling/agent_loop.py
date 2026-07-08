@@ -28,12 +28,19 @@ from src.eval.datasets.runtime import MaterializingDatasetSpec
 from src.eval.scheduler.config import REPO_ROOT
 
 _SOURCE_ROOT_ENV = "RWKV_AGENT_LOOP_SOURCE_ROOT"
+_LEGACY_SOURCE_ROOT_ENV = "RWKV_AGENT_BENCHMARKS_ROOT"
 _ENV_PREFIX = "RWKV_AGENT_LOOP_SOURCE"
 _REQUIRED_FIELDS = ("task_id", "instruction", "tools", "executor", "verifier")
 
 _AGENT_LOOP_SOURCES: dict[str, dict[str, str | None]] = {
     item.benchmark_name: {"source": item.source_url, "source_kind": item.source_kind}
     for item in AGENT_LOOP_BENCHMARK_SOURCES
+}
+_ALIASES: dict[str, str] = {
+    "deep_swe": "deepswe",
+    "wide_search": "widesearch",
+    "claw_eval": "claweval",
+    "hle_tools": "hle_with_tools",
 }
 
 _RUBRIC_KEYS = ("rubrics", "rubric", "grading_rubrics", "checklist")
@@ -66,8 +73,8 @@ _AGENT_LOOP_PROFILES: dict[str, AgentLoopProfile] = {
         executor_config={"backend": "subprocess"},
         verifier_kind="repo_tests_official",
     ),
-    # Search agents: recorded search-tool outputs, official/LLM judging.
-    "widesearch": AgentLoopProfile(verifier_kind="widesearch_official"),
+    # Search agents: live web search by default; rows may override to replay recorded outputs.
+    "widesearch": AgentLoopProfile(executor_kind="web_search", verifier_kind="widesearch_official"),
     "deepsearchqa": AgentLoopProfile(verifier_kind="llm_rubric_judge"),
     # MCP-server agents graded by their official evaluators.
     "mcp_atlas": AgentLoopProfile(executor_kind="mcp_worker", verifier_kind="mcp_atlas_official"),
@@ -97,7 +104,8 @@ if _MISSING_PROFILES:  # pragma: no cover - guards future benchmark_sources edit
 
 class AgentLoopDatasetSpec(MaterializingDatasetSpec):
     def __init__(self, output_root: Path, split: str, *, name: str) -> None:
-        if name not in _AGENT_LOOP_SOURCES:
+        canonical_name = _ALIASES.get(name, name)
+        if canonical_name not in _AGENT_LOOP_SOURCES:
             raise ValueError(f"unknown agent-loop dataset alias: {name}")
         super().__init__(
             name,
@@ -106,34 +114,41 @@ class AgentLoopDatasetSpec(MaterializingDatasetSpec):
             required_fields=_REQUIRED_FIELDS,
             source_kind="rwkvc_agent_loop_source",
         )
+        self._canonical_name = canonical_name
         self._source_path: Path | None = None
+        self._skipped_rows = 0
 
     def source_path(self) -> Path:
         if self._source_path is None:
-            self._source_path = resolve_source_path(
-                self.name,
+            path = resolve_source_path(
+                self._canonical_name,
                 self.split,
                 env_prefix=_ENV_PREFIX,
-                root_envs=(_SOURCE_ROOT_ENV,),
+                root_envs=(_SOURCE_ROOT_ENV, _LEGACY_SOURCE_ROOT_ENV),
                 default_root=REPO_ROOT / "data" / "agent_loop_sources",
             )
+            if not path.exists() and self._canonical_name == "terminal_bench_2_1":
+                tasks_path = path.parent / "tasks.jsonl"
+                if tasks_path.exists():
+                    path = tasks_path.resolve()
+            self._source_path = path
         return self._source_path
 
     def download(self) -> None:
         path = self.source_path()
         if not path.exists():
-            if _AGENT_LOOP_SOURCES[self.name].get("source_kind") == "hf_dataset":
+            if _AGENT_LOOP_SOURCES[self._canonical_name].get("source_kind") == "hf_dataset":
                 return None
-            env_name = per_dataset_source_env(_ENV_PREFIX, self.name)
+            env_name = per_dataset_source_env(_ENV_PREFIX, self._canonical_name)
             raise FileNotFoundError(
-                f"missing source for {self.name}:{self.split}: {path}. "
+                f"missing source for {self._canonical_name}:{self.split}: {path}. "
                 f"Set {env_name}=<json/jsonl file or dir> or {_SOURCE_ROOT_ENV}=<root>. "
                 "See docs/agent_loop.md."
             )
 
     def load_records(self) -> Iterable[dict[str, Any]]:
         path = self.source_path()
-        info = _AGENT_LOOP_SOURCES[self.name]
+        info = _AGENT_LOOP_SOURCES[self._canonical_name]
         if path.exists():
             rows = read_source_rows(path)
             source_label = str(path)
@@ -142,21 +157,38 @@ class AgentLoopDatasetSpec(MaterializingDatasetSpec):
             source_label = str(info.get("source") or "")
         else:
             raise FileNotFoundError(path)
-        return [
-            normalize_agent_loop_row(row, dataset_name=self.name, index=index, source_path=source_label)
-            for index, row in enumerate(rows)
-        ]
+        records: list[dict[str, Any]] = []
+        skipped_rows = 0
+        for index, row in enumerate(rows):
+            try:
+                records.append(
+                    normalize_agent_loop_row(
+                        row,
+                        dataset_name=self._canonical_name,
+                        index=index,
+                        source_path=source_label,
+                    )
+                )
+            except ValueError as exc:
+                if _is_missing_reference_row(exc):
+                    skipped_rows += 1
+                    continue
+                raise
+        self._skipped_rows = skipped_rows
+        return records
 
     def manifest_extra(self) -> dict[str, Any]:
-        info = _AGENT_LOOP_SOURCES[self.name]
+        info = _AGENT_LOOP_SOURCES[self._canonical_name]
         return {
             "source_path": str(self.source_path()),
             "source": info["source"],
             "source_kind": info["source_kind"],
+            "canonical_name": self._canonical_name,
             "input_contract": (
                 "JSONL rows may carry explicit executor/verifier specs, recorded tool outputs, "
                 "rubrics, or plain question/answer fields; each row is classified by format."
             ),
+            "skipped_rows": self._skipped_rows,
         }
 
 
@@ -209,7 +241,7 @@ def normalize_agent_loop_row(
     if row.get("official_task_id") or metadata.get("official_task_id"):
         metadata.setdefault("official_task_id", str(row.get("official_task_id") or metadata.get("official_task_id")))
 
-    return {
+    payload = {
         "task_id": str(base.get("task_id")),
         "instruction": str(base.get("instruction") or ""),
         "system_extra": str(row.get("system_extra") or ""),
@@ -220,6 +252,12 @@ def normalize_agent_loop_row(
         "recorded_tool_outputs": recorded,
         "metadata": metadata,
     }
+    if dataset_name == "terminal_bench_2_1":
+        metadata["official_sandbox_required"] = True
+        metadata["official_sandbox_env"] = "RWKV_TERMINAL_BENCH_2_1_SANDBOX_ROOT"
+        payload["answer"] = str(row.get("answer") or row.get("expected_answer") or "")
+        payload["official_payload"] = dict(row)
+    return payload
 
 
 def _recorded_tool_outputs(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -242,6 +280,11 @@ def _rubric_lines(row: Mapping[str, Any]) -> list[str]:
     return []
 
 
+def _is_missing_reference_row(exc: ValueError) -> bool:
+    message = str(exc)
+    return "agent tool-call row missing answer/expected_tool_calls" in message
+
+
 def _reference_answer_from_expected(expected_tool_calls: Iterable[Mapping[str, Any]]) -> str:
     for call in expected_tool_calls:
         if str(call.get("name") or "") == "final_answer":
@@ -261,7 +304,7 @@ def _register(name: str):
     return _prepare
 
 
-for _dataset_name in _AGENT_LOOP_SOURCES:
+for _dataset_name in (*_AGENT_LOOP_SOURCES, *_ALIASES):
     _register(_dataset_name)
 
 

@@ -417,58 +417,71 @@ def _run_tau_official_attempt(
     retail_progressive_tool_disclosure: bool = False,
 ) -> dict[str, Any]:
     attempt_started = time.perf_counter()
-    task = runtime_env.load_task(record.task)
-    environment = runtime_env.create_environment(solo_mode=False)
-    agent = RWKVTauOfficialAgent(
-        engine=run.engine,
-        sampling=sampling,
-        tools=environment.get_tools(),
-        domain_policy=str(environment.get_policy()),
-        domain=record.domain,
-        history_max_chars=history_max_chars,
-        prompt_max_chars=prompt_max_chars,
-        long_doc_config=long_doc_config,
-        tool_routing_config=tool_routing_config or ToolRoutingConfig(),
-        retail_repeated_read_guard=retail_repeated_read_guard,
-        retail_tool_use_guard=retail_tool_use_guard,
-        retail_progressive_tool_disclosure=retail_progressive_tool_disclosure,
-    )
-    user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
-    seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
-    orchestrator = runtime_env.build_orchestrator(
-        agent=agent,
-        user=user,
-        environment=environment,
-        task=task,
-        max_steps=max_steps,
-        max_errors=max_tool_errors,
-        seed=seed,
-        validate_communication=True,
-    )
     timing: dict[str, Any] = {}
-    try:
-        run_started = time.perf_counter()
-        simulation = orchestrator.run()
-        timing["orchestrator_run_s"] = time.perf_counter() - run_started
-        evaluation_started = time.perf_counter()
-        evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
-        timing["evaluation_s"] = time.perf_counter() - evaluation_started
-    except Exception as exc:
-        error_text = f"tau official runtime error: {type(exc).__name__}: {exc}"
-        agent.parse_errors.append(error_text)
-        messages = list(getattr(orchestrator, "messages", []) or getattr(orchestrator, "_messages", []) or [])
-        simulation = SimpleNamespace(
-            task_id=record.task_id,
-            messages=messages,
-            agent_cost=float(getattr(orchestrator, "agent_cost", 0.0) or 0.0),
-            user_cost=float(getattr(orchestrator, "user_cost", 0.0) or 0.0),
-            termination_reason=error_text,
+    max_runtime_retries = _tau_runtime_retry_count()
+    runtime_retry_count = 0
+    for runtime_attempt in range(max_runtime_retries + 1):
+        task = runtime_env.load_task(record.task)
+        environment = runtime_env.create_environment(solo_mode=False)
+        agent = RWKVTauOfficialAgent(
+            engine=run.engine,
+            sampling=sampling,
+            tools=environment.get_tools(),
+            domain_policy=str(environment.get_policy()),
+            domain=record.domain,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+            long_doc_config=long_doc_config,
+            tool_routing_config=tool_routing_config or ToolRoutingConfig(),
+            retail_repeated_read_guard=retail_repeated_read_guard,
+            retail_tool_use_guard=retail_tool_use_guard,
+            retail_progressive_tool_disclosure=retail_progressive_tool_disclosure,
         )
-        evaluation = SimpleNamespace(
-            reward=0.0,
-            is_passed=False,
-            details={"termination_reason": error_text, "runtime_error": error_text},
+        user = runtime_env.build_user(task=task, environment=environment, user_model=user_model)
+        seed = sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=1)
+        orchestrator = runtime_env.build_orchestrator(
+            agent=agent,
+            user=user,
+            environment=environment,
+            task=task,
+            max_steps=max_steps,
+            max_errors=max_tool_errors,
+            seed=seed,
+            validate_communication=True,
         )
+        try:
+            run_started = time.perf_counter()
+            simulation = orchestrator.run()
+            timing["orchestrator_run_s"] = time.perf_counter() - run_started
+            evaluation_started = time.perf_counter()
+            evaluation = runtime_env.evaluate(simulation=simulation, task=task, judge_model=judge_model)
+            timing["evaluation_s"] = time.perf_counter() - evaluation_started
+            break
+        except Exception as exc:
+            error_text = f"tau official runtime error: {type(exc).__name__}: {exc}"
+            is_transient = _is_transient_tau_runtime_error(exc)
+            if runtime_attempt < max_runtime_retries and is_transient:
+                runtime_retry_count += 1
+                time.sleep(_tau_runtime_retry_delay_s(runtime_attempt))
+                continue
+            if is_transient:
+                raise
+            agent.parse_errors.append(error_text)
+            messages = list(getattr(orchestrator, "messages", []) or getattr(orchestrator, "_messages", []) or [])
+            simulation = SimpleNamespace(
+                task_id=record.task_id,
+                messages=messages,
+                agent_cost=float(getattr(orchestrator, "agent_cost", 0.0) or 0.0),
+                user_cost=float(getattr(orchestrator, "user_cost", 0.0) or 0.0),
+                termination_reason=error_text,
+            )
+            evaluation = SimpleNamespace(
+                reward=0.0,
+                is_passed=False,
+                details={"termination_reason": error_text, "runtime_error": error_text},
+            )
+            break
+    timing["runtime_retry_count"] = runtime_retry_count
     timing["total_attempt_s"] = time.perf_counter() - attempt_started
     return _tau_official_completion_payload(
         record=record,
@@ -483,6 +496,57 @@ def _run_tau_official_attempt(
         sampling_payload=sampling_payload,
         timing=timing,
     )
+
+
+def _tau_runtime_retry_count() -> int:
+    raw = os.environ.get("RWKV_TAU_RUNTIME_RETRIES", "4").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 4
+
+
+def _tau_runtime_retry_delay_s(attempt_index: int) -> float:
+    base_raw = os.environ.get("RWKV_TAU_RUNTIME_RETRY_BASE_S", "3").strip()
+    cap_raw = os.environ.get("RWKV_TAU_RUNTIME_RETRY_CAP_S", "30").strip()
+    try:
+        base = max(0.1, float(base_raw))
+    except ValueError:
+        base = 3.0
+    try:
+        cap = max(base, float(cap_raw))
+    except ValueError:
+        cap = 30.0
+    return min(cap, base * (2 ** max(0, int(attempt_index))))
+
+
+def _is_transient_tau_runtime_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = (
+        "当前系统繁忙",
+        "rate limit",
+        "ratelimit",
+        "temporarily unavailable",
+        "timeout",
+        "timed out",
+        "apierror",
+        "openaiexception",
+        "server error",
+        "http 429",
+        "status 429",
+        " 429",
+        "http 500",
+        "status 500",
+        "http 502",
+        "status 502",
+        "http 503",
+        "status 503",
+        "http 504",
+        "status 504",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(marker in text for marker in markers)
 
 
 def _tau_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
@@ -576,9 +640,12 @@ def _run_tau(
     batch_size = max(1, int(args.batch_size or 16))
     max_steps = max(1, int(args.max_steps))
     max_tool_errors = max(1, int(args.max_tool_errors))
-    prompt_max_chars = int(
-        getattr(args, "prompt_max_chars", None)
-        or os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS))
+    prompt_max_chars = max(
+        DEFAULT_TAU_PROMPT_MAX_CHARS,
+        int(
+            getattr(args, "prompt_max_chars", None)
+            or os.environ.get("RWKV_TAU_PROMPT_MAX_CHARS", str(DEFAULT_TAU_PROMPT_MAX_CHARS))
+        ),
     )
     long_doc_config = _tau_long_doc_config(args)
     tool_routing_config = tool_routing_config_from_args(args)
@@ -747,14 +814,14 @@ def _run_tau(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=plan.sample_size,
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
-                extra={"cot_mode": CoTMode.COT.value},
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                extra={"cot_mode": CoTMode.NO_COT.value},
             ),
         )
     except Exception as exc:

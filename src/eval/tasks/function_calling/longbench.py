@@ -679,16 +679,16 @@ def _longbench_score_payload(
     metrics.update(compute_longbench_completion_metrics(completions_payloads))
     return make_score_payload(
         run.dataset_slug,
-        is_cot=True,
+        is_cot=False,
         model_name=model_name,
         metrics=metrics,
         samples=len(completions_payloads),
         problems=plan.sample_size,
         task=job_name,
-        task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+        task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
         extra={
             "sampling_config": sampling_payload,
-            "cot_mode": CoTMode.COT.value,
+            "cot_mode": CoTMode.NO_COT.value,
             "scoring": "best_reference_token_f1_exact_match",
         },
     )

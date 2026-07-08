@@ -63,8 +63,8 @@ class BrowseCompJudgeConfig:
     model: str
     base_url: str | None = None
     max_workers: int = 4
-    max_retries: int = 3
-    backoff_base_s: float = 0.5
+    max_retries: int = 6
+    backoff_base_s: float = 3.0
     timeout_s: float = 60.0
 
 
@@ -72,6 +72,10 @@ class BrowseCompJudgeConfig:
 class BrowseCompJudgeOutcome:
     is_passed: bool
     reason: str
+
+
+class BrowseCompJudgeRuntimeError(RuntimeError):
+    """Raised when the external judge cannot be reached or returns an unusable response."""
 
 
 _BROWSECOMP_DEFAULT_PROMPT_MAX_CHARS = 8192
@@ -298,12 +302,11 @@ def judge_browsecomp_answers(
                 f"[correct_answer]\n{record.answer}\n"
             )
 
-        last_error = "judge failed"
         for attempt in range(max(1, int(config.max_retries))):
             try:
                 response = client.chat.completions.create(
                     model=config.model,
-                    temperature=0.0,
+                    temperature=0.8,
                     top_p=1.0,
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
@@ -315,18 +318,21 @@ def judge_browsecomp_answers(
                     reason=str(payload.get("reason") or "").strip(),
                 )
             except Exception as exc:
-                last_error = str(exc)
                 if attempt + 1 >= max(1, int(config.max_retries)):
-                    break
+                    raise BrowseCompJudgeRuntimeError(f"browsecomp judge failed after retries: {exc}") from exc
                 time.sleep(float(config.backoff_base_s) * (2**attempt))
-        return BrowseCompJudgeOutcome(is_passed=False, reason=last_error or "judge failed")
+        raise BrowseCompJudgeRuntimeError("browsecomp judge failed")
 
     results: list[BrowseCompJudgeOutcome] = [BrowseCompJudgeOutcome(False, "judge failed")] * len(items)
     max_workers = max(1, min(int(config.max_workers), len(items) or 1))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(worker, entry): index for index, entry in enumerate(items)}
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results[index] = BrowseCompJudgeOutcome(False, f"judge failed after retries: {exc}")
     return results
 
 
@@ -744,7 +750,7 @@ def _run_browsecomp(
                             "response": final_answer,
                             "judge_reason": outcome.reason,
                             "locale": record.locale,
-                            "cot_mode": CoTMode.COT.value,
+                            "cot_mode": CoTMode.NO_COT.value,
                             "topic": record.topic or "",
                             "final_answer_call": final_row["final_answer_call"],
                             "decoded_final_answer_call": final_row["decoded_final_answer_call"],
@@ -782,17 +788,17 @@ def _run_browsecomp(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=len(records),
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
                 extra={
                     "sampling_config": sampling_payload,
                     "judger_model_name": judge.model,
-                    "cot_mode": CoTMode.COT.value,
+                    "cot_mode": CoTMode.NO_COT.value,
                 },
             ),
         )

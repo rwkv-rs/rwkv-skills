@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import multiprocessing as mp
 import os
+import queue
 import re
 import sys
 from dataclasses import dataclass, field
@@ -24,11 +26,11 @@ from .context_budget import (
 from .rwkv_prompt import (
     assistant_json_prefix,
     build_rwkv_json_call_prompt,
-    coerce_json_function_call_payloads,
     extract_json_call_value_text,
     render_assistant_json_block,
 )
 from .tau_bench import TauDecision, TauToolCall
+from .tool_call_contract import parse_tool_calls_text
 
 BFCL_V3_MAX_TOOL_SCHEMA_CHARS = DEFAULT_TOOL_SCHEMA_MAX_CHARS
 BFCL_V3_MAX_RESULT_CHARS = DEFAULT_TOOL_RESULT_MAX_CHARS
@@ -48,6 +50,7 @@ BFCL_DECISION_STOP_SUFFIXES = (
     "\nAssistant:",
 )
 BFCL_ROUTER_LABELS = ("TOOL", "ASK", "HANDOFF")
+DEFAULT_BFCL_OFFICIAL_TOOL_TIMEOUT_S = 30.0
 _BFCL_FORBIDDEN_OUTPUT_PATTERNS = (
     "**Tool Call:**",
     "### Tool Output",
@@ -294,7 +297,7 @@ def build_bfcl_system_block(system_prompt: str) -> str:
 
 
 def build_bfcl_assistant_json_prefix() -> str:
-    return assistant_json_prefix(enable_think=False, prefill_object=True)
+    return assistant_json_prefix(enable_think=False, prefill_object=False)
 
 
 def build_bfcl_assistant_json_block(json_text: str) -> str:
@@ -449,6 +452,7 @@ def build_bfcl_rwkv_prompt(
         system_prompt,
         prompt_messages,
         history_max_chars=history_max_chars,
+        assistant_prefix=build_bfcl_assistant_json_prefix(),
     )
 
 
@@ -530,6 +534,9 @@ def build_bfcl_tool_prompt(
                 "The router selected TOOL.",
                 "Return only a JSON function call.",
                 'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+                "The arguments field must be a JSON object, not a quoted JSON string.",
+                "Do not include id, call_id, type, response, output, exception, state, analysis, or markdown fields.",
+                "If any required argument is missing from user text or successful tool output, use ask_user instead of empty strings.",
                 "Do not output <think> tags, markdown, or natural-language commentary.",
             ]
         )
@@ -634,9 +641,12 @@ def build_bfcl_system_prompt(tools: Sequence[Mapping[str, Any]]) -> str:
         render_bfcl_tool_catalog(_bfcl_tools_with_control_functions(tools)),
         "Return only a JSON function call.",
         'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+        "The arguments field must be a JSON object, not a quoted JSON string.",
         "Use exactly one listed tool name.",
         "Use ask_user only when required information is missing.",
         "Use final_answer only when no environment tool should be called for this turn.",
+        "Do not use empty strings for required arguments; ask_user if a required value is unknown.",
+        "Do not include id, call_id, type, response, output, exception, state, analysis, or markdown fields.",
         "Do not invent tool names, arguments, tool results, or state transitions.",
     ]
     return normalize_bfcl_rwkv_text("\n".join(lines))
@@ -682,7 +692,12 @@ def parse_bfcl_assistant_output(response: str) -> TauDecision:
 
 
 def _parse_bfcl_assistant_payloads(response: str) -> list[dict[str, Any]]:
-    normalized = extract_json_call_value_text(response)
+    try:
+        normalized = extract_json_call_value_text(response)
+        calls = parse_tool_calls_text(normalized, context_label="BFCL tool call", recover_partial=True)
+    except ValueError:
+        calls = parse_tool_calls_text(response, context_label="BFCL tool call", recover_partial=True)
+        normalized = json.dumps([call.layer_payload() for call in calls], ensure_ascii=False, separators=(",", ":"))
     if not normalized:
         raise ValueError("model returned empty response")
 
@@ -692,7 +707,7 @@ def _parse_bfcl_assistant_payloads(response: str) -> list[dict[str, Any]]:
             raise ValueError(f"forbidden BFCL output pattern detected: {pattern}")
     if "<think>" in lowered or "</think>" in lowered:
         raise ValueError("decision output must not contain <think> tags")
-    return coerce_json_function_call_payloads(json.loads(normalized), context_label="BFCL tool call")
+    return [call.layer_payload() for call in calls]
 
 
 def _bfcl_payload_to_decision(payload: Mapping[str, Any]) -> TauDecision:
@@ -787,18 +802,17 @@ def execute_bfcl_official_tool_call(
     runtime = _load_bfcl_official_runtime(str(official_root))
     model_name = runtime_state.official_model_name or "rwkv_bfcl"
     call_string = render_bfcl_official_call(tool_call)
-    execution_results, involved_instances = runtime.execute_multi_turn_func_call(
-        func_call_list=[call_string],
-        initial_config=dict(record.initial_state),
+    raw_result, state_snapshot = _execute_bfcl_official_tool_call_with_timeout(
+        official_root=str(official_root),
+        call_string=call_string,
+        initial_state=dict(record.initial_state),
         involved_classes=list(record.involved_classes),
         model_name=model_name,
-        test_entry_id=record.task_id,
+        task_id=record.task_id,
         long_context=_is_official_long_context_task(record),
-        is_evaL_run=False,
     )
-    raw_result = execution_results[0] if execution_results else ""
     ok, output, error = _decode_official_execution_result(raw_result)
-    runtime_state.current_state = _snapshot_official_instances(involved_instances)
+    runtime_state.current_state = state_snapshot
     runtime_state.executed_tool_calls.append(
         {
             "name": tool_call.name,
@@ -815,6 +829,124 @@ def execute_bfcl_official_tool_call(
         state_snapshot=dict(runtime_state.current_state),
         matched_expectation=not str(raw_result).startswith("Error during execution:"),
     )
+
+
+def _execute_bfcl_official_tool_call_with_timeout(
+    *,
+    official_root: str,
+    call_string: str,
+    initial_state: Mapping[str, Any],
+    involved_classes: Sequence[str],
+    model_name: str,
+    task_id: str,
+    long_context: bool,
+) -> tuple[Any, dict[str, Any]]:
+    timeout_s = _resolve_bfcl_official_tool_timeout_s()
+    if timeout_s <= 0:
+        return _execute_bfcl_official_tool_call_inprocess(
+            official_root=official_root,
+            call_string=call_string,
+            initial_state=initial_state,
+            involved_classes=involved_classes,
+            model_name=model_name,
+            task_id=task_id,
+            long_context=long_context,
+        )
+
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue[dict[str, Any]] = ctx.Queue(maxsize=1)
+    process = ctx.Process(
+        target=_bfcl_official_tool_call_worker,
+        args=(
+            result_queue,
+            official_root,
+            call_string,
+            dict(initial_state),
+            list(involved_classes),
+            model_name,
+            task_id,
+            bool(long_context),
+        ),
+    )
+    process.start()
+    process.join(timeout_s)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2.0)
+        raise TimeoutError(
+            f"BFCL official tool execution timed out after {timeout_s:g}s for task_id={task_id}"
+        )
+    try:
+        payload = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise RuntimeError(
+            f"BFCL official tool execution exited without a result for task_id={task_id} "
+            f"(exitcode={process.exitcode})"
+        ) from exc
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "BFCL official tool execution failed"))
+    return payload.get("raw_result"), dict(payload.get("state_snapshot") or {})
+
+
+def _bfcl_official_tool_call_worker(
+    result_queue: mp.Queue[dict[str, Any]],
+    official_root: str,
+    call_string: str,
+    initial_state: dict[str, Any],
+    involved_classes: list[str],
+    model_name: str,
+    task_id: str,
+    long_context: bool,
+) -> None:
+    try:
+        raw_result, state_snapshot = _execute_bfcl_official_tool_call_inprocess(
+            official_root=official_root,
+            call_string=call_string,
+            initial_state=initial_state,
+            involved_classes=involved_classes,
+            model_name=model_name,
+            task_id=task_id,
+            long_context=long_context,
+        )
+        result_queue.put({"ok": True, "raw_result": raw_result, "state_snapshot": state_snapshot})
+    except BaseException as exc:  # noqa: BLE001 - subprocess boundary must report all failures.
+        result_queue.put({"ok": False, "error": repr(exc)})
+
+
+def _execute_bfcl_official_tool_call_inprocess(
+    *,
+    official_root: str,
+    call_string: str,
+    initial_state: Mapping[str, Any],
+    involved_classes: Sequence[str],
+    model_name: str,
+    task_id: str,
+    long_context: bool,
+) -> tuple[Any, dict[str, Any]]:
+    runtime = _load_bfcl_official_runtime(str(official_root))
+    execution_results, involved_instances = runtime.execute_multi_turn_func_call(
+        func_call_list=[call_string],
+        initial_config=dict(initial_state),
+        involved_classes=list(involved_classes),
+        model_name=model_name,
+        test_entry_id=task_id,
+        long_context=long_context,
+        is_evaL_run=False,
+    )
+    raw_result = execution_results[0] if execution_results else ""
+    return raw_result, _snapshot_official_instances(involved_instances)
+
+
+def _resolve_bfcl_official_tool_timeout_s() -> float:
+    raw = os.environ.get("RWKV_BFCL_OFFICIAL_TOOL_TIMEOUT_S") or os.environ.get(
+        "BFCL_OFFICIAL_TOOL_TIMEOUT_S"
+    )
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_BFCL_OFFICIAL_TOOL_TIMEOUT_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_BFCL_OFFICIAL_TOOL_TIMEOUT_S
 
 
 def apply_bfcl_tool_call(
@@ -1565,6 +1697,10 @@ def _resolve_official_root(
     env_path = _resolve_env_path(_BFCL_OFFICIAL_ROOT_ENV_VARS)
     if env_path is not None:
         return env_path
+    project_root = Path(__file__).resolve().parents[4]
+    bundled_root = project_root / "references" / "gorilla" / "berkeley-function-call-leaderboard"
+    if (bundled_root / "bfcl_eval").is_dir():
+        return bundled_root.resolve()
     for candidate in (possible_answer_root, func_doc_root, source_hint):
         resolved = _candidate_official_root(candidate)
         if resolved is not None:

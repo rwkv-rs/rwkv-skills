@@ -62,6 +62,7 @@ from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, split
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
+    require_completion_style_remote_protocol,
     validate_inference_backend_args,
 )
 
@@ -434,6 +435,7 @@ def _resolve_run(args: argparse.Namespace) -> ResolvedFunctionCallingRun:
             )
         benchmark_kind = requested_kind
     benchmark_name, dataset_split = split_benchmark_and_split(dataset_slug)
+    require_completion_style_remote_protocol(args, benchmark_name=f"function-calling/{benchmark_name}")
     engine = build_inference_backend_from_args(args)
     return ResolvedFunctionCallingRun(
         benchmark_kind=benchmark_kind,

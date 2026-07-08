@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """ComplexFuncBench official multi-turn function-calling runner."""
+
+from __future__ import annotations
 
 import argparse
 import copy
@@ -32,6 +32,7 @@ from src.eval.tasks.function_calling.common import (
     prepare_function_calling_run,
     repeat_probe_entries,
 )
+from src.eval.tasks.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text, truncate_text
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
@@ -42,9 +43,10 @@ from src.eval.tasks.function_calling.runner_common import (
 from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     assistant_json_prefix,
-    coerce_json_function_call_payloads,
+    build_rwkv_json_call_prompt,
     extract_json_call_value_text,
 )
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_calls_text
 from src.eval.tasks.function_calling.tool_router import ToolRouteResult, route_tools_for_prompt, tool_routing_config_from_args
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
@@ -56,6 +58,9 @@ if TYPE_CHECKING:
 OFFICIAL_COMPLEXFUNC_SOURCE = "zai-org/ComplexFuncBench"
 DEFAULT_COMPLEXFUNC_MAX_ROWS = 0
 COMPLEXFUNCBENCH_TASK_PREFIX = "complexfuncbench_official__"
+DEFAULT_COMPLEXFUNC_PROMPT_MAX_CHARS = 8192
+COMPLEXFUNC_TOOL_DESC_BUDGETS = (360, 180, 80, 0)
+COMPLEXFUNC_ARG_DESC_BUDGETS = (160, 80, 0, 0)
 
 COMPLEXFUNCBENCH_FINAL_SCHEMA: dict[str, Any] = {
     "name": "final_answer",
@@ -789,33 +794,46 @@ def build_complexfuncbench_prompt(
     step: int,
     *,
     tool_route: ToolRouteResult | None = None,
+    history_max_chars: int = DEFAULT_HISTORY_MAX_CHARS,
+    prompt_max_chars: int | None = None,
 ) -> str:
+    del step
     selected_tools = tool_route.selected_tools if tool_route is not None else record.tools
-    tools_json = json.dumps(selected_tools or [], ensure_ascii=False, indent=2)
-    trajectory = _render_agent_trajectory(events)
-    current = str(observation.content or "")
-    route_note = ""
-    if tool_route is not None:
-        route_note = (
-            "Tool router trace:\n"
-            + json.dumps(tool_route.trace_payload(), ensure_ascii=False, separators=(",", ":"))
-            + "\n\n"
-        )
-    return (
-        "You are running the official ComplexFuncBench function-calling task.\n"
-        "Return only JSON and no extra text.\n"
-        'For one call, use {"name":"ToolName","arguments":{"arg":"value"}}.\n'
-        "For multiple calls in the same assistant turn, return a JSON array of those objects.\n"
-        "After all official sandbox observations indicate the required calls are complete, "
-        'call {"name":"final_answer","arguments":{"answer":"..."}}.\n'
-        "Available tools:\n"
-        f"{tools_json}\n\n"
-        f"{route_note}"
-        f"Trajectory:\n{trajectory}\n\n"
-        f"Current observation:\n{current}\n\n"
-        f"Step: {step}\n\n"
-        + assistant_json_prefix()
+    messages = _complexfuncbench_dialog_messages(events, observation)
+    total_tool_count = len(record.tools) if tool_route is not None else None
+    prompt = _render_complexfuncbench_prompt(
+        selected_tools,
+        messages,
+        total_tool_count=total_tool_count,
+        history_max_chars=max(0, int(history_max_chars)),
     )
+    if prompt_max_chars is None or int(prompt_max_chars) <= 0 or len(prompt) <= int(prompt_max_chars):
+        return prompt
+
+    target = int(prompt_max_chars)
+    for tool_desc_chars, arg_desc_chars in zip(COMPLEXFUNC_TOOL_DESC_BUDGETS, COMPLEXFUNC_ARG_DESC_BUDGETS, strict=True):
+        compact_tools = _compact_complexfuncbench_tools(
+            selected_tools,
+            description_chars=tool_desc_chars,
+            argument_description_chars=arg_desc_chars,
+        )
+        base_prompt = _render_complexfuncbench_prompt(
+            compact_tools,
+            [],
+            total_tool_count=total_tool_count,
+            history_max_chars=0,
+        )
+        history_budget = max(0, min(int(history_max_chars), target - len(base_prompt) - 256))
+        prompt = _render_complexfuncbench_prompt(
+            compact_tools,
+            messages,
+            total_tool_count=total_tool_count,
+            history_max_chars=history_budget,
+        )
+        if len(prompt) <= target:
+            return prompt
+
+    return _hard_trim_complexfuncbench_prompt(prompt, target)
 
 
 def build_complexfuncbench_system_prompt(
@@ -825,25 +843,137 @@ def build_complexfuncbench_system_prompt(
 ) -> str:
     route_note = ""
     if total_tool_count is not None and int(total_tool_count) != len(tools):
-        route_note = f"\nOnly {len(tools)} of {int(total_tool_count)} tools are visible this turn."
+        route_note = f"\nOnly these {len(tools)} of {int(total_tool_count)} tools are visible this turn."
     return _normalize_prompt_text(
-        "You are running the official ComplexFuncBench function-calling task.\n"
-        "Return only JSON and no extra text.\n"
-        'For one call, use {"name":"ToolName","arguments":{"arg":"value"}}.\n'
+        "Tools:\n"
+        + json.dumps(list(tools), ensure_ascii=False, separators=(",", ":"))
+        + "\nReturn only a JSON function call.\n"
+        'For one call, return {"name":"ToolName","arguments":{"arg":"value"}}.\n'
         "For multiple calls in the same assistant turn, return a JSON array of those objects.\n"
         f"{route_note}\n"
-        "Available tools:\n"
-        + json.dumps(list(tools), ensure_ascii=False, indent=2)
+        'When the task is complete, call {"name":"final_answer","arguments":{"answer":"..."}}.'
     )
 
 
+def _render_complexfuncbench_prompt(
+    tools: Sequence[Mapping[str, Any]],
+    messages: Sequence[Mapping[str, object]],
+    *,
+    total_tool_count: int | None,
+    history_max_chars: int,
+) -> str:
+    system_prompt = build_complexfuncbench_system_prompt(tools, total_tool_count=total_tool_count)
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        messages,
+        history_max_chars=max(0, int(history_max_chars)),
+        assistant_prefix=assistant_json_prefix(),
+        single_user_turn=False,
+    )
+
+
+def _compact_complexfuncbench_tools(
+    tools: Sequence[Mapping[str, Any]],
+    *,
+    description_chars: int,
+    argument_description_chars: int,
+) -> list[dict[str, Any]]:
+    return [
+        _compact_complexfuncbench_tool(
+            tool,
+            description_chars=description_chars,
+            argument_description_chars=argument_description_chars,
+        )
+        for tool in tools
+    ]
+
+
+def _compact_complexfuncbench_tool(
+    tool: Mapping[str, Any],
+    *,
+    description_chars: int,
+    argument_description_chars: int,
+) -> dict[str, Any]:
+    schema = dict(tool)
+    function_schema = schema.get("function")
+    if isinstance(function_schema, Mapping):
+        schema = dict(function_schema)
+    parameters = schema.get("parameters") or schema.get("arguments") or {}
+    if not isinstance(parameters, Mapping):
+        parameters = {"type": "object", "properties": {}}
+    compact: dict[str, Any] = {
+        "name": str(schema.get("name") or "").strip(),
+        "parameters": _compact_complexfuncbench_parameters(
+            parameters,
+            argument_description_chars=argument_description_chars,
+        ),
+    }
+    if description_chars > 0:
+        compact["description"] = truncate_text(
+            normalize_rwkv_text(str(schema.get("description") or "")),
+            description_chars,
+        )
+    return compact
+
+
+def _compact_complexfuncbench_parameters(
+    parameters: Mapping[str, Any],
+    *,
+    argument_description_chars: int,
+) -> dict[str, Any]:
+    compact: dict[str, Any] = {"type": str(parameters.get("type") or "object")}
+    properties = parameters.get("properties")
+    if isinstance(properties, Mapping):
+        compact_properties: dict[str, Any] = {}
+        for name, raw_schema in properties.items():
+            if not isinstance(raw_schema, Mapping):
+                compact_properties[str(name)] = {}
+                continue
+            property_schema: dict[str, Any] = {}
+            if raw_schema.get("type") is not None:
+                property_schema["type"] = raw_schema.get("type")
+            if argument_description_chars > 0 and raw_schema.get("description") is not None:
+                property_schema["description"] = truncate_text(
+                    normalize_rwkv_text(str(raw_schema.get("description") or "")),
+                    argument_description_chars,
+                )
+            if argument_description_chars > 0 and raw_schema.get("enum") is not None:
+                enum_values = raw_schema.get("enum")
+                if isinstance(enum_values, Sequence) and not isinstance(enum_values, (str, bytes)):
+                    property_schema["enum"] = list(enum_values)[:20]
+            if argument_description_chars > 0 and raw_schema.get("items") is not None:
+                property_schema["items"] = raw_schema.get("items")
+            compact_properties[str(name)] = property_schema
+        compact["properties"] = compact_properties
+    required = parameters.get("required")
+    if isinstance(required, Sequence) and not isinstance(required, (str, bytes)):
+        compact["required"] = [str(item) for item in required]
+    return compact
+
+
+def _hard_trim_complexfuncbench_prompt(prompt: str, target_chars: int) -> str:
+    target = max(1, int(target_chars))
+    if len(prompt) <= target:
+        return prompt
+    prefix = "System: "
+    assistant = assistant_json_prefix()
+    assistant_index = prompt.rfind(assistant)
+    if assistant_index < 0:
+        return prompt[:target]
+    tail = prompt[assistant_index:]
+    head_budget = max(0, target - len(tail) - 1)
+    if head_budget <= 0:
+        return tail[-target:]
+    return f"{prompt[:head_budget].rstrip()}\n{tail}"
+
+
 def parse_complexfuncbench_tool_calls(response: str) -> list[ToolAction]:
-    candidate = extract_json_call_value_text(str(response or ""))
-    payload = json.loads(candidate)
-    if payload == []:
-        return []
-    calls = coerce_json_function_call_payloads(payload, context_label="ComplexFuncBench tool-call selection")
-    return [ToolAction.from_mapping(call) for call in calls]
+    calls = parse_tool_calls_text(
+        str(response or ""),
+        context_label="ComplexFuncBench tool-call selection",
+        recover_partial=True,
+    )
+    return [ToolAction(name=call.name, arguments=dict(call.arguments)) for call in calls]
 
 
 def parse_complexfuncbench_calls(response: str) -> list[ToolAction]:
@@ -983,13 +1113,17 @@ def _run_complexfuncbench(
     )
     if sample_limit is not None:
         records = records[:sample_limit]
-    if getattr(args, "complexfuncbench_disable_response_eval", False):
-        raise ValueError("ComplexFuncBench must use official response evaluation; remove --complexfuncbench-disable-response-eval")
-    if getattr(args, "complexfuncbench_offline_compare", False):
-        raise ValueError("ComplexFuncBench must use the official sandbox comparison; remove --complexfuncbench-offline-compare")
     if not records:
         raise ValueError("ComplexFuncBench manifest is empty")
     _validate_complexfuncbench_official_records(records)
+    response_eval_enabled = _env_flag("RWKV_COMPLEXFUNCBENCH_ENABLE_RESPONSE_EVAL", default=False)
+    if getattr(args, "complexfuncbench_disable_response_eval", False):
+        response_eval_enabled = False
+    offline_compare_enabled = _env_flag("RWKV_COMPLEXFUNCBENCH_OFFLINE_COMPARE", default=True)
+    if getattr(args, "complexfuncbench_offline_compare", False):
+        offline_compare_enabled = True
+    records = [_with_complexfuncbench_response_eval(record, enabled=response_eval_enabled) for record in records]
+    records = [_with_complexfuncbench_offline_compare(record, enabled=offline_compare_enabled) for record in records]
 
     plan = _resolve_function_calling_plan(
         run.dataset_slug,
@@ -1010,9 +1144,12 @@ def _run_complexfuncbench(
     tool_sampling = clamp_function_calling_sampling(tool_sampling, max(1, int(args.decision_max_tokens or 1024)))
     tool_sampling = replace(tool_sampling, stop_tokens=())
     tool_routing_config = tool_routing_config_from_args(args)
+    history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
+    prompt_max_chars = int(args.prompt_max_chars or DEFAULT_COMPLEXFUNC_PROMPT_MAX_CHARS)
     sampling_payload = attach_function_calling_context_metadata(
         normalize_sampling_config_by_stage([(1, tool_sampling)]),
         tool_routing_config=tool_routing_config,
+        prompt_max_chars=prompt_max_chars,
     )
     batch_size = max(1, int(args.batch_size or 1))
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
@@ -1032,7 +1169,17 @@ def _run_complexfuncbench(
                 prompt_seed=sample_repeat_seed(index, 0, stage=1),
                 progress_desc=f"ComplexFuncBench router probe {index}",
             )
-            prompts.append(build_complexfuncbench_prompt(record, [], observation, 0, tool_route=route))
+            prompts.append(
+                build_complexfuncbench_prompt(
+                    record,
+                    [],
+                    observation,
+                    0,
+                    tool_route=route,
+                    history_max_chars=history_max_chars,
+                    prompt_max_chars=prompt_max_chars,
+                )
+            )
         run.engine.generate(
             prompts,
             sampling=tool_sampling,
@@ -1087,6 +1234,8 @@ def _run_complexfuncbench(
                             pass_index=key.pass_index,
                             max_steps=max(1, int(record.max_steps or args.max_steps or 8)),
                             tool_routing_config=tool_routing_config,
+                            history_max_chars=history_max_chars,
+                            prompt_max_chars=prompt_max_chars,
                             benchmark_name=run.benchmark_name,
                             dataset_split=run.dataset_split,
                             sampling_payload=sampling_payload,
@@ -1137,6 +1286,8 @@ def _run_complexfuncbench_attempt(
     pass_index: int,
     max_steps: int,
     tool_routing_config: "ToolRoutingConfig",
+    history_max_chars: int,
+    prompt_max_chars: int,
     benchmark_name: str,
     dataset_split: str,
     sampling_payload: Sequence[tuple[int, Mapping[str, Any]]],
@@ -1150,6 +1301,8 @@ def _run_complexfuncbench_attempt(
         pass_index=pass_index,
         max_steps=max_steps,
         tool_routing_config=tool_routing_config,
+        history_max_chars=history_max_chars,
+        prompt_max_chars=prompt_max_chars,
     )
     return _complexfuncbench_completion_payload(
         episode,
@@ -1192,6 +1345,18 @@ def _validate_complexfuncbench_official_records(records: Sequence[ComplexFuncBen
         )
 
 
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
 def _with_complexfuncbench_response_eval(
     record: ComplexFuncBenchRecord,
     *,
@@ -1224,6 +1389,8 @@ def _run_complexfuncbench_episode(
     pass_index: int,
     max_steps: int,
     tool_routing_config: "ToolRoutingConfig",
+    history_max_chars: int = DEFAULT_HISTORY_MAX_CHARS,
+    prompt_max_chars: int = DEFAULT_COMPLEXFUNC_PROMPT_MAX_CHARS,
 ) -> ComplexFuncBenchEpisodeResult:
     env = create_complexfuncbench_env(record)
     observation = env.reset()
@@ -1252,7 +1419,15 @@ def _run_complexfuncbench_episode(
             progress_desc=f"ComplexFuncBench router {sample_index}",
         )
         tool_routes.append(route.trace_payload())
-        prompt = build_complexfuncbench_prompt(record, events, observation, step, tool_route=route)
+        prompt = build_complexfuncbench_prompt(
+            record,
+            events,
+            observation,
+            step,
+            tool_route=route,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+        )
         output = engine.generate(
             [prompt],
             sampling=sampling,
@@ -1483,7 +1658,7 @@ def _complexfuncbench_completion_payload(
         "error": None if episode.success else str(episode.details.get("finish_reason") or ""),
     }
     payload["agent_info"] = {
-        "cot_mode": CoTMode.COT.value,
+        "cot_mode": CoTMode.NO_COT.value,
         "final_answer": episode.final_answer,
         "official_id": record.metadata.get("official_id") or record.task_id,
     }
@@ -1557,14 +1732,14 @@ def _complexfuncbench_score_payload(
     merged["response_eval_samples"] = float(complex_metrics.response_eval_samples)
     return make_score_payload(
         run.dataset_slug,
-        is_cot=True,
+        is_cot=False,
         model_name=model_name,
         metrics=merged,
         samples=len(completions_payloads),
         problems=plan.sample_size,
         task=job_name,
         task_details={
-            **build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+            **build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
             "complexfuncbench_official": {
                 "call_accuracy": complex_metrics.call_accuracy,
                 "response_eval_samples": complex_metrics.response_eval_samples,
@@ -1574,7 +1749,7 @@ def _complexfuncbench_score_payload(
                 "max_tools": tool_routing_config.max_tools,
             },
         },
-        extra={"cot_mode": CoTMode.COT.value},
+        extra={"cot_mode": CoTMode.NO_COT.value},
     )
 
 
@@ -1729,6 +1904,87 @@ def _read_json_or_jsonl_items(path: Path) -> list[Any]:
     if isinstance(payload, Mapping):
         return [payload]
     raise ValueError(f"unsupported JSON payload: {path}")
+
+
+def _complexfuncbench_dialog_messages(
+    events: Sequence[Mapping[str, Any]],
+    observation: AgentObservation,
+) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    action_events_by_step: dict[int, list[Mapping[str, Any]]] = {}
+    rendered_action_steps: set[int] = set()
+
+    for event in events:
+        if str(event.get("type") or "") != "action":
+            continue
+        metadata = event.get("metadata")
+        step = int(metadata.get("step") or 0) if isinstance(metadata, Mapping) else 0
+        action_events_by_step.setdefault(step, []).append(event)
+
+    for event in events:
+        event_type = str(event.get("type") or "")
+        content = str(event.get("content") or "")
+        metadata = event.get("metadata")
+        step = int(metadata.get("step") or 0) if isinstance(metadata, Mapping) else 0
+
+        if event_type == "observation":
+            if content and not messages:
+                messages.append({"role": "user", "content": content})
+            continue
+        if event_type == "format_bridge":
+            calls = metadata.get("internal_tool_actions") if isinstance(metadata, Mapping) else None
+            if isinstance(calls, list):
+                messages.append({"role": "assistant", "content": _json_tool_call_text(calls)})
+                rendered_action_steps.add(step)
+            continue
+        if event_type == "action" and step not in rendered_action_steps:
+            calls = [
+                {"name": item.get("name"), "arguments": item.get("arguments") or {}}
+                for item in action_events_by_step.get(step, [])
+            ]
+            if calls:
+                messages.append({"role": "assistant", "content": _json_tool_call_text(calls)})
+                rendered_action_steps.add(step)
+            continue
+        if event_type == "env_result":
+            if content:
+                messages.append({"role": "tool", "content": _complexfuncbench_function_output_text(content)})
+            continue
+        if event_type == "error" and content:
+            messages.append({"role": "tool", "content": f"Error: {content}"})
+
+    current = str(observation.content or "")
+    if current:
+        current_is_duplicate = bool(messages) and messages[-1]["role"] in {"user", "tool"} and messages[-1]["content"] == current
+        function_output = _complexfuncbench_function_output_text(current)
+        function_output_is_duplicate = (
+            bool(messages)
+            and messages[-1]["role"] == "tool"
+            and messages[-1]["content"] == function_output
+        )
+        if not current_is_duplicate and not function_output_is_duplicate:
+            role = "user" if not messages else "tool"
+            messages.append({"role": role, "content": function_output if role == "tool" else current})
+
+    return messages
+
+
+def _json_tool_call_text(calls: Sequence[Mapping[str, Any]]) -> str:
+    payloads = [
+        {"name": str(item.get("name") or ""), "arguments": dict(item.get("arguments") or {})}
+        for item in calls
+        if str(item.get("name") or "")
+    ]
+    payload: Any = payloads[0] if len(payloads) == 1 else payloads
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _complexfuncbench_function_output_text(content: str) -> str:
+    normalized = _normalize_prompt_text(content)
+    prefix = "Official sandbox observation:"
+    if normalized.startswith(prefix):
+        normalized = _normalize_prompt_text(normalized[len(prefix) :])
+    return normalized
 
 
 def _render_agent_trajectory(events: Sequence[Mapping[str, Any]]) -> str:
@@ -1912,7 +2168,7 @@ def _json_dumps(value: Any) -> str:
 
 
 def _normalize_prompt_text(text: str) -> str:
-    return "\n".join(line.rstrip() for line in str(text or "").replace("\r\n", "\n").split("\n")).strip()
+    return normalize_rwkv_text(str(text or ""))
 
 
 def _trim_stop_suffixes(text: str, stop_suffixes: tuple[str, ...]) -> str:
@@ -1947,6 +2203,8 @@ def _resolve_complexfuncbench_openai_connection() -> dict[str, Any]:
         or payload.get("OPENAI_API_KEY")
         or os.environ.get("RWKV_COMPLEXFUNCBENCH_OPENAI_API_KEY")
         or os.environ.get("RWKV_COMPLEXFUNC_OPENAI_API_KEY")
+        or os.environ.get("JUDGE_API_KEY")
+        or os.environ.get("USER_API_KEY")
     )
     base_url = (
         payload.get("url")
@@ -1955,6 +2213,8 @@ def _resolve_complexfuncbench_openai_connection() -> dict[str, Any]:
         or payload.get("OPENAI_BASE_URL")
         or os.environ.get("RWKV_COMPLEXFUNCBENCH_OPENAI_BASE_URL")
         or os.environ.get("RWKV_COMPLEXFUNC_OPENAI_BASE_URL")
+        or os.environ.get("JUDGE_BASE_URL")
+        or os.environ.get("USER_BASE_URL")
     )
 
     model_map: dict[str, str] = {}
@@ -1968,6 +2228,8 @@ def _resolve_complexfuncbench_openai_connection() -> dict[str, Any]:
         payload.get("response_eval_model")
         or os.environ.get("RWKV_COMPLEXFUNCBENCH_RESPONSE_EVAL_MODEL")
         or os.environ.get("RWKV_COMPLEXFUNC_RESPONSE_EVAL_MODEL")
+        or os.environ.get("JUDGE_MODEL")
+        or os.environ.get("USER_MODEL_NAME")
     )
     if response_eval_model:
         model_map["gpt-4o-2024-08-06"] = str(response_eval_model)
@@ -1975,6 +2237,8 @@ def _resolve_complexfuncbench_openai_connection() -> dict[str, Any]:
         payload.get("compare_model")
         or os.environ.get("RWKV_COMPLEXFUNCBENCH_COMPARE_MODEL")
         or os.environ.get("RWKV_COMPLEXFUNC_COMPARE_MODEL")
+        or os.environ.get("JUDGE_MODEL")
+        or os.environ.get("USER_MODEL_NAME")
     )
     if compare_model:
         model_map["gpt-4o-2024-05-13"] = str(compare_model)

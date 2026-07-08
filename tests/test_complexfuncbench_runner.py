@@ -202,7 +202,10 @@ def test_complexfuncbench_episode_uses_lexical_router_and_records_format_bridge(
         [{"name": "final_answer", "arguments": {"answer": "Booked h1."}}],
     ]
     assert any(route["mode"] == "lexical" and route["routed"] for route in episode.tool_routes)
-    assert "Available tools:" in engine.prompts[0]
+    assert engine.prompts[0].startswith("System: Tools:\n")
+    assert "Available tools:" not in engine.prompts[0]
+    assert "Tool router trace" not in engine.prompts[0]
+    assert "Function output:" in engine.prompts[1]
     assert "CancelFlight" not in engine.prompts[0]
     assert all(kwargs.get("show_progress") is False for kwargs in engine.generate_kwargs)
 

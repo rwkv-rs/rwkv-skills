@@ -8,6 +8,7 @@ them against tool schemas, but it does not encode domain planning policy.
 """
 
 import json
+import ast
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -32,11 +33,20 @@ def parse_tool_call_text(
     context_label: str = "tool call",
     recover_partial: bool = True,
 ) -> ParsedToolCall:
-    payload = load_tool_call_payload(text, context_label=context_label, recover_partial=recover_partial)
-    calls = coerce_tool_call_payloads(payload, context_label=context_label)
+    calls = parse_tool_calls_text(text, context_label=context_label, recover_partial=recover_partial)
     if not calls:
         raise ValueError(f"{context_label} payload did not contain a tool call")
     return calls[0]
+
+
+def parse_tool_calls_text(
+    text: str,
+    *,
+    context_label: str = "tool call",
+    recover_partial: bool = True,
+) -> list[ParsedToolCall]:
+    payload = load_tool_call_payload(text, context_label=context_label, recover_partial=recover_partial)
+    return coerce_tool_call_payloads(payload, context_label=context_label)
 
 
 def load_tool_call_payload(
@@ -46,11 +56,20 @@ def load_tool_call_payload(
     recover_partial: bool = True,
 ) -> Any:
     try:
-        return json.loads(extract_json_call_value_text(text))
-    except (json.JSONDecodeError, ValueError) as exc:
-        if not recover_partial:
+        candidate = extract_json_call_value_text(text)
+    except ValueError as exc:
+        if not recover_partial or not _should_recover_partial_tool_payload(text):
             raise
         return partial_tool_call_payload(text, context_label=context_label, cause=exc)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, TypeError, ValueError):
+            if not recover_partial or not _should_recover_partial_tool_payload(text):
+                raise
+            return partial_tool_call_payload(text, context_label=context_label, cause=exc)
 
 
 def coerce_tool_call_payloads(payload: Any, *, context_label: str = "tool call") -> list[ParsedToolCall]:
@@ -101,6 +120,13 @@ def partial_tool_call_payload(text: str, *, context_label: str = "tool call", ca
         except ValueError:
             pass
     return payload
+
+
+def _should_recover_partial_tool_payload(text: str) -> bool:
+    stripped = normalize_rwkv_text(text).lstrip()
+    if not stripped:
+        return False
+    return stripped.startswith(("Assistant:", "```", "{", "[", '"'))
 
 
 def tool_name(tool: Any) -> str:
@@ -324,6 +350,7 @@ __all__ = [
     "normalize_tool_call_arguments",
     "normalize_tool_schema",
     "parse_tool_call_text",
+    "parse_tool_calls_text",
     "partial_tool_call_payload",
     "prune_tool_call_arguments",
     "required_arguments_by_tool_name",

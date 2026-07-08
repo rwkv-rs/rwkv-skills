@@ -114,9 +114,12 @@ def test_complexfuncbench_prompt_uses_routed_tool_window(tmp_path: Path, monkeyp
     )
     prompt = build_complexfuncbench_prompt(record, [], AgentObservation(record.instruction), 0, tool_route=route)
 
-    assert "Tool router trace" in prompt
+    assert prompt.startswith("System: Tools:\n")
+    assert "Tool router trace" not in prompt
+    assert "Available tools:" not in prompt
     assert "final_answer" in prompt
     assert "JSON array" in prompt
+    assert "\n\n\n" not in prompt
     assert prompt.endswith("Assistant: ```json\n{")
     assert route.trace_payload()["routed"] is True
 

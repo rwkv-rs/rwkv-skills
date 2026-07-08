@@ -416,6 +416,7 @@ def test_evaluate_bfcl_v3_episode_fails_closed_without_supervision() -> None:
 
 
 def test_execute_bfcl_official_tool_call_uses_official_runtime(monkeypatch) -> None:
+    monkeypatch.setenv("RWKV_BFCL_OFFICIAL_TOOL_TIMEOUT_S", "0")
     record = BfclTaskRecord(
         task_id="multi_turn_base_59",
         instruction="Official task",
@@ -689,9 +690,9 @@ def test_build_bfcl_router_and_branch_prompts_use_hidden_summary_and_tool_prefix
     assert '"name": "lookup"' in router_prompt
     assert "```json" not in router_prompt
     assert "<tool_call>" not in tool_prompt
-    assert tool_prompt.endswith("Assistant: ```json\n{")
-    assert ask_prompt.endswith("Assistant: ```json\n{")
-    assert handoff_prompt.endswith("Assistant: ```json\n{")
+    assert tool_prompt.rstrip().endswith("Assistant: ```json")
+    assert ask_prompt.rstrip().endswith("Assistant: ```json")
+    assert handoff_prompt.rstrip().endswith("Assistant: ```json")
 
 
 def test_build_bfcl_tool_result_message_omits_request_replay() -> None:
@@ -930,6 +931,17 @@ def test_parse_bfcl_assistant_output_accepts_stringified_json_arguments() -> Non
     assert decision.tool_call.arguments == {"id": "A1"}
 
 
+def test_parse_bfcl_assistant_output_recovers_truncated_metadata_tail() -> None:
+    decision = parse_bfcl_assistant_output(
+        '{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}","id":"call_eeeeeeee'
+    )
+
+    assert decision.is_tool_call is True
+    assert decision.tool_call is not None
+    assert decision.tool_call.name == "lookup"
+    assert decision.tool_call.arguments == {"id": "A1"}
+
+
 def test_extract_hidden_summary_and_state_delta_are_compact() -> None:
     summary = extract_bfcl_cot_hidden_summary("<think>\nPlan lookup then answer.\n</think>")
     delta = render_bfcl_state_delta(
@@ -999,10 +1011,10 @@ def test_build_bfcl_rwkv_prompt_uses_trained_function_call_skeleton() -> None:
     assert context.startswith("System: Tools:")
     assert '"name": "lookup"' in context
     assert sum(1 for line in context.splitlines() if line.startswith("User:")) == 1
-    assert sum(1 for line in context.splitlines() if line.startswith("Assistant:")) == 1
-    assert "Conversation transcript JSON:" in context
-    assert '{"role":"assistant","content":"{\\"name\\":\\"lookup\\",\\"arguments\\":{\\"id\\":\\"A1\\"}}"}' in context
-    assert context.endswith("Assistant: ```json\n{")
+    assert sum(1 for line in context.splitlines() if line.startswith("Assistant:")) == 2
+    assert "Conversation transcript JSON:" not in context
+    assert '{"name":"lookup","arguments":{"id":"A1"}}' in context
+    assert context.rstrip().endswith("Assistant: ```json")
 
 
 def _run_bfcl_v3_attempt_for_test(

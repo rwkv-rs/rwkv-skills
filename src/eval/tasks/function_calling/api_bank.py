@@ -17,6 +17,7 @@ from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     _run_simple_tool_call,
 )
+from src.eval.tasks.function_calling.api_bank_prompt import render_api_bank_history
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
@@ -303,21 +304,7 @@ def _api_bank_level_from_name(file_name: str) -> int | None:
 
 
 def _render_api_bank_history(history: Sequence[Mapping[str, Any]]) -> str:
-    lines: list[str] = []
-    for item in history:
-        role = str(item.get("role") or "").strip()
-        if role == "User":
-            text = str(item.get("text") or "").lstrip().rstrip(" ")
-            lines.append(f"User: {text}" if text else "User:")
-        elif role == "AI":
-            text = str(item.get("text") or "").lstrip().rstrip(" ")
-            lines.append(f"Assistant: {text}" if text else "Assistant:")
-        elif role == "API":
-            args = ", ".join(
-                f"{key}={_official_arg_repr(value)}" for key, value in dict(item.get("param_dict") or {}).items()
-            )
-            lines.append(f"API: [{item.get('api_name')}({args})] Response: {item.get('result')}")
-    return "\n".join(lines).strip()
+    return render_api_bank_history(history)
 
 
 def _api_bank_tool_schema(source_root: Path, api_name: str, fallback_args: Mapping[str, Any]) -> dict[str, Any]:
@@ -372,14 +359,6 @@ def _api_bank_result_payload(result: ApiBankCallResult) -> dict[str, Any]:
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def _official_arg_repr(value: Any) -> str:
-    if isinstance(value, str):
-        return repr(value)
-    if value is None:
-        return "None"
-    return repr(value)
 
 
 def _api_bank_json_type(value: Any) -> str:

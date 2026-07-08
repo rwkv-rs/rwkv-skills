@@ -4,7 +4,12 @@ import json
 from pathlib import Path
 import zipfile
 
-from src.eval.datasets.data_prepper.data_manager import available_function_calling_datasets, prepare_dataset
+from src.eval.datasets.data_prepper.data_manager import (
+    available_code_generation_datasets,
+    available_free_answer_datasets,
+    available_function_calling_datasets,
+    prepare_dataset,
+)
 from src.eval.datasets.runtime import read_jsonl_items
 from src.eval.tasks.function_calling import BrowseCompRecord, McpBenchItem, McpBenchTaskSpec
 
@@ -59,6 +64,69 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "tau3_bench_banking_knowledge" in names
     assert "tau3_bench_mock" in names
     assert "tau3_bench_mock_long_context" in names
+    assert "terminal_bench_2_1" in names
+    assert "nl2repo" in names
+    assert "deep_swe" in names
+    assert "wide_search" in names
+    assert "deepsearchqa" in names
+    assert "mcp_atlas" in names
+    assert "toolathlon" in names
+    assert "apex_agents" in names
+    assert "claw_eval" in names
+    assert "wildclawbench" in names
+    assert "skillsbench" in names
+    assert "hle_tools" in names
+    assert "hy_backend_2_0" in names
+    assert "hy_swe_max" in names
+    assert "hy_companybench" in names
+    assert "e_bench" in names
+    assert "hy_finmodelbench" in names
+    assert "prodbench" in names
+    assert "hy_skillsworld" in names
+    assert "hy_euler_pro" in names
+
+
+def test_available_free_answer_datasets_lists_hy_math() -> None:
+    names = set(available_free_answer_datasets())
+
+    assert "hy_math" in names
+
+
+def test_available_code_generation_datasets_lists_swe_bench_expansions() -> None:
+    names = set(available_code_generation_datasets())
+
+    assert "swe_bench_multilingual" in names
+    assert "swe_bench_pro" in names
+
+
+def test_prepare_dataset_materializes_source_required_agent_slot(tmp_path: Path, monkeypatch) -> None:
+    source_root = tmp_path / "official-agent-data"
+    terminal_source = source_root / "terminal_bench_2_1"
+    terminal_source.mkdir(parents=True)
+    (terminal_source / "tasks.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "terminal-demo",
+                "prompt": "Create a file named done.txt.",
+                "answer": "done.txt exists",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_AGENT_BENCHMARKS_ROOT", str(source_root))
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("terminal_bench_2_1", output_root, "test")
+
+    assert paths == [output_root / "terminal_bench_2_1" / "test.jsonl"]
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "terminal-demo"
+    assert row["instruction"] == "Create a file named done.txt."
+    assert row["answer"] == "done.txt exists"
+    assert row["metadata"]["official_sandbox_required"] is True
+    assert row["metadata"]["official_sandbox_env"] == "RWKV_TERMINAL_BENCH_2_1_SANDBOX_ROOT"
+    assert row["official_payload"]["prompt"] == "Create a file named done.txt."
 
 
 def test_prepare_dataset_materializes_agent_loop_answer_rows(tmp_path: Path, monkeypatch) -> None:
@@ -87,7 +155,7 @@ def test_prepare_dataset_materializes_agent_loop_answer_rows(tmp_path: Path, mon
     [row] = read_jsonl_items(paths[0])
     assert row["task_id"] == "wide-1"
     assert row["instruction"].startswith("Context:\nUse the provided search tools")
-    assert row["executor"]["kind"] == "manifest_replay"
+    assert row["executor"]["kind"] == "web_search"
     assert row["verifier"]["kind"] == "widesearch_official"
     assert row["expected_tool_calls"][0]["name"] == "final_answer"
     assert row["metadata"]["source_format"] == "rwkvc_agent_loop"
@@ -148,6 +216,11 @@ def test_prepare_dataset_materializes_agent_loop_hf_source(tmp_path: Path, monke
                 "id": f"{source}:{split}:0",
                 "question": "Find the cited answer.",
                 "answer": "reference value",
+            },
+            {
+                "id": f"{source}:{split}:1",
+                "question": "This official row has no released answer.",
+                "answer": None,
             }
         ],
     )
@@ -161,6 +234,7 @@ def test_prepare_dataset_materializes_agent_loop_hf_source(tmp_path: Path, monke
     assert row["verifier"]["config"]["reference_answer"] == "reference value"
     assert row["metadata"]["source_benchmark"] == "deepsearchqa"
     assert row["metadata"]["source_path"] == "https://huggingface.co/datasets/google/deepsearchqa"
+    assert len(read_jsonl_items(paths[0])) == 1
 
 
 def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monkeypatch) -> None:
@@ -187,7 +261,7 @@ def test_prepare_dataset_materializes_api_bank_level1_spec(tmp_path: Path, monke
     assert paths == [output_root / "apibank_level1" / "test.jsonl"]
     [row] = read_jsonl_items(paths[0])
     assert row["task_id"] == "apibank_level1__Demo-level-1-1_001"
-    assert row["instruction"] == "User: What is 2 plus 2?"
+    assert row["instruction"] == 'Conversation transcript JSON:\n[{"role":"user","content":"What is 2 plus 2?"}]'
     assert row["expected_tool_calls"] == [
         {
             "name": "Calculator",

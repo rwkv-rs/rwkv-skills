@@ -122,6 +122,16 @@ class AgentBenchControllerClient:
         except Exception:  # noqa: BLE001
             pass
 
+    def ensure_available(self) -> None:
+        req = urllib.request.Request(f"{self.base_url}/list_workers", method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=min(self.timeout_s, 10.0)) as resp:
+                resp.read()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"AgentBench controller is not available at {self.base_url}: {exc}"
+            ) from exc
+
     def _post(
         self,
         path: str,
@@ -248,6 +258,7 @@ def _run_agentbench(
     )
     controller_url = _agentbench_controller_url(args)
     controller = AgentBenchControllerClient(controller_url)
+    controller.ensure_available()
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
 
     if args.probe_only:
@@ -353,14 +364,14 @@ def _run_agentbench(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=plan.sample_size,
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
-                extra={"cot_mode": CoTMode.COT.value, "controller_url": controller_url},
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                extra={"cot_mode": CoTMode.NO_COT.value, "controller_url": controller_url},
             ),
         )
     except Exception as exc:
@@ -488,7 +499,7 @@ def _run_one_agentbench_attempt(
         "task_name": record.task_name,
         "task_index": record.index,
         "reward": reward,
-        "cot_mode": CoTMode.COT.value,
+        "cot_mode": CoTMode.NO_COT.value,
     }
     payload["agent_trace"] = trace
     payload["task_id"] = record.task_id

@@ -58,10 +58,9 @@ from src.eval.tasks.function_calling.runner_common import (
 )
 from src.eval.tasks.function_calling.rwkv_prompt import (
     RWKV_OFFICIAL_JSON_PROMPT_STYLE,
-    coerce_json_function_call_payloads,
-    extract_json_call_value_text,
     normalize_function_prompt_style,
 )
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_calls_text
 from src.eval.tasks.function_calling.parallel_candidate_router import (
     CandidateToolCall,
     ParallelCandidateRouterConfig,
@@ -439,15 +438,10 @@ def _bfcl_prompt_context_trace(
 
 def _bfcl_action_type_from_decision_text(text: str) -> str:
     try:
-        import json
-
-        payloads = coerce_json_function_call_payloads(
-            json.loads(extract_json_call_value_text(text)),
-            context_label="BFCL tool call",
-        )
+        calls = parse_tool_calls_text(text, context_label="BFCL tool call", recover_partial=True)
     except Exception:  # noqa: BLE001
         return "TOOL"
-    name = str(payloads[0].get("name") or "").strip() if payloads else ""
+    name = calls[0].name if calls else ""
     if name == "ask_user":
         return "ASK"
     if name == "final_answer":
@@ -616,7 +610,7 @@ def _run_bfcl_official_json_generation_step(
             stop_suffixes=BFCL_DECISION_STOP_SUFFIXES,
             constraint=build_bfcl_tool_call_constraint(
                 _bfcl_tools_with_control_functions(routed_tools),
-                prefilled_object=True,
+                prefilled_object=False,
             ),
             constraint_mode="strict",
         )
@@ -802,6 +796,9 @@ def _run_bfcl_v3_official_episode(
                         execution = execute_bfcl_official_tool_call(state.record, state.runtime_state, tool_call)
                     except Exception as exc:
                         state.tool_errors += 1
+                        if isinstance(exc, TimeoutError):
+                            state.termination_reason = "tool_timeout"
+                            state.error = str(exc)
                         recent_tool_result = build_bfcl_tool_result_payload(
                             tool_call,
                             ok=False,
@@ -831,6 +828,8 @@ def _run_bfcl_v3_official_episode(
                         if state.tool_errors >= max_tool_errors:
                             state.termination_reason = "too_many_errors"
                             state.error = str(exc)
+                            break
+                        if state.termination_reason == "tool_timeout":
                             break
                         continue
 
@@ -1126,7 +1125,7 @@ def _run_one_bfcl_v3_attempt(
         "final_answer": state.final_answer,
         "ref_answer": build_bfcl_ref_answer(record),
         "fail_reason": evaluation.fail_reason,
-        "cot_mode": CoTMode.COT.value,
+        "cot_mode": CoTMode.NO_COT.value,
         "history_max_chars": history_max_chars,
         "prompt_max_chars": prompt_max_chars,
         "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",
@@ -1272,7 +1271,7 @@ def _run_bfcl_v3(
                 else [
                     build_bfcl_tool_call_constraint(
                         _bfcl_tools_with_control_functions(routed_tools),
-                        prefilled_object=True,
+                        prefilled_object=False,
                     )
                     for _route, routed_tools in probe_routes
                 ]
@@ -1373,15 +1372,15 @@ def _run_bfcl_v3(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=plan.sample_size,
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
                 extra={
-                    "cot_mode": CoTMode.COT.value,
+                    "cot_mode": CoTMode.NO_COT.value,
                     "history_max_chars": history_max_chars,
                     "prompt_max_chars": prompt_max_chars,
                     "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",

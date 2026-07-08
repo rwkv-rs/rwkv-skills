@@ -43,7 +43,9 @@ from src.eval.tasks.function_calling.simple_tool_call import (
     _auto_candidate_router_config,
     build_simple_tool_call_messages,
     build_simple_tool_call_prompt,
+    decode_simple_tool_call_response,
 )
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_call_text, parse_tool_calls_text
 from src.infer.sampling import SamplingConfig
 from src.eval.tasks.function_calling.tool_router import ToolRoutingConfig
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
@@ -107,13 +109,15 @@ def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     assert '"required": [' in prompt
     assert prompt.index('"name": "translate_text"') < prompt.index('"arguments": {')
     assert '"parameters"' not in prompt
+    assert "Output JSON schema:" not in prompt
+    assert '"oneOf": [' not in prompt
     assert "Return only a JSON function call." in prompt
-    assert 'The JSON shape is {"name":"tool_name","arguments":{...}}.' in prompt
     assert "return a JSON array containing every required call" in prompt
     assert "Output JSON schema:" not in prompt
     assert "Available tools:" not in prompt
     assert '\n\nUser: Translate "Will it rain tomorrow?" into Japanese.\n\nAssistant: ```json' in prompt
     assert prompt.endswith("Assistant: ```json\n")
+    assert not prompt.endswith("{")
     assert "<think>" not in prompt
 
 
@@ -168,6 +172,32 @@ def test_api_bank_prompt_documents_missing_year_convention() -> None:
 
     assert "API-Bank date convention" in prompt
     assert "use year 2023" in prompt
+    assert "User message:" not in prompt
+
+
+def test_api_bank_prompt_converts_legacy_role_headers_to_transcript_json() -> None:
+    record = SimpleToolCallRecord(
+        task_id="api-bank-legacy",
+        instruction=(
+            "User: Can you help me?\n"
+            "Assistant: Sure. What do you need?\n"
+            "User: Check my balance.\n"
+            "API: [GetUserToken(username='foo')] Response: {'output': {'token': 't1'}}\n"
+            "Assistant: I have your token."
+        ),
+        tools=(),
+        expected_tool_calls=(),
+        metadata={"source_format": "official_api_bank"},
+    )
+
+    prompt = build_simple_tool_call_prompt(record, history_max_chars=4000)
+
+    assert "Conversation transcript JSON:" in prompt
+    assert '"role":"user","content":"Can you help me?"' in prompt
+    assert '"role":"assistant","content":"Sure. What do you need?"' in prompt
+    assert '"role":"api","content":"[GetUserToken(username=' in prompt
+    assert "User message:" not in prompt
+    assert "Assistant message:" not in prompt
 
 
 def test_simple_tool_call_auto_candidate_router_triggers_for_long_context() -> None:
@@ -222,6 +252,30 @@ def test_normalize_rwkv_text_strips_crlf_and_blank_lines() -> None:
     assert normalize_rwkv_text("  Line 1\r\n\r\nLine 2\n\n\nLine 3  ") == "Line 1\nLine 2\nLine 3"
 
 
+def test_rwkv_prompt_embedded_role_headers_become_transcript_json() -> None:
+    prompt = build_rwkv_json_call_prompt(
+        "Tools:\n[]\nReturn only a JSON function call.",
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Conversation history:\n"
+                    "User: Can you help me?\n"
+                    "Assistant: Sure.\n"
+                    "User: Call lookup now."
+                ),
+            }
+        ],
+        history_max_chars=4000,
+    )
+
+    assert "Conversation transcript JSON:" in prompt
+    assert '"role":"user","content":"Can you help me?"' in prompt
+    assert '"role":"assistant","content":"Sure."' in prompt
+    assert "User message:" not in prompt
+    assert "Assistant message:" not in prompt
+
+
 def test_extract_json_call_value_accepts_sft_safe_wrappers() -> None:
     assert (
         extract_json_call_value_text(
@@ -243,6 +297,65 @@ def test_extract_json_call_value_accepts_rwkv_agentic_tool_call_format() -> None
         extract_json_call_value_text('**Tool Call:** lookup(id="A1")')
         == '{"name":"lookup","arguments":{"id":"A1"}}'
     )
+
+
+def test_extract_json_call_value_ignores_next_turn_after_complete_json() -> None:
+    assert (
+        extract_json_call_value_text('{"name":"lookup","arguments":{"id":"A1"}}\n```\n\nUser: next')
+        == '{"name":"lookup","arguments":{"id":"A1"}}'
+    )
+
+
+def test_extract_json_call_value_recovers_complete_prefix_from_truncated_array() -> None:
+    assert (
+        extract_json_call_value_text(
+            '[{"name":"lookup","arguments":{"id":"A1"}},{"name":"lookup","arguments":{"id":'
+        )
+        == '[{"name":"lookup","arguments":{"id":"A1"}}]'
+    )
+
+
+def test_decode_simple_tool_call_response_recovers_truncated_json_object() -> None:
+    calls = decode_simple_tool_call_response(
+        '{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}","id":"call_eeeeeeee'
+    )
+
+    assert calls == [{"name": "lookup", "arguments": {"id": "A1"}}]
+
+
+def test_tool_call_contract_accepts_openai_tool_calls_shape() -> None:
+    calls = parse_tool_calls_text(
+        '{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}}]}'
+    )
+
+    assert [(call.name, call.arguments) for call in calls] == [("lookup", {"id": "A1"})]
+
+
+def test_tool_call_contract_does_not_recover_plain_prose_prefix() -> None:
+    try:
+        parse_tool_call_text('I will call lookup now {"name":"lookup","arguments":{"id":"A1"}}')
+    except ValueError as exc:
+        assert "JSON function call object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected prose-prefixed tool call to fail")
+
+
+def test_tool_call_contract_does_not_recover_unclosed_think_prefix() -> None:
+    try:
+        parse_tool_call_text('<think>I should call {"name":"lookup","arguments":{"id":"A1"}}')
+    except ValueError as exc:
+        assert "JSON function call object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected unclosed think output to fail")
+
+
+def test_parse_final_answer_call_recovers_truncated_metadata_tail() -> None:
+    final_call = parse_final_answer_call(
+        '{"name":"final_answer","arguments":"{\\"answer\\":\\"Alice\\"}","id":"call_eeeeeeee'
+    )
+
+    assert final_call.answer == "Alice"
+    assert final_call.call["arguments"] == {"answer": "Alice"}
 
 
 def test_final_answer_helper_renders_and_parses_rwkv_call() -> None:
@@ -510,7 +623,7 @@ def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypat
     assert malformed_payload["agent_info"]["fail_reason"] == ""
 
 
-def test_rwkv_json_call_prompt_collapses_history_to_single_user_and_assistant_turn() -> None:
+def test_rwkv_json_call_prompt_renders_multi_turn_dialog_by_default() -> None:
     prompt = build_rwkv_json_call_prompt(
         "Use exactly one tool call.",
         [
@@ -519,6 +632,25 @@ def test_rwkv_json_call_prompt_collapses_history_to_single_user_and_assistant_tu
             {"role": "user", "content": "Function output:\n{\"ok\":true}"},
         ],
         history_max_chars=4000,
+    )
+
+    assert sum(1 for line in prompt.splitlines() if line.startswith("User:")) == 2
+    assert sum(1 for line in prompt.splitlines() if line.startswith("Assistant:")) == 2
+    assert "Conversation transcript JSON:" not in prompt
+    assert "Function output:" in prompt
+    assert prompt.endswith('Assistant: ```json\n{')
+
+
+def test_rwkv_json_call_prompt_can_collapse_history_to_single_user_turn() -> None:
+    prompt = build_rwkv_json_call_prompt(
+        "Use exactly one tool call.",
+        [
+            {"role": "user", "content": "Find A1"},
+            {"role": "assistant", "content": '{"name":"lookup","arguments":{"id":"A1"}}'},
+            {"role": "user", "content": "Function output:\n{\"ok\":true}"},
+        ],
+        history_max_chars=4000,
+        single_user_turn=True,
     )
 
     assert sum(1 for line in prompt.splitlines() if line.startswith("User:")) == 1

@@ -907,15 +907,15 @@ def _browsecomp_plus_score_payload(
 ) -> Mapping[str, object]:
     return make_score_payload(
         run.dataset_slug,
-        is_cot=True,
+        is_cot=False,
         model_name=run.model_name,
         metrics=metrics,
         samples=len(completions_payloads),
         problems=plan.sample_size,
         task=job_name,
-        task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+        task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
         extra={
-            "cot_mode": CoTMode.COT.value,
+            "cot_mode": CoTMode.NO_COT.value,
             "history_max_chars": history_max_chars,
             "prompt_max_chars": prompt_max_chars,
             "sampling_config": sampling_payload,
@@ -1068,7 +1068,7 @@ def _run_one_browsecomp_plus_attempt(
         "judge_reason": judge_reason,
         "fail_reason": fail_reason,
         "judge_pending": bool(final_answer and defer_judge),
-        "cot_mode": CoTMode.COT.value,
+        "cot_mode": CoTMode.NO_COT.value,
         "long_context": {
             "prompt_max_chars": int(prompt_max_chars),
             "history_max_chars": int(history_max_chars),

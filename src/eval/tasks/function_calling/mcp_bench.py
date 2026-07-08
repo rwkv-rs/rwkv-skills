@@ -30,12 +30,12 @@ from src.eval.tasks.function_calling.runner_common import (
 from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     build_rwkv_json_call_prompt,
-    coerce_json_function_call_payload,
     extract_json_call_value_text,
     normalize_function_prompt_style,
     render_function_output_user_block,
     render_json_function_call,
 )
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_call_text
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 from src.eval.scheduler.config import REPO_ROOT
@@ -142,6 +142,37 @@ class McpBenchPreflightReport:
     worker_script: str
     checked_servers: tuple[str, ...]
     errors: tuple[str, ...] = ()
+
+
+_MCP_BENCH_RUNTIME_ERROR_MARKERS: tuple[str, ...] = (
+    "worker_open_task_failed",
+    "worker stdout closed",
+    "worker stdin closed",
+    "official evaluator returned a non-dict payload",
+    "setuptools.build_meta.build_wheel",
+    "Call to `setuptools.build_meta.build_wheel` failed",
+    "Failed to build",
+    "No module named",
+    "ModuleNotFoundError",
+    "ImportError",
+    "Error code: 401",
+    "Error code: 403",
+    "Error code: 429",
+    "Error code: 500",
+    "Error code: 502",
+    "Error code: 503",
+    "Error code: 504",
+    "当前系统繁忙",
+    "rate limit",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+)
+
+
+def _is_mcp_bench_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker.lower() in message for marker in _MCP_BENCH_RUNTIME_ERROR_MARKERS)
 
 
 class McpBenchWorkerClient:
@@ -565,15 +596,14 @@ def render_trace(steps: Sequence[dict[str, Any]]) -> str:
 
 
 def parse_planning_decision(response: str) -> PlanningDecision:
-    candidate = extract_json_candidate(response)
     try:
-        payload = coerce_json_function_call_payload(json.loads(candidate), context_label="planning")
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"failed to parse planning json: {exc}; json={candidate}") from exc
-    name = str(payload["name"]).strip()
+        call = parse_tool_call_text(response, context_label="planning", recover_partial=True)
+    except ValueError as exc:
+        raise ValueError(f"failed to parse planning tool call: {exc}") from exc
+    name = call.name
     if not name:
         raise ValueError("planning JSON missing name")
-    arguments = payload["arguments"]
+    arguments = call.arguments
     if name == "final_answer":
         return PlanningDecision(
             reasoning="",
@@ -1096,7 +1126,7 @@ def _run_mcp_bench(
                             "ref_answer": ref_answer,
                             "fail_reason": fail_reason,
                             "evaluation_summary": evaluation_summary,
-                            "cot_mode": CoTMode.COT.value,
+                            "cot_mode": CoTMode.NO_COT.value,
                             "execution_count": len(execution_results),
                         }
                         payload["agent_trace"] = steps
@@ -1105,6 +1135,8 @@ def _run_mcp_bench(
                         payload["instruction"] = presented_task(item)
                         writer.enqueue(payload)
                     except Exception as exc:
+                        if _is_mcp_bench_runtime_error(exc):
+                            raise
                         ref_answer = build_mcp_bench_ref_answer(item)
                         payload = SampleRecord(
                             benchmark_name=run.benchmark_name,
@@ -1127,7 +1159,7 @@ def _run_mcp_bench(
                             "ref_answer": ref_answer,
                             "fail_reason": str(exc),
                             "evaluation_summary": "",
-                            "cot_mode": CoTMode.COT.value,
+                            "cot_mode": CoTMode.NO_COT.value,
                             "execution_count": len(execution_results),
                         }
                         payload["agent_trace"] = steps
@@ -1159,17 +1191,17 @@ def _run_mcp_bench(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=len(items),
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
                 extra={
                     "sampling_config": sampling_payload,
                     "judger_model_name": judge_cfg.model_name,
-                    "cot_mode": CoTMode.COT.value,
+                    "cot_mode": CoTMode.NO_COT.value,
                 },
             ),
         )

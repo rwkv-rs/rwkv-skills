@@ -6,8 +6,11 @@ from pathlib import Path
 
 from src.eval.tasks.function_calling import browsecomp as browsecomp_module
 from src.eval.tasks.function_calling.browsecomp import (
+    BrowseCompJudgeConfig,
     BrowseCompJudgeOutcome,
+    BrowseCompRecord,
     _run_browsecomp,
+    judge_browsecomp_answers,
 )
 from src.eval.tasks.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
 from src.infer.sampling import GenerationOutput, SamplingConfig
@@ -29,6 +32,35 @@ class _FakeRuntime:
 
     def fail_task(self, *_args, **_kwargs) -> None:
         return None
+
+
+def test_judge_browsecomp_answers_marks_failed_items_after_retries(monkeypatch) -> None:
+    class FakeCompletions:
+        def create(self, **_kwargs):
+            raise RuntimeError("rate limited")
+
+    class FakeClient:
+        chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setattr("openai.OpenAI", lambda **_kwargs: FakeClient())
+
+    outcomes = judge_browsecomp_answers(
+        [(BrowseCompRecord(task_id="bc-1", question="q", answer="a", locale="en"), "response")],
+        config=BrowseCompJudgeConfig(
+            api_key="key",
+            model="judge",
+            max_workers=1,
+            max_retries=1,
+            backoff_base_s=0,
+        ),
+    )
+
+    assert outcomes == [
+        BrowseCompJudgeOutcome(
+            is_passed=False,
+            reason="judge failed after retries: browsecomp judge failed after retries: rate limited",
+        )
+    ]
 
 
 def test_run_browsecomp_keeps_raw_completion_separate_from_sandbox_return(

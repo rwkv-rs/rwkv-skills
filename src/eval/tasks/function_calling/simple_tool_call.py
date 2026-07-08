@@ -39,9 +39,9 @@ from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
     assistant_json_prefix,
     build_rwkv_json_call_prompt,
-    coerce_json_function_call_payloads,
-    extract_json_call_value_text,
 )
+from src.eval.tasks.function_calling.api_bank_prompt import normalize_api_bank_instruction_for_prompt
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_calls_text
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 
@@ -168,20 +168,28 @@ def build_simple_tool_call_prompt(
     history_max_chars: int,
     prefill_object: bool = False,
 ) -> str:
+    instruction = _simple_tool_call_instruction(record)
     system_prompt = _simple_tool_call_system_prompt(record)
     return build_rwkv_json_call_prompt(
         system_prompt,
-        [{"role": "user", "content": normalize_rwkv_text(record.instruction)}],
+        [{"role": "user", "content": instruction}],
         history_max_chars=history_max_chars,
-        assistant_prefix=assistant_json_prefix(prefill_object=prefill_object),
+        assistant_prefix=assistant_json_prefix(enable_think=False, prefill_object=prefill_object),
     )
 
 
 def build_simple_tool_call_messages(record: SimpleToolCallRecord) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": _simple_tool_call_native_system_prompt(record)},
-        {"role": "user", "content": normalize_rwkv_text(record.instruction)},
+        {"role": "user", "content": _simple_tool_call_instruction(record)},
     ]
+
+
+def _simple_tool_call_instruction(record: SimpleToolCallRecord) -> str:
+    instruction = normalize_rwkv_text(record.instruction)
+    if _is_api_bank_record(record):
+        return normalize_api_bank_instruction_for_prompt(instruction)
+    return instruction
 
 
 def _simple_tool_call_system_prompt(record: SimpleToolCallRecord) -> str:
@@ -191,10 +199,16 @@ def _simple_tool_call_system_prompt(record: SimpleToolCallRecord) -> str:
                 "Tools:",
                 _render_tool_catalog(record.tools),
                 "Return only a JSON function call.",
-                'The JSON shape is {"name":"tool_name","arguments":{...}}.',
+                "For one tool call, return one JSON object.",
                 "For multiple required tool calls, return a JSON array containing every required call in execution order; do not stop after the first call.",
-                "Use only listed tool names.",
+                "Each arguments object must contain only final argument values for that tool.",
+                "The arguments field must be a JSON object, not a quoted JSON string.",
                 *_simple_tool_call_date_instructions(record),
+                "Do not copy tool schemas, descriptions, type/items/properties/required/default fields, or wrapper objects like {\"type\":...,\"value\":...} into arguments.",
+                "Do not include id, call_id, type, response, output, exception, api_name, input, schema, analysis, or markdown fields.",
+                "Previous API or function outputs in the conversation are history only; never copy response/output objects into the next call.",
+                "Use only listed tool names.",
+                "Return no prose, no markdown, and no extra text outside the JSON value.",
             ]
         )
     )
@@ -218,26 +232,23 @@ def _simple_tool_call_date_instructions(record: SimpleToolCallRecord) -> list[st
     instructions = [
         "For dates and times, use only dates/times stated or implied by the conversation or function outputs; do not use the real current date.",
     ]
-    if str(record.metadata.get("source_format") or "").strip() in {
-        "official_api_bank",
-        "official_apibank",
-    }:
+    if _is_api_bank_record(record):
         instructions.append(
             "API-Bank date convention: if a month/day or relative date has no explicit year and the conversation does not state today's date, use year 2023."
         )
     return instructions
 
 
+def _is_api_bank_record(record: SimpleToolCallRecord) -> bool:
+    return str(record.metadata.get("source_format") or "").strip() in {
+        "official_api_bank",
+        "official_apibank",
+    }
+
+
 def decode_simple_tool_call_response(response: str) -> list[dict[str, Any]]:
-    candidate = extract_json_call_value_text(response)
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        payload = _literal_from_ast(ast.parse(candidate, mode="eval").body)
-    if payload == []:
-        return []
-    calls = coerce_json_function_call_payloads(payload, context_label="tool-call selection")
-    return [{"name": str(call["name"]), "arguments": dict(call.get("arguments") or {})} for call in calls]
+    calls = parse_tool_calls_text(response, context_label="tool-call selection", recover_partial=True)
+    return [{"name": call.name, "arguments": dict(call.arguments)} for call in calls]
 
 
 def evaluate_simple_tool_calls(
@@ -498,7 +509,7 @@ def _run_simple_tool_call(
                     payload["agent_info"] = {
                         **dict(evaluation.details),
                         "fail_reason": evaluation.fail_reason,
-                        "cot_mode": CoTMode.COT.value,
+                        "cot_mode": CoTMode.NO_COT.value,
                     }
                     payload["agent_trace"] = [trace_entry]
                     payload["task_id"] = record.task_id
@@ -522,14 +533,14 @@ def _run_simple_tool_call(
             timeout_s=float(args.db_close_timeout_s),
             build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
                 run.dataset_slug,
-                is_cot=True,
+                is_cot=False,
                 model_name=run.model_name,
                 metrics=metrics,
                 samples=len(completions_payloads),
                 problems=plan.sample_size,
                 task=job_name,
-                task_details=build_plan_task_details(plan, cot_mode=CoTMode.COT.value),
-                extra={"cot_mode": CoTMode.COT.value, "history_max_chars": history_max_chars},
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                extra={"cot_mode": CoTMode.NO_COT.value, "history_max_chars": history_max_chars},
             ),
         )
     except Exception as exc:

@@ -328,7 +328,7 @@ def run_tau_v2_episode(
     user_model: OpenAIModelConfig,
     max_steps: int,
     max_errors: int = 10,
-    user_temperature: float = 0.0,
+    user_temperature: float = 1e-5,
     sampling: SamplingConfig | None = None,
     prompt_profile: PromptProfile = "tau_v2",
 ) -> EpisodeResult:
@@ -480,7 +480,7 @@ def run_tau_v2_episodes(
     max_steps: int,
     max_errors: int = 10,
     max_concurrency: int = 1,
-    user_temperature: float = 0.0,
+    user_temperature: float = 1e-5,
     sampling: SamplingConfig | None = None,
     prompt_profile: PromptProfile = "tau_v2",
     on_complete: Callable[[int, EpisodeResult], None] | None = None,

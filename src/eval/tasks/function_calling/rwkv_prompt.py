@@ -103,7 +103,11 @@ def render_assistant_json_block(json_text: str, *, assistant_prefix: str | None 
 
 
 def render_function_output_user_block(payload: Any) -> str:
-    return render_user_block("Function output:\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    if isinstance(payload, str):
+        rendered = normalize_rwkv_text(payload)
+    else:
+        rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return render_user_block("Function output:\n" + rendered)
 
 
 def build_rwkv_json_call_prompt(
@@ -112,7 +116,7 @@ def build_rwkv_json_call_prompt(
     *,
     history_max_chars: int,
     assistant_prefix: str | None = None,
-    single_user_turn: bool = True,
+    single_user_turn: bool = False,
 ) -> str:
     bounded_messages = trim_message_history(messages, max_chars=max(0, int(history_max_chars)))
     json_prefix = assistant_prefix if assistant_prefix is not None else assistant_json_prefix()
@@ -127,6 +131,9 @@ def build_rwkv_json_call_prompt(
         role = str(message.get("role") or "").strip().lower()
         content = normalize_rwkv_text(str(message.get("content") or ""))
         if not content:
+            continue
+        if role in {"tool", "function", "observation"}:
+            parts.append(render_function_output_user_block(content))
             continue
         if role == "assistant":
             assistant_content = _strip_role_prefix(content, ASSISTANT_HEADER)
@@ -161,11 +168,14 @@ def extract_json_call_value_text(response: str) -> str:
         raise ValueError(f"model response must be a JSON function call object or array: {normalized}")
     end = _find_leading_json_value_end(normalized)
     if end is None:
+        recovered_array = _recover_leading_json_array_text(normalized)
+        if recovered_array is not None:
+            return recovered_array
         raise ValueError(f"model response must be a complete JSON function call object or array: {normalized}")
     candidate = normalized[:end]
     trailing = normalize_rwkv_text(normalized[end:])
     trailing = _strip_json_fence(trailing) if trailing.startswith("```") else trailing
-    if trailing and trailing != "```":
+    if not _is_ignorable_json_call_trailing(trailing):
         raise ValueError(f"model response has extra text after JSON function call object or array: {trailing}")
     return candidate
 
@@ -283,21 +293,62 @@ def _render_single_user_turn_content(messages: Sequence[Mapping[str, str]]) -> s
 
 def _sanitize_embedded_role_headers(text: str) -> str:
     normalized = normalize_rwkv_text(text)
-    replacements = {
-        USER_HEADER: "User message:",
-        ASSISTANT_HEADER: "Assistant message:",
-        SYSTEM_HEADER: "System message:",
+    transcript = _embedded_role_headers_to_transcript_text(normalized)
+    if transcript is not None:
+        return transcript
+    return normalized
+
+
+def _embedded_role_headers_to_transcript_text(text: str) -> str | None:
+    normalized = normalize_rwkv_text(text)
+    transcript: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    preamble: list[str] = []
+    saw_header = False
+    header_count = 0
+    role_map = {
+        USER_HEADER: "user",
+        ASSISTANT_HEADER: "assistant",
+        SYSTEM_HEADER: "system",
+        "API:": "tool",
+        "Tool:": "tool",
+        "Function output:": "tool",
     }
-    rendered: list[str] = []
     for line in normalized.split("\n"):
         stripped = line.lstrip()
-        indent = line[: len(line) - len(stripped)]
-        for header, replacement in replacements.items():
+        matched = False
+        for header, role in role_map.items():
             if stripped.startswith(header):
-                stripped = replacement + stripped[len(header) :]
+                saw_header = True
+                header_count += 1
+                matched = True
+                if preamble:
+                    transcript.append({"role": "instruction", "content": "\n".join(preamble).strip()})
+                    preamble = []
+                current = {"role": role, "content": stripped[len(header) :].strip()}
+                transcript.append(current)
                 break
-        rendered.append(indent + stripped)
-    return "\n".join(rendered)
+        if matched:
+            continue
+        if current is None:
+            if line.strip():
+                preamble.append(line)
+            continue
+        current["content"] = current["content"] + "\n" + line
+    if not saw_header:
+        return None
+    if header_count < 2:
+        return None
+    if preamble:
+        transcript.append({"role": "instruction", "content": "\n".join(preamble).strip()})
+    cleaned = [
+        {"role": item["role"], "content": normalize_rwkv_text(item["content"])}
+        for item in transcript
+        if item.get("content")
+    ]
+    if not cleaned:
+        return None
+    return "Conversation transcript JSON:\n" + json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
 
 
 def _strip_assistant_prefix(text: str) -> str:
@@ -437,6 +488,56 @@ def _strip_json_fence(text: str) -> str:
     if normalized.endswith("```"):
         normalized = normalize_rwkv_text(normalized[: -len("```")])
     return normalized
+
+
+def _is_ignorable_json_call_trailing(text: str) -> bool:
+    normalized = normalize_rwkv_text(text)
+    if not normalized or normalized == "```":
+        return True
+    if normalized.startswith("```"):
+        rest = normalize_rwkv_text(normalized[len("```") :])
+        if not rest:
+            return True
+        normalized = rest
+    return normalized.startswith((USER_HEADER, ASSISTANT_HEADER, SYSTEM_HEADER))
+
+
+def _recover_leading_json_array_text(text: str) -> str | None:
+    normalized = normalize_rwkv_text(text)
+    if not normalized.startswith("["):
+        return None
+    index = 1
+    items: list[str] = []
+    while index < len(normalized):
+        while index < len(normalized) and normalized[index].isspace():
+            index += 1
+        if index < len(normalized) and normalized[index] == "]":
+            return normalized[: index + 1]
+        if index < len(normalized) and normalized[index] == ",":
+            index += 1
+            continue
+        if index >= len(normalized) or normalized[index] not in "{[":
+            break
+        end = _find_leading_json_value_end(normalized[index:])
+        if end is None:
+            break
+        item_text = normalized[index : index + end]
+        try:
+            json.loads(item_text)
+        except json.JSONDecodeError:
+            break
+        items.append(item_text)
+        index += end
+        while index < len(normalized) and normalized[index].isspace():
+            index += 1
+        if index < len(normalized) and normalized[index] == "]":
+            return normalized[: index + 1]
+        if index < len(normalized) and normalized[index] == ",":
+            continue
+        break
+    if not items:
+        return None
+    return "[" + ",".join(items) + "]"
 
 
 def _find_leading_json_value_end(text: str) -> int | None:

@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -149,21 +150,53 @@ async def handle_evaluate(_state: WorkerState, payload: dict[str, Any]) -> dict[
         provider_type="openai_compatible",
     )
     evaluator = TaskEvaluator(provider, enable_judge_stability=False)
-    with contextlib.redirect_stdout(sys.stderr):
-        evaluation = await evaluator.evaluate(
-            task=str(request.get("task") or ""),
-            execution_results=list(request.get("execution_results") or []),
-            final_solution=str(request.get("final_solution") or ""),
-            total_rounds=int(request.get("total_rounds") or 0),
-            available_tools=dict(request.get("available_tools") or {}),
-            planning_json_compliance=float(request.get("planning_json_compliance") or 0.0),
-            accumulated_information=str(request.get("accumulated_information") or ""),
-            concrete_task_description=str(request.get("concrete_task_description") or ""),
-            dependency_analysis=str(request.get("dependency_analysis") or ""),
-        )
+    last_error: Exception | None = None
+    evaluation: Any = None
+    for attempt in range(1, 6):
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                evaluation = await evaluator.evaluate(
+                    task=str(request.get("task") or ""),
+                    execution_results=list(request.get("execution_results") or []),
+                    final_solution=str(request.get("final_solution") or ""),
+                    total_rounds=int(request.get("total_rounds") or 0),
+                    available_tools=dict(request.get("available_tools") or {}),
+                    planning_json_compliance=float(request.get("planning_json_compliance") or 0.0),
+                    accumulated_information=str(request.get("accumulated_information") or ""),
+                    concrete_task_description=str(request.get("concrete_task_description") or ""),
+                    dependency_analysis=str(request.get("dependency_analysis") or ""),
+                )
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if not _is_transient_evaluator_error(exc) or attempt >= 5:
+                raise
+            time.sleep(min(30.0, 3.0 * (2 ** (attempt - 1))))
+    if evaluation is None and last_error is not None:
+        raise last_error
     if not isinstance(evaluation, dict):
         raise RuntimeError("official evaluator returned a non-dict payload")
     return evaluation
+
+
+def _is_transient_evaluator_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "当前系统繁忙",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "error code: 429",
+            "error code: 500",
+            "error code: 502",
+            "error code: 503",
+            "error code: 504",
+        )
+    )
 
 
 async def handle_close_task(state: WorkerState, _payload: dict[str, Any]) -> dict[str, Any]:

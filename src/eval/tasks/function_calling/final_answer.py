@@ -9,9 +9,8 @@ from typing import Any
 from src.eval.tasks.function_calling.context_budget import normalize_rwkv_text
 from src.eval.tasks.function_calling.rwkv_prompt import (
     build_rwkv_json_call_prompt,
-    coerce_json_function_call_payloads,
-    extract_json_call_value_text,
 )
+from src.eval.tasks.function_calling.tool_call_contract import coerce_tool_call_payloads, load_tool_call_payload
 
 FINAL_ANSWER_TOOL_NAME = "final_answer"
 FINAL_ANSWER_CALL_ID = "final_answer"
@@ -104,24 +103,22 @@ def parse_final_answer_call(
     answer_keys: Sequence[str] = DEFAULT_FINAL_ANSWER_KEYS,
     context_label: str = "final answer",
 ) -> FinalAnswerCall:
-    candidate = extract_json_call_value_text(response)
-    payload = _loads_json_or_literal(candidate)
-    calls = coerce_json_function_call_payloads(payload, context_label=context_label)
+    payload = load_tool_call_payload(response, context_label=context_label, recover_partial=True)
+    calls = coerce_tool_call_payloads(payload, context_label=context_label)
     for call in calls:
-        name = str(call.get("name") or "").strip()
-        if name != FINAL_ANSWER_TOOL_NAME:
+        if call.name != FINAL_ANSWER_TOOL_NAME:
             continue
-        arguments = dict(call.get("arguments") or {})
+        arguments = dict(call.arguments)
         answer = _extract_answer(arguments, answer_keys=answer_keys)
         if answer is None:
             raise ValueError(f"{context_label} final_answer call missing answer")
-        call_id = _find_final_answer_call_id(payload) or FINAL_ANSWER_CALL_ID
+        call_id = _find_final_answer_call_id(call.raw_payload) or _find_final_answer_call_id(payload) or FINAL_ANSWER_CALL_ID
         return FinalAnswerCall(
             answer=answer,
             call={"name": FINAL_ANSWER_TOOL_NAME, "arguments": arguments, "id": call_id},
             call_id=call_id,
         )
-    names = ", ".join(str(call.get("name") or "") for call in calls) or "<none>"
+    names = ", ".join(call.name for call in calls) or "<none>"
     raise ValueError(f"{context_label} must call final_answer, got {names}")
 
 

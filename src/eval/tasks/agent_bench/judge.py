@@ -20,7 +20,7 @@ class NLAssertionJudge:
     model_name: str
     api_key: str
     base_url: str | None = None
-    temperature: float = 0.0
+    temperature: float = 1e-5
     num_retries: int = 2
 
     def evaluate(self, assertions: list[str], messages: list[Any]) -> list[NLAssertionResult]:

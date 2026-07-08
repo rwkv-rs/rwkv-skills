@@ -82,7 +82,7 @@ class TauOfficialRuntime:
             return {}
         return {"retrieval_variant": DEFAULT_TAU_BANKING_RETRIEVAL_VARIANT}
 
-    def build_user(self, *, task: Any, environment: Any, user_model: Any | None, temperature: float = 0.0) -> Any:
+    def build_user(self, *, task: Any, environment: Any, user_model: Any | None, temperature: float = 1e-5) -> Any:
         if user_model is None:
             return StaticStopTauUser()
         user_module = import_module_with_auto_install("tau2.user.user_simulator", context="tau2 user simulator import")
@@ -171,7 +171,7 @@ def configure_tau_nl_assertions_judge(judge_model: Any) -> None:
     if not model_name or not api_key:
         return
     llm_args: dict[str, Any] = {
-        "temperature": _tau_openai_temperature(0.0),
+        "temperature": _tau_openai_temperature(1e-5),
         "stream": False,
         "api_key": api_key,
         "response_format": {"type": "json_object"},
@@ -232,7 +232,7 @@ def _tau_litellm_provider_args(model_config: Any) -> dict[str, str]:
 
 
 def _tau_openai_temperature(value: float) -> float:
-    return max(0.001, float(value))
+    return max(1e-5, float(value))
 
 
 def _tau_llm_timeout_args() -> dict[str, float]:
@@ -944,7 +944,14 @@ def _recover_tau_alias_decision(
             or "Could you provide the missing information so I can continue?"
         )
         return RESPOND_TOOL_NAME, {"content": str(content).strip()}
-    if normalized_name in {"search_reservation", "find_reservation", "lookup_reservation", "get_booking"}:
+    if normalized_name in {
+        "search_reservation",
+        "find_reservation",
+        "lookup_reservation",
+        "get_booking",
+        "get_reservations",
+        "list_reservations",
+    }:
         if "get_reservation_details" not in available_tool_names:
             return None
         requested_id = _requested_tau_reservation_id_from_user(prompt_messages)
@@ -971,6 +978,93 @@ def _recover_tau_alias_decision(
             return recovered_product
         if "list_all_product_types" in available_tool_names:
             return "list_all_product_types", {}
+    telecom_replacement = _recover_tau_telecom_alias_decision(
+        normalized_name,
+        normalized_arguments,
+        prompt_messages,
+        available_tool_names=available_tool_names,
+    )
+    if telecom_replacement is not None:
+        return telecom_replacement
+    return None
+
+
+def _recover_tau_telecom_alias_decision(
+    name: str,
+    arguments: Mapping[str, Any],
+    prompt_messages: Sequence[Mapping[str, object]],
+    *,
+    available_tool_names: set[str],
+) -> tuple[str, dict[str, Any]] | None:
+    if not {"get_customer_by_phone", "get_details_by_id"} & available_tool_names:
+        return None
+    normalized_name = str(name or "").strip()
+    normalized_arguments = dict(arguments)
+    detail_aliases = {
+        "get_line_details",
+        "get_phone_info",
+        "get_phone_details",
+        "get_device_details",
+        "get_bill_details",
+        "get_plan_details",
+        "lookup_line",
+        "lookup_phone",
+        "lookup_device",
+        "lookup_bill",
+        "lookup_plan",
+    }
+    customer_aliases = {"get_customer", "lookup_customer", "find_customer", "search_customer"}
+    if normalized_name not in detail_aliases and normalized_name not in customer_aliases:
+        return None
+
+    detail_id = _first_tau_value(
+        normalized_arguments,
+        "id",
+        "line_id",
+        "device_id",
+        "bill_id",
+        "plan_id",
+    ) or _first_latest_tau_fact_value(prompt_messages, "line_id", "device_id", "bill_id", "plan_id")
+    if detail_id and "get_details_by_id" in available_tool_names:
+        return "get_details_by_id", {"id": detail_id}
+
+    phone_number = _first_tau_value(
+        normalized_arguments,
+        "phone_number",
+        "phone",
+        "line_phone_number",
+    ) or _latest_tau_fact_value(prompt_messages, "phone_number")
+    if phone_number and "get_customer_by_phone" in available_tool_names:
+        return "get_customer_by_phone", {"phone_number": phone_number}
+
+    customer_id = _first_tau_value(normalized_arguments, "customer_id") or _latest_tau_fact_value(
+        prompt_messages,
+        "customer_id",
+    )
+    if customer_id and "get_customer_by_id" in available_tool_names:
+        return "get_customer_by_id", {"customer_id": customer_id}
+
+    return RESPOND_TOOL_NAME, {
+        "content": (
+            "Please provide the telecom phone number, customer ID, line ID, device ID, bill ID, or plan ID "
+            "so I can look up the account details."
+        )
+    }
+
+
+def _first_tau_value(arguments: Mapping[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = str(arguments.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _first_latest_tau_fact_value(messages: Sequence[Mapping[str, object]], *keys: str) -> str | None:
+    for key in keys:
+        value = _latest_tau_fact_value(messages, key)
+        if value:
+            return value
     return None
 
 
