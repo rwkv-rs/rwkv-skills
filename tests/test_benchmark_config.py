@@ -25,7 +25,7 @@ def test_resolve_math_500_cot_config_merges_default_and_template() -> None:
     assert config.report_avg_k == (8,)
     assert config.sampling_overrides["max_generate_tokens"] == 4096
     assert config.sampling_overrides["top_k"] == 40
-    assert config.sampling_overrides["temperature"] == 0.25
+    assert config.sampling_overrides["temperature"] == 0.8
     assert config.sampling_overrides["stop_tokens"] == (0,)
 
 
@@ -34,7 +34,7 @@ def test_resolve_livecodebench_final_sampling_config_uses_code_template() -> Non
 
     assert config is not None
     assert config.max_generate_tokens == 8192
-    assert config.temperature == 0.6
+    assert config.temperature == 0.8
     assert config.top_p == 0.6
     assert config.stop_tokens == (6884, 21214)
     assert config.pad_zero is True
@@ -53,7 +53,7 @@ def test_resolve_sampling_config_supports_fallback_templates() -> None:
 
     assert config is not None
     assert config.max_generate_tokens == 1024
-    assert config.temperature == 0.6
+    assert config.temperature == 0.8
     assert config.top_p == 0.6
     assert config.stop_tokens == (0, 261, 6884, 21214, 24281)
 
@@ -68,9 +68,9 @@ def test_resolve_sampling_config_expands_nested_template_aliases() -> None:
 
     assert config is not None
     assert config.max_generate_tokens == 2048
-    assert config.temperature == 1.0
+    assert config.temperature == 0.8
     assert config.top_k == 200
-    assert config.top_p == 0.0
+    assert config.top_p == 1e-5
 
 
 def test_parse_table_accepts_rwkv_rs_sampling_aliases() -> None:

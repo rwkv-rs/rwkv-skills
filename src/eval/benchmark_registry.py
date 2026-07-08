@@ -476,6 +476,9 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
     canonical_slug("apex_agents"): (canonical_slug("apex_agents"),),
     canonical_slug("apex-agents"): (canonical_slug("apex_agents"),),
     canonical_slug("apex-agent"): (canonical_slug("apex_agents"),),
+    canonical_slug("hle_tools"): (canonical_slug("hle_with_tools"),),
+    canonical_slug("claw_eval"): (canonical_slug("claweval"),),
+    canonical_slug("wide_search"): (canonical_slug("widesearch"),),
     canonical_slug("frontierscience"): (
         canonical_slug("frontierscience_research"),
         canonical_slug("frontierscience_olympiad"),

@@ -31,20 +31,21 @@ _SOURCE_ROOT_ENV = "RWKV_FREE_ANSWER_SOURCE_ROOT"
 _ENV_PREFIX = "RWKV_FREE_ANSWER_SOURCE"
 _REQUIRED_FIELDS = ("problem", "expected_answer")
 
-_QUESTION_KEYS = ("problem", "question", "prompt", "instruction", "query", "task", "input", "text")
+_QUESTION_KEYS = ("problem", "question", "prompt", "instruction", "query", "task", "input", "text", "content")
 _ANSWER_KEYS = (
     "expected_answer",
     "answer",
     "final_answer",
     "reference_answer",
     "gold_answer",
+    "sample_solution",
     "reference_solution",
     "solution",
     "target",
     "output",
 )
 _CONTEXT_KEYS = ("context", "source_context", "document", "documents", "passage", "passages")
-_RUBRIC_KEYS = ("rubrics", "rubric", "grading_rubrics", "checklist")
+_RUBRIC_KEYS = ("rubrics", "rubric", "grading_rubrics", "grading_scheme", "checklist")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +99,7 @@ class RequestedFreeAnswerDatasetSpec(MaterializingDatasetSpec):
         )
         self._spec = _REQUESTED_FREE_ANSWER_SPECS[name]
         self._source_path: Path | None = None
+        self._skipped_rows = 0
 
     def source_path(self) -> Path:
         if self._source_path is None:
@@ -129,16 +131,25 @@ class RequestedFreeAnswerDatasetSpec(MaterializingDatasetSpec):
             source_label = self._spec.hf_dataset_id
         else:
             raise FileNotFoundError(path)
-        return [
-            normalize_free_answer_row(row, dataset_name=self.name, index=index, source_path=source_label)
-            for index, row in enumerate(rows)
-        ]
+        records: list[dict[str, Any]] = []
+        skipped_rows = 0
+        for index, row in enumerate(rows):
+            try:
+                records.append(normalize_free_answer_row(row, dataset_name=self.name, index=index, source_path=source_label))
+            except ValueError as exc:
+                if _is_missing_reference_row(exc):
+                    skipped_rows += 1
+                    continue
+                raise
+        self._skipped_rows = skipped_rows
+        return records
 
     def manifest_extra(self) -> dict[str, Any]:
         return {
             "source_path": str(self.source_path()),
             "hf_dataset_id": self._spec.hf_dataset_id,
             "input_contract": "Rows normalize to problem/expected_answer; rubric rows keep rubrics in metadata.",
+            "skipped_rows": self._skipped_rows,
         }
 
 
@@ -260,6 +271,11 @@ def _is_json_scalarish(value: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return True
+
+
+def _is_missing_reference_row(exc: ValueError) -> bool:
+    message = str(exc)
+    return "free-answer row missing expected answer" in message or "free-answer row missing problem/question" in message
 
 
 def _register(name: str):

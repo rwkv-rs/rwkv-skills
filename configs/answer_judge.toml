@@ -10,7 +10,7 @@ cot_prompt_template = """User: Decide whether the predicted answer matches the e
 
 Assistant: <think"""
 max_generate_tokens = 4096
-temperature = 0.25
+temperature = 0.8
 top_k = 40
 top_p = 0.35
 alpha_presence = 0.65
@@ -25,11 +25,11 @@ no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
 final_prompt_template = """<Q><COT>
 Return exactly one final label: """
 max_generate_tokens = 16
-temperature = 0.0
+temperature = 0.8
 top_k = 1
-top_p = 0.0
-alpha_presence = 0.0
-alpha_frequency = 0.0
+top_p = 1e-5
+alpha_presence = 1e-5
+alpha_frequency = 1e-5
 alpha_decay = 0.99
 stop_tokens = [0, 2402, 4910]
 pad_zero = true

@@ -138,7 +138,7 @@ def test_agent_loop_source_catalog_is_derived_from_requested_benchmarks() -> Non
         assert item.scheduler_job in {"free_response", "free_response_judge"}
 
 
-def test_agent_tool_call_benchmarks_have_function_call_sampling_fallback() -> None:
+def test_agent_loop_benchmarks_have_explicit_instruction_sampling_config() -> None:
     sampling = resolve_sampling_config(
         "widesearch_test",
         "demo-model",
@@ -147,8 +147,8 @@ def test_agent_tool_call_benchmarks_have_function_call_sampling_fallback() -> No
     )
 
     assert sampling is not None
-    assert sampling.max_generate_tokens == 2048
-    assert sampling.top_k == 200
+    assert sampling.max_generate_tokens == 4096
+    assert sampling.top_k == 50
 
 
 def test_benchmark_domains_partition_the_requested_set() -> None:
@@ -268,3 +268,22 @@ def test_free_answer_prepper_normalizes_qa_rubric_and_message_rows() -> None:
         source_path="src.jsonl",
     )
     assert context["problem"].startswith("Context:\nlong doc")
+
+    usamo = normalize_free_answer_row(
+        {"problem_idx": 1, "problem": "Prove P.", "sample_solution": "Proof.", "grading_scheme": "7 point rubric"},
+        dataset_name="usamo_2026",
+        index=0,
+        source_path="hf",
+    )
+    assert usamo["id"] == "usamo_2026__00000"
+    assert usamo["expected_answer"] == "Proof."
+    assert usamo["rubrics"] == ["7 point rubric"]
+
+    phybench = normalize_free_answer_row(
+        {"id": 495, "content": "Physics problem", "answer": "42", "solution": "derive 42"},
+        dataset_name="phybench",
+        index=0,
+        source_path="hf",
+    )
+    assert phybench["problem"] == "Physics problem"
+    assert phybench["expected_answer"] == "42"

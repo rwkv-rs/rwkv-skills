@@ -1,0 +1,3 @@
+[default]
+avg_k = [0.2]
+report_avg_k = [0.2]

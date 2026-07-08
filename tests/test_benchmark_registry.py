@@ -92,6 +92,10 @@ def test_swe_bench_family_is_coding_cot_only_with_naive_variant() -> None:
     assert metadata.field is BenchmarkField.CODING
     assert metadata.cot_modes == (CoTMode.COT,)
     assert metadata.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
+    assert multilingual.field is BenchmarkField.CODING
+    assert multilingual.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
+    assert pro.field is BenchmarkField.CODING
+    assert pro.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
     assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
     assert not supports_cot_mode("swe_bench_lite_test", CoTMode.NO_COT)
     assert multilingual.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")

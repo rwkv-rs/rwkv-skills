@@ -1,8 +1,10 @@
 [default]
+avg_k = [1]
+report_avg_k = [1]
 template = "instruction_following_default"
 agent_plugin_enabled = true
 max_generate_tokens = 4096
-temperature = 0.3
+temperature = 0.8
 top_p = 0.3
 top_k = 50
 tool_router_mode = "lexical"
