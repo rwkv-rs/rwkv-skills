@@ -376,9 +376,9 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
     elif spec.job == "function_bfcl_ast":
         config.update(candidate_router_defaults(mode="auto"))
     elif spec.kind in {"longbench", "longcodebench"}:
-        config["answer_max_tokens"] = 1024
-        config["history_max_chars"] = 32000
-        config["prompt_max_chars"] = 36000
+        config["answer_max_tokens"] = 512
+        config["history_max_chars"] = 24000
+        config["prompt_max_chars"] = 28000
     elif spec.kind.startswith("tau"):
         config["history_max_chars"] = 16000 if spec.kind != "tau3_bench" else 12000
         config["prompt_max_chars"] = 28000
