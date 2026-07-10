@@ -375,6 +375,10 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
         config["prompt_max_chars"] = 28000
     elif spec.job == "function_bfcl_ast":
         config.update(candidate_router_defaults(mode="auto"))
+    elif spec.kind == "complexfuncbench":
+        config["decision_max_tokens"] = 512
+        config["history_max_chars"] = 24000
+        config["prompt_max_chars"] = 28000
     elif spec.kind in {"longbench", "longcodebench"}:
         config["answer_max_tokens"] = 512
         config["history_max_chars"] = 24000
