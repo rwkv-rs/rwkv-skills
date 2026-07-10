@@ -22,7 +22,7 @@ _DATASETS = {
         "harness_dataset": "princeton-nlp/SWE-bench_Lite",
     },
     "swe_bench_multilingual": {
-        "hf_dataset": None,
+        "hf_dataset": "swe-bench/SWE-bench_Multilingual",
         "harness_dataset": "swe-bench/SWE-bench_Multilingual",
         "source_repo_url": "https://github.com/swe-bench/SWE-bench",
     },
@@ -31,8 +31,8 @@ _DATASETS = {
         "harness_dataset": "princeton-nlp/SWE-bench_Verified",
     },
     "swe_bench_pro": {
-        "hf_dataset": None,
-        "harness_dataset": "scaleapi/SWE-bench_Pro-os",
+        "hf_dataset": "ScaleAI/SWE-bench_Pro",
+        "harness_dataset": "ScaleAI/SWE-bench_Pro",
         "source_repo_url": "https://github.com/scaleapi/SWE-bench_Pro-os",
     },
     "swe_bench_lite_oracle": {

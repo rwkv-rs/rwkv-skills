@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 from src.eval.benchmark_config import resolve_benchmark_model_config
-from src.eval.execution_plan import build_auto_avg_k_execution_plan, build_avg_k_execution_plan
+from src.eval.execution_plan import (
+    build_auto_avg_k_execution_plan,
+    build_avg_k_execution_plan,
+)
 from src.infer.backend import InferenceBackend
 
 if TYPE_CHECKING:
@@ -88,15 +91,22 @@ def _resolve_function_calling_plan(
 
     if config_defaults:
         configured = ()
+        target_samples = _resolve_function_calling_target_samples(dataset_slug, model_name)
         if model_name:
             config = resolve_benchmark_model_config(dataset_slug, model_name, stage=None)
             configured = tuple(config.avg_k or ()) if config is not None else ()
+        if target_samples is not None and dataset_len > target_samples:
+            return build_avg_k_execution_plan(dataset_slug, dataset_len, avg_k=target_samples / dataset_len)
         if configured:
             if len(configured) != 1:
                 rendered = ", ".join(str(item) for item in configured)
                 raise ValueError(f"function-calling runner accepts exactly one configured avg_k value, got: {rendered}")
             return build_avg_k_execution_plan(dataset_slug, dataset_len, avg_k=float(configured[0]))
         return build_avg_k_execution_plan(dataset_slug, dataset_len, avg_k=1.0)
+
+    target_samples = _resolve_function_calling_target_samples(dataset_slug, model_name)
+    if target_samples is not None and dataset_len > target_samples:
+        return build_avg_k_execution_plan(dataset_slug, dataset_len, avg_k=target_samples / dataset_len)
 
     return build_auto_avg_k_execution_plan(dataset_slug, dataset_len)
 
@@ -114,4 +124,17 @@ def _resolve_function_calling_sample_limit(
     if config is None or config.max_samples is None:
         return None
     value = int(config.max_samples)
+    return value if value > 0 else None
+
+
+def _resolve_function_calling_target_samples(
+    dataset_slug: str,
+    model_name: str | None,
+) -> int | None:
+    if not model_name:
+        return None
+    config = resolve_benchmark_model_config(dataset_slug, model_name, stage=None)
+    if config is None or config.target_samples is None:
+        return None
+    value = int(config.target_samples)
     return value if value > 0 else None

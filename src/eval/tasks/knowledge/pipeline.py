@@ -471,7 +471,8 @@ class MultipleChoicePipeline:
 def _multiple_choice_answer_sampling() -> SamplingConfig:
     return SamplingConfig(
         max_generate_tokens=8,
-        temperature=0.0,
+        # Keep top_k=1 deterministic while avoiding vLLM rapid-sampler greedy crashes.
+        temperature=1.0,
         top_k=1,
         top_p=1.0,
         alpha_presence=0.0,

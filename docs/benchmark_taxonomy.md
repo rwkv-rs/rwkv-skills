@@ -13,18 +13,18 @@
 | benchmark | 问题领域 | executor | verifier |
 | --- | --- | --- | --- |
 | terminal_bench_2_1 | 终端环境任务 | shell_sandbox(docker,官方任务镜像) | terminal_bench_official |
-| nl2repo | 自然语言生成完整仓库 | shell_sandbox(subprocess 工作区) | repo_tests_official(任务自带 pytest) |
+| nl2repo | 自然语言生成完整仓库 | shell_sandbox(subprocess 工作区) | nl2repo_official(官方 post_processor + Docker 基础镜像测试) |
 | deepswe | 长程软件工程 | shell_sandbox(docker) | repo_tests_official(任务自带程序化测试) |
-| browsecomp | 浏览器搜索/深度查找 | 专用通道 `function_browsecomp`(封闭卷 + 官方 judge;后续可升级 agent_loop 浏览工具版) | LLM judge |
-| widesearch | 宽搜索/大规模信息收集 | manifest_replay(预录检索输出) | widesearch_official |
-| deepsearchqa | 深度研究/多步搜索 | manifest_replay | llm_rubric_judge |
+| browsecomp | 浏览器搜索/深度查找 | 专用通道 `function_browsecomp`(可启用 agentic web_search + 官方 judge) | LLM judge |
+| widesearch | 宽搜索/大规模信息收集 | web_search(实时检索;可由行覆盖为回放) | widesearch_official |
+| deepsearchqa | 深度研究/多步搜索 | web_search(实时检索;可由行覆盖为回放) | llm_rubric_judge |
 | mcp_atlas | MCP 工具调用 | mcp_worker | mcp_atlas_official(官方 claim-coverage) |
 | toolathlon | 通用工具使用 | mcp_worker | toolathlon_official(官方逐任务 evaluator) |
 | apex_agents | 职业服务工作流 | shell_sandbox | unsupported_official |
 | claweval | 通用真实 agent 工作流 | shell_sandbox | unsupported_official |
 | wildclawbench | 真实运行环境 agent | shell_sandbox | unsupported_official |
 | skillsbench | Agent skill 使用 | shell_sandbox | unsupported_official |
-| hle_with_tools | 工具增强专家问答 | manifest_replay(行内提供工具) | llm_rubric_judge |
+| hle_with_tools | 工具增强专家问答 | web_search(实时检索;HF 源需授权) | llm_rubric_judge |
 | hy_backend_2_0 | 后端工程 agent(内部) | 按行格式自动分类 | expected_tool_calls / llm_rubric_judge |
 | hy_swe_max | 高难软件工程 agent(内部) | 同上 | 同上 |
 | hy_companybench | 企业工作流 agent(内部) | 同上 | 同上 |

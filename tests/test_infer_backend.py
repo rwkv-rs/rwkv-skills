@@ -143,7 +143,7 @@ def test_vllm_tool_call_generation_preserves_native_tool_calls(monkeypatch) -> N
     ]
 
 
-def test_completions_protocol_rejects_native_tool_calls() -> None:
+def test_completions_protocol_still_allows_native_tool_calls(monkeypatch) -> None:
     backend = RemoteInferenceBackend(
         RemoteInferenceConfig(
             base_url="http://127.0.0.1:19082",
@@ -151,15 +151,54 @@ def test_completions_protocol_rejects_native_tool_calls() -> None:
             protocol="completions",
         )
     )
+    calls: list[tuple[str, dict[str, object]]] = []
 
-    with pytest.raises(NotImplementedError, match="native chat tool calls"):
-        backend.generate_tool_calls(
-            [[{"role": "user", "content": "weather?"}]],
-            [[]],
-            sampling=SamplingConfig(),
-            batch_size=1,
-            show_progress=False,
-        )
+    def _fake_post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:  # noqa: ANN001
+        calls.append((url, payload))
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "final_answer", "arguments": "{\"answer\":\"Zurich\"}"},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", _fake_post_json)
+
+    outputs = backend.generate_tool_calls(
+        [[{"role": "user", "content": "answer?"}]],
+        [
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "final_answer",
+                        "parameters": {"type": "object", "properties": {"answer": {"type": "string"}}},
+                    },
+                }
+            ]
+        ],
+        sampling=SamplingConfig(),
+        batch_size=1,
+        prompt_seeds=[123],
+        show_progress=False,
+    )
+
+    assert calls[0][0] == "http://127.0.0.1:19082/v1/chat/completions"
+    assert "seed" not in calls[0][1]
+    assert outputs[0].tool_calls[0].name == "final_answer"
+    assert outputs[0].tool_calls[0].arguments == {"answer": "Zurich"}
 
 
 def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatch) -> None:
@@ -229,3 +268,43 @@ def test_completions_generation_maps_frequency_to_rwkv_repetition_penalty(monkey
 
     assert "frequency_penalty" not in calls[0][1]
     assert calls[0][1]["repetition_penalty"] == 0.2
+
+
+def test_completions_generation_can_use_openai_sampling_compat(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19082/v1",
+            model="demo",
+            protocol="completions",
+        )
+    )
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _fake_post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:  # noqa: ANN001
+        calls.append((url, payload))
+        return {"choices": [{"text": "ok", "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(RemoteInferenceBackend, "_post_json", _fake_post_json)
+
+    backend.generate(
+        ["hello"],
+        sampling=SamplingConfig(
+            max_generate_tokens=3,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=17,
+            alpha_presence=0.0,
+            alpha_frequency=0.0,
+            alpha_decay=0.0,
+        ),
+        batch_size=1,
+        openai_sampling_compat=True,
+        show_progress=False,
+    )
+
+    payload = calls[0][1]
+    assert calls[0][0] == "http://127.0.0.1:19082/v1/completions"
+    assert "presence_penalty" not in payload
+    assert "top_k" not in payload
+    assert "repetition_penalty" not in payload
+    assert "penalty_decay" not in payload

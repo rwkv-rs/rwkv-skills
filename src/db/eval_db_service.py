@@ -84,13 +84,19 @@ def _get_cached_git_sha() -> str:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=str(REPO_ROOT),
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        root_fingerprint = hashlib.sha1(str(REPO_ROOT).encode("utf-8")).hexdigest()[:12]
+        _GIT_SHA_CACHE = f"nogit-{root_fingerprint}"
+        return _GIT_SHA_CACHE
     sha = result.stdout.strip()
     if not sha:
-        raise RuntimeError("git rev-parse HEAD returned empty output")
+        root_fingerprint = hashlib.sha1(str(REPO_ROOT).encode("utf-8")).hexdigest()[:12]
+        _GIT_SHA_CACHE = f"nogit-{root_fingerprint}"
+        return _GIT_SHA_CACHE
     _GIT_SHA_CACHE = sha
     return _GIT_SHA_CACHE
 
@@ -535,11 +541,12 @@ class EvalDbService:
         for row in raw_matches:
             task_id = int(row["task_id"])
             status = str(row.get("status") or "")
-            if self._repo.task_has_score(task_id=task_id):
+            has_score = self._repo.task_has_score(task_id=task_id)
+            if has_score:
                 status = "Completed"
             lookup = TaskLookup(task_id=task_id, status=status)
             matches.append(lookup)
-            if self._is_completed_task_status(status):
+            if has_score:
                 completed_ids.append(task_id)
 
         ctx.matching_tasks = tuple(matches)
@@ -1189,7 +1196,22 @@ class EvalDbService:
         stats = payload.get("stats")
         if isinstance(stats, Mapping):
             context["stats"] = dict(stats)
-        for key in ("agent_result", "agent_info", "agent_trace", "task_id", "domain", "instruction"):
+        for key in (
+            "agent_result",
+            "agent_info",
+            "agent_trace",
+            "agent_details",
+            "events",
+            "format_bridges",
+            "complexfuncbench_official_result",
+            "official_score",
+            "success",
+            "final_answer",
+            "metadata",
+            "task_id",
+            "domain",
+            "instruction",
+        ):
             value = payload.get(key)
             if value is not None:
                 context[key] = EvalDbService._compact_completion_extra(value)

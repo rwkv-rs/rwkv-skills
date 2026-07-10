@@ -22,10 +22,6 @@ from src.eval.tasks.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.tasks.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text, truncate_text
-from src.eval.tasks.function_calling.parallel_candidate_router import (
-    ParallelCandidateRouterConfig,
-    route_parallel_candidate_tool_call,
-)
 from src.eval.tasks.function_calling.native_tool_calls import (
     run_native_tool_call_decision,
 )
@@ -47,6 +43,7 @@ from src.eval.results.schema import make_eval_payload, normalize_sampling_config
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
+    from src.eval.tasks.function_calling.parallel_candidate_router import ParallelCandidateRouterConfig
 
 _MAX_TOOL_DESCRIPTION_CHARS = 700
 _MAX_TOOL_SCHEMA_CHARS = 1200
@@ -55,6 +52,7 @@ _GENERIC_CANDIDATE_ROUTER_POLICY = (
     "Use only the provided tools and include final argument values only."
 )
 _AUTO_CANDIDATE_ROUTER_MIN_TOOLS = 16
+_TOOL_CALL_IO_CHOICES = frozenset({"native", "rwkv-json"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,7 +366,8 @@ def _run_simple_tool_call(
     history_max_chars = max(0, int(args.history_max_chars or DEFAULT_HISTORY_MAX_CHARS))
     batch_size = max(1, int(args.batch_size or 16))
     candidate_router_mode = _simple_candidate_router_mode(args)
-    if not callable(getattr(run.engine, "generate_tool_calls", None)):
+    tool_call_io = _simple_tool_call_io(args)
+    if tool_call_io == "native" and not callable(getattr(run.engine, "generate_tool_calls", None)):
         raise NotImplementedError("simple tool-call evaluation requires an inference backend with generate_tool_calls")
     candidate_router_config = (
         _simple_candidate_router_config_from_args(args) if candidate_router_mode == "parallel" else None
@@ -379,16 +378,27 @@ def _run_simple_tool_call(
         repeated = repeat_probe_entries(selected_entries, batch_size=batch_size)
         probe_count = 0
         for index, record in repeated:
-            run_native_tool_call_decision(
-                engine=run.engine,
-                messages=build_simple_tool_call_messages(record),
-                tools=record.tools,
-                sampling=tool_sampling,
-                progress_desc="ToolCall-Native-Probe",
-                prompt_seed=sample_repeat_seed(index, 0, stage=1),
-                parallel_tool_calls=True,
-                context_label="tool-call selection",
-            )
+            prompt_seed = sample_repeat_seed(index, 0, stage=1)
+            if tool_call_io == "rwkv-json":
+                _run_json_prompt_simple_tool_call(
+                    run,
+                    record,
+                    tool_sampling=tool_sampling,
+                    history_max_chars=history_max_chars,
+                    prompt_seed=prompt_seed,
+                    progress_desc="ToolCall-JSON-Probe",
+                )
+            else:
+                run_native_tool_call_decision(
+                    engine=run.engine,
+                    messages=build_simple_tool_call_messages(record),
+                    tools=record.tools,
+                    sampling=tool_sampling,
+                    progress_desc="ToolCall-Native-Probe",
+                    prompt_seed=prompt_seed,
+                    parallel_tool_calls=True,
+                    context_label="tool-call selection",
+                )
             probe_count += 1
         print(f"probe-only run completed: {probe_count} prompt(s)")
         return 0
@@ -447,22 +457,39 @@ def _run_simple_tool_call(
                             progress_desc=f"ToolCall-CandidateRouter sample {key.sample_index}",
                         )
                     elif record.tools:
-                        decision = run_native_tool_call_decision(
-                            engine=run.engine,
-                            messages=build_simple_tool_call_messages(record),
-                            tools=record.tools,
-                            sampling=tool_sampling,
-                            progress_desc=f"ToolCall-Native sample {key.sample_index}",
-                            prompt_seed=prompt_seed,
-                            parallel_tool_calls=True,
-                            context_label="tool-call selection",
-                        )
-                        prompt = decision.prompt
-                        completion = decision.completion
-                        finish_reason = decision.finish_reason
-                        decoded_calls = decision.decoded_calls
-                        parse_error = decision.parse_error
-                        trace_entry = decision.trace
+                        if tool_call_io == "rwkv-json":
+                            (
+                                prompt,
+                                completion,
+                                finish_reason,
+                                decoded_calls,
+                                parse_error,
+                                trace_entry,
+                            ) = _run_json_prompt_simple_tool_call(
+                                run,
+                                record,
+                                tool_sampling=tool_sampling,
+                                history_max_chars=history_max_chars,
+                                prompt_seed=prompt_seed,
+                                progress_desc=f"ToolCall-JSON sample {key.sample_index}",
+                            )
+                        else:
+                            decision = run_native_tool_call_decision(
+                                engine=run.engine,
+                                messages=build_simple_tool_call_messages(record),
+                                tools=record.tools,
+                                sampling=tool_sampling,
+                                progress_desc=f"ToolCall-Native sample {key.sample_index}",
+                                prompt_seed=prompt_seed,
+                                parallel_tool_calls=True,
+                                context_label="tool-call selection",
+                            )
+                            prompt = decision.prompt
+                            completion = decision.completion
+                            finish_reason = decision.finish_reason
+                            decoded_calls = decision.decoded_calls
+                            parse_error = decision.parse_error
+                            trace_entry = decision.trace
                     else:
                         messages = build_simple_tool_call_messages(record)
                         prompt = json.dumps(
@@ -564,12 +591,59 @@ def _simple_candidate_router_mode(args: argparse.Namespace) -> str:
     return str(getattr(args, "candidate_router_mode", "off") or "off").strip().lower()
 
 
+def _simple_tool_call_io(args: argparse.Namespace) -> str:
+    value = str(getattr(args, "tool_call_io", "native") or "native").strip().lower()
+    if value not in _TOOL_CALL_IO_CHOICES:
+        raise ValueError(f"unsupported tool_call_io={value!r}; expected native or rwkv-json")
+    return value
+
+
+def _run_json_prompt_simple_tool_call(
+    run: ResolvedFunctionCallingRun,
+    record: SimpleToolCallRecord,
+    *,
+    tool_sampling: Any,
+    history_max_chars: int,
+    prompt_seed: int,
+    progress_desc: str,
+) -> tuple[str, str, str, list[dict[str, Any]], str | None, dict[str, Any]]:
+    prompt = build_simple_tool_call_prompt(record, history_max_chars=history_max_chars, prefill_object=True)
+    output = run.engine.generate(
+        [prompt],
+        sampling=tool_sampling,
+        batch_size=1,
+        progress_desc=progress_desc,
+        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+        prompt_seeds=[prompt_seed],
+    )[0]
+    completion = output.text
+    decoded_calls: list[dict[str, Any]] = []
+    parse_error: str | None = None
+    try:
+        decoded_calls = decode_simple_tool_call_response(completion)
+    except Exception as exc:  # noqa: BLE001 - parse errors are sample-level failures
+        parse_error = str(exc)
+    trace_entry = {
+        "tool_call_io": "rwkv-json",
+        "request": {
+            "prompt": prompt,
+            "tool_names": [str(tool.get("name") or "") for tool in record.tools],
+        },
+        "completion": completion,
+        "response_source": "content",
+        "decoded_calls": decoded_calls,
+        "parse_error": parse_error or "",
+    }
+    return prompt, completion, str(output.finish_reason or "stop"), decoded_calls, parse_error, trace_entry
+
+
 def _candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig:
-    defaults = ParallelCandidateRouterConfig()
+    router_config_type, _route = _parallel_candidate_router_api()
+    defaults = router_config_type()
     schema_mode = str(
         getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode
     )
-    return ParallelCandidateRouterConfig(
+    return router_config_type(
         chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
         batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
         context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
@@ -636,6 +710,7 @@ def _run_candidate_routed_simple_tool_call(
     progress_desc: str,
 ) -> tuple[str, str, str, list[dict[str, Any]], str | None, dict[str, Any]]:
     del args
+    _router_config_type, route_parallel_candidate_tool_call = _parallel_candidate_router_api()
     messages = [{"role": "user", "content": normalize_rwkv_text(record.instruction)}]
     route = route_parallel_candidate_tool_call(
         tools=record.tools,
@@ -669,6 +744,15 @@ def _run_candidate_routed_simple_tool_call(
         "candidate_router": route.trace_payload(include_prompts=True),
     }
     return route.aggregate_prompt, completion, finish_reason, decoded_calls, parse_error, trace_entry
+
+
+def _parallel_candidate_router_api():
+    from src.eval.tasks.function_calling.parallel_candidate_router import (
+        ParallelCandidateRouterConfig,
+        route_parallel_candidate_tool_call,
+    )
+
+    return ParallelCandidateRouterConfig, route_parallel_candidate_tool_call
 
 
 def _candidate_router_facts_text(record: SimpleToolCallRecord) -> str | None:

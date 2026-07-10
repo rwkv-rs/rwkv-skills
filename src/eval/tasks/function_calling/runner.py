@@ -71,7 +71,11 @@ if TYPE_CHECKING:
 
 
 _SAMPLE_WORKER_ENABLED_KINDS = frozenset(
-    {FunctionCallingBenchmarkKind.BFCL_V3, FunctionCallingBenchmarkKind.BROWSECOMP_PLUS}
+    {
+        FunctionCallingBenchmarkKind.AGENT_LOOP,
+        FunctionCallingBenchmarkKind.BFCL_V3,
+        FunctionCallingBenchmarkKind.BROWSECOMP_PLUS,
+    }
 )
 _PARALLEL_CANDIDATE_ROUTER_DEFAULTS = ParallelCandidateRouterConfig()
 
@@ -82,7 +86,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--task-desc", help="Task description stored in the local evaluation DB")
     parser.add_argument(
         "--run-mode",
-        choices=("auto", "new", "resume", "rerun"),
+        choices=("auto", "new", "resume", "rerun", "fresh"),
         help="Task persistence mode; mirrors RWKV_EVAL_RUN_MODE without requiring shell env injection",
     )
     parser.add_argument(
@@ -157,6 +161,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=FUNCTION_TOOL_CATALOG_FORMAT_CHOICES,
         default=DEFAULT_TOOL_CATALOG_FORMAT,
         help="Function-calling tool catalog serialization format",
+    )
+    parser.add_argument(
+        "--tool-call-io",
+        choices=("native", "rwkv-json"),
+        default=os.environ.get("RWKV_TOOL_CALL_IO", "native"),
+        help=(
+            "Tool-call decision transport for simple tool-call benchmarks. "
+            "native uses OpenAI chat tools/tool_calls; rwkv-json prompts the model to continue a JSON call "
+            "and parses it locally."
+        ),
     )
     parser.add_argument(
         "--history-max-chars",
@@ -240,7 +254,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate-router-mode",
         choices=("off", "auto", "parallel"),
-        default="off",
+        default=None,
         help=(
             "Candidate-layer router mode; auto is used by generic agent tool-call benchmarks for long contexts, "
             "parallel always splits the tool table into shards before aggregation"

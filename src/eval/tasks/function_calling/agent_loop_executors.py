@@ -8,13 +8,19 @@ returns a JSON-serializable outcome that is fed back to the model as
 ``User: Function output:\\n<json>``.
 """
 
+import fcntl
+import gzip
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +30,16 @@ from src.eval.tasks.function_calling.context_budget import truncate_text
 
 DEFAULT_COMMAND_TIMEOUT_S = 60.0
 DEFAULT_MAX_OUTPUT_CHARS = 8000
+_PROXY_ENV_NAMES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+)
 
 WEB_SEARCH_API_URL_ENV = "RWKV_WEB_SEARCH_API_URL"
 WEB_SEARCH_API_KEY_ENV = "RWKV_WEB_SEARCH_API_KEY"
@@ -49,6 +65,44 @@ _WEB_SEARCH_TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
 )
+
+
+def _decode_http_body(body: bytes, headers: Any) -> str:
+    encoding = str(headers.get("Content-Encoding") or "").lower()
+    if "gzip" in encoding:
+        body = gzip.decompress(body)
+    elif "deflate" in encoding:
+        try:
+            body = zlib.decompress(body)
+        except zlib.error:
+            body = zlib.decompress(body, -zlib.MAX_WBITS)
+    charset_getter = getattr(headers, "get_content_charset", None)
+    charset = charset_getter() if callable(charset_getter) else None
+    return body.decode(charset or "utf-8", errors="replace")
+
+
+def _docker_proxy_env_args() -> list[str]:
+    args: list[str] = []
+    for name in _PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if value:
+            args.extend(["-e", f"{name}={value}"])
+    return args
+
+
+def _docker_proxy_build_args() -> list[str]:
+    args: list[str] = []
+    for name in _PROXY_ENV_NAMES:
+        value = os.environ.get(name)
+        if value:
+            args.extend(["--build-arg", f"{name}={value}"])
+    return args
+
+
+def _safe_docker_token(value: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
+    safe = "-".join(part for part in safe.split("-") if part)
+    return safe or "agent-loop"
 
 _SHELL_TOOLS: tuple[dict[str, Any], ...] = (
     {
@@ -215,6 +269,10 @@ class ShellSandboxExecutor:
         *,
         backend: str = "subprocess",
         image: str | None = None,
+        dockerfile_context: str | None = None,
+        dockerfile_path: str | None = None,
+        docker_compose_file: str | None = None,
+        docker_copy_paths: Sequence[Mapping[str, str]] = (),
         workspace_archive: str | None = None,
         setup_commands: Sequence[str] = (),
         command_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
@@ -226,6 +284,10 @@ class ShellSandboxExecutor:
             raise ValueError(f"unsupported shell sandbox backend: {backend!r}")
         self._backend = backend
         self._image = image
+        self._dockerfile_context = dockerfile_context
+        self._dockerfile_path = dockerfile_path
+        self._docker_compose_file = docker_compose_file
+        self._docker_copy_paths = tuple(dict(item) for item in docker_copy_paths)
         self._workspace_archive = workspace_archive
         self._setup_commands = tuple(setup_commands)
         self._timeout_s = float(command_timeout_s)
@@ -234,6 +296,9 @@ class ShellSandboxExecutor:
         self._container_workdir = container_workdir
         self._workspace: Path | None = None
         self._container_id: str | None = None
+        self._compose_project: str | None = None
+        self._compose_env: dict[str, str] | None = None
+        self._compose_logs_root: Path | None = None
         self._calls: list[dict[str, Any]] = []
 
     def open(self) -> tuple[dict[str, Any], ...]:
@@ -248,18 +313,199 @@ class ShellSandboxExecutor:
             if not self._image:
                 raise ValueError("docker shell sandbox requires an image")
             name = f"agent-loop-{uuid.uuid4().hex[:12]}"
-            subprocess.run(
-                ["docker", "run", "-d", "--rm", "--name", name, self._image, "sleep", "infinity"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            if self._docker_compose_file:
+                self._start_docker_compose(name)
+            else:
+                if self._dockerfile_context:
+                    self._ensure_docker_image()
+                subprocess.run(
+                    [
+                        "docker",
+                        "run",
+                        "-d",
+                        "--rm",
+                        "--name",
+                        name,
+                        *_docker_proxy_env_args(),
+                        self._image,
+                        "sleep",
+                        "infinity",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self._container_id = name
             self._container_id = name
+            for item in self._docker_copy_paths:
+                self._copy_path_to_container(str(item.get("src") or ""), str(item.get("dst") or ""))
         for command in self._setup_commands:
             outcome = self._run_command(command)
             if not outcome.ok:
                 raise RuntimeError(f"shell sandbox setup command failed: {command}: {outcome.error}")
         return _SHELL_TOOLS
+
+    def _copy_path_to_container(self, src: str, dst: str) -> None:
+        if not src or not dst:
+            raise ValueError("docker_copy_paths entries require src and dst")
+        source = Path(src).expanduser()
+        if not source.exists():
+            raise ValueError(f"docker_copy_paths source does not exist: {source}")
+        assert self._container_id is not None
+        proc = subprocess.run(
+            ["docker", "cp", str(source), f"{self._container_id}:{dst}"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if proc.returncode != 0:
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            raise RuntimeError(f"docker cp failed for {source} -> {dst}: {output[-2000:]}")
+
+    def _ensure_docker_image(self) -> None:
+        assert self._image is not None
+        context = Path(str(self._dockerfile_context)).expanduser()
+        dockerfile = Path(str(self._dockerfile_path)).expanduser() if self._dockerfile_path else context / "Dockerfile"
+        if not dockerfile.is_file():
+            raise ValueError(f"dockerfile_context missing Dockerfile: {dockerfile}")
+        lock_path = self._docker_lock_path(self._image)
+        with lock_path.open("w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._ensure_docker_image_unlocked(context, dockerfile)
+
+    def _ensure_docker_image_unlocked(self, context: Path, dockerfile: Path) -> None:
+        assert self._image is not None
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", self._image],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if inspect.returncode == 0:
+            return
+        self._run_with_retries(
+            ["docker", "build", "-f", str(dockerfile), "-t", self._image, *_docker_proxy_build_args(), str(context)],
+            timeout=max(300.0, self._timeout_s),
+            action=f"docker build for {self._image} from {context}",
+        )
+
+    def _start_docker_compose(self, container_name: str) -> None:
+        assert self._image is not None
+        compose_file = Path(str(self._docker_compose_file)).expanduser()
+        if not compose_file.is_file():
+            raise ValueError(f"docker compose file not found: {compose_file}")
+        logs_root = Path(tempfile.mkdtemp(prefix="agent-loop-tbench-"))
+        sessions_logs = logs_root / "sessions"
+        agent_logs = logs_root / "agent"
+        sessions_logs.mkdir(parents=True, exist_ok=True)
+        agent_logs.mkdir(parents=True, exist_ok=True)
+
+        prefix = _safe_docker_token(self._image)
+        env = dict(os.environ)
+        env.update(
+            {
+                "T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME": self._image,
+                "T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME": container_name,
+                "T_BENCH_TASK_DOCKER_NAME_PREFIX": prefix,
+                "T_BENCH_CONTAINER_LOGS_PATH": "/logs",
+                "T_BENCH_CONTAINER_AGENT_LOGS_PATH": "/agent-logs",
+                "T_BENCH_TEST_DIR": "/tests",
+                "T_BENCH_TASK_LOGS_PATH": str(sessions_logs),
+                "T_BENCH_TASK_AGENT_LOGS_PATH": str(agent_logs),
+            }
+        )
+        self._compose_project = container_name
+        self._compose_env = env
+        self._compose_logs_root = logs_root
+
+        base = ["docker", "compose", "-p", container_name, "-f", str(compose_file)]
+        lock_path = self._docker_lock_path(f"{self._image}\0{compose_file.resolve()}")
+        with lock_path.open("w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            self._run_with_retries(
+                [*base, "build"],
+                timeout=max(1800.0, self._timeout_s),
+                action=f"docker compose build for {compose_file}",
+                env=env,
+            )
+        self._run_checked(
+            [*base, "up", "-d", "--no-build"],
+            timeout=max(300.0, self._timeout_s),
+            action=f"docker compose up for {compose_file}",
+            env=env,
+        )
+        self._run_checked(
+            ["docker", "container", "inspect", container_name],
+            timeout=60.0,
+            action=f"docker inspect client container {container_name}",
+            env=env,
+        )
+
+    def _docker_lock_path(self, key: str) -> Path:
+        lock_dir = (
+            Path(os.environ.get("RWKV_AGENT_LOOP_DOCKER_LOCK_DIR") or tempfile.gettempdir())
+            / "rwkv-agent-loop-docker-locks"
+        )
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_hash = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
+        return lock_dir / f"{lock_hash}.lock"
+
+    def _run_with_retries(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        action: str,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        attempts = _positive_env_int("RWKV_AGENT_LOOP_DOCKER_BUILD_RETRIES", 3)
+        last_output = ""
+        for attempt in range(1, attempts + 1):
+            proc = subprocess.run(
+                list(argv),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+                env=dict(env) if env is not None else None,
+            )
+            if proc.returncode == 0:
+                return proc
+            last_output = (proc.stdout + "\n" + proc.stderr).strip()
+            if attempt < attempts:
+                time.sleep(min(30.0, 5.0 * attempt))
+        raise RuntimeError(f"{action} failed after {attempts} attempt(s): {last_output[-4000:]}")
+
+    def _run_checked(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float,
+        action: str,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        proc = subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=dict(env) if env is not None else None,
+        )
+        if proc.returncode != 0:
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            raise RuntimeError(f"{action} failed: {output[-4000:]}")
+        return proc
 
     def execute(self, name: str, arguments: Mapping[str, Any]) -> AgentLoopStepOutcome:
         self._calls.append({"name": name, "arguments": dict(arguments)})
@@ -311,6 +557,8 @@ class ShellSandboxExecutor:
                 input=stdin,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._timeout_s,
             )
         except subprocess.TimeoutExpired:
@@ -334,9 +582,50 @@ class ShellSandboxExecutor:
         }
 
     def close(self) -> None:
-        if self._container_id is not None:
-            subprocess.run(["docker", "rm", "-f", self._container_id], capture_output=True, text=True, check=False)
+        if self._compose_project and self._docker_compose_file:
+            compose_file = Path(str(self._docker_compose_file)).expanduser()
+            subprocess.run(
+                [
+                    "docker",
+                    "compose",
+                    "-p",
+                    self._compose_project,
+                    "-f",
+                    str(compose_file),
+                    "down",
+                    "--volumes",
+                    "--remove-orphans",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=dict(self._compose_env) if self._compose_env is not None else None,
+                check=False,
+            )
+            self._compose_project = None
             self._container_id = None
+            if self._compose_logs_root is not None:
+                shutil.rmtree(self._compose_logs_root, ignore_errors=True)
+                self._compose_logs_root = None
+            return None
+        if self._container_id is not None:
+            subprocess.run(
+                ["docker", "rm", "-f", self._container_id],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self._container_id = None
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return max(1, int(default))
 
 
 class WebSearchExecutor:
@@ -359,6 +648,43 @@ class WebSearchExecutor:
                 f"web_search executor requires {WEB_SEARCH_API_URL_ENV} and {WEB_SEARCH_API_KEY_ENV} in .env"
             )
         return None
+
+    @staticmethod
+    def health_error(*, timeout_s: float = 5.0) -> str | None:
+        error = WebSearchExecutor.config_error()
+        if error:
+            return error
+        url = os.environ[WEB_SEARCH_API_URL_ENV]
+        health_url = WebSearchExecutor._health_url(url)
+        if health_url:
+            try:
+                with urllib.request.urlopen(health_url, timeout=max(1.0, float(timeout_s))) as response:
+                    response.read(1)
+                    return None
+            except Exception:
+                pass
+        request = urllib.request.Request(
+            url,
+            data=json.dumps({"q": "rwkv skills web search preflight"}).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                os.environ.get(WEB_SEARCH_API_KEY_HEADER_ENV) or "X-API-KEY": os.environ[WEB_SEARCH_API_KEY_ENV],
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=max(1.0, float(timeout_s))) as response:
+                response.read(1)
+        except Exception as exc:  # noqa: BLE001 - convert network failures into preflight errors.
+            return f"web_search executor cannot reach {WEB_SEARCH_API_URL_ENV}={url!r}: {type(exc).__name__}: {exc}"
+        return None
+
+    @staticmethod
+    def _health_url(search_url: str) -> str | None:
+        parsed = urllib.parse.urlparse(search_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "/health", "", "", ""))
 
     def open(self) -> tuple[dict[str, Any], ...]:
         error = self.config_error()
@@ -394,12 +720,19 @@ class WebSearchExecutor:
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-            return truncate_text(response.read().decode("utf-8", errors="replace"), self._max_output_chars)
+            return truncate_text(_decode_http_body(response.read(), response.headers), self._max_output_chars)
 
     def _fetch(self, url: str) -> str:
-        request = urllib.request.Request(url, headers={"User-Agent": "rwkv-skills-agent-loop/1.0"})
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,text/plain,application/json,*/*;q=0.8",
+                "Accept-Encoding": "identity, gzip, deflate",
+                "User-Agent": "rwkv-skills-agent-loop/1.0",
+            },
+        )
         with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-            return truncate_text(response.read().decode("utf-8", errors="replace"), self._max_output_chars)
+            return truncate_text(_decode_http_body(response.read(), response.headers), self._max_output_chars)
 
     def snapshot(self) -> dict[str, Any]:
         return {"calls": list(self._calls)}

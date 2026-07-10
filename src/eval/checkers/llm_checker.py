@@ -180,7 +180,7 @@ class LLMCheckerConfig:
     api_key: str
     model: str
     base_url: str | None = None
-    temperature: float = 0.0
+    temperature: float = 1e-5
     max_workers: int = 16
     max_prompt_chars: int = 20000
     # Set to -1 to retry forever (handled by the scheduler loop with backoff).

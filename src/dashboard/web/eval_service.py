@@ -12,6 +12,7 @@ from typing import Any
 
 from ..core.constants import EVAL_PAGE_SIZE
 from ..core.vocab import token_id_to_display
+from .context_display import clean_context_for_display, clean_legacy_role_message_labels
 from .store import DashboardStore
 
 
@@ -93,6 +94,10 @@ def load_eval_records(
     )
     has_more = len(records) > limit
     page = records[:limit]
+    for record in page:
+        preview = record.get("context_preview")
+        if isinstance(preview, str):
+            record["context_preview"] = clean_legacy_role_message_labels(preview)
     return {
         "task_id": task_id,
         "records": page,
@@ -153,6 +158,7 @@ def load_eval_context(
             event["raw_text"] = json.dumps(context_obj, ensure_ascii=False, indent=2)
         except Exception:  # noqa: BLE001
             pass
+    context_obj = clean_context_for_display(context_obj)
 
     sampling_config = context_obj.get("sampling_config")
     if not isinstance(sampling_config, dict) or not sampling_config:
@@ -172,6 +178,10 @@ def load_eval_context(
         event["view"] = "structured"
         event["context"] = context_obj
         event["stop_tokens"] = _build_stop_tokens_mapping(sampling_config)
+        try:
+            event["raw_text"] = json.dumps(context_obj, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
     return event
 
 

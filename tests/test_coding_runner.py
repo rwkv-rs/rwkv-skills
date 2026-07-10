@@ -62,6 +62,8 @@ def test_coding_runner_parser_accepts_swebench_options() -> None:
             "princeton-nlp/SWE-bench_Lite",
             "--swebench-max-context-chars",
             "12000",
+            "--swebench-max-prompt-chars",
+            "18000",
             "--swebench-harness-timeout-s",
             "3600",
             "--long-doc-mode",
@@ -75,6 +77,7 @@ def test_coding_runner_parser_accepts_swebench_options() -> None:
     assert args.swebench_run_harness is True
     assert args.swebench_dataset_name == "princeton-nlp/SWE-bench_Lite"
     assert args.swebench_max_context_chars == 12000
+    assert args.swebench_max_prompt_chars == 18000
     assert args.swebench_harness_timeout_s == 3600
     assert args.long_doc_mode == "lexical"
     assert args.long_doc_max_evidence_chars == 3000

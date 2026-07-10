@@ -35,7 +35,7 @@ Assistant: ```json
   "system_extra": "",
   "tools": [{"name": "...", "description": "...", "parameters": {...}}],
   "executor": {"kind": "manifest_replay|shell_sandbox|mcp_worker", "config": {...}},
-  "verifier": {"kind": "expected_tool_calls|llm_rubric_judge|terminal_bench_official|widesearch_official|mcp_atlas_official|toolathlon_official|unsupported_official", "config": {...}},
+  "verifier": {"kind": "expected_tool_calls|llm_rubric_judge|terminal_bench_official|nl2repo_official|widesearch_official|mcp_atlas_official|toolathlon_official|unsupported_official", "config": {...}},
   "expected_tool_calls": [{"name": "...", "arguments": {...}, "argument_options": {...}}],
   "recorded_tool_outputs": [{"name": "...", "arguments": {...}, "output": ..., "error": ""}],
   "metadata": {"source_benchmark": "...", "official_task_id": "...", "docker_image": "...", "rubrics": [...]}
@@ -61,13 +61,13 @@ Assistant: ```json
 | benchmark | executor | verifier | 需要的 env / 资产 |
 | --- | --- | --- | --- |
 | terminal_bench_2_1 | shell_sandbox(docker, 官方任务镜像) | terminal_bench_official(容器内跑官方任务测试) | `RWKV_TERMINAL_BENCH_ROOT`=terminal-bench-2-1 checkout;docker;行 metadata.official_task_id + docker_image |
-| widesearch | manifest_replay(预录检索输出) | widesearch_official(subprocess 官方 eval 阶段) | `RWKV_WIDESEARCH_OFFICIAL_ROOT`;可选 `RWKV_WIDESEARCH_EVAL_COMMAND` |
+| widesearch | web_search 或 manifest_replay | widesearch_official(官方数据/gold + 官方 evaluation 逻辑) | `RWKV_WIDESEARCH_OFFICIAL_ROOT`;默认读取 `data/widesearch_official` 或 `RWKV_WIDESEARCH_DATA_ROOT`;可选 `RWKV_WIDESEARCH_EVAL_COMMAND` |
 | mcp_atlas | mcp_worker | mcp_atlas_official(官方 score_claims.py claim-coverage) | `RWKV_MCP_ATLAS_ROOT`;`JUDGE_MODEL/JUDGE_API_KEY[/JUDGE_BASE_URL]`;executor.config.runtime_root |
 | toolathlon | mcp_worker | toolathlon_official(官方逐任务 evaluator) | `RWKV_TOOLATHLON_ROOT`;docker/podman;行 verifier.config.evaluator_command |
-| deepsearchqa | manifest_replay | llm_rubric_judge | `JUDGE_MODEL/JUDGE_API_KEY` |
-| hle_with_tools | manifest_replay(行内提供工具) | llm_rubric_judge | HF `cais/hle`;`JUDGE_MODEL/JUDGE_API_KEY` |
+| deepsearchqa | web_search 或 manifest_replay | llm_rubric_judge | `RWKV_WEB_SEARCH_API_URL` / `RWKV_WEB_SEARCH_API_KEY`;`JUDGE_MODEL/JUDGE_API_KEY` |
+| hle_with_tools | web_search 或 manifest_replay | llm_rubric_judge | HF `cais/hle` 授权;`RWKV_WEB_SEARCH_API_URL` / `RWKV_WEB_SEARCH_API_KEY`;`JUDGE_MODEL/JUDGE_API_KEY` |
 | deepswe | shell_sandbox(docker) | repo_tests_official(行内 test_command,官方程序化 verifier) | docker;行 verifier.config.test_command |
-| nl2repo | shell_sandbox(subprocess 工作区) | repo_tests_official(pytest 等) | 行 verifier.config.test_command |
+| nl2repo | shell_sandbox(subprocess 工作区) | nl2repo_official(官方 post_processor + Docker 基础镜像测试) | `RWKV_NL2REPO_ROOT`=NL2RepoBench checkout;docker |
 | claweval / wildclawbench / skillsbench / apex_agents | shell_sandbox | unsupported_official(v1 preflight 报错并给出 clone/配置指引) | 待接入官方 harness |
 | 内部 hy_* / e_bench / prodbench / hy_euler_pro | 按行格式自动分类 | expected_tool_calls 或 llm_rubric_judge | 本地源 |
 
@@ -89,3 +89,7 @@ python -m src.eval.tasks.function_calling.runner \
 ```
 
 调度侧 job 名为 `function_agent_loop`,数据集矩阵由 `benchmark_registry.py` 自动派生。
+
+长上下文路由: `function_agent_loop` 默认使用 `--candidate-router-mode auto`。当工具表过大、原始对话/metadata 上下文超过
+candidate-router budget,或 long-doc compaction 实际压缩了消息时,该轮会走 `parallel_candidate`;显式传
+`--candidate-router-mode off` 可关闭。

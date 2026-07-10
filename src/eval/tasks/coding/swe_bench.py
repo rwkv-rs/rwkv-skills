@@ -18,6 +18,8 @@ from src.eval.results.schema import build_context_from_completions, strict_nonne
 
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _FENCED_BLOCK_RE = re.compile(r"```(?:diff|patch)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+_SWE_BENCH_ASSISTANT_PREFILL = "Assistant: <think>\n</think>\n```diff\n"
+_SWE_BENCH_TRUNCATION_MARKER = "\n[...truncated...]\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,7 @@ def build_swebench_prompt(
     record: CodeGenerationRecord,
     *,
     max_context_chars: int | None = None,
+    max_prompt_chars: int | None = None,
     long_doc_config: LongDocEvidenceConfig | None = None,
     engine: Any | None = None,
     sampling: Any | None = None,
@@ -41,6 +44,7 @@ def build_swebench_prompt(
     prompt, _trace = build_swebench_prompt_with_trace(
         record,
         max_context_chars=max_context_chars,
+        max_prompt_chars=max_prompt_chars,
         long_doc_config=long_doc_config,
         engine=engine,
         sampling=sampling,
@@ -54,6 +58,7 @@ def build_swebench_prompt_with_trace(
     record: CodeGenerationRecord,
     *,
     max_context_chars: int | None = None,
+    max_prompt_chars: int | None = None,
     long_doc_config: LongDocEvidenceConfig | None = None,
     engine: Any | None = None,
     sampling: Any | None = None,
@@ -64,15 +69,18 @@ def build_swebench_prompt_with_trace(
     if str(prompt_profile or "normal").strip().lower() == "naive":
         clean_prompt = str(record.prompt or "").strip()
         trace = _empty_long_doc_trace("", None)
-        prompt = f"User: {clean_prompt}\n\nAssistant: <think>\n</think>\n```diff\n"
+        prompt = f"User: {clean_prompt}\n\n{_SWE_BENCH_ASSISTANT_PREFILL}"
+        prompt = _truncate_prompt_preserving_prefill(prompt, max_prompt_chars)
         trace["prompt_profile"] = "naive"
         trace["prompt_chars"] = len(prompt)
+        trace["max_prompt_chars"] = int(max_prompt_chars or 0)
         return prompt, trace
 
     repo = str(metadata.get("repo") or "")
     base_commit = str(metadata.get("base_commit") or "")
     instance_id = str(metadata.get("instance_id") or record.task_id)
     hints_text = str(metadata.get("hints_text") or "").strip()
+    issue_text = record.prompt.strip()
     raw_retrieved_context = str(metadata.get("retrieved_context") or "").strip()
     retrieved_context = raw_retrieved_context
     trace = _empty_long_doc_trace(raw_retrieved_context, long_doc_config)
@@ -104,6 +112,52 @@ def build_swebench_prompt_with_trace(
         trace["rendered_context_chars"] = len(retrieved_context)
         trace["trimmed_context_chars"] = int(trace.get("trimmed_context_chars", 0)) + before_trim - len(retrieved_context)
 
+    prompt = _render_swebench_prompt(
+        instance_id=instance_id,
+        repo=repo,
+        base_commit=base_commit,
+        issue_text=issue_text,
+        hints_text=hints_text,
+        retrieved_context=retrieved_context,
+    )
+    if max_prompt_chars is not None and max_prompt_chars > 0 and len(prompt) > max_prompt_chars:
+        before_trim = len(prompt)
+        if retrieved_context:
+            overhead = len(prompt) - len(retrieved_context)
+            context_budget = max(0, int(max_prompt_chars) - overhead)
+            if context_budget < len(retrieved_context):
+                before_context_trim = len(retrieved_context)
+                retrieved_context = _truncate_middle(retrieved_context, context_budget).rstrip()
+                trace["rendered_context_chars"] = len(retrieved_context)
+                trace["trimmed_context_chars"] = int(trace.get("trimmed_context_chars", 0)) + (
+                    before_context_trim - len(retrieved_context)
+                )
+                prompt = _render_swebench_prompt(
+                    instance_id=instance_id,
+                    repo=repo,
+                    base_commit=base_commit,
+                    issue_text=issue_text,
+                    hints_text=hints_text,
+                    retrieved_context=retrieved_context,
+                )
+        if len(prompt) > max_prompt_chars:
+            prompt = _truncate_prompt_preserving_prefill(prompt, max_prompt_chars)
+        trace["prompt_trimmed_chars"] = max(0, before_trim - len(prompt))
+
+    trace["max_prompt_chars"] = int(max_prompt_chars or 0)
+    trace["prompt_chars"] = len(prompt)
+    return prompt, trace
+
+
+def _render_swebench_prompt(
+    *,
+    instance_id: str,
+    repo: str,
+    base_commit: str,
+    issue_text: str,
+    hints_text: str,
+    retrieved_context: str,
+) -> str:
     lines = [
         "User: You are resolving a real GitHub issue from SWE-bench.",
         "Return only a unified git diff patch. Do not include prose, commands, or markdown outside the patch.",
@@ -115,14 +169,37 @@ def build_swebench_prompt_with_trace(
         lines.append(f"Repository: {repo}")
     if base_commit:
         lines.append(f"Base commit: {base_commit}")
-    lines.extend(["", "Issue:", record.prompt.strip()])
+    lines.extend(["", "Issue:", issue_text])
     if hints_text:
         lines.extend(["", "Hints:", hints_text])
     if retrieved_context:
         lines.extend(["", "Retrieved repository context:", retrieved_context])
-    lines.extend(["", "Assistant: <think>\n</think>\n```diff\n"])
-    trace["prompt_chars"] = len("\n".join(lines))
-    return "\n".join(lines), trace
+    lines.extend(["", _SWE_BENCH_ASSISTANT_PREFILL])
+    return "\n".join(lines)
+
+
+def _truncate_middle(text: str, max_chars: int | None) -> str:
+    if max_chars is None or max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = _SWE_BENCH_TRUNCATION_MARKER
+    if max_chars <= len(marker) + 16:
+        return text[:max_chars].rstrip()
+    head_chars = max(1, (max_chars - len(marker)) // 2)
+    tail_chars = max(1, max_chars - len(marker) - head_chars)
+    return f"{text[:head_chars].rstrip()}{marker}{text[-tail_chars:].lstrip()}"
+
+
+def _truncate_prompt_preserving_prefill(prompt: str, max_chars: int | None) -> str:
+    if max_chars is None or max_chars <= 0 or len(prompt) <= max_chars:
+        return prompt
+    prefill = _SWE_BENCH_ASSISTANT_PREFILL
+    if not prompt.endswith(prefill) or max_chars <= len(prefill) + 64:
+        return _truncate_middle(prompt, max_chars)
+    body = prompt[: -len(prefill)]
+    body_budget = max_chars - len(prefill)
+    return f"{_truncate_middle(body, body_budget).rstrip()}\n{prefill}"
 
 
 def extract_swebench_patch(text: str) -> str:

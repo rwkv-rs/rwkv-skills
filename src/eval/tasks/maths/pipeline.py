@@ -29,12 +29,29 @@ DEFAULT_FINAL_PROMPT = """<Q><COT>
 Therefore, the answer is \\(\\boxed{"""
 
 
-def _render_prompt(template: str, question: str) -> str:
+def _render_prompt(template: str, question: str, *, prompt_max_chars: int | None = None) -> str:
+    if prompt_max_chars is not None and prompt_max_chars > 0:
+        empty_prompt_len = len(template.replace("<Q>", "").rstrip(" "))
+        question_budget = max(0, prompt_max_chars - empty_prompt_len)
+        question = _truncate_prompt_text(question.lstrip(), question_budget)
     return template.replace("<Q>", question.lstrip()).rstrip(" ")
 
 
 def _render_final_prompt(template: str, cot_prompt: str, cot_completion: str) -> str:
     return template.replace("<Q>", cot_prompt).replace("<COT>", cot_completion).rstrip(" ")
+
+
+def _truncate_prompt_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = "\n[...truncated...]\n"
+    if max_chars <= len(marker) + 2:
+        return text[-max_chars:]
+    head_budget = min(512, max_chars // 5)
+    tail_budget = max_chars - head_budget - len(marker)
+    return f"{text[:head_budget].rstrip()}{marker}{text[-tail_budget:].lstrip()}"
 
 
 def _clip_user_sentinel(text: str) -> str:
@@ -87,6 +104,7 @@ class FreeResponsePipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        prompt_max_chars: int | None = None,
     ) -> FreeResponsePipelineResult:
         if cot_prompt_template:
             prompt_template = cot_prompt_template
@@ -164,7 +182,10 @@ class FreeResponsePipeline:
         sampling_config = normalize_sampling_config_by_stage(sampling_items)
 
         if probe_only:
-            prompts = [_render_prompt(prompt_template, record.question) for _key, record in remaining_entries]
+            prompts = [
+                _render_prompt(prompt_template, record.question, prompt_max_chars=prompt_max_chars)
+                for _key, record in remaining_entries
+            ]
             probe_seeds = [
                 sample_repeat_seed(
                     key.sample_index,
@@ -222,7 +243,10 @@ class FreeResponsePipeline:
         chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
-            prompts = [_render_prompt(prompt_template, record.question) for _key, record in chunk]
+            prompts = [
+                _render_prompt(prompt_template, record.question, prompt_max_chars=prompt_max_chars)
+                for _key, record in chunk
+            ]
 
             if use_final_stage:
                 assert final_answer_template is not None

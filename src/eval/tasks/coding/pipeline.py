@@ -877,6 +877,7 @@ class CodingPipeline:
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
         max_context_chars: int | None = None,
+        max_prompt_chars: int | None = None,
         long_doc_config: LongDocEvidenceConfig | None = None,
         prompt_profile: str = "normal",
     ) -> CodingPipelineResult:
@@ -903,6 +904,7 @@ class CodingPipeline:
                 prompt_text, _trace = build_swebench_prompt_with_trace(
                     record,
                     max_context_chars=max_context_chars,
+                    max_prompt_chars=max_prompt_chars,
                     long_doc_config=long_doc_config,
                     engine=self.backend,
                     sampling=sampling,
@@ -943,6 +945,7 @@ class CodingPipeline:
             prompt_text, trace = build_swebench_prompt_with_trace(
                 record,
                 max_context_chars=max_context_chars,
+                max_prompt_chars=max_prompt_chars,
                 long_doc_config=long_doc_config,
                 engine=self.backend,
                 sampling=sampling,

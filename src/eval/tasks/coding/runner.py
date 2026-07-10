@@ -66,6 +66,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--swebench-clean", action="store_true", help="Ask the SWE-bench harness to clean resources")
     parser.add_argument("--swebench-predictions-path", help="Where to write official SWE-bench predictions JSONL")
     parser.add_argument("--swebench-max-context-chars", type=int, help="Clamp retrieved context included in SWE-bench prompts")
+    parser.add_argument("--swebench-max-prompt-chars", type=int, help="Clamp full rendered SWE-bench prompt length")
     parser.add_argument("--swebench-harness-timeout-s", type=float, help="Wall-clock timeout for official SWE-bench harness")
     parser.add_argument(
         "--long-doc-mode",
@@ -393,6 +394,7 @@ def main(
                 probe_only=True,
                 samples_per_task=1,
                 max_context_chars=args.swebench_max_context_chars,
+                max_prompt_chars=args.swebench_max_prompt_chars,
                 long_doc_config=long_doc_config,
                 prompt_profile=prompt_profile,
             )
@@ -506,6 +508,7 @@ def main(
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
                 max_context_chars=args.swebench_max_context_chars,
+                max_prompt_chars=args.swebench_max_prompt_chars,
                 long_doc_config=long_doc_config,
                 prompt_profile=prompt_profile,
             )

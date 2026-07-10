@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Launch the RWKV Skills dashboard API.
 
-Serves the JSON API (leaderboard, eval records, context). The frontend is a
-Next.js app under ``client/``; run it with ``pnpm dev``/``pnpm start`` and
-let Next rewrite ``/api`` requests back to this FastAPI process.
+Serves leaderboard, eval records, context, and scheduler admin APIs. Run the
+Next.js frontend in ``client/`` separately; it rewrites ``/api`` back to this
+server.
 """
 
 import argparse

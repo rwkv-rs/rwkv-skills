@@ -56,12 +56,13 @@ pnpm dev
 ```
 
 Open `http://localhost:3000` in development. Set `SCOREBOARD_API_BASE_URL` when the FastAPI backend
-is not on `http://127.0.0.1:7860`:
+is not on `http://127.0.0.1:7860`. For deployment behind `/new-eval`, also set
+`NEXT_PUBLIC_BASE_PATH=/new-eval`:
 
 ```bash
 cd client
-SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
-SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
+NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
+NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
 ```
 
 The dashboard also includes an **admin panel** (the "管理面板" tab) that drives the eval scheduler:

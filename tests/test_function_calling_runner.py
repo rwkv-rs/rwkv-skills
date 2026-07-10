@@ -111,6 +111,19 @@ def test_function_calling_runner_parser_accepts_candidate_router_auto_for_generi
     assert bfcl_v3_runner._candidate_router_config_from_args(args) is None
 
 
+def test_function_calling_runner_parser_accepts_fresh_run_mode() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "terminal_bench_2_1_test.jsonl",
+            "--run-mode",
+            "fresh",
+        ]
+    )
+
+    assert args.run_mode == "fresh"
+
+
 def test_function_calling_runner_falls_back_for_local_sample_workers() -> None:
     args = function_calling_runner.parse_args(
         [
@@ -204,6 +217,35 @@ def test_function_calling_runner_allows_browsecomp_plus_sample_workers() -> None
     function_calling_runner._validate_sample_worker_benchmark(args, run)
 
 
+def test_function_calling_runner_allows_agent_loop_sample_workers() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "widesearch_test.jsonl",
+            "--infer-base-url",
+            "http://127.0.0.1:8081",
+            "--infer-model",
+            "demo",
+            "--sample-workers",
+            "2",
+        ]
+    )
+    run = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.AGENT_LOOP,
+        dataset_path=Path("/tmp/widesearch_test.jsonl"),
+        dataset_slug="widesearch_test",
+        benchmark_name="widesearch",
+        dataset_split="test",
+        model_name="demo",
+        engine=object(),  # type: ignore[arg-type]
+    )
+
+    function_calling_runner._normalize_sample_worker_args(args)
+    function_calling_runner._validate_sample_worker_benchmark(args, run)
+
+    assert args.sample_workers == 2
+
+
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
     plan = runner_common._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0])
 
@@ -236,6 +278,48 @@ def test_function_calling_runner_resolves_configured_avg_k_plan(tmp_path: Path, 
     assert plan.repeat_count == 1
     assert plan.sample_size == 10
     assert sample_limit == 12
+
+
+def test_function_calling_runner_resolves_target_samples_plan(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "browsecomp.toml").write_text(
+        "[default]\ntarget_samples = 500\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", str(tmp_path))
+
+    plan = runner_common._resolve_function_calling_plan(
+        "browsecomp_test",
+        1266,
+        avg_ks=None,
+        model_name="demo-model",
+    )
+
+    assert round(plan.avg_k, 6) == round(500 / 1266, 6)
+    assert plan.repeat_count == 1
+    assert plan.sample_size == 500
+    assert len(set(plan.sample_indices)) == 500
+    assert plan.sample_indices == tuple(sorted(plan.sample_indices))
+
+
+def test_function_calling_runner_explicit_avg_k_overrides_target_samples(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "browsecomp.toml").write_text(
+        "[default]\ntarget_samples = 500\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", str(tmp_path))
+
+    plan = runner_common._resolve_function_calling_plan(
+        "browsecomp_test",
+        1266,
+        avg_ks=[1.0],
+        model_name="demo-model",
+    )
+
+    assert plan.avg_k == 1.0
+    assert plan.sample_size == 1266
 
 
 def test_function_calling_runner_rejects_multiple_explicit_avg_k_values() -> None:

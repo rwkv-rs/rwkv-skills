@@ -73,6 +73,26 @@ def test_build_swebench_naive_prompt_uses_raw_issue_only() -> None:
     assert "Return only a unified git diff patch" not in prompt
 
 
+def test_build_swebench_prompt_clamps_full_prompt_and_preserves_prefill() -> None:
+    record = CodeGenerationRecord(
+        task_id="sympy__sympy-20590",
+        prompt="Fix sympify.",
+        metadata={
+            "instance_id": "sympy__sympy-20590",
+            "retrieved_context": "\n".join(f"ctx line {index:04d} abcdefghijklmnop" for index in range(500)),
+        },
+    )
+
+    prompt, trace = build_swebench_prompt_with_trace(record, max_prompt_chars=1200)
+
+    assert len(prompt) <= 1200
+    assert prompt.endswith("Assistant: <think>\n</think>\n```diff\n")
+    assert "[...truncated...]" in prompt
+    assert trace["prompt_chars"] == len(prompt)
+    assert trace["max_prompt_chars"] == 1200
+    assert trace["prompt_trimmed_chars"] > 0
+
+
 def test_build_swebench_prompt_can_compact_retrieved_context() -> None:
     context = "\n".join(
         [f"noise row {index:03d}" for index in range(35)]

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Formal function-calling API for the parallel candidate router."""
 
-from src.eval.experiments.parallel_candidate_router import (
+from src.eval.experiments.parallel_candidate_router.router import (
     CANDIDATE_LAYER_KEYS,
     CandidateToolCall,
+    NO_CANDIDATE_TOOL_NAME,
     ParallelCandidateRouteResult,
     ParallelCandidateRouterConfig,
     build_candidate_aggregate_prompt,
@@ -17,6 +18,7 @@ from src.eval.experiments.parallel_candidate_router import (
 __all__ = [
     "CANDIDATE_LAYER_KEYS",
     "CandidateToolCall",
+    "NO_CANDIDATE_TOOL_NAME",
     "ParallelCandidateRouteResult",
     "ParallelCandidateRouterConfig",
     "build_candidate_aggregate_prompt",

@@ -11,6 +11,8 @@ score is ever fabricated. See docs/agent_loop.md for per-benchmark setup.
 
 import json
 import os
+import shlex
+import sys
 import shutil
 import subprocess
 import tempfile
@@ -27,8 +29,10 @@ if TYPE_CHECKING:
 _DOCS_HINT = "see docs/agent_loop.md for setup instructions"
 
 TERMINAL_BENCH_ROOT_ENV = "RWKV_TERMINAL_BENCH_ROOT"
+NL2REPO_ROOT_ENV = "RWKV_NL2REPO_ROOT"
 WIDESEARCH_ROOT_ENV = "RWKV_WIDESEARCH_OFFICIAL_ROOT"
 WIDESEARCH_EVAL_COMMAND_ENV = "RWKV_WIDESEARCH_EVAL_COMMAND"
+WIDESEARCH_DATA_ROOT_ENV = "RWKV_WIDESEARCH_DATA_ROOT"
 MCP_ATLAS_ROOT_ENV = "RWKV_MCP_ATLAS_ROOT"
 TOOLATHLON_ROOT_ENV = "RWKV_TOOLATHLON_ROOT"
 
@@ -78,6 +82,8 @@ def build_agent_loop_verifier(kind: str, args: Any) -> AgentLoopVerifier:
         return TerminalBenchOfficialVerifier()
     if kind == "repo_tests_official":
         return RepoTestsOfficialVerifier()
+    if kind == "nl2repo_official":
+        return NL2RepoOfficialVerifier()
     if kind == "widesearch_official":
         return WideSearchOfficialVerifier()
     if kind == "mcp_atlas_official":
@@ -125,6 +131,10 @@ def preflight_agent_loop_runtime(records: Sequence["AgentLoopRecord"], args: Any
             config_error = WebSearchExecutor.config_error()
             if config_error:
                 errors.append(f"{config_error}; {_DOCS_HINT}")
+            else:
+                health_error = WebSearchExecutor.health_error()
+                if health_error:
+                    errors.append(f"{health_error}; {_DOCS_HINT}")
         elif kind != "manifest_replay":
             errors.append(f"unknown agent-loop executor kind: {kind!r}")
 
@@ -288,17 +298,14 @@ class TerminalBenchOfficialVerifier:
         task_dir = _terminal_bench_task_dir(root, record)
         if task_dir is None:
             raise ValueError(f"official task dir not found for {record.task_id}")
-        test_command = _terminal_bench_test_command(task_dir)
-        subprocess.run(
-            ["docker", "cp", str(task_dir), f"{container_id}:/official-task"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        self._setup_test_env(container_id, task_dir)
+        test_command = "bash /tests/run-tests.sh"
         proc = subprocess.run(
-            ["docker", "exec", "-w", "/official-task", container_id, "bash", "-lc", test_command],
+            ["docker", "exec", container_id, "bash", "-lc", test_command],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=float(record.verifier.config.get("test_timeout_s") or 600.0),
         )
         passed = proc.returncode == 0
@@ -312,6 +319,45 @@ class TerminalBenchOfficialVerifier:
                 "stderr_tail": proc.stderr[-2000:],
             },
         )
+
+    def _setup_test_env(self, container_id: str, task_dir: Path) -> None:
+        run_tests = task_dir / "run-tests.sh"
+        if not run_tests.is_file():
+            raise ValueError(f"no official run-tests.sh found in {task_dir}")
+        subprocess.run(
+            ["docker", "exec", container_id, "rm", "-rf", "/tests"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        subprocess.run(
+            ["docker", "exec", container_id, "mkdir", "-p", "/tests"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        subprocess.run(
+            ["docker", "cp", str(run_tests), f"{container_id}:/tests/run-tests.sh"],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        tests_dir = task_dir / "tests"
+        if tests_dir.is_dir():
+            subprocess.run(
+                ["docker", "cp", f"{tests_dir}/.", f"{container_id}:/tests/"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
 
 
 class RepoTestsOfficialVerifier:
@@ -355,7 +401,15 @@ class RepoTestsOfficialVerifier:
             cwd = workspace
         else:
             raise ValueError("repo_tests_official verifier requires a shell_sandbox executor snapshot")
-        proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout_s)
+        proc = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s,
+        )
         passed = proc.returncode == 0
         return AgentLoopVerdict(
             reward=1.0 if passed else 0.0,
@@ -373,6 +427,89 @@ def _repo_test_command(record: "AgentLoopRecord") -> str:
     return str(record.verifier.config.get("test_command") or record.metadata.get("test_command") or "").strip()
 
 
+class NL2RepoOfficialVerifier:
+    """Runs NL2RepoBench's official post-processor against the generated workspace."""
+
+    def preflight(self, records: Sequence["AgentLoopRecord"], args: Any) -> list[str]:
+        errors: list[str] = []
+        root = _official_root(NL2REPO_ROOT_ENV)
+        if root is None:
+            errors.append(f"nl2repo_official verifier requires {NL2REPO_ROOT_ENV}=<NL2RepoBench checkout>; {_DOCS_HINT}")
+            return errors
+        if not (root / "openhands" / "post_processor.py").is_file():
+            errors.append(f"nl2repo_official verifier: openhands/post_processor.py not found under {root}; {_DOCS_HINT}")
+        if shutil.which("docker") is None:
+            errors.append(f"nl2repo_official verifier requires the docker CLI; {_DOCS_HINT}")
+        for record in records:
+            task_name = _nl2repo_task_name(record)
+            if not _nl2repo_task_dir(root, task_name):
+                errors.append(f"{record.task_id}: NL2Repo official test files not found for {task_name!r}; {_DOCS_HINT}")
+                break
+        return errors
+
+    def verify(
+        self,
+        record: "AgentLoopRecord",
+        *,
+        final_answer: str,
+        trace: Sequence[Mapping[str, Any]],
+        executor_snapshot: Mapping[str, Any],
+    ) -> AgentLoopVerdict:
+        root = _official_root(NL2REPO_ROOT_ENV)
+        if root is None:
+            raise ValueError(f"missing {NL2REPO_ROOT_ENV}")
+        workspace = str(executor_snapshot.get("workspace") or "")
+        if not workspace:
+            raise ValueError("nl2repo_official verifier requires a subprocess shell_sandbox workspace")
+        task_name = _nl2repo_task_name(record)
+        if not _nl2repo_task_dir(root, task_name):
+            raise ValueError(f"NL2Repo official test files not found for {task_name!r}")
+        with tempfile.TemporaryDirectory(prefix="nl2repo-eval-") as tmp:
+            result_path = Path(tmp) / "result.json"
+            script = _nl2repo_eval_script()
+            proc = subprocess.run(
+                ["python", "-c", script],
+                cwd=str(root),
+                env={
+                    **os.environ,
+                    "NL2REPO_ROOT": str(root),
+                    "NL2REPO_TASK": task_name,
+                    "NL2REPO_WORKSPACE": workspace,
+                    "NL2REPO_RESULT_PATH": str(result_path),
+                },
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=float(record.verifier.config.get("test_timeout_s") or 10800.0),
+            )
+            if proc.returncode != 0:
+                return AgentLoopVerdict(
+                    reward=0.0,
+                    is_passed=False,
+                    fail_reason=f"official NL2Repo post-processor failed (exit {proc.returncode})",
+                    details={"stdout_tail": proc.stdout[-2000:], "stderr_tail": proc.stderr[-2000:]},
+                )
+            result = _read_json_mapping(result_path)
+        pytest_results = _nl2repo_pytest_results(result)
+        total = int(pytest_results.get("total") or 0)
+        passed_count = int(pytest_results.get("passed") or 0)
+        reward = float(pytest_results.get("success_rate") or ((passed_count / total) if total else 0.0))
+        passed = bool(result.get("status") == "success" and total > 0 and passed_count >= total)
+        return AgentLoopVerdict(
+            reward=reward,
+            is_passed=passed,
+            fail_reason="" if passed else f"official NL2Repo tests passed {passed_count}/{total}",
+            details={
+                "official_score": reward,
+                "passed": passed_count,
+                "total": total,
+                "status": result.get("status"),
+                "log_path": result.get("log_path"),
+            },
+        )
+
+
 class WideSearchOfficialVerifier:
     """Converts final answers into the official WideSearch format and runs the official eval stage."""
 
@@ -380,11 +517,45 @@ class WideSearchOfficialVerifier:
         root = _official_root(WIDESEARCH_ROOT_ENV)
         if root is None:
             return [f"widesearch_official verifier requires {WIDESEARCH_ROOT_ENV}=<WideSearch checkout>; {_DOCS_HINT}"]
+        data_root = _widesearch_data_root()
+        if data_root is not None:
+            errors: list[str] = []
+            try:
+                judge = resolve_judge_model_config(
+                    model_name=getattr(args, "judge_model", None),
+                    api_key=getattr(args, "judge_api_key", None),
+                    base_url=getattr(args, "judge_base_url", None),
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+                judge = None
+            if judge is None:
+                errors.append(f"widesearch_official direct eval requires JUDGE_MODEL + JUDGE_API_KEY; {_DOCS_HINT}")
+            import_error = _widesearch_direct_eval_import_error(root)
+            if import_error:
+                errors.append(
+                    "widesearch_official direct eval cannot import the official eval stack: "
+                    f"{import_error}; {_DOCS_HINT}"
+                )
+            for record in records:
+                missing = _widesearch_missing_data_files(data_root, _widesearch_instance_id(record))
+                if missing:
+                    errors.append(f"{record.task_id}: missing WideSearch official data: {missing}; {_DOCS_HINT}")
+                    break
+            return errors
         if not os.environ.get(WIDESEARCH_EVAL_COMMAND_ENV) and not list(root.glob("scripts/run_infer_and_eval*.py")):
             return [
                 f"widesearch_official verifier: official eval script not found under {root}/scripts "
                 f"(or set {WIDESEARCH_EVAL_COMMAND_ENV}); {_DOCS_HINT}"
             ]
+        if not os.environ.get(WIDESEARCH_EVAL_COMMAND_ENV) and (root / "src" / "evaluation" / "evaluation.py").is_file():
+            import_error = _widesearch_eval_import_error(root)
+            if import_error:
+                return [
+                    "widesearch_official verifier cannot import the official eval stack with the current Python: "
+                    f"{import_error}; install WideSearch dependencies or set {WIDESEARCH_EVAL_COMMAND_ENV} "
+                    f"to a command that uses the official WideSearch environment; {_DOCS_HINT}"
+                ]
         return []
 
     def verify(
@@ -398,12 +569,43 @@ class WideSearchOfficialVerifier:
         root = _official_root(WIDESEARCH_ROOT_ENV)
         if root is None:
             raise ValueError(f"missing {WIDESEARCH_ROOT_ENV}")
+        data_root = _widesearch_data_root()
+        if data_root is not None:
+            return _verify_widesearch_direct(
+                root=root,
+                data_root=data_root,
+                record=record,
+                final_answer=final_answer,
+                trace=trace,
+            )
         with tempfile.TemporaryDirectory(prefix="widesearch-eval-") as tmp:
-            response_path = Path(tmp) / "responses.jsonl"
+            instance_id = _widesearch_instance_id(record)
+            trial_idx = int(record.metadata.get("trial") or record.verifier.config.get("trial") or 0)
+            model_config_name = str(
+                record.verifier.config.get("model_config_name")
+                or os.environ.get("WIDESEARCH_MODEL_CONFIG_NAME")
+                or "rwkv_eval"
+            )
+            response_root = Path(tmp) / "responses"
             result_dir = Path(tmp) / "results"
+            response_root.mkdir()
             result_dir.mkdir()
+            response_path = response_root / _widesearch_response_filename(
+                model_config_name=model_config_name,
+                instance_id=instance_id,
+                trial_idx=trial_idx,
+            )
             response_path.write_text(
-                json.dumps(widesearch_answer_to_official_row(record, final_answer), ensure_ascii=False) + "\n",
+                json.dumps(
+                    _widesearch_official_response_row(
+                        instance_id=instance_id,
+                        final_answer=final_answer,
+                        trace=trace,
+                        trial_idx=trial_idx,
+                    ),
+                    ensure_ascii=False,
+                )
+                + "\n",
                 encoding="utf-8",
             )
             command = os.environ.get(WIDESEARCH_EVAL_COMMAND_ENV) or _default_widesearch_eval_command(root)
@@ -413,11 +615,17 @@ class WideSearchOfficialVerifier:
                 cwd=str(root),
                 env={
                     **os.environ,
+                    "PYTHONPATH": _prepend_pythonpath(root),
+                    "WIDESEARCH_INSTANCE_ID": instance_id,
+                    "WIDESEARCH_MODEL_CONFIG_NAME": model_config_name,
                     "WIDESEARCH_RESPONSE_PATH": str(response_path),
+                    "WIDESEARCH_RESPONSE_ROOT": str(response_root),
                     "WIDESEARCH_RESULT_DIR": str(result_dir),
                 },
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=float(record.verifier.config.get("eval_timeout_s") or 1800.0),
             )
             if proc.returncode != 0:
@@ -492,6 +700,8 @@ class McpAtlasOfficialVerifier:
                 },
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=float(record.verifier.config.get("eval_timeout_s") or 900.0),
             )
             if proc.returncode != 0:
@@ -544,6 +754,8 @@ class ToolathlonOfficialVerifier:
             cwd=str(root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=float(record.verifier.config.get("eval_timeout_s") or 1800.0),
         )
         passed = proc.returncode == 0
@@ -579,10 +791,171 @@ class UnsupportedOfficialVerifier:
 
 def widesearch_answer_to_official_row(record: "AgentLoopRecord", final_answer: str) -> dict[str, Any]:
     return {
-        "question_id": str(record.metadata.get("official_task_id") or record.task_id),
+        "question_id": _widesearch_instance_id(record),
         "response": final_answer,
         "trial": int(record.metadata.get("trial") or 0),
     }
+
+
+def _widesearch_instance_id(record: "AgentLoopRecord") -> str:
+    return str(record.metadata.get("official_task_id") or record.task_id)
+
+
+def _widesearch_response_filename(*, model_config_name: str, instance_id: str, trial_idx: int) -> str:
+    return f"{model_config_name}_{instance_id}_{trial_idx}_response.json"
+
+
+def _widesearch_official_response_row(
+    *,
+    instance_id: str,
+    final_answer: str,
+    trace: Sequence[Mapping[str, Any]],
+    trial_idx: int,
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = []
+    for step in trace:
+        if step.get("kind") == "tool_call":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": {
+                        "tool": step.get("name"),
+                        "arguments": dict(step.get("arguments") or {}),
+                    },
+                }
+            )
+            messages.append({"role": "tool", "content": step.get("output")})
+    if final_answer:
+        messages.append({"role": "assistant", "content": final_answer})
+    return {
+        "instance_id": instance_id,
+        "response": final_answer,
+        "messages": messages,
+        "trial_idx": trial_idx,
+    }
+
+
+def _widesearch_data_root() -> Path | None:
+    raw = os.environ.get(WIDESEARCH_DATA_ROOT_ENV)
+    if raw:
+        candidate = Path(raw).expanduser()
+        return candidate if (candidate / "widesearch.jsonl").is_file() and (candidate / "widesearch_gold").is_dir() else None
+    candidates: list[Path] = []
+    candidates.append(Path.cwd() / "data" / "widesearch_official")
+    for candidate in candidates:
+        if (candidate / "widesearch.jsonl").is_file() and (candidate / "widesearch_gold").is_dir():
+            return candidate
+    return None
+
+
+def _widesearch_missing_data_files(data_root: Path, instance_id: str) -> str:
+    missing: list[str] = []
+    if not (data_root / "widesearch.jsonl").is_file():
+        missing.append(str(data_root / "widesearch.jsonl"))
+    if not (data_root / "widesearch_gold" / f"{instance_id}.csv").is_file():
+        missing.append(str(data_root / "widesearch_gold" / f"{instance_id}.csv"))
+    return ", ".join(missing)
+
+
+def _verify_widesearch_direct(
+    *,
+    root: Path,
+    data_root: Path,
+    record: "AgentLoopRecord",
+    final_answer: str,
+    trace: Sequence[Mapping[str, Any]],
+) -> AgentLoopVerdict:
+    judge = resolve_judge_model_config()
+    if judge is None:
+        raise ValueError("widesearch_official direct eval requires JUDGE_MODEL + JUDGE_API_KEY")
+    instance_id = _widesearch_instance_id(record)
+    missing = _widesearch_missing_data_files(data_root, instance_id)
+    if missing:
+        raise ValueError(f"missing WideSearch official data: {missing}")
+    with tempfile.TemporaryDirectory(prefix="widesearch-direct-eval-") as tmp:
+        tmp_path = Path(tmp)
+        stub_root = tmp_path / "stubs"
+        _write_widesearch_stub_modules(stub_root)
+        response_path = tmp_path / "response.json"
+        result_path = tmp_path / "result.json"
+        response_path.write_text(
+            json.dumps(
+                _widesearch_official_response_row(
+                    instance_id=instance_id,
+                    final_answer=final_answer,
+                    trace=trace,
+                    trial_idx=int(record.metadata.get("trial") or record.verifier.config.get("trial") or 0),
+                ),
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [sys.executable or "python3", "-c", _widesearch_direct_eval_script()],
+            cwd=str(root),
+            env={
+                **os.environ,
+                "PYTHONPATH": _prepend_pythonpath_chain((stub_root, root)),
+                "WIDESEARCH_DATA_ROOT": str(data_root),
+                "WIDESEARCH_INSTANCE_ID": instance_id,
+                "WIDESEARCH_RESPONSE_JSON": str(response_path),
+                "WIDESEARCH_RESULT_JSON": str(result_path),
+                "WIDESEARCH_JUDGE_MODEL": judge.model_name,
+                "WIDESEARCH_JUDGE_API_KEY": judge.api_key,
+                "WIDESEARCH_JUDGE_BASE_URL": judge.base_url or "",
+            },
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=float(record.verifier.config.get("eval_timeout_s") or 1800.0),
+            check=False,
+        )
+        if proc.returncode != 0:
+            output = (proc.stdout + "\n" + proc.stderr).strip()
+            raise RuntimeError(f"official WideSearch direct eval failed (exit {proc.returncode}): {output[-3000:]}")
+        result = _read_json_mapping(result_path)
+    score = _first_score_from_payload(result)
+    if score is None:
+        raise RuntimeError("official WideSearch direct eval produced no parsable score")
+    passed = score >= float(record.verifier.config.get("pass_threshold") or 1.0)
+    return AgentLoopVerdict(
+        reward=score,
+        is_passed=passed,
+        fail_reason="" if passed else f"official score {score:.3f} below threshold",
+        details={"official_score": score, "result": result},
+    )
+
+
+def _write_widesearch_stub_modules(stub_root: Path) -> None:
+    stub_root.mkdir(parents=True, exist_ok=True)
+    pandarallel_root = stub_root / "pandarallel"
+    pandarallel_root.mkdir()
+    (pandarallel_root / "__init__.py").write_text(
+        "class _Pandarallel:\n"
+        "    def initialize(self, *args, **kwargs):\n"
+        "        return None\n"
+        "pandarallel = _Pandarallel()\n",
+        encoding="utf-8",
+    )
+    (stub_root / "dateparser.py").write_text(
+        "def parse(value, settings=None):\n"
+        "    try:\n"
+        "        import pandas as _pd\n"
+        "        parsed = _pd.to_datetime(value, errors='coerce')\n"
+        "        if _pd.isna(parsed):\n"
+        "            return None\n"
+        "        return parsed.to_pydatetime()\n"
+        "    except Exception:\n"
+        "        return None\n",
+        encoding="utf-8",
+    )
+    (stub_root / "volcenginesdkarkruntime.py").write_text(
+        "class Ark:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        raise RuntimeError('Ark is not available in WideSearch direct eval')\n",
+        encoding="utf-8",
+    )
 
 
 def trace_to_mcp_atlas_transcript(
@@ -664,9 +1037,222 @@ def _official_root(env_name: str) -> Path | None:
     return root if root.is_dir() else None
 
 
+def _prepend_pythonpath(path: Path) -> str:
+    current = os.environ.get("PYTHONPATH")
+    return f"{path}{os.pathsep}{current}" if current else str(path)
+
+
+def _prepend_pythonpath_chain(paths: Sequence[Path]) -> str:
+    current = os.environ.get("PYTHONPATH")
+    rendered = os.pathsep.join(str(path) for path in paths)
+    return f"{rendered}{os.pathsep}{current}" if current else rendered
+
+
+def _widesearch_eval_import_error(root: Path) -> str:
+    proc = subprocess.run(
+        [
+            sys.executable or "python3",
+            "-c",
+            "import src.evaluation.evaluation",  # noqa: S603 - static import check.
+        ],
+        cwd=str(root),
+        env={**os.environ, "PYTHONPATH": _prepend_pythonpath(root)},
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15.0,
+        check=False,
+    )
+    if proc.returncode == 0:
+        return ""
+    output = (proc.stderr or proc.stdout or "").strip()
+    return output[-800:] or f"import check exited {proc.returncode}"
+
+
+def _widesearch_direct_eval_import_error(root: Path) -> str:
+    with tempfile.TemporaryDirectory(prefix="widesearch-import-") as tmp:
+        stub_root = Path(tmp) / "stubs"
+        _write_widesearch_stub_modules(stub_root)
+        proc = subprocess.run(
+            [
+                sys.executable or "python3",
+                "-c",
+                "import src.evaluation.data_loader; import src.evaluation.evaluation",
+            ],
+            cwd=str(root),
+            env={**os.environ, "PYTHONPATH": _prepend_pythonpath_chain((stub_root, root))},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15.0,
+            check=False,
+        )
+    if proc.returncode == 0:
+        return ""
+    output = (proc.stderr or proc.stdout or "").strip()
+    return output[-800:] or f"import check exited {proc.returncode}"
+
+
+def _widesearch_direct_eval_script() -> str:
+    return r'''
+import dataclasses
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pandas as pd
+from openai import OpenAI
+
+from src.evaluation.data_loader import WideSearchQuery, WideSearchResponse
+from src.evaluation.evaluation import evaluate_single_query
+from src.utils.utils import norm_column
+import src.evaluation.metric_utils as metric_utils
+
+
+def _judge_completion(messages, tools=None, model_config_name="default_eval_config"):
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
+    client = OpenAI(
+        api_key=os.environ["WIDESEARCH_JUDGE_API_KEY"],
+        base_url=os.environ.get("WIDESEARCH_JUDGE_BASE_URL") or None,
+        timeout=300,
+        max_retries=2,
+    )
+    response = client.chat.completions.create(
+        model=os.environ["WIDESEARCH_JUDGE_MODEL"],
+        messages=messages,
+        temperature=0,
+    )
+    return SimpleNamespace(content=response.choices[0].message.content or "")
+
+
+metric_utils.llm_completion = _judge_completion
+
+data_root = Path(os.environ["WIDESEARCH_DATA_ROOT"])
+instance_id = os.environ["WIDESEARCH_INSTANCE_ID"]
+response_payload = json.loads(Path(os.environ["WIDESEARCH_RESPONSE_JSON"]).read_text(encoding="utf-8"))
+
+source_row = None
+with (data_root / "widesearch.jsonl").open(encoding="utf-8") as fh:
+    for line in fh:
+        item = json.loads(line)
+        if str(item.get("instance_id") or item.get("official_task_id") or item.get("id")) == instance_id:
+            source_row = item
+            break
+if source_row is None:
+    raise SystemExit(f"WideSearch instance not found: {instance_id}")
+
+evaluation = source_row.get("evaluation") or {}
+if isinstance(evaluation, str):
+    evaluation = json.loads(evaluation)
+required = evaluation["required"]
+answer = pd.read_csv(data_root / "widesearch_gold" / f"{instance_id}.csv")
+answer.columns = [norm_column(col.strip()) for col in answer.columns]
+answer = answer[required]
+query = WideSearchQuery(
+    instance_id=instance_id,
+    query=str(source_row.get("query") or source_row.get("question") or ""),
+    evaluation=evaluation,
+    answer=answer,
+    language=str(source_row.get("language") or "en"),
+)
+response = WideSearchResponse(
+    instance_id=instance_id,
+    response=str(response_payload.get("response") or ""),
+    messages=response_payload.get("messages") or [],
+    trial_idx=response_payload.get("trial_idx"),
+)
+result = evaluate_single_query(
+    query,
+    response,
+    result_save_path=None,
+    eval_model_config_name="default_eval_config",
+)
+Path(os.environ["WIDESEARCH_RESULT_JSON"]).write_text(
+    json.dumps(dataclasses.asdict(result), ensure_ascii=False),
+    encoding="utf-8",
+)
+'''
+
+
+def _nl2repo_task_name(record: "AgentLoopRecord") -> str:
+    return str(record.verifier.config.get("official_task_id") or record.metadata.get("official_task_id") or record.task_id)
+
+
+def _nl2repo_task_dir(root: Path, task_name: str) -> Path | None:
+    candidate = root / "test_files" / task_name
+    if (
+        candidate.is_dir()
+        and (candidate / "start.md").is_file()
+        and (candidate / "test_commands.json").is_file()
+        and (candidate / "test_files.json").is_file()
+    ):
+        return candidate
+    return None
+
+
+def _nl2repo_eval_script() -> str:
+    return r'''
+import json
+import os
+import sys
+from pathlib import Path
+
+root = Path(os.environ["NL2REPO_ROOT"])
+task_name = os.environ["NL2REPO_TASK"]
+workspace = os.environ["NL2REPO_WORKSPACE"]
+result_path = Path(os.environ["NL2REPO_RESULT_PATH"])
+os.chdir(root)
+sys.path.insert(0, str(root))
+
+import test_data_service  # noqa: E402
+from openhands.post_processor import post_process_task  # noqa: E402
+
+
+class _Logger:
+    def info(self, message): print(message, flush=True)
+    def warning(self, message): print(message, flush=True)
+    def error(self, message): print(message, flush=True)
+    def debug(self, message): print(message, flush=True)
+
+
+test_data_service.test_data_list.clear()
+test_data_service.read_all_test_data()
+test_data = next((item for item in test_data_service.test_data_list if item.proName == task_name), None)
+if test_data is None:
+    raise SystemExit(f"NL2Repo task not found: {task_name}")
+
+result = post_process_task("rwkv-" + task_name, workspace, test_data, _Logger())
+result_path.write_text(json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8")
+'''
+
+
+def _read_json_mapping(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _nl2repo_pytest_results(result: Mapping[str, Any]) -> dict[str, Any]:
+    raw = result.get("pytest_results")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    test_results = result.get("test_results")
+    if isinstance(test_results, Mapping):
+        nested = test_results.get("pytest_results")
+        if isinstance(nested, Mapping):
+            return dict(nested)
+    return {}
+
+
 def _terminal_bench_task_dir(root: Path, record: "AgentLoopRecord") -> Path | None:
-    task_id = str(record.metadata.get("official_task_id") or record.task_id)
-    candidates = (root / "tasks" / task_id, root / task_id)
+    task_id = str(record.verifier.config.get("official_task_id") or record.metadata.get("official_task_id") or record.task_id)
+    candidates = (root / "tasks" / task_id, root / "original-tasks" / task_id, root / task_id)
     for candidate in candidates:
         if candidate.is_dir():
             return candidate
@@ -689,9 +1275,15 @@ def _default_widesearch_eval_command(root: Path) -> str:
     scripts = sorted(root.glob("scripts/run_infer_and_eval*.py"))
     if not scripts:
         raise ValueError(f"official WideSearch eval script not found under {root}/scripts")
+    python_executable = shlex.quote(sys.executable or "python3")
+    script_path = shlex.quote(str(scripts[0]))
     return (
-        f"python {scripts[0]} --stage eval "
-        f"--response_root $WIDESEARCH_RESPONSE_PATH --result_save_root $WIDESEARCH_RESULT_DIR"
+        f"{python_executable} {script_path} --stage eval "
+        '--response_root "$WIDESEARCH_RESPONSE_ROOT" '
+        '--result_save_root "$WIDESEARCH_RESULT_DIR" '
+        '--model_config_name "$WIDESEARCH_MODEL_CONFIG_NAME" '
+        '--instance_id "$WIDESEARCH_INSTANCE_ID" '
+        "--trial_num 1"
     )
 
 
@@ -702,10 +1294,17 @@ def _first_score_from_result_dir(result_dir: Path) -> float | None:
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(payload, Mapping):
-            for key in ("score", "accuracy", "f1", "success_rate"):
-                value = payload.get(key)
-                if isinstance(value, (int, float)):
-                    return float(value)
+            score = _first_score_from_payload(payload)
+            if score is not None:
+                return score
+    return None
+
+
+def _first_score_from_payload(payload: Mapping[str, Any]) -> float | None:
+    for key in ("score", "accuracy", "f1", "success_rate"):
+        value = payload.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
     return None
 
 
@@ -726,6 +1325,7 @@ __all__ = [
     "AgentLoopVerdict",
     "AgentLoopVerifier",
     "MCP_ATLAS_ROOT_ENV",
+    "NL2REPO_ROOT_ENV",
     "TERMINAL_BENCH_ROOT_ENV",
     "TOOLATHLON_ROOT_ENV",
     "WIDESEARCH_EVAL_COMMAND_ENV",

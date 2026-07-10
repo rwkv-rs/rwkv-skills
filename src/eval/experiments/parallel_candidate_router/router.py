@@ -39,6 +39,7 @@ from src.eval.tasks.function_calling.tool_call_contract import (
 )
 
 CANDIDATE_LAYER_KEYS = ("name", "arguments", "confidence", "evidence")
+NO_CANDIDATE_TOOL_NAME = "__no_candidate__"
 PARALLEL_CANDIDATE_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=True)
 _RESERVATION_ID_RE = re.compile(r"\b(?=[A-Z0-9]{6}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{6}\b", re.IGNORECASE)
 _USER_ID_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z][a-z0-9]*_\d+\b", re.IGNORECASE)
@@ -225,22 +226,28 @@ def route_parallel_candidate_tool_call(
         completion = _generation_text(output)
         finish_reason = _generation_finish_reason(output) if output is not None else "missing_output"
         valid_names = _chunk_valid_names(chunk, include_respond=cfg.include_respond)
+        candidate_valid_names = set(valid_names)
+        if not cfg.include_respond:
+            candidate_valid_names.add(NO_CANDIDATE_TOOL_NAME)
         try:
             candidate = parse_candidate_tool_call(completion)
-            candidate = _normalize_candidate_name_alias(candidate, valid_names=valid_names)
-            _validate_candidate_name(candidate, valid_names=valid_names)
-            candidate = _normalize_candidate_argument_aliases(candidate)
-            candidate = _prune_candidate_arguments(candidate, allowed_args_by_name=allowed_args_by_name)
-            _validate_candidate_arguments(candidate, required_args_by_name=required_args_by_name)
-            if cfg.ground_identifier_arguments:
-                _validate_candidate_grounded_identifiers(candidate, messages=messages)
-            _validate_candidate_domain_intent(candidate, messages=messages, domain=domain)
-            candidate = _complete_candidate_layer(
-                candidate,
-                fallback_confidence=0.5,
-                fallback_evidence=f"candidate shard {chunk_index} selected {candidate.name} for: {context_hint}",
-                evidence_chars=cfg.evidence_chars,
-            )
+            candidate = _normalize_candidate_name_alias(candidate, valid_names=candidate_valid_names)
+            _validate_candidate_name(candidate, valid_names=candidate_valid_names)
+            if candidate.name == NO_CANDIDATE_TOOL_NAME:
+                candidate = None
+            else:
+                candidate = _normalize_candidate_argument_aliases(candidate)
+                candidate = _prune_candidate_arguments(candidate, allowed_args_by_name=allowed_args_by_name)
+                _validate_candidate_arguments(candidate, required_args_by_name=required_args_by_name)
+                if cfg.ground_identifier_arguments:
+                    _validate_candidate_grounded_identifiers(candidate, messages=messages)
+                _validate_candidate_domain_intent(candidate, messages=messages, domain=domain)
+                candidate = _complete_candidate_layer(
+                    candidate,
+                    fallback_confidence=0.5,
+                    fallback_evidence=f"candidate shard {chunk_index} selected {candidate.name} for: {context_hint}",
+                    evidence_chars=cfg.evidence_chars,
+                )
             error = None
         except Exception as exc:  # noqa: BLE001 - one bad shard should not discard other shards.
             candidate = None
@@ -387,6 +394,8 @@ def build_candidate_system_prompt(
     schemas = [_schema_for_prompt(tool, mode=cfg.tool_schema_mode) for tool in tools if tool_name(tool)]
     if cfg.include_respond:
         schemas.append(_respond_schema())
+    else:
+        schemas.append(_no_candidate_schema())
     lines = [
         "You are one worker in a parallel candidate tool-call router.",
         "Given this tool shard and the conversation, propose the single best next action.",
@@ -395,14 +404,30 @@ def build_candidate_system_prompt(
         "confidence must be a number from 0 to 1.",
         "evidence must cite the user request, prior tool output, policy, or tool schema that supports the candidate.",
         "Use exactly one name from this shard's Tools array. Do not invent tool names.",
-        "Use respond only when the assistant should send a user-facing message instead of calling a real tool.",
         "Never invent ids, emails, phones, order ids, reservation ids, customer ids, line ids, item ids, or payment ids.",
-        "For reservation_id, user_id, payment_id/payment_method_id, flight_number, and required travel dates, use only exact values from the user text or successful tool output; otherwise choose respond and ask.",
         "Do not include id, type, tool_calls, function, requestor, role, rationale, analysis, markdown, or extra fields.",
     ]
+    if cfg.include_respond:
+        lines.extend(
+            [
+                "Use respond only when the assistant should send a user-facing message instead of calling a real tool.",
+                "For reservation_id, user_id, payment_id/payment_method_id, flight_number, and required travel dates, use only exact values from the user text or successful tool output; otherwise choose respond and ask.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"Use {NO_CANDIDATE_TOOL_NAME} when none of this shard's real tools is the right next action.",
+                "Use final_answer only when the task is complete and the conversation already contains the answer or verification evidence.",
+                "If required evidence or identifiers are missing, prefer a real tool that can inspect, search, execute, or verify; otherwise use __no_candidate__ for this shard.",
+            ]
+        )
     domain_name = str(domain or "").strip().lower()
     if domain_name == "telecom":
-        lines.append("Telecom device actions in policy prose are not JSON tool names; use respond for user instructions.")
+        if cfg.include_respond:
+            lines.append("Telecom device actions in policy prose are not JSON tool names; use respond for user instructions.")
+        else:
+            lines.append("Telecom device actions in policy prose are not JSON tool names.")
     elif domain_name == "retail":
         lines.append("Retail IDs must come from the user request or prior tool outputs; preserve leading # on order IDs.")
     elif domain_name == "airline":
@@ -433,6 +458,14 @@ def build_candidate_aggregate_prompt(
     ranked_candidates = sorted(candidates, key=lambda item: float(item.confidence), reverse=True)[
         : max(1, int(cfg.max_candidates))
     ]
+    if cfg.include_respond:
+        missing_evidence_rule = (
+            "Do not invent tool names or identifiers. If a required reservation/user/payment/flight ID or travel date is not in user text or successful tool output, choose respond and ask."
+        )
+    else:
+        missing_evidence_rule = (
+            "Do not invent tool names or identifiers. If required evidence is missing, choose a real candidate tool that can inspect, search, execute, or verify; do not use final_answer for missing evidence."
+        )
     system_prompt = normalize_rwkv_text(
         "\n".join(
             [
@@ -441,7 +474,8 @@ def build_candidate_aggregate_prompt(
                 "Return exactly one JSON object with only these fields:",
                 '{"name":"tool_name","arguments":{},"confidence":0.0,"evidence":"short reason"}',
                 "Use only a valid tool name listed below and prefer a candidate's name/arguments unless the transcript evidence clearly fixes an ID or empty argument.",
-                "Do not invent tool names or identifiers. If a required reservation/user/payment/flight ID or travel date is not in user text or successful tool output, choose respond and ask.",
+                missing_evidence_rule,
+                "Use final_answer only when the task is complete and the transcript contains the answer or verification evidence.",
                 "Do not include id, type, tool_calls, function, requestor, role, analysis, or markdown.",
                 f"Domain: {str(domain or '').strip() or 'unknown'}",
                 "Valid tool names:",
@@ -493,6 +527,14 @@ def _respond_schema() -> dict[str, Any]:
             "properties": {"content": {"type": "string"}},
             "required": ["content"],
         },
+    }
+
+
+def _no_candidate_schema() -> dict[str, Any]:
+    return {
+        "name": NO_CANDIDATE_TOOL_NAME,
+        "description": "Candidate-router-only abstention. Use when this shard has no appropriate real tool.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
     }
 
 

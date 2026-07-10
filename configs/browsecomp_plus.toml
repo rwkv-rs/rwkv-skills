@@ -1,6 +1,7 @@
 [default]
 avg_k = [1]
 report_avg_k = [1]
+target_samples = 500
 
 [tool]
 template = "instruction_following_default"

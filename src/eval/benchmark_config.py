@@ -59,6 +59,7 @@ class BenchmarkModelConfig:
     report_pass_k: tuple[int, ...] | None = None
     report_avg_k: tuple[NumericK, ...] | None = None
     max_samples: int | None = None
+    target_samples: int | None = None
     direct_prompt_template: str | None = None
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
@@ -345,6 +346,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     report_pass_k: tuple[int, ...] | None = None
     report_avg_k: tuple[NumericK, ...] | None = None
     max_samples: int | None = None
+    target_samples: int | None = None
     direct_prompt_template: str | None = None
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
@@ -405,6 +407,9 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             continue
         elif key == "max_samples":
             max_samples = _coerce_int(raw)
+            continue
+        elif key == "target_samples":
+            target_samples = _coerce_int(raw)
             continue
         elif key == "direct_prompt_template":
             direct_prompt_template = _coerce_str(raw)
@@ -520,6 +525,7 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         report_pass_k=report_pass_k,
         report_avg_k=report_avg_k,
         max_samples=max_samples,
+        target_samples=target_samples,
         direct_prompt_template=direct_prompt_template,
         cot_prompt_template=cot_prompt_template,
         final_prompt_template=final_prompt_template,

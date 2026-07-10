@@ -91,6 +91,18 @@ def test_parse_table_accepts_rwkv_rs_sampling_aliases() -> None:
     }
 
 
+def test_parse_table_accepts_target_samples() -> None:
+    config = benchmark_config._parse_table(  # type: ignore[attr-defined]
+        {
+            "target_samples": 500,
+            "max_samples": 20,
+        }
+    )
+
+    assert config.target_samples == 500
+    assert config.max_samples == 20
+
+
 def test_sampling_config_to_dict_uses_rwkv_rs_field_names() -> None:
     payload = sampling_config_to_dict(
         SamplingConfig(

@@ -498,7 +498,7 @@ class HfRepoJsonlDatasetSpec(MaterializingDatasetSpec):
 
 def ensure_dataset_materialized(spec: DatasetSpec) -> list[Path]:
     with FileLock(str(spec.lock_path)):
-        if spec.validate_materialized_artifact():
+        if not _dataset_refresh_requested() and spec.validate_materialized_artifact():
             return spec.materialized_paths()
         if spec.load():
             spec.download()
@@ -507,6 +507,11 @@ def ensure_dataset_materialized(spec: DatasetSpec) -> list[Path]:
         if spec.check():
             raise RuntimeError(f"dataset {spec.name}:{spec.split} failed check()")
         return spec.materialize()
+
+
+def _dataset_refresh_requested() -> bool:
+    value = os.environ.get("RWKV_EVAL_REFRESH_DATASET") or os.environ.get("RWKV_DATASET_REFRESH")
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 __all__ = [

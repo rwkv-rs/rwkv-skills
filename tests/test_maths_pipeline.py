@@ -60,6 +60,34 @@ def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -
     ]
 
 
+def test_free_response_pipeline_clamps_rendered_prompt_chars(tmp_path) -> None:
+    dataset = tmp_path / "math.jsonl"
+    dataset.write_text(
+        '{"question":"prefix ' + ("context " * 200) + ' final question?","answer":"7"}\n',
+        encoding="utf-8",
+    )
+    backend = _FakeBackend()
+    pipeline = FreeResponsePipeline(backend)
+
+    pipeline.run(
+        dataset_path=str(dataset),
+        prompt_template="User: solve\n<Q>\n\nAssistant: <think",
+        generation_sampling=SamplingConfig(max_generate_tokens=32),
+        batch_size=4,
+        dataset_name="math_test",
+        pass_k=(1,),
+        samples_per_task=1,
+        prompt_max_chars=220,
+    )
+
+    prompt = backend.calls[0]["prompts"][0]
+    assert len(prompt) <= 220
+    assert "prefix context" in prompt
+    assert "[...truncated...]" in prompt
+    assert "final question?" in prompt
+    assert prompt.endswith("Assistant: <think")
+
+
 def test_free_response_pipeline_generates_cot_then_final_answer(tmp_path) -> None:
     dataset = tmp_path / "math.jsonl"
     dataset.write_text('{"question":"2+5?","answer":"7"}\n', encoding="utf-8")

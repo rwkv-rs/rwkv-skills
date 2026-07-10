@@ -2,3 +2,4 @@
 temperature = 0.8
 avg_k = [1]
 report_avg_k = [1]
+target_samples = 500

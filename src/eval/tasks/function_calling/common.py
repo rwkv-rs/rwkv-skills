@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace
@@ -232,6 +233,9 @@ def clamp_function_calling_sampling(config: SamplingConfig, max_tokens: int | No
     """Use role-boundary string suffixes instead of unsafe raw role tokens."""
 
     clamped = config.clamp(max_tokens)
+    alpha_decay_override = os.environ.get("RWKV_FUNCTION_CALLING_ALPHA_DECAY")
+    if alpha_decay_override not in (None, ""):
+        clamped = replace(clamped, alpha_decay=float(alpha_decay_override))
     return replace(clamped, stop_tokens=FUNCTION_CALLING_STOP_TOKENS)
 
 

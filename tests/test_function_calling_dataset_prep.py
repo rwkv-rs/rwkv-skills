@@ -129,6 +129,148 @@ def test_prepare_dataset_materializes_source_required_agent_slot(tmp_path: Path,
     assert row["official_payload"]["prompt"] == "Create a file named done.txt."
 
 
+def test_prepare_dataset_materializes_terminal_bench_official_checkout(tmp_path: Path, monkeypatch) -> None:
+    official_root = tmp_path / "terminal-bench"
+    task_dir = official_root / "original-tasks" / "fix-demo"
+    task_dir.mkdir(parents=True)
+    (task_dir / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\n", encoding="utf-8")
+    (task_dir / "run-tests.sh").write_text("test -f /app/done.txt\n", encoding="utf-8")
+    (task_dir / "task.yaml").write_text(
+        "\n".join(
+            [
+                "instruction: |-",
+                "  Create /app/done.txt.",
+                "difficulty: easy",
+                "category: filesystem",
+                "parser_name: pytest",
+                "max_agent_timeout_sec: 120",
+                "max_test_timeout_sec: 30",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_TERMINAL_BENCH_ROOT", str(official_root))
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("terminal_bench_2_1", output_root, "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "fix-demo"
+    assert row["instruction"] == "Create /app/done.txt."
+    assert row["executor"]["kind"] == "shell_sandbox"
+    assert row["executor"]["config"]["backend"] == "docker"
+    assert row["executor"]["config"]["dockerfile_context"] == str(task_dir)
+    assert row["verifier"]["kind"] == "terminal_bench_official"
+    assert row["verifier"]["config"]["official_task_id"] == "fix-demo"
+    assert row["metadata"]["official_task_id"] == "fix-demo"
+
+
+def test_prepare_dataset_materializes_terminal_bench_compose_client_build(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    official_root = tmp_path / "terminal-bench"
+    task_dir = official_root / "original-tasks" / "compose-demo"
+    client_dir = task_dir / "client"
+    client_dir.mkdir(parents=True)
+    (client_dir / "Dockerfile").write_text("FROM ubuntu:24.04\nWORKDIR /app\n", encoding="utf-8")
+    (task_dir / "docker-compose.yaml").write_text(
+        "\n".join(
+            [
+                "services:",
+                "  client:",
+                "    build:",
+                "      context: client",
+                "      dockerfile: Dockerfile",
+                "    image: ${T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME}",
+                "    container_name: ${T_BENCH_TASK_DOCKER_CLIENT_CONTAINER_NAME}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (task_dir / "run-tests.sh").write_text("test -f /app/done.txt\n", encoding="utf-8")
+    (task_dir / "task.yaml").write_text("instruction: Create /app/done.txt.\n", encoding="utf-8")
+    monkeypatch.setenv("RWKV_TERMINAL_BENCH_ROOT", str(official_root))
+
+    [path] = prepare_dataset("terminal_bench_2_1", tmp_path / "prepared", "test")
+    [row] = read_jsonl_items(path)
+
+    assert row["task_id"] == "compose-demo"
+    assert row["executor"]["config"]["dockerfile_context"] == str(client_dir.resolve())
+    assert row["executor"]["config"]["dockerfile_path"] == str((client_dir / "Dockerfile").resolve())
+    assert row["executor"]["config"]["docker_compose_file"] == str(task_dir / "docker-compose.yaml")
+    assert row["metadata"]["docker_compose_file"] == str(task_dir / "docker-compose.yaml")
+
+
+def test_prepare_dataset_materializes_nl2repo_official_checkout(tmp_path: Path, monkeypatch) -> None:
+    official_root = tmp_path / "NL2RepoBench"
+    project_dir = official_root / "test_files" / "demo_project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "start.md").write_text("Create a package named demo_project.", encoding="utf-8")
+    (project_dir / "test_commands.json").write_text(json.dumps(["pip install -e .", "pytest tests"]), encoding="utf-8")
+    (project_dir / "test_files.json").write_text(json.dumps(["tests"]), encoding="utf-8")
+    (project_dir / "test_case_count.txt").write_text("3", encoding="utf-8")
+    monkeypatch.setenv("RWKV_NL2REPO_ROOT", str(official_root))
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("nl2repo", output_root, "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "demo_project"
+    assert row["instruction"].startswith("Create a package named demo_project.")
+    assert row["executor"]["kind"] == "shell_sandbox"
+    assert row["executor"]["config"]["backend"] == "subprocess"
+    assert row["verifier"]["kind"] == "nl2repo_official"
+    assert row["verifier"]["config"]["official_task_id"] == "demo_project"
+    assert row["metadata"]["official_task_id"] == "demo_project"
+    assert row["metadata"]["test_case_count"] == 3
+
+
+def test_prepare_dataset_materializes_deepswe_official_checkout(tmp_path: Path, monkeypatch) -> None:
+    official_root = tmp_path / "deep-swe"
+    task_dir = official_root / "tasks" / "fix-demo"
+    (task_dir / "tests").mkdir(parents=True)
+    (task_dir / "instruction.md").write_text("Fix the demo bug.", encoding="utf-8")
+    (task_dir / "pre_artifacts.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (task_dir / "tests" / "test.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (task_dir / "tests" / "grader.py").write_text("# grader\n", encoding="utf-8")
+    (task_dir / "task.toml").write_text(
+        "\n".join(
+            [
+                "[metadata]",
+                'task_id = "fix-demo"',
+                'display_title = "Fix demo"',
+                'repository_url = "https://example.test/repo.git"',
+                'language = "python"',
+                'category = "bugfix"',
+                'base_commit_hash = "abc123"',
+                "[environment]",
+                'docker_image = "example/deepswe:fix-demo"',
+                "[verifier]",
+                "timeout_sec = 123",
+                "[agent]",
+                "timeout_sec = 456",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RWKV_DEEPSWE_ROOT", str(official_root))
+
+    output_root = tmp_path / "prepared"
+    paths = prepare_dataset("deepswe", output_root, "test")
+
+    [row] = read_jsonl_items(paths[0])
+    assert row["task_id"] == "fix-demo"
+    assert row["executor"]["kind"] == "shell_sandbox"
+    assert row["executor"]["config"]["backend"] == "docker"
+    assert row["executor"]["config"]["image"] == "example/deepswe:fix-demo"
+    assert row["executor"]["config"]["docker_copy_paths"][0]["dst"] == "/tests"
+    assert row["verifier"]["kind"] == "repo_tests_official"
+    assert row["verifier"]["config"]["test_command"] == "bash /pre_artifacts.sh && bash /tests/test.sh"
+    assert row["verifier"]["config"]["test_timeout_s"] == 123.0
+    assert row["metadata"]["official_task_id"] == "fix-demo"
+
+
 def test_prepare_dataset_materializes_agent_loop_answer_rows(tmp_path: Path, monkeypatch) -> None:
     source_root = tmp_path / "sources"
     source_dir = source_root / "widesearch"
@@ -207,7 +349,7 @@ def test_prepare_dataset_materializes_agent_loop_explicit_manifest(tmp_path: Pat
 
 
 def test_prepare_dataset_materializes_agent_loop_hf_source(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.delenv("RWKV_AGENT_LOOP_SOURCE_ROOT", raising=False)
+    monkeypatch.setenv("RWKV_AGENT_LOOP_SOURCE_ROOT", str(tmp_path / "missing-agent-loop-sources"))
     monkeypatch.delenv("RWKV_AGENT_LOOP_SOURCE_DEEPSEARCHQA", raising=False)
     monkeypatch.setattr(
         "src.eval.datasets.data_prepper.function_calling.agent_loop.load_hf_rows",
@@ -229,7 +371,7 @@ def test_prepare_dataset_materializes_agent_loop_hf_source(tmp_path: Path, monke
 
     [row] = read_jsonl_items(paths[0])
     assert row["task_id"] == "https://huggingface.co/datasets/google/deepsearchqa:test:0"
-    assert row["executor"]["kind"] == "manifest_replay"
+    assert row["executor"]["kind"] == "web_search"
     assert row["verifier"]["kind"] == "llm_rubric_judge"
     assert row["verifier"]["config"]["reference_answer"] == "reference value"
     assert row["metadata"]["source_benchmark"] == "deepsearchqa"

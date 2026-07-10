@@ -55,12 +55,13 @@ pnpm dev
 ```
 
 开发模式下访问 `http://localhost:3000`。如果 FastAPI 后端不在 `http://127.0.0.1:7860`，
-用 `SCOREBOARD_API_BASE_URL` 指定 API 地址：
+用 `SCOREBOARD_API_BASE_URL` 指定 API 地址；如果部署到 `/new-eval`，同时设置
+`NEXT_PUBLIC_BASE_PATH=/new-eval`：
 
 ```bash
 cd client
-SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
-SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
+NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
+NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
 ```
 
 看板还内置**管理面板**（"管理面板"页签）用于驱动评测调度器：启动 / 暂停 / 恢复 / 取消任务，

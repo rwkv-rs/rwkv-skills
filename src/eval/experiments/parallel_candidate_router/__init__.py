@@ -3,6 +3,7 @@ from __future__ import annotations
 from .router import (
     CANDIDATE_LAYER_KEYS,
     CandidateToolCall,
+    NO_CANDIDATE_TOOL_NAME,
     ParallelCandidateRouteResult,
     ParallelCandidateRouterConfig,
     build_candidate_aggregate_prompt,
@@ -15,6 +16,7 @@ from .router import (
 __all__ = [
     "CANDIDATE_LAYER_KEYS",
     "CandidateToolCall",
+    "NO_CANDIDATE_TOOL_NAME",
     "ParallelCandidateRouteResult",
     "ParallelCandidateRouterConfig",
     "build_candidate_aggregate_prompt",

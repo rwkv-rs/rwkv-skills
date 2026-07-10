@@ -1,4 +1,4 @@
-"""FastAPI application serving the RWKV Skills evaluation dashboard.
+"""FastAPI JSON API for the RWKV Skills evaluation dashboard.
 
 Data sources (no Rust backend, no raw SQL in this layer):
   * leaderboard scores  ->  ``results/space/score_index.jsonl`` via ``load_scores``
@@ -39,7 +39,6 @@ from .screenshot import capture_page
 from .store import DashboardStore
 from ..core.selection import _compute_choices, _prepare_selection
 from .serialize import serialize_leaderboard, serialize_selection
-
 
 class _ScoreCache:
     """Process-wide cache of parsed score entries, refreshable on demand.

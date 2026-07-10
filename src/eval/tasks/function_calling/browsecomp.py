@@ -4,12 +4,13 @@ import base64
 import csv
 import hashlib
 import json
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
@@ -24,11 +25,27 @@ from src.eval.tasks.function_calling.common import (
     attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
+    clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
     repeat_probe_entries,
 )
-from src.eval.tasks.function_calling.final_answer import parse_final_answer_call, render_final_answer_call
+from src.eval.tasks.function_calling.final_answer import (
+    final_answer_tool_schema,
+    parse_final_answer_call,
+    render_final_answer_call,
+)
+from src.eval.tasks.function_calling.agent_loop import (
+    AgentLoopRecord,
+    _agent_loop_candidate_router_config_from_args,
+    _agent_loop_candidate_router_mode,
+    _agent_loop_long_doc_config,
+    run_agent_loop_episode,
+)
+from src.eval.tasks.function_calling.agent_loop_executors import WebSearchExecutor
+from src.eval.tasks.function_calling.agent_loop_executors import ExecutorSpec
+from src.eval.tasks.function_calling.agent_loop_verifiers import AgentLoopVerdict, VerifierSpec
+from src.eval.tasks.function_calling.native_tool_calls import openai_tool_schema
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _resolve_function_calling_plan,
@@ -79,6 +96,8 @@ class BrowseCompJudgeRuntimeError(RuntimeError):
 
 
 _BROWSECOMP_DEFAULT_PROMPT_MAX_CHARS = 8192
+_BROWSECOMP_NATIVE_TOOL_MAX_RETRIES = 2
+_BROWSECOMP_AGENTIC_ENV = "RWKV_BROWSECOMP_AGENTIC"
 
 
 def decrypt_xor_base64(ciphertext_b64: str, password: str) -> str:
@@ -452,6 +471,122 @@ def decode_browsecomp_final_answer(response: str, *, locale: str) -> tuple[str, 
     return answer, dict(final_call.call)
 
 
+def _browsecomp_final_answer_tool() -> dict[str, Any]:
+    return openai_tool_schema(final_answer_tool_schema(answer_description="The succinct final answer."))
+
+
+def _browsecomp_final_answer_tool_choice() -> dict[str, Any]:
+    return {"type": "function", "function": {"name": "final_answer"}}
+
+
+def _native_tool_raw_completion(output: Any) -> str:
+    raw_message = getattr(output, "raw_message", {}) or {}
+    if isinstance(raw_message, Mapping) and raw_message:
+        return json.dumps(raw_message, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    calls = []
+    for call in getattr(output, "tool_calls", []) or []:
+        calls.append(
+            {
+                "id": str(getattr(call, "id", "") or "final_answer"),
+                "type": "function",
+                "function": {
+                    "name": str(getattr(call, "name", "") or ""),
+                    "arguments": json.dumps(
+                        dict(getattr(call, "arguments", {}) or {}),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        )
+    return json.dumps(
+        {"role": "assistant", "content": getattr(output, "content", "") or None, "tool_calls": calls},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _native_browsecomp_final_answer_row(output: Any, *, locale: str, retry_attempt: int = 0) -> dict[str, Any]:
+    raw_completion = _native_tool_raw_completion(output)
+    tool_calls = list(getattr(output, "tool_calls", []) or [])
+    decoded_call: dict[str, Any] = {}
+    final_answer = ""
+    parse_error = ""
+    if tool_calls:
+        call = tool_calls[0]
+        call_name = str(getattr(call, "name", "") or "").strip()
+        arguments = dict(getattr(call, "arguments", {}) or {})
+        if call_name != "final_answer":
+            parse_error = f"browsecomp final answer expected final_answer tool, got {call_name!r}"
+        else:
+            answer = str(arguments.get("answer") or "").strip()
+            call_id = str(getattr(call, "id", "") or "final_answer")
+            decoded_call = {"name": "final_answer", "arguments": arguments, "id": call_id}
+            if answer:
+                final_answer = _normalize_final_answer(answer, locale=locale)
+            else:
+                parse_error = "browsecomp final answer final_answer call missing answer"
+    else:
+        content = str(getattr(output, "content", "") or "")
+        try:
+            final_answer, decoded_call = decode_browsecomp_final_answer(content, locale=locale)
+        except Exception as exc:  # noqa: BLE001 - sample-level parser failure
+            parse_error = str(exc)
+    raw_arguments = decoded_call.get("arguments") if isinstance(decoded_call, Mapping) else {}
+    raw_answer = str(raw_arguments.get("answer") or "").strip() if isinstance(raw_arguments, Mapping) else ""
+    raw_call_id = str(decoded_call.get("id") or "").strip() if isinstance(decoded_call, Mapping) else ""
+    final_call = render_final_answer_call(raw_answer, call_id=raw_call_id) if raw_answer else ""
+    return {
+        "response": final_answer,
+        "decoded_final_answer_call": decoded_call,
+        "final_answer_call": final_call,
+        "parse_error": parse_error,
+        "raw_completion": raw_completion,
+        "finish_reason": str(getattr(output, "finish_reason", "stop") or "stop"),
+        "native_tool": {
+            "enabled": True,
+            "response_source": str(getattr(output, "response_source", "") or ""),
+            "retry_attempt": int(retry_attempt),
+        },
+    }
+
+
+def _browsecomp_answer_runtime_sampling(sampling: Any) -> Any:
+    return replace(sampling, alpha_presence=0.0, alpha_frequency=0.0, alpha_decay=0.0)
+
+
+def _generate_native_browsecomp_final_answers(
+    engine: Any,
+    answer_prompts: Sequence[str],
+    *,
+    sampling: Any,
+    prompt_seeds: Sequence[int | None],
+) -> tuple[list[Any] | None, str]:
+    generate_tool_calls = getattr(engine, "generate_tool_calls", None)
+    if not callable(generate_tool_calls):
+        return None, "engine does not expose generate_tool_calls"
+    messages = [[{"role": "user", "content": prompt}] for prompt in answer_prompts]
+    tools = [[_browsecomp_final_answer_tool()] for _ in answer_prompts]
+    native_sampling = _browsecomp_answer_runtime_sampling(sampling)
+    try:
+        outputs = generate_tool_calls(
+            messages,
+            tools,
+            sampling=native_sampling,
+            batch_size=len(answer_prompts),
+            progress_desc="BrowseComp-Answer-NativeTool",
+            tool_choice=_browsecomp_final_answer_tool_choice(),
+            parallel_tool_calls=False,
+            prompt_seeds=list(prompt_seeds),
+        )
+    except NotImplementedError as exc:
+        return None, str(exc)
+    except Exception as exc:  # noqa: BLE001 - keep old text path when native tools are unavailable server-side
+        return None, f"{type(exc).__name__}: {exc}"
+    return list(outputs), ""
+
+
 def _browsecomp_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConfig:
     mode = str(getattr(args, "long_doc_mode", "lexical") or "lexical").strip().lower()
     enabled = mode != "off"
@@ -486,6 +621,286 @@ def _browsecomp_completion_to_eval_payload(payload: dict[str, object]) -> dict[s
     )
 
 
+def _browsecomp_agentic_enabled(args: argparse.Namespace) -> bool:
+    raw = str(os.environ.get(_BROWSECOMP_AGENTIC_ENV) or "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "agent", "agentic", "web"}
+
+
+def _browsecomp_agentic_instruction(record: BrowseCompRecord) -> str:
+    if record.locale.strip().lower() == "zh":
+        return normalize_rwkv_text(
+            "这是 BrowseComp 浏览检索题。请使用 web_search 搜索，并只对搜索结果中明确出现或可核验的 URL 使用 fetch_url。\n"
+            "不要只凭记忆作答。需要多次检索时请拆分查询并交叉验证。\n"
+            "最终完成时调用 final_answer，answer 字段只填写简洁、精确的最终答案，不要放解释或置信度。\n\n"
+            f"问题:\n{record.question}"
+        )
+    return normalize_rwkv_text(
+        "This is a BrowseComp browsing task. Use web_search to investigate, and use fetch_url only for URLs "
+        "that came from search results or visible evidence.\n"
+        "Do not answer from memory alone. Split the search into narrower queries when needed and cross-check evidence.\n"
+        "When finished, call final_answer with only the succinct exact answer in the answer field; do not include "
+        "explanation or confidence in final_answer.\n\n"
+        f"Question:\n{record.question}"
+    )
+
+
+def _browsecomp_agentic_record(record: BrowseCompRecord) -> AgentLoopRecord:
+    return AgentLoopRecord(
+        task_id=record.task_id,
+        instruction=_browsecomp_agentic_instruction(record),
+        tools=(),
+        executor=ExecutorSpec(kind="web_search", config={}),
+        verifier=VerifierSpec(kind="browsecomp_agentic", config={}),
+        metadata={
+            "source_benchmark": "browsecomp",
+            "locale": record.locale,
+            "topic": record.topic or "",
+        },
+    )
+
+
+class _BrowseCompAgenticVerifier:
+    def __init__(self, records: Sequence[BrowseCompRecord], judge: BrowseCompJudgeConfig) -> None:
+        self._records = {record.task_id: record for record in records}
+        self._judge = judge
+
+    def verify(
+        self,
+        record: AgentLoopRecord,
+        *,
+        final_answer: str,
+        trace: Sequence[Mapping[str, Any]],
+        executor_snapshot: Mapping[str, Any],
+    ) -> AgentLoopVerdict:
+        del trace, executor_snapshot
+        source = self._records.get(record.task_id)
+        if source is None:
+            raise ValueError(f"BrowseComp source record not found: {record.task_id}")
+        response = _normalize_final_answer(final_answer, locale=source.locale)
+        if not response.strip():
+            return AgentLoopVerdict(
+                reward=0.0,
+                is_passed=False,
+                fail_reason="browsecomp agent produced no final answer",
+                details={"judge_reason": "browsecomp agent produced no final answer", "response": ""},
+            )
+        outcome = judge_browsecomp_answers([(source, response)], config=self._judge)[0]
+        return AgentLoopVerdict(
+            reward=1.0 if outcome.is_passed else 0.0,
+            is_passed=bool(outcome.is_passed),
+            fail_reason="" if outcome.is_passed else outcome.reason,
+            details={"judge_reason": outcome.reason, "response": response},
+        )
+
+
+def _run_browsecomp_agentic(
+    args: argparse.Namespace,
+    run: ResolvedFunctionCallingRun,
+    records: Sequence[BrowseCompRecord],
+    *,
+    run_context: "RunContext | None" = None,
+) -> int:
+    if args.probe_only:
+        raise ValueError(f"{_BROWSECOMP_AGENTIC_ENV}=1 does not support --probe-only")
+
+    search_error = WebSearchExecutor.config_error() or WebSearchExecutor.health_error()
+    if search_error:
+        raise ValueError(f"BrowseComp agentic mode requires a healthy web_search executor: {search_error}")
+
+    plan = _resolve_function_calling_plan(
+        run.dataset_slug,
+        len(records),
+        avg_ks=args.avg_k,
+        model_name=run.model_name,
+        config_defaults=True,
+    )
+    attempt_keys = build_attempt_keys(plan, max_pass_k=1)
+    tool_sampling = resolve_sampling_config(
+        run.dataset_slug,
+        run.model_name,
+        stage="tool",
+        fallback_templates="function_call_default",
+    )
+    if tool_sampling is None:
+        raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
+    tool_sampling = clamp_function_calling_sampling(
+        tool_sampling,
+        max(1, int(getattr(args, "decision_max_tokens", None) or 1024)),
+    )
+
+    judge_cfg = resolve_judge_model_config()
+    if judge_cfg is None:
+        raise ValueError("BrowseComp agentic mode requires JUDGE_MODEL + JUDGE_API_KEY")
+    judge = BrowseCompJudgeConfig(
+        api_key=judge_cfg.api_key,
+        model=judge_cfg.model_name,
+        base_url=judge_cfg.base_url,
+        max_workers=resolve_judge_max_workers(getattr(args, "judge_max_workers", None), default=4),
+        timeout_s=resolve_judge_timeout_s(default=60.0),
+    )
+    verifier = _BrowseCompAgenticVerifier(records, judge)
+    long_doc_config = _agent_loop_long_doc_config(args)
+    candidate_router_mode = _agent_loop_candidate_router_mode(args)
+    candidate_router_config = _agent_loop_candidate_router_config_from_args(args)
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, tool_sampling)]),
+        long_doc_config=long_doc_config,
+        candidate_router_config=candidate_router_config,
+    )
+    sampling_payload["browsecomp_adapter"] = {
+        "mode": "agentic_web_search",
+        "candidate_router_mode": candidate_router_mode,
+        "decision_io": "rwkv_json_or_parallel_candidate",
+    }
+
+    history_max_chars = max(0, int(getattr(args, "history_max_chars", None) or 24000))
+    max_steps = max(1, int(getattr(args, "max_steps", None) or 16))
+    max_tool_errors = max(1, int(getattr(args, "max_tool_errors", None) or 5))
+    max_output_chars = int(getattr(args, "agent_loop_max_output_chars", None) or 8000)
+
+    job_name = _resolve_job_name("function_browsecomp", run_context=run_context)
+    ctx = prepare_function_calling_run(
+        dataset_slug=str(run.dataset_slug),
+        model_name=run.model_name,
+        job_name=job_name,
+        attempt_keys=attempt_keys,
+        expected_attempt_count=plan_attempt_count(plan, max_pass_k=1),
+        sampling_payload=sampling_payload,
+        avg_k=plan.avg_k,
+        effective_sample_count=plan.effective_sample_count,
+        db_write_queue=int(args.db_write_queue or 8),
+        run_context=run_context,
+        judger_model_name=judge.model,
+    )
+    runtime = ctx.runtime
+    writer = ctx.writer
+    flush_partial = build_partial_eval_flusher(
+        ctx=ctx,
+        completion_to_eval=_browsecomp_completion_to_eval_payload,
+        runner_name="browsecomp_agentic",
+    )
+
+    try:
+        with TaskRunSignalGuard(
+            controller=runtime,
+            writer=writer,
+            close_timeout_s=float(args.db_close_timeout_s),
+            on_interrupt=flush_partial,
+        ):
+            try:
+                pending = build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
+                for key, source_record in pending:
+                    agent_record = _browsecomp_agentic_record(source_record)
+                    executor = WebSearchExecutor(max_output_chars=max_output_chars)
+                    try:
+                        episode = run_agent_loop_episode(
+                            record=agent_record,
+                            engine=run.engine,
+                            tool_sampling=tool_sampling,
+                            executor=executor,
+                            verifier=verifier,
+                            sample_index=key.sample_index,
+                            repeat_index=key.repeat_index,
+                            pass_index=key.pass_index,
+                            max_steps=max_steps,
+                            max_tool_errors=max_tool_errors,
+                            history_max_chars=history_max_chars,
+                            max_output_chars=max_output_chars,
+                            long_doc_config=long_doc_config,
+                            candidate_router_mode=candidate_router_mode,
+                            candidate_router_config=candidate_router_config,
+                            progress_prefix="BrowseComp-Agentic",
+                        )
+                    except Exception as exc:  # noqa: BLE001 - sample-level infrastructure failures become failed rows.
+                        episode = {
+                            "stages": [],
+                            "trace": [],
+                            "final_answer": "",
+                            "termination_reason": "episode_error",
+                            "error": str(exc),
+                            "verdict": AgentLoopVerdict(0.0, False, str(exc), {}),
+                            "fail_reason": str(exc),
+                            "num_turns": 0,
+                        }
+                    finally:
+                        executor.close()
+
+                    verdict: AgentLoopVerdict = episode["verdict"]
+                    response = str(verdict.details.get("response") or "")
+                    judge_reason = str(verdict.details.get("judge_reason") or verdict.fail_reason or "")
+                    payload = SampleRecord(
+                        benchmark_name=run.benchmark_name,
+                        dataset_split=run.dataset_split,
+                        sample_index=key.sample_index,
+                        repeat_index=key.repeat_index,
+                        pass_index=key.pass_index,
+                        stages=episode["stages"],
+                        sampling_config=sampling_payload,
+                    ).as_payload()
+                    payload["agent_result"] = {
+                        "reward": float(verdict.reward),
+                        "num_turns": int(episode["num_turns"]),
+                        "cost": 0.0,
+                        "is_passed": bool(verdict.is_passed),
+                        "error": episode["error"] or (None if verdict.is_passed else verdict.fail_reason or None),
+                    }
+                    payload["agent_info"] = {
+                        "question": source_record.question,
+                        "reference_answer": source_record.answer,
+                        "response": response,
+                        "final_answer": episode["final_answer"],
+                        "judge_reason": judge_reason,
+                        "fail_reason": episode["fail_reason"],
+                        "termination_reason": episode["termination_reason"],
+                        "locale": source_record.locale,
+                        "cot_mode": CoTMode.NO_COT.value,
+                        "topic": source_record.topic or "",
+                        "agentic": True,
+                    }
+                    payload["agent_trace"] = episode["trace"]
+                    payload["task_id"] = source_record.task_id
+                    payload["domain"] = "function_call"
+                    payload["instruction"] = source_record.question
+                    writer.enqueue(payload)
+            except Exception:
+                runtime.handle_attempt_stage_failure(
+                    writer,
+                    timeout_s=float(args.db_close_timeout_s),
+                    on_after_close=lambda: flush_partial("exception"),
+                )
+                raise
+
+        completions_payloads, _eval_payloads, metrics = finalize_function_calling_run(
+            ctx=ctx,
+            completion_to_eval=_browsecomp_completion_to_eval_payload,
+            model_name=run.model_name,
+            avg_k=plan.avg_k,
+            timeout_s=float(args.db_close_timeout_s),
+            build_score_payload=lambda completions_payloads, _eval_payloads, metrics: make_score_payload(
+                run.dataset_slug,
+                is_cot=False,
+                model_name=run.model_name,
+                metrics=metrics,
+                samples=len(completions_payloads),
+                problems=len(records),
+                task=job_name,
+                task_details=build_plan_task_details(plan, cot_mode=CoTMode.NO_COT.value),
+                extra={
+                    "sampling_config": sampling_payload,
+                    "judger_model_name": judge.model,
+                    "cot_mode": CoTMode.NO_COT.value,
+                    "browsecomp_agentic": True,
+                },
+            ),
+        )
+    except Exception as exc:
+        if not ctx.runtime.state.is_terminal():
+            ctx.runtime.fail_task(error=str(exc))
+        raise
+    print(f"browsecomp agentic done: samples={len(completions_payloads)}, metrics={metrics}")
+    return 0
+
+
 def _run_browsecomp(
     args: argparse.Namespace,
     run: ResolvedFunctionCallingRun,
@@ -502,6 +917,8 @@ def _run_browsecomp(
         records = records[:sample_limit]
     if not records:
         raise ValueError("BrowseComp manifest is empty")
+    if _browsecomp_agentic_enabled(args):
+        return _run_browsecomp_agentic(args, run, records, run_context=run_context)
 
     plan = _resolve_function_calling_plan(
         run.dataset_slug,
@@ -527,6 +944,7 @@ def _run_browsecomp(
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     cot_sampling = cot_sampling.clamp(args.cot_max_tokens)
     answer_sampling = answer_sampling.clamp(args.answer_max_tokens)
+    answer_runtime_sampling = _browsecomp_answer_runtime_sampling(answer_sampling)
 
     batch_size = max(1, int(args.batch_size or 32))
     prompt_max_chars = int(args.prompt_max_chars or _BROWSECOMP_DEFAULT_PROMPT_MAX_CHARS)
@@ -563,7 +981,7 @@ def _run_browsecomp(
 
     job_name = _resolve_job_name("function_browsecomp", run_context=run_context)
     sampling_payload = attach_function_calling_context_metadata(
-        normalize_sampling_config_by_stage([(1, cot_sampling), (2, answer_sampling)]),
+        normalize_sampling_config_by_stage([(1, cot_sampling), (2, answer_runtime_sampling)]),
         long_doc_config=long_doc_config,
         prompt_max_chars=prompt_max_chars,
     )
@@ -635,7 +1053,7 @@ def _run_browsecomp(
                             long_doc_config=long_doc_config,
                             prompt_max_chars=prompt_max_chars,
                             engine=run.engine,
-                            sampling=answer_sampling,
+                            sampling=answer_runtime_sampling,
                             prompt_seed=sample_repeat_seed(
                                 _key.sample_index,
                                 _key.repeat_index,
@@ -651,23 +1069,106 @@ def _run_browsecomp(
                         answer_prompts.append(answer_prompt)
                         answer_stage_prompts.append(answer_prompt_payload)
                         answer_long_doc_traces.append(answer_trace)
-                    answer_outputs = run.engine.generate(
+                    answer_prompt_seeds = [
+                        sample_repeat_seed(
+                            key.sample_index,
+                            key.repeat_index,
+                            pass_index=key.pass_index,
+                            stage=2,
+                        )
+                        for key, _record in chunk
+                    ]
+                    native_outputs, native_fallback_error = _generate_native_browsecomp_final_answers(
+                        run.engine,
                         answer_prompts,
-                        sampling=answer_sampling,
-                        batch_size=len(answer_prompts),
-                        progress_desc="BrowseComp-Answer",
-                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in answer_prompts],
-                        prompt_seeds=[
-                            sample_repeat_seed(
-                                key.sample_index,
-                                key.repeat_index,
-                                pass_index=key.pass_index,
-                                stage=2,
-                            )
-                            for key, _record in chunk
-                        ],
+                        sampling=answer_runtime_sampling,
+                        prompt_seeds=answer_prompt_seeds,
                     )
-                    answer_by_index = {int(output.prompt_index): output for output in answer_outputs}
+                    answer_by_index: dict[int, dict[str, Any]] = {}
+                    if native_outputs is not None:
+                        for index, (_key, record) in enumerate(chunk):
+                            output = native_outputs[index]
+                            row = _native_browsecomp_final_answer_row(output, locale=record.locale)
+                            retry_errors: list[str] = []
+                            retry_count = 0
+                            while row.get("parse_error") and retry_count < _BROWSECOMP_NATIVE_TOOL_MAX_RETRIES:
+                                retry_count += 1
+                                retry_outputs, retry_error = _generate_native_browsecomp_final_answers(
+                                    run.engine,
+                                    [answer_prompts[index]],
+                                    sampling=answer_runtime_sampling,
+                                    prompt_seeds=[answer_prompt_seeds[index]],
+                                )
+                                if retry_outputs is None:
+                                    if retry_error:
+                                        retry_errors.append(retry_error)
+                                    break
+                                row = _native_browsecomp_final_answer_row(
+                                    retry_outputs[0],
+                                    locale=record.locale,
+                                    retry_attempt=retry_count,
+                                )
+                                if row.get("parse_error"):
+                                    retry_errors.append(str(row.get("parse_error") or "native retry parse failed"))
+                            native_tool_info = dict(row.get("native_tool") or {})
+                            native_tool_info["retry_count"] = retry_count
+                            if retry_errors:
+                                native_tool_info["retry_errors"] = retry_errors[-3:]
+                            row["native_tool"] = native_tool_info
+                            if row.get("parse_error"):
+                                fallback_reason = str(row.get("parse_error") or "native final_answer parse failed")
+                                try:
+                                    fallback_outputs = run.engine.generate(
+                                        [answer_prompts[index]],
+                                        sampling=answer_runtime_sampling,
+                                        batch_size=1,
+                                        progress_desc="BrowseComp-Answer-Fallback",
+                                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                                        prompt_seeds=[answer_prompt_seeds[index]],
+                                        openai_sampling_compat=True,
+                                    )
+                                    fallback_output = fallback_outputs[0]
+                                    row = {
+                                        "response": None,
+                                        "decoded_final_answer_call": None,
+                                        "final_answer_call": "",
+                                        "parse_error": "",
+                                        "raw_completion": fallback_output.text,
+                                        "finish_reason": fallback_output.finish_reason,
+                                        "native_tool": {
+                                            **native_tool_info,
+                                            "fallback_to_text": True,
+                                            "fallback_reason": fallback_reason,
+                                        },
+                                    }
+                                except Exception as exc:  # noqa: BLE001 - keep native failure if text fallback also fails
+                                    native_tool_info["fallback_to_text"] = False
+                                    native_tool_info["fallback_error"] = f"{type(exc).__name__}: {exc}"
+                                    row["native_tool"] = native_tool_info
+                            answer_by_index[int(getattr(output, "prompt_index", index))] = row
+                    else:
+                        if native_fallback_error:
+                            for trace in answer_long_doc_traces:
+                                trace["native_tool_fallback_error"] = native_fallback_error
+                        answer_outputs = run.engine.generate(
+                            answer_prompts,
+                            sampling=answer_runtime_sampling,
+                            batch_size=len(answer_prompts),
+                            progress_desc="BrowseComp-Answer",
+                            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in answer_prompts],
+                            prompt_seeds=answer_prompt_seeds,
+                            openai_sampling_compat=True,
+                        )
+                        for output in answer_outputs:
+                            answer_by_index[int(output.prompt_index)] = {
+                                "response": None,
+                                "decoded_final_answer_call": None,
+                                "final_answer_call": "",
+                                "parse_error": "",
+                                "raw_completion": output.text,
+                                "finish_reason": output.finish_reason,
+                                "native_tool": {"enabled": False},
+                            }
                     final_rows: list[dict[str, Any]] = []
                     judge_inputs: list[tuple[BrowseCompRecord, str]] = []
                     judge_positions: list[int] = []
@@ -676,30 +1177,38 @@ def _run_browsecomp(
                         for _ in chunk
                     ]
                     for index, (_key, record) in enumerate(chunk):
-                        output = answer_by_index[index]
-                        parse_error = ""
-                        final_answer = ""
-                        decoded_call: dict[str, Any] = {}
-                        try:
-                            final_answer, decoded_call = decode_browsecomp_final_answer(output.text, locale=record.locale)
-                        except Exception as exc:  # noqa: BLE001
-                            parse_error = str(exc)
-                        raw_answer = ""
-                        raw_arguments = decoded_call.get("arguments") if isinstance(decoded_call, Mapping) else {}
-                        if isinstance(raw_arguments, Mapping):
-                            raw_answer = str(raw_arguments.get("answer") or "").strip()
-                        raw_call_id = (
-                            str(decoded_call.get("id") or "").strip()
-                            if isinstance(decoded_call, Mapping)
-                            else ""
-                        )
-                        final_call = render_final_answer_call(raw_answer, call_id=raw_call_id) if raw_answer else ""
+                        answer_row = answer_by_index[index]
+                        parse_error = str(answer_row.get("parse_error") or "")
+                        final_answer = str(answer_row.get("response") or "")
+                        decoded_call = answer_row.get("decoded_final_answer_call")
+                        if not isinstance(decoded_call, Mapping):
+                            decoded_call = {}
+                            try:
+                                final_answer, decoded_call = decode_browsecomp_final_answer(
+                                    str(answer_row.get("raw_completion") or ""),
+                                    locale=record.locale,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                parse_error = str(exc)
+                        final_call = str(answer_row.get("final_answer_call") or "")
+                        if not final_call:
+                            raw_arguments = decoded_call.get("arguments") if isinstance(decoded_call, Mapping) else {}
+                            raw_answer = str(raw_arguments.get("answer") or "").strip() if isinstance(raw_arguments, Mapping) else ""
+                            raw_call_id = (
+                                str(decoded_call.get("id") or "").strip()
+                                if isinstance(decoded_call, Mapping)
+                                else ""
+                            )
+                            final_call = render_final_answer_call(raw_answer, call_id=raw_call_id) if raw_answer else ""
                         final_rows.append(
                             {
                                 "response": final_answer,
                                 "decoded_final_answer_call": decoded_call,
                                 "final_answer_call": final_call,
                                 "parse_error": parse_error,
+                                "raw_completion": str(answer_row.get("raw_completion") or ""),
+                                "finish_reason": str(answer_row.get("finish_reason") or "stop"),
+                                "native_tool": dict(answer_row.get("native_tool") or {}),
                             }
                         )
                         if parse_error:
@@ -712,7 +1221,6 @@ def _run_browsecomp(
                             judged[position] = outcome
                     for index, ((key, record), outcome) in enumerate(zip(chunk, judged)):
                         cot_output = cot_by_index[index]
-                        answer_output = answer_by_index[index]
                         final_row = final_rows[index]
                         final_answer = str(final_row["response"])
                         parse_error = str(final_row["parse_error"])
@@ -724,8 +1232,8 @@ def _run_browsecomp(
                             ),
                             StageRecord(
                                 prompt=answer_stage_prompts[index],
-                                completion=answer_output.text,
-                                stop_reason=answer_output.finish_reason,
+                                completion=str(final_row["raw_completion"]),
+                                stop_reason=str(final_row["finish_reason"]),
                             ),
                         ]
                         payload = SampleRecord(
@@ -756,15 +1264,17 @@ def _run_browsecomp(
                             "decoded_final_answer_call": final_row["decoded_final_answer_call"],
                             "parse_error": parse_error,
                             "long_doc": answer_long_doc_traces[index],
+                            "native_tool": final_row["native_tool"],
                         }
                         payload["agent_trace"] = [
                             {"stage": "cot", "text": cot_output.text},
                             {
                                 "stage": "answer",
                                 "text": final_answer,
-                                "raw_completion": answer_output.text,
+                                "raw_completion": final_row["raw_completion"],
                                 "sandbox_return": final_row["final_answer_call"],
                                 "parse_error": parse_error,
+                                "native_tool": final_row["native_tool"],
                                 "long_doc": answer_long_doc_traces[index],
                             },
                         ]

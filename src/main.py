@@ -205,6 +205,7 @@ class RunnerSection:
     tool_router_context_chars: int | None = None
     tool_router_max_tokens: int | None = None
     tool_router_description_chars: int | None = None
+    tool_call_io: str | None = None
     candidate_router_mode: str | None = None
     candidate_router_chunk_tools: int | None = None
     candidate_router_batch_size: int | None = None
@@ -297,6 +298,7 @@ class RunnerSection:
                 payload.get("tool_router_description_chars"),
                 field_name="runner.tool_router_description_chars",
             ),
+            tool_call_io=_maybe_str(payload.get("tool_call_io")),
             candidate_router_mode=_maybe_str(payload.get("candidate_router_mode")),
             candidate_router_chunk_tools=_maybe_int(
                 payload.get("candidate_router_chunk_tools"),
@@ -768,6 +770,7 @@ def _build_runner_argv(
         _append_flag(argv, "--tool-router-context-chars", runner_cfg.tool_router_context_chars)
         _append_flag(argv, "--tool-router-max-tokens", runner_cfg.tool_router_max_tokens)
         _append_flag(argv, "--tool-router-description-chars", runner_cfg.tool_router_description_chars)
+        _append_flag(argv, "--tool-call-io", runner_cfg.tool_call_io)
         _append_flag(argv, "--candidate-router-mode", runner_cfg.candidate_router_mode)
         _append_flag(argv, "--candidate-router-chunk-tools", runner_cfg.candidate_router_chunk_tools)
         _append_flag(argv, "--candidate-router-batch-size", runner_cfg.candidate_router_batch_size)

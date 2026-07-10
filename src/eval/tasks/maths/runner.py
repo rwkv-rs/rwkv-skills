@@ -49,6 +49,7 @@ class MathStageConfig:
     final_answer_template: str
     cot_sampling: Any
     final_sampling: Any
+    prompt_max_chars: int | None = None
 
 
 def _safe_int(value: object) -> int:
@@ -260,6 +261,7 @@ def main(
             pass_k=(1,),
             samples_per_task=1,
             probe_only=True,
+            prompt_max_chars=stage_config.prompt_max_chars,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
@@ -297,6 +299,7 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                prompt_max_chars=stage_config.prompt_max_chars,
             )
         except Exception:
             runtime.handle_attempt_stage_failure(writer, timeout_s=close_timeout_s)
@@ -316,8 +319,8 @@ def main(
             for summary in judge_errors:
                 print(f"⚠️ LLM judge 存在异常样本：{summary}")
             if judge_mode is JudgeMode.LLM and judge_errors:
-                raise RuntimeError(
-                    "LLM judge 存在异常样本，拒绝写入正式分数: "
+                print(
+                    "⚠️ LLM judge 异常样本已按 judge_false 计入，并写入 judge_stats: "
                     + "; ".join(judge_errors)
                 )
 
@@ -402,12 +405,15 @@ def _resolve_math_stage_config(
         cot_max_tokens=cot_max_tokens,
         final_max_tokens=final_max_tokens,
     )
+    root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    prompt_max_chars = getattr(root_config, "prompt_max_chars", None)
     if prompt_profile == "naive":
         return MathStageConfig(
             cot_prompt_template=DEFAULT_COT_PROMPT,
             final_answer_template=DEFAULT_FINAL_PROMPT,
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
+            prompt_max_chars=prompt_max_chars,
         )
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
@@ -426,6 +432,7 @@ def _resolve_math_stage_config(
         ),
         cot_sampling=cot_sampling,
         final_sampling=final_sampling,
+        prompt_max_chars=prompt_max_chars,
     )
 
 

@@ -17,6 +17,7 @@ from typing import Any
 from ..core.boards import BOARD_NAIVE, BOARD_NORMAL, is_naive_meta
 from ..core.metrics import _display_metric_from_context, _score_to_percent
 from ..core.vocab import token_id_to_display
+from .context_display import clean_context_for_display
 from .eval_service import _extract_context_object
 from .store import DashboardStore
 
@@ -172,6 +173,7 @@ def score_history_detail(*, task_id: int, store: DashboardStore | None = None) -
     prompt_stages: list[dict[str, Any]] = []
     context = _extract_context_object(detail.get("context"))
     if isinstance(context, dict) and isinstance(context.get("stages"), list):
+        context = clean_context_for_display(context)
         for stage in context["stages"]:
             if isinstance(stage, dict):
                 prompt_stages.append(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
 import threading
 import time
@@ -196,6 +197,7 @@ class InferenceBackend(Protocol):
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
+        openai_sampling_compat: bool = False,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         """生成补全。
@@ -286,6 +288,7 @@ class RemoteInferenceBackend:
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
+        openai_sampling_compat: bool = False,
         show_progress: bool = True,
     ) -> list[GenerationOutput]:
         effective_constraints = _resolve_effective_constraints(
@@ -326,6 +329,7 @@ class RemoteInferenceBackend:
                         None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
                         None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index],
                         prefill_chunk_size,
+                        openai_sampling_compat,
                     ): prompt_index
                     for prompt_index, prompt in enumerate(prompts)
                 }
@@ -355,15 +359,16 @@ class RemoteInferenceBackend:
         prompt_seeds: Sequence[int | None] | None = None,
         show_progress: bool = True,
     ) -> list[ToolCallGenerationOutput]:
-        if self.config.protocol == "completions":
-            raise NotImplementedError("completion-style remote infer does not support native chat tool calls")
         if not message_batches:
             return []
         if len(tools_batches) != len(message_batches):
             raise ValueError("tools_batches length must match message_batches length")
         if prompt_seeds is not None and len(prompt_seeds) != len(message_batches):
             raise ValueError("prompt_seeds length must match message_batches length")
-        omit_prompt_seeds = self.config.protocol == "vllm" or self.config.seed_policy == "omit"
+        omit_prompt_seeds = (
+            self.config.protocol in {"vllm", "completions"}
+            or self.config.seed_policy == "omit"
+        )
         if prompt_seeds is not None:
             has_prompt_seeds = any(seed is not None for seed in prompt_seeds)
             if has_prompt_seeds and omit_prompt_seeds:
@@ -413,8 +418,9 @@ class RemoteInferenceBackend:
         seed: int | None,
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
+        openai_sampling_compat: bool,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol == "completions"
+        include_private_fields = self.config.protocol == "completions" and not openai_sampling_compat
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -423,6 +429,7 @@ class RemoteInferenceBackend:
             stop_suffixes=stop_suffixes,
             prefill_chunk_size=prefill_chunk_size,
             include_private_fields=include_private_fields,
+            preserve_zero_penalties=openai_sampling_compat,
         )
         chat_payload = _chat_payload_from_completion_payload(
             payload,
@@ -623,6 +630,7 @@ def _completion_payload_from_sampling(
     stop_suffixes: Sequence[str] | None,
     prefill_chunk_size: int,
     include_private_fields: bool,
+    preserve_zero_penalties: bool = False,
 ) -> dict[str, object]:
     def nonzero(value: float) -> float:
         value = float(value)
@@ -634,8 +642,10 @@ def _completion_payload_from_sampling(
         "max_tokens": int(sampling.max_generate_tokens),
         "temperature": nonzero(sampling.temperature),
         "top_p": nonzero(sampling.top_p),
-        "presence_penalty": nonzero(sampling.alpha_presence),
     }
+    presence_penalty = float(sampling.alpha_presence)
+    if not preserve_zero_penalties or presence_penalty != 0.0:
+        payload["presence_penalty"] = presence_penalty if preserve_zero_penalties else nonzero(presence_penalty)
     if seed is not None:
         payload["seed"] = int(seed)
     if stop_suffixes:
@@ -645,7 +655,6 @@ def _completion_payload_from_sampling(
             {
                 "top_k": int(sampling.top_k),
                 "repetition_penalty": nonzero(sampling.alpha_frequency),
-                "penalty_decay": nonzero(sampling.alpha_decay),
                 "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
                 "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
                 "pad_zero": bool(sampling.pad_zero),
@@ -653,6 +662,8 @@ def _completion_payload_from_sampling(
                 "prefill_chunk_size": int(prefill_chunk_size),
             }
         )
+        if os.environ.get("RWKV_OMIT_PENALTY_DECAY") not in {"1", "true", "TRUE", "yes", "YES"}:
+            payload["penalty_decay"] = nonzero(sampling.alpha_decay)
     return payload
 
 

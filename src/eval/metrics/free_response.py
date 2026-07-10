@@ -46,6 +46,16 @@ _PREFERRED_ANSWER_KEYS = (
     "target",
     "final_answer",
 )
+_ANSWER_WINDOW_MARKERS = (
+    "\\boxed",
+    "final answer",
+    "answer is",
+    "the answer",
+    "therefore",
+)
+_ANSWER_WINDOW_PREFIX_CHARS = 400
+_ANSWER_WINDOW_SUFFIX_CHARS = 1800
+_ANSWER_WINDOW_TAIL_CHARS = 2500
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
     "You are a rigorous AI judge. Your task is to evaluate whether a student's "
@@ -225,7 +235,7 @@ class LLMJudge:
                     request_kwargs: dict[str, Any] = {
                         "model": self.config.model,
                         "stream": False,
-                        "temperature": 0.0,
+                        "temperature": 0.8,
                         "messages": [{"role": "user", "content": prompt}],
                     }
                     if "qwen3" in self.config.model.lower():
@@ -319,6 +329,40 @@ def _reference_expr(reference: str) -> str:
     return f"$\\boxed{{{reference}}}$"
 
 
+def _math_verify_input(scoring_text: str) -> str:
+    """Keep math_verify focused on the final-answer region.
+
+    Some RWKV outputs contain long repeated reasoning before or after the final
+    answer. Passing the full text into math_verify can trigger very slow
+    symbolic comparisons even when the answer is plainly present near the end.
+    """
+
+    text = scoring_text.strip()
+    if len(text) <= _ANSWER_WINDOW_TAIL_CHARS:
+        return text
+    boxed_start = text.rfind("\\boxed{")
+    if boxed_start >= 0:
+        depth = 0
+        for offset, char in enumerate(text[boxed_start:]):
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[boxed_start : boxed_start + offset + 1]
+        return text[boxed_start : boxed_start + _ANSWER_WINDOW_SUFFIX_CHARS]
+    lowered = text.lower()
+    marker_index = -1
+    for marker in _ANSWER_WINDOW_MARKERS:
+        index = lowered.rfind(marker)
+        marker_index = max(marker_index, index)
+    if marker_index >= 0:
+        start = max(0, marker_index - _ANSWER_WINDOW_PREFIX_CHARS)
+        end = min(len(text), marker_index + _ANSWER_WINDOW_SUFFIX_CHARS)
+        return text[start:end]
+    return text[-_ANSWER_WINDOW_TAIL_CHARS:]
+
+
 def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
     api = _load_math_verify()
     display_answer = _short_text(scoring_text)
@@ -343,8 +387,9 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
             answer=display_answer,
             fail_reason=f"reference_parse_error:{type(exc).__name__}",
         )
+    verify_text = _math_verify_input(scoring_text)
     try:
-        pred = parse(scoring_text)
+        pred = parse(verify_text)
     except Exception as exc:  # noqa: BLE001
         return _MathVerifyResult(
             passed=False,
