@@ -386,15 +386,17 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
 
 
 def candidate_router_defaults(*, mode: str) -> dict[str, Any]:
+    batch_size = positive_int(os.getenv("RWKV_CANDIDATE_ROUTER_BATCH_SIZE"), 16)
+    max_candidates = positive_int(os.getenv("RWKV_CANDIDATE_ROUTER_MAX_CANDIDATES"), 8)
     return {
         "candidate_router_mode": mode,
         "candidate_router_chunk_tools": 2,
-        "candidate_router_batch_size": 16,
+        "candidate_router_batch_size": batch_size,
         "candidate_router_context_chars": 6000,
         "candidate_router_prompt_max_chars": 8192,
         "candidate_router_candidate_max_tokens": 192,
         "candidate_router_aggregate_max_tokens": 192,
-        "candidate_router_max_candidates": 8,
+        "candidate_router_max_candidates": max_candidates,
         "candidate_router_tool_schema_mode": "compact",
         "candidate_router_evidence_chars": 1200,
         "candidate_router_policy_chars": 2000,
