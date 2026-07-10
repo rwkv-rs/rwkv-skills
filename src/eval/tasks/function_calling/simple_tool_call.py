@@ -52,6 +52,7 @@ _GENERIC_CANDIDATE_ROUTER_POLICY = (
     "Use only the provided tools and include final argument values only."
 )
 _AUTO_CANDIDATE_ROUTER_MIN_TOOLS = 16
+DEFAULT_TOOL_CALL_IO = "rwkv-json"
 _TOOL_CALL_IO_CHOICES = frozenset({"native", "rwkv-json"})
 
 
@@ -592,7 +593,7 @@ def _simple_candidate_router_mode(args: argparse.Namespace) -> str:
 
 
 def _simple_tool_call_io(args: argparse.Namespace) -> str:
-    value = str(getattr(args, "tool_call_io", "native") or "native").strip().lower()
+    value = str(getattr(args, "tool_call_io", DEFAULT_TOOL_CALL_IO) or DEFAULT_TOOL_CALL_IO).strip().lower()
     if value not in _TOOL_CALL_IO_CHOICES:
         raise ValueError(f"unsupported tool_call_io={value!r}; expected native or rwkv-json")
     return value

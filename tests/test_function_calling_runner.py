@@ -124,6 +124,12 @@ def test_function_calling_runner_parser_accepts_fresh_run_mode() -> None:
     assert args.run_mode == "fresh"
 
 
+def test_function_calling_runner_defaults_to_rwkv_json_tool_calls() -> None:
+    args = function_calling_runner.parse_args(["--dataset", "bfcl_ast_test.jsonl"])
+
+    assert args.tool_call_io == "rwkv-json"
+
+
 def test_function_calling_runner_falls_back_for_local_sample_workers() -> None:
     args = function_calling_runner.parse_args(
         [

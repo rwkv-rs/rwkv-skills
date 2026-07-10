@@ -49,7 +49,7 @@ from src.eval.tasks.function_calling.runner_common import (
     FunctionCallingBenchmarkKind,
     ResolvedFunctionCallingRun,
 )
-from src.eval.tasks.function_calling.simple_tool_call import _run_simple_tool_call
+from src.eval.tasks.function_calling.simple_tool_call import DEFAULT_TOOL_CALL_IO, _run_simple_tool_call
 from src.eval.tasks.function_calling.tau_runner import (
     DEFAULT_MAX_STEPS,
     DEFAULT_MAX_TOOL_ERRORS,
@@ -165,11 +165,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--tool-call-io",
         choices=("native", "rwkv-json"),
-        default=os.environ.get("RWKV_TOOL_CALL_IO", "native"),
+        default=os.environ.get("RWKV_TOOL_CALL_IO", DEFAULT_TOOL_CALL_IO),
         help=(
             "Tool-call decision transport for simple tool-call benchmarks. "
-            "native uses OpenAI chat tools/tool_calls; rwkv-json prompts the model to continue a JSON call "
-            "and parses it locally."
+            "rwkv-json prompts the model to continue a JSON call and parses it locally; "
+            "native uses OpenAI chat tools/tool_calls and must be enabled explicitly."
         ),
     )
     parser.add_argument(
