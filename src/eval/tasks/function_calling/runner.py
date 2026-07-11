@@ -75,6 +75,7 @@ _SAMPLE_WORKER_ENABLED_KINDS = frozenset(
         FunctionCallingBenchmarkKind.AGENT_LOOP,
         FunctionCallingBenchmarkKind.BFCL_V3,
         FunctionCallingBenchmarkKind.BROWSECOMP_PLUS,
+        FunctionCallingBenchmarkKind.MCP_BENCH,
     }
 )
 _PARALLEL_CANDIDATE_ROUTER_DEFAULTS = ParallelCandidateRouterConfig()

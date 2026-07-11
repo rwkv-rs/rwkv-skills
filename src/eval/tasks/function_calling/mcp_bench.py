@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from src.eval.benchmark_config import resolve_sampling_config
 from src.eval.benchmark_registry import CoTMode
+from src.eval.concurrent_runner import run_episodes
 from src.eval.env_config import resolve_judge_model_config
 from src.eval.evaluating import TaskRunSignalGuard
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
@@ -1286,7 +1287,6 @@ def _run_mcp_bench(
         run_context=run_context,
         judger_model_name=judge_cfg.model_name,
     )
-    worker = McpBenchWorkerClient(runtime_root=runtime_root, worker_script=worker_script)
     runtime = ctx.runtime
     writer = ctx.writer
     _flush_partial_eval = build_partial_eval_flusher(
@@ -1294,10 +1294,21 @@ def _run_mcp_bench(
         completion_to_eval=_mcp_bench_completion_to_eval_payload,
         runner_name="mcp_bench",
     )
+    active_workers: set[McpBenchWorkerClient] = set()
+    active_workers_lock = threading.Lock()
+
+    def _close_active_workers() -> None:
+        with active_workers_lock:
+            workers = tuple(active_workers)
+        for active_worker in workers:
+            try:
+                active_worker.close()
+            except Exception:
+                pass
 
     def _handle_runtime_interrupt(signame: str) -> None:
         try:
-            worker.close()
+            _close_active_workers()
         finally:
             _flush_partial_eval(signame)
 
@@ -1311,7 +1322,10 @@ def _run_mcp_bench(
             try:
                 pending = build_pending_attempts(attempt_keys, items, skip_keys=ctx.skip_keys)
                 max_rounds = max(1, int(args.max_rounds))
-                for key, item in pending:
+                sample_workers = max(1, int(getattr(args, "sample_workers", 1) or 1))
+
+                def _run_pending_item(entry: tuple[Any, McpBenchItem]) -> dict[str, Any]:
+                    key, item = entry
                     sample_index = key.sample_index
                     repeat_index = key.repeat_index
                     stages: list[StageRecord] = []
@@ -1323,6 +1337,9 @@ def _run_mcp_bench(
                     evaluation_summary = ""
                     is_passed = False
                     tool_call_counts: dict[str, int] = {}
+                    worker = McpBenchWorkerClient(runtime_root=runtime_root, worker_script=worker_script)
+                    with active_workers_lock:
+                        active_workers.add(worker)
                     try:
                         available_tools = worker.open_task(item)
                         candidate_router_tools = mcp_candidate_router_tools(available_tools)
@@ -1661,7 +1678,7 @@ def _run_mcp_bench(
                         payload["task_id"] = item.task.task_id
                         payload["domain"] = "function_call"
                         payload["instruction"] = presented_task(item)
-                        writer.enqueue(payload)
+                        return payload
                     except Exception as exc:
                         if _is_mcp_bench_runtime_error(exc):
                             raise
@@ -1694,12 +1711,26 @@ def _run_mcp_bench(
                         payload["task_id"] = item.task.task_id
                         payload["domain"] = "function_call"
                         payload["instruction"] = presented_task(item)
-                        writer.enqueue(payload)
+                        return payload
                     finally:
                         try:
                             worker.close_task()
                         except Exception:
                             pass
+                        with active_workers_lock:
+                            active_workers.discard(worker)
+                        try:
+                            worker.close()
+                        except Exception:
+                            pass
+                run_episodes(
+                    pending,
+                    _run_pending_item,
+                    max_workers=sample_workers,
+                    on_result=writer.enqueue,
+                    label="mcp_bench episode",
+                    collect_results=False,
+                )
             except Exception:
                 runtime.handle_attempt_stage_failure(
                     writer,
@@ -1708,7 +1739,7 @@ def _run_mcp_bench(
                 )
                 raise
     finally:
-        worker.close()
+        _close_active_workers()
 
     try:
         completions_payloads, _eval_payloads, metrics = finalize_function_calling_run(

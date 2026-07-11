@@ -252,6 +252,35 @@ def test_function_calling_runner_allows_agent_loop_sample_workers() -> None:
     assert args.sample_workers == 2
 
 
+def test_function_calling_runner_allows_mcp_bench_sample_workers() -> None:
+    args = function_calling_runner.parse_args(
+        [
+            "--dataset",
+            "mcp_bench_test.jsonl",
+            "--infer-base-url",
+            "http://127.0.0.1:8081",
+            "--infer-model",
+            "demo",
+            "--sample-workers",
+            "2",
+        ]
+    )
+    run = function_calling_runner.ResolvedFunctionCallingRun(
+        benchmark_kind=function_calling_runner.FunctionCallingBenchmarkKind.MCP_BENCH,
+        dataset_path=Path("/tmp/mcp_bench_test.jsonl"),
+        dataset_slug="mcp_bench_test",
+        benchmark_name="mcp_bench",
+        dataset_split="test",
+        model_name="demo",
+        engine=object(),  # type: ignore[arg-type]
+    )
+
+    function_calling_runner._normalize_sample_worker_args(args)
+    function_calling_runner._validate_sample_worker_benchmark(args, run)
+
+    assert args.sample_workers == 2
+
+
 def test_function_calling_runner_resolves_explicit_avg_k_plan() -> None:
     plan = runner_common._resolve_function_calling_plan("bfcl_v3_test", 50, avg_ks=[1.0])
 
