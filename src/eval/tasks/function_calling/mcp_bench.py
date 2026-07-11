@@ -835,7 +835,10 @@ def clean_mcp_final_answer(text: str) -> str:
 
 
 def infer_model_context_tokens(model_name: str) -> int:
-    match = re.search(r"ctx(\d+)", str(model_name or ""), flags=re.IGNORECASE)
+    name = str(model_name or "")
+    if "g1h" not in name.lower():
+        return 8192
+    match = re.search(r"ctx(\d+)", name, flags=re.IGNORECASE)
     if match:
         try:
             return int(match.group(1))

@@ -80,6 +80,7 @@ def test_mcp_context_budget_respects_g1h_10k_and_legacy_8k_contexts() -> None:
 
     g1h_budget = resolve_mcp_context_budget(args, "rwkv7-g1h-7.2b-20260710-ctx10240")
     old_budget = resolve_mcp_context_budget(args, "rwkv7-g1g-7.2b-20260523-ctx8192")
+    non_g1h_with_10k_name = resolve_mcp_context_budget(args, "rwkv7-g1g-7.2b-20260710-ctx10240")
 
     assert g1h_budget == {
         "context_tokens": 10240,
@@ -95,6 +96,7 @@ def test_mcp_context_budget_respects_g1h_10k_and_legacy_8k_contexts() -> None:
         "decision_max_tokens": 768,
         "final_max_tokens": 1024,
     }
+    assert non_g1h_with_10k_name == old_budget
 
 
 def test_clean_mcp_final_answer_strips_role_fence_and_final_answer_call() -> None:
