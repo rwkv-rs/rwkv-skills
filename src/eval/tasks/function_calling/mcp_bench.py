@@ -43,6 +43,7 @@ from src.eval.tasks.function_calling.rwkv_prompt import (
     render_json_function_call,
 )
 from src.eval.tasks.function_calling.tool_call_contract import parse_tool_call_text
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_calls_text
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import make_eval_payload, normalize_sampling_config_by_stage
 from src.eval.scheduler.config import REPO_ROOT
@@ -533,7 +534,8 @@ def build_planning_json_call_prompt(
                 "Output JSON schema:",
                 _render_mcp_output_schema(),
                 "Return exactly one JSON value that validates against the schema.",
-                "Use final_answer when no more MCP tool calls are needed.",
+                "Return a JSON array when multiple independent MCP tool calls can run in the same round.",
+                "Use final_answer only by itself when no more MCP tool calls are needed.",
                 "Do not invent tool names, arguments, or tool results.",
                 "Return no prose, no markdown, and no extra text outside the JSON value.",
             ]
@@ -633,12 +635,11 @@ def _should_use_mcp_candidate_router(
         return True
     if mode != "auto":
         return False
-    real_tool_count = max(0, len(tools) - 1)
-    if real_tool_count >= max(MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS, int(config.chunk_tools) * 2):
+    message_chars = _mcp_message_chars(prompt_messages)
+    catalog_chars = len(render_tool_catalog(available_tools))
+    if message_chars > int(config.context_chars):
         return True
-    if _mcp_message_chars(prompt_messages) > int(config.context_chars):
-        return True
-    if len(render_tool_catalog(available_tools)) > max(1, int(config.prompt_max_chars) // 2):
+    if message_chars + catalog_chars > max(1, int(config.prompt_max_chars)):
         return True
     return False
 
@@ -715,7 +716,7 @@ def run_mcp_candidate_router_decision(
 
 
 def _render_mcp_output_schema() -> str:
-    schema = {
+    call_schema = {
         "type": "object",
         "required": ["name", "arguments"],
         "additionalProperties": False,
@@ -723,6 +724,12 @@ def _render_mcp_output_schema() -> str:
             "name": {"type": "string"},
             "arguments": {"type": "object"},
         },
+    }
+    schema = {
+        "oneOf": [
+            call_schema,
+            {"type": "array", "minItems": 1, "items": call_schema},
+        ]
     }
     return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
 
@@ -883,10 +890,26 @@ def render_trace(steps: Sequence[dict[str, Any]]) -> str:
 
 def parse_planning_decision(response: str) -> PlanningDecision:
     try:
-        call = parse_tool_call_text(response, context_label="planning", recover_partial=True)
+        calls = parse_tool_calls_text(response, context_label="planning", recover_partial=True)
     except ValueError as exc:
         raise ValueError(f"failed to parse planning tool call: {exc}") from exc
-    return _planning_decision_from_name_args(call.name, call.arguments)
+    if not calls:
+        raise ValueError("planning payload did not contain a tool call")
+    final_calls = [call for call in calls if call.name == "final_answer"]
+    tool_calls = [call for call in calls if call.name != "final_answer"]
+    if final_calls and not tool_calls:
+        return _planning_decision_from_name_args(final_calls[0].name, final_calls[0].arguments)
+    planned_calls: list[PlannedToolCall] = []
+    for call in tool_calls:
+        decision = _planning_decision_from_name_args(call.name, call.arguments)
+        planned_calls.extend(decision.tool_calls)
+    if not planned_calls:
+        raise ValueError("planning payload did not contain a MCP tool call")
+    return PlanningDecision(
+        reasoning="",
+        should_continue=True,
+        tool_calls=tuple(planned_calls),
+    )
 
 
 def _planning_decision_from_name_args(name: str, arguments: Mapping[str, Any]) -> PlanningDecision:

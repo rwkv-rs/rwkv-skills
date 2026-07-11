@@ -103,6 +103,20 @@ def test_clean_mcp_final_answer_strips_role_fence_and_final_answer_call() -> Non
     assert clean_mcp_final_answer(raw) == "answer text"
 
 
+def test_mcp_planning_decision_accepts_parallel_tool_call_array() -> None:
+    decision = parse_planning_decision(
+        """
+        [
+          {"name":"maps:directions","arguments":{"origin":"A","destination":"B"}},
+          {"name":"calendar:search","arguments":{"query":"meeting"}}
+        ]
+        """
+    )
+
+    assert decision.should_continue is True
+    assert [call.full_name for call in decision.tool_calls] == ["maps:directions", "calendar:search"]
+
+
 def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
     record = SimpleToolCallRecord(
         task_id="demo",
