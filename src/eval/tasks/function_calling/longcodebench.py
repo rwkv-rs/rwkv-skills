@@ -555,26 +555,141 @@ def _run_longcodebench(
                         for key, record in chunk
                     ]
                     prompts = [prompt for prompt, _trace in prompt_rows]
-                    outputs = run.engine.generate(
-                        prompts,
-                        sampling=sampling,
-                        batch_size=len(prompts),
-                        progress_desc="LongCodeBench",
-                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
-                        prompt_seeds=[
-                            sample_repeat_seed(
-                                key.sample_index,
-                                key.repeat_index,
+                    try:
+                        outputs = run.engine.generate(
+                            prompts,
+                            sampling=sampling,
+                            batch_size=len(prompts),
+                            progress_desc="LongCodeBench",
+                            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES) for _ in prompts],
+                            prompt_seeds=[
+                                sample_repeat_seed(
+                                    key.sample_index,
+                                    key.repeat_index,
+                                    pass_index=key.pass_index,
+                                    stage=1,
+                                )
+                                for key, _record in chunk
+                            ],
+                        )
+                    except Exception as exc:  # noqa: BLE001 - score failed samples instead of killing the task
+                        error = f"inference_error:{type(exc).__name__}:{exc}"
+                        for index, (key, record) in enumerate(chunk):
+                            prompt, trace = prompt_rows[index]
+                            payload = SampleRecord(
+                                benchmark_name=run.benchmark_name,
+                                dataset_split=run.dataset_split,
+                                sample_index=key.sample_index,
+                                repeat_index=key.repeat_index,
                                 pass_index=key.pass_index,
-                                stage=1,
-                            )
-                            for key, _record in chunk
-                        ],
-                    )
+                                stages=[
+                                    StageRecord(
+                                        prompt=prompt,
+                                        completion="",
+                                        stop_reason="inference_error",
+                                    )
+                                ],
+                                sampling_config=sampling_payload,
+                            ).as_payload()
+                            payload["agent_result"] = {
+                                "reward": 0.0,
+                                "num_turns": 1,
+                                "cost": 0.0,
+                                "is_passed": False,
+                                "error": error,
+                            }
+                            payload["agent_info"] = {
+                                "dataset": LONGCODEQA_DATASET,
+                                "task_id": record.task_id,
+                                "repo": record.repo,
+                                "context_bucket": record.context_bucket,
+                                "context_size": record.context_size,
+                                "question": record.question,
+                                "prediction": "",
+                                "correct_letter": record.correct_letter,
+                                "exact_match": False,
+                                "allowed_letters": list(_choice_letters(record.question)),
+                                "final_answer_call": "",
+                                "decoded_final_answer_call": None,
+                                "parse_error": error,
+                                "prompt_goal": record.prompt_goal,
+                                "is_hard_label": record.is_hard_label,
+                                "long_doc": trace,
+                            }
+                            payload["agent_trace"] = [
+                                {
+                                    "stage": "answer",
+                                    "text": "",
+                                    "raw_completion": "",
+                                    "sandbox_return": "",
+                                    "parse_error": error,
+                                }
+                            ]
+                            payload["task_id"] = record.task_id
+                            payload["domain"] = "long_code"
+                            payload["instruction"] = record.question
+                            writer.enqueue(payload)
+                        continue
                     outputs_by_index = {int(output.prompt_index): output for output in outputs}
                     for index, (key, record) in enumerate(chunk):
-                        output = outputs_by_index[index]
                         prompt, trace = prompt_rows[index]
+                        output = outputs_by_index.get(index)
+                        if output is None:
+                            error = f"inference_error:missing_output_index:{index}"
+                            payload = SampleRecord(
+                                benchmark_name=run.benchmark_name,
+                                dataset_split=run.dataset_split,
+                                sample_index=key.sample_index,
+                                repeat_index=key.repeat_index,
+                                pass_index=key.pass_index,
+                                stages=[
+                                    StageRecord(
+                                        prompt=prompt,
+                                        completion="",
+                                        stop_reason="inference_error",
+                                    )
+                                ],
+                                sampling_config=sampling_payload,
+                            ).as_payload()
+                            payload["agent_result"] = {
+                                "reward": 0.0,
+                                "num_turns": 1,
+                                "cost": 0.0,
+                                "is_passed": False,
+                                "error": error,
+                            }
+                            payload["agent_info"] = {
+                                "dataset": LONGCODEQA_DATASET,
+                                "task_id": record.task_id,
+                                "repo": record.repo,
+                                "context_bucket": record.context_bucket,
+                                "context_size": record.context_size,
+                                "question": record.question,
+                                "prediction": "",
+                                "correct_letter": record.correct_letter,
+                                "exact_match": False,
+                                "allowed_letters": list(_choice_letters(record.question)),
+                                "final_answer_call": "",
+                                "decoded_final_answer_call": None,
+                                "parse_error": error,
+                                "prompt_goal": record.prompt_goal,
+                                "is_hard_label": record.is_hard_label,
+                                "long_doc": trace,
+                            }
+                            payload["agent_trace"] = [
+                                {
+                                    "stage": "answer",
+                                    "text": "",
+                                    "raw_completion": "",
+                                    "sandbox_return": "",
+                                    "parse_error": error,
+                                }
+                            ]
+                            payload["task_id"] = record.task_id
+                            payload["domain"] = "long_code"
+                            payload["instruction"] = record.question
+                            writer.enqueue(payload)
+                            continue
                         allowed_letters = _choice_letters(record.question)
                         parsed_answer, parsed_call, parsed_call_id, parse_error = parse_longcodeqa_final_answer_text(
                             output.text,
