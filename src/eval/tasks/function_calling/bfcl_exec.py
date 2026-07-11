@@ -772,26 +772,34 @@ def _run_bfcl_exec(
                 pending = build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
                 for key, record in pending:
                     prompt = build_bfcl_exec_prompt(record, history_max_chars=history_max_chars)
-                    output = run.engine.generate(
-                        [prompt],
-                        sampling=tool_sampling,
-                        batch_size=1,
-                        progress_desc=f"BFCL-Exec sample {key.sample_index}",
-                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                        prompt_seeds=[sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)],
-                    )[0]
                     parse_error: str | None = None
                     decoded_calls: list[dict[str, Any]] = []
+                    decision_text = ""
+                    decision_completion = ""
+                    finish_reason = "sample_exception"
                     try:
-                        if _looks_like_template_leak(output.text):
-                            raise ValueError("decision stage leaked internal template/control tokens")
-                        decision_completion = _complete_bfcl_exec_forced_prefix(record, output.text)
-                        decoded_calls = decode_simple_tool_call_response(decision_completion)
+                        output = run.engine.generate(
+                            [prompt],
+                            sampling=tool_sampling,
+                            batch_size=1,
+                            progress_desc=f"BFCL-Exec sample {key.sample_index}",
+                            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                            prompt_seeds=[sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)],
+                        )[0]
+                        decision_text = output.text
+                        finish_reason = output.finish_reason
+                        try:
+                            if _looks_like_template_leak(decision_text):
+                                raise ValueError("decision stage leaked internal template/control tokens")
+                            decision_completion = _complete_bfcl_exec_forced_prefix(record, decision_text)
+                            decoded_calls = decode_simple_tool_call_response(decision_completion)
+                        except Exception as exc:  # noqa: BLE001
+                            parse_error = str(exc)
+                            decision_completion = _complete_bfcl_exec_forced_prefix(record, decision_text)
                     except Exception as exc:  # noqa: BLE001
-                        parse_error = str(exc)
-                        decision_completion = _complete_bfcl_exec_forced_prefix(record, output.text)
+                        parse_error = f"sample_exception: {exc}"
                     evaluation = evaluate_bfcl_exec_calls(record, decoded_calls, parse_error=parse_error, sandbox=sandbox)
-                    stage = StageRecord(prompt=prompt, completion=decision_completion, stop_reason=output.finish_reason)
+                    stage = StageRecord(prompt=prompt, completion=decision_completion, stop_reason=finish_reason)
                     payload = SampleRecord(
                         benchmark_name=run.benchmark_name,
                         dataset_split=run.dataset_split,
@@ -815,9 +823,9 @@ def _run_bfcl_exec(
                     }
                     payload["agent_trace"] = [
                         {
-                            "decision_completion": output.text,
+                            "decision_completion": decision_text,
                             "decision_completion_for_eval": decision_completion,
-                            "decision_stop_reason": output.finish_reason,
+                            "decision_stop_reason": finish_reason,
                             "decoded_calls": decoded_calls,
                             "decoded_executable_calls": evaluation.details.get("decoded_executable_calls", []),
                             "parse_error": parse_error or "",
