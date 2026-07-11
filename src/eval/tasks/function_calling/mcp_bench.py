@@ -26,6 +26,8 @@ from src.eval.tasks.function_calling.common import (
 )
 from src.eval.tasks.function_calling.final_answer import final_answer_tool_schema
 from src.eval.tasks.function_calling.parallel_candidate_router import (
+    CandidateToolCall,
+    NO_CANDIDATE_TOOL_NAME,
     ParallelCandidateRouterConfig,
     route_parallel_candidate_tool_call,
 )
@@ -594,7 +596,7 @@ def _mcp_candidate_router_config_from_args(args: argparse.Namespace) -> Parallel
     if schema_mode not in {"minimal", "compact", "full"}:
         schema_mode = defaults.tool_schema_mode
     return ParallelCandidateRouterConfig(
-        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), 1),
         batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
         context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
         prompt_max_chars=_positive_int(
@@ -641,6 +643,8 @@ def _should_use_mcp_candidate_router(
         return True
     if mode != "auto":
         return False
+    if len(tools) >= MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS:
+        return True
     message_chars = _mcp_message_chars(prompt_messages)
     catalog_chars = len(render_tool_catalog(available_tools))
     if message_chars > int(config.context_chars):
@@ -658,10 +662,12 @@ def _mcp_candidate_router_policy(item: McpBenchItem) -> str:
     return normalize_rwkv_text(
         "\n".join(
             [
-                "MCP-Bench policy: choose exactly one next JSON function call for the official MCP runtime.",
+                "MCP-Bench candidate-filter policy: each shard proposes at most one useful next tool candidate.",
+                "The final MCP planner will receive the union of candidates and may call multiple independent tools in parallel.",
                 "Use only listed tool names. Do not invent MCP servers, tools, arguments, or tool outputs.",
-                "Prefer a real MCP tool while more evidence is needed. Use final_answer only when the task is complete and gathered evidence supports the answer.",
-                "If a previous identical tool call failed or returned no useful data, choose a different tool or final_answer instead of repeating it.",
+                "Prefer real MCP tools that can gather, inspect, search, compute, or verify evidence for the task.",
+                "Use final_answer only when the task is complete and gathered evidence supports the answer.",
+                "If this shard has no relevant tool, use __no_candidate__.",
                 f"Task: {presented_task(item)}",
                 f"Servers: {', '.join(item.servers)}",
             ]
@@ -682,19 +688,106 @@ def _mcp_candidate_router_facts(item: McpBenchItem) -> str:
     return normalize_rwkv_text("\n".join(rows))
 
 
-def run_mcp_candidate_router_decision(
+def select_mcp_candidate_available_tools(
+    available_tools: Mapping[str, Mapping[str, Any]],
+    candidates: Sequence[CandidateToolCall],
+    *,
+    item: McpBenchItem,
+    prompt_messages: Sequence[Mapping[str, object]],
+    max_tools: int,
+) -> dict[str, Mapping[str, Any]]:
+    selected_names: list[str] = []
+    seen: set[str] = set()
+    real_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.name in available_tools and candidate.name not in {NO_CANDIDATE_TOOL_NAME, "final_answer"}
+    ]
+    for candidate in sorted(real_candidates, key=lambda entry: float(entry.confidence), reverse=True):
+        if candidate.name not in seen:
+            selected_names.append(candidate.name)
+            seen.add(candidate.name)
+        if len(selected_names) >= max(1, int(max_tools)):
+            break
+    if not selected_names:
+        selected_names = _lexical_mcp_tool_candidates(
+            available_tools,
+            item=item,
+            prompt_messages=prompt_messages,
+            max_tools=max_tools,
+        )
+    return {name: available_tools[name] for name in selected_names if name in available_tools}
+
+
+def _lexical_mcp_tool_candidates(
+    available_tools: Mapping[str, Mapping[str, Any]],
+    *,
+    item: McpBenchItem,
+    prompt_messages: Sequence[Mapping[str, object]],
+    max_tools: int,
+) -> list[str]:
+    context_text = "\n".join(
+        [
+            presented_task(item),
+            item.task.dependency_analysis,
+            "\n".join(str(message.get("content") or "") for message in prompt_messages[-4:]),
+        ]
+    ).lower()
+    query_terms = {
+        token
+        for token in re.findall(r"[a-z0-9_]{3,}", context_text)
+        if token
+        not in {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "this",
+            "that",
+            "tool",
+            "tools",
+            "result",
+            "answer",
+            "task",
+        }
+    }
+    scored: list[tuple[int, str]] = []
+    for name, tool in available_tools.items():
+        haystack = normalize_rwkv_text(
+            " ".join(
+                [
+                    name,
+                    str(tool.get("name") or ""),
+                    str(tool.get("server") or ""),
+                    str(tool.get("description") or ""),
+                ]
+            )
+        ).lower()
+        score = 0
+        for term in query_terms:
+            if term in haystack:
+                score += 3 if term in name.lower() else 1
+        scored.append((score, name))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    limit = max(1, min(len(scored), int(max_tools)))
+    return [name for _score, name in scored[:limit]]
+
+
+def run_mcp_candidate_router_tool_filter(
     *,
     item: McpBenchItem,
     engine: Any,
     sampling: Any,
     tools: Sequence[Mapping[str, Any]],
+    available_tools: Mapping[str, Mapping[str, Any]],
     prompt_messages: Sequence[Mapping[str, object]],
     config: ParallelCandidateRouterConfig,
     sample_index: int,
     repeat_index: int,
     pass_index: int,
     round_num: int,
-) -> tuple[StageRecord, PlanningDecision, dict[str, Any]]:
+) -> tuple[dict[str, Mapping[str, Any]], list[StageRecord], dict[str, Any]]:
     route = route_parallel_candidate_tool_call(
         tools=tools,
         messages=prompt_messages,
@@ -707,18 +800,38 @@ def run_mcp_candidate_router_decision(
         progress_desc=f"MCPBench-CandidateRouter sample {sample_index} round {round_num}",
         prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=40_000 + round_num),
     )
-    selected = route.selected
-    if selected is None:
-        raise ValueError(str(route.aggregate_error or "candidate router did not select a MCP action"))
-    decision = _planning_decision_from_name_args(selected.name, selected.arguments)
-    decision_text = render_json_function_call(selected.name, selected.arguments)
-    completion = route.aggregate_completion or decision_text
-    finish_reason = route.aggregate_finish_reason or "stop"
+    candidate_pool = list(route.candidates)
+    if route.selected is not None:
+        candidate_pool.insert(0, route.selected)
+    max_tools = max(1, int(config.max_candidates))
+    available_subset = select_mcp_candidate_available_tools(
+        available_tools,
+        candidate_pool,
+        item=item,
+        prompt_messages=prompt_messages,
+        max_tools=max_tools,
+    )
+    filtered_names = list(available_subset)
     trace = {
-        "decision_io": "parallel_candidate",
-        "candidate_router": route.trace_payload(include_prompts=True),
+        "decision_io": "parallel_candidate_filtered_rwkv_json",
+        "candidate_router": {
+            **route.trace_payload(include_prompts=False),
+            "filtered_tool_names": filtered_names,
+            "filtered_tool_count": len(filtered_names),
+            "full_tool_count": len(available_tools),
+            "planner_receives_filtered_catalog": True,
+        },
     }
-    return StageRecord(prompt=route.aggregate_prompt, completion=completion, stop_reason=finish_reason), decision, trace
+    stages: list[StageRecord] = []
+    if route.aggregate_prompt or route.aggregate_completion:
+        stages.append(
+            StageRecord(
+                prompt=route.aggregate_prompt,
+                completion=route.aggregate_completion,
+                stop_reason=route.aggregate_finish_reason or "stop",
+            )
+        )
+    return available_subset, stages, trace
 
 
 def _render_mcp_output_schema() -> str:
@@ -1223,6 +1336,7 @@ def _run_mcp_bench(
                             candidate_trace: dict[str, Any] = {}
                             decision_raw = ""
                             try:
+                                planning_tools: Mapping[str, Mapping[str, Any]] = available_tools
                                 use_candidate_router = _should_use_mcp_candidate_router(
                                     mode=candidate_router_mode,
                                     config=candidate_router_config,
@@ -1232,11 +1346,12 @@ def _run_mcp_bench(
                                 ) and candidate_router_config is not None
                                 if use_candidate_router:
                                     try:
-                                        stage_record, decision, candidate_trace = run_mcp_candidate_router_decision(
+                                        planning_tools, route_stages, candidate_trace = run_mcp_candidate_router_tool_filter(
                                             item=item,
                                             engine=run.engine,
                                             sampling=decision_sampling,
                                             tools=candidate_router_tools,
+                                            available_tools=available_tools,
                                             prompt_messages=prompt_messages,
                                             config=candidate_router_config,
                                             sample_index=sample_index,
@@ -1244,49 +1359,61 @@ def _run_mcp_bench(
                                             pass_index=key.pass_index,
                                             round_num=round_num,
                                         )
-                                        stages.append(stage_record)
-                                        decision_raw = stage_record.completion
+                                        stages.extend(route_stages)
                                     except Exception as router_exc:
+                                        planning_tools = select_mcp_candidate_available_tools(
+                                            available_tools,
+                                            (),
+                                            item=item,
+                                            prompt_messages=prompt_messages,
+                                            max_tools=(
+                                                candidate_router_config.max_candidates
+                                                if candidate_router_config is not None
+                                                else MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS
+                                            ),
+                                        )
                                         candidate_trace = {
-                                            "decision_io": "rwkv_json",
+                                            "decision_io": "parallel_candidate_filtered_rwkv_json",
                                             "candidate_router": {
                                                 "routed": True,
-                                                "reason": "candidate_router_error_full_prompt_fallback",
+                                                "reason": "candidate_router_error_lexical_tool_fallback",
                                                 "error": str(router_exc),
+                                                "filtered_tool_names": list(planning_tools),
+                                                "filtered_tool_count": len(planning_tools),
+                                                "full_tool_count": len(available_tools),
+                                                "planner_receives_filtered_catalog": True,
                                             },
                                         }
-                                        use_candidate_router = False
-                                if not use_candidate_router:
-                                    decision_prompt = build_planning_json_call_prompt(
-                                        item,
-                                        available_tools,
-                                        prompt_messages,
-                                        history_max_chars=history_max_chars,
-                                    )
-                                    decision_output = run.engine.generate(
-                                        [decision_prompt],
-                                        sampling=decision_sampling,
-                                        batch_size=1,
-                                        progress_desc="MCPBench-Decision",
-                                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                                        prompt_seeds=[
-                                            sample_repeat_seed(
-                                                sample_index,
-                                                repeat_index,
-                                                pass_index=key.pass_index,
-                                                stage=round_num,
-                                            )
-                                        ],
-                                    )[0]
-                                    stages.append(
-                                        StageRecord(
-                                            prompt=decision_prompt,
-                                            completion=decision_output.text,
-                                            stop_reason=decision_output.finish_reason,
+                                decision_prompt = build_planning_json_call_prompt(
+                                    item,
+                                    planning_tools,
+                                    prompt_messages,
+                                    history_max_chars=history_max_chars,
+                                )
+                                decision_output = run.engine.generate(
+                                    [decision_prompt],
+                                    sampling=decision_sampling,
+                                    batch_size=1,
+                                    progress_desc="MCPBench-Decision",
+                                    prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                                    prompt_seeds=[
+                                        sample_repeat_seed(
+                                            sample_index,
+                                            repeat_index,
+                                            pass_index=key.pass_index,
+                                            stage=round_num,
                                         )
+                                    ],
+                                )[0]
+                                stages.append(
+                                    StageRecord(
+                                        prompt=decision_prompt,
+                                        completion=decision_output.text,
+                                        stop_reason=decision_output.finish_reason,
                                     )
-                                    decision_raw = decision_output.text
-                                    decision = parse_planning_decision(decision_output.text)
+                                )
+                                decision_raw = decision_output.text
+                                decision = parse_planning_decision(decision_output.text)
                             except Exception as exc:
                                 fail_reason = str(exc)
                                 steps.append(

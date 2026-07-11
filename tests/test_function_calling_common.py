@@ -38,7 +38,9 @@ from src.eval.tasks.function_calling.mcp_bench import (
     clean_mcp_final_answer,
     parse_planning_decision,
     resolve_mcp_context_budget,
+    select_mcp_candidate_available_tools,
 )
+from src.eval.tasks.function_calling.parallel_candidate_router import CandidateToolCall
 from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
@@ -117,6 +119,41 @@ def test_mcp_planning_decision_accepts_parallel_tool_call_array() -> None:
 
     assert decision.should_continue is True
     assert [call.full_name for call in decision.tool_calls] == ["maps:directions", "calendar:search"]
+
+
+def test_mcp_candidate_filter_keeps_multiple_parallel_candidate_tools() -> None:
+    item = McpBenchItem(
+        task_file="demo.json",
+        server_name="maps_weather",
+        combination_name="maps_weather",
+        combination_type="single",
+        servers=("maps", "weather"),
+        task=McpBenchTaskSpec(
+            task_id="demo",
+            task_description="Find weather and directions for Paris.",
+            fuzzy_description="",
+        ),
+        runtime_root="",
+    )
+    available_tools = {
+        "maps:directions": {"server": "maps", "name": "directions", "description": "Find driving directions"},
+        "weather:forecast": {"server": "weather", "name": "forecast", "description": "Find weather forecast"},
+        "files:read": {"server": "files", "name": "read", "description": "Read local files"},
+    }
+
+    filtered = select_mcp_candidate_available_tools(
+        available_tools,
+        (
+            CandidateToolCall("maps:directions", confidence=0.9),
+            CandidateToolCall("weather:forecast", confidence=0.8),
+            CandidateToolCall("final_answer", confidence=0.7),
+        ),
+        item=item,
+        prompt_messages=({"role": "user", "content": "Need weather and directions."},),
+        max_tools=4,
+    )
+
+    assert list(filtered) == ["maps:directions", "weather:forecast"]
 
 
 def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
