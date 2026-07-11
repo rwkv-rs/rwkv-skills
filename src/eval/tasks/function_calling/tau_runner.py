@@ -464,8 +464,6 @@ def _run_tau_official_attempt(
                 runtime_retry_count += 1
                 time.sleep(_tau_runtime_retry_delay_s(runtime_attempt))
                 continue
-            if is_transient:
-                raise
             agent.parse_errors.append(error_text)
             messages = list(getattr(orchestrator, "messages", []) or getattr(orchestrator, "_messages", []) or [])
             simulation = SimpleNamespace(
@@ -478,7 +476,12 @@ def _run_tau_official_attempt(
             evaluation = SimpleNamespace(
                 reward=0.0,
                 is_passed=False,
-                details={"termination_reason": error_text, "runtime_error": error_text},
+                details={
+                    "termination_reason": error_text,
+                    "runtime_error": error_text,
+                    "transient_runtime_error": bool(is_transient),
+                    "runtime_retries_exhausted": bool(is_transient),
+                },
             )
             break
     timing["runtime_retry_count"] = runtime_retry_count
