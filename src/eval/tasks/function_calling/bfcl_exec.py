@@ -329,6 +329,8 @@ def _complete_bfcl_exec_forced_prefix(record: BfclExecRecord, completion: str) -
         return completion
     if stripped.startswith("{") and not completion.rstrip().endswith("]"):
         return "[\n" + completion.rstrip() + "\n]"
+    if stripped.startswith('"name"') or stripped.startswith("'name'"):
+        return "[\n  {" + stripped.rstrip() + "\n]"
     return "[\n" + completion
 
 
