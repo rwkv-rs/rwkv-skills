@@ -373,6 +373,12 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
         config.update(candidate_router_defaults(mode="parallel"))
         config["history_max_chars"] = 24000
         config["prompt_max_chars"] = 28000
+        if model.infer_workers <= 2 or model.sample_workers <= 1:
+            config["decision_max_tokens"] = 512
+            config["final_max_tokens"] = 1024
+            config["planning_max_tokens"] = 1024
+            config["cot_max_tokens"] = 1024
+            config["max_steps"] = 80
     elif spec.job == "function_bfcl_ast":
         config.update(candidate_router_defaults(mode="auto"))
     elif spec.kind == "complexfuncbench":

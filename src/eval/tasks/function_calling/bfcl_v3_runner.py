@@ -927,6 +927,57 @@ def _checker_failure_evaluation(
     )
 
 
+def _build_bfcl_v3_attempt_payload(
+    *,
+    state: _ActiveBfclEpisode,
+    record: BfclTaskRecord,
+    run: ResolvedFunctionCallingRun,
+    sampling_payload: Mapping[str, object],
+    evaluation: BfclEvaluation,
+    trace: Sequence[Mapping[str, object]],
+    history_max_chars: int,
+    prompt_max_chars: int,
+    candidate_router_config: ParallelCandidateRouterConfig | None,
+) -> dict[str, object]:
+    payload = SampleRecord(
+        benchmark_name=run.benchmark_name,
+        dataset_split=run.dataset_split,
+        sample_index=state.sample_index,
+        repeat_index=state.repeat_index,
+        pass_index=state.pass_index,
+        stages=list(state.stages),
+        sampling_config=sampling_payload,
+    ).as_payload()
+    payload["agent_result"] = {
+        "reward": float(evaluation.reward),
+        "num_turns": int(state.turn_count),
+        "cost": 0.0,
+        "is_passed": bool(evaluation.is_passed),
+        "error": state.error or evaluation.fail_reason or None,
+    }
+    payload["agent_info"] = {
+        **dict(evaluation.details),
+        "termination_reason": state.termination_reason,
+        "tool_errors": state.tool_errors,
+        "num_steps": state.step_count or state.turn_count,
+        "final_answer": state.final_answer,
+        "ref_answer": build_bfcl_ref_answer(record),
+        "fail_reason": evaluation.fail_reason,
+        "cot_mode": CoTMode.NO_COT.value,
+        "history_max_chars": history_max_chars,
+        "prompt_max_chars": prompt_max_chars,
+        "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",
+        "final_prompt_messages": [dict(message) for message in state.prompt_messages],
+        "final_runtime_state_snapshot": dict(getattr(state.runtime_state, "current_state", {}) or {}),
+        "active_tools": [dict(tool) for tool in state.active_tools],
+    }
+    payload["agent_trace"] = [dict(item) for item in trace]
+    payload["task_id"] = record.task_id
+    payload["domain"] = "function_call"
+    payload["instruction"] = record.instruction
+    return payload
+
+
 def _run_one_bfcl_v3_attempt(
     *,
     key: AttemptKey,
@@ -1101,43 +1152,84 @@ def _run_one_bfcl_v3_attempt(
         if state.termination_reason is None or state.termination_reason == "agent_stop":
             state.termination_reason = "checker_error"
         state.error = state.error or f"checker_error:{exc}"
-    payload = SampleRecord(
-        benchmark_name=run.benchmark_name,
-        dataset_split=run.dataset_split,
-        sample_index=state.sample_index,
-        repeat_index=state.repeat_index,
-        pass_index=state.pass_index,
-        stages=list(state.stages),
-        sampling_config=sampling_payload,
-    ).as_payload()
-    payload["agent_result"] = {
-        "reward": float(evaluation.reward),
-        "num_turns": int(state.turn_count),
-        "cost": 0.0,
-        "is_passed": bool(evaluation.is_passed),
-        "error": state.error or evaluation.fail_reason or None,
-    }
-    payload["agent_info"] = {
-        **dict(evaluation.details),
-        "termination_reason": state.termination_reason,
-        "tool_errors": state.tool_errors,
-        "num_steps": state.step_count or state.turn_count,
-        "final_answer": state.final_answer,
-        "ref_answer": build_bfcl_ref_answer(record),
-        "fail_reason": evaluation.fail_reason,
-        "cot_mode": CoTMode.NO_COT.value,
-        "history_max_chars": history_max_chars,
-        "prompt_max_chars": prompt_max_chars,
-        "candidate_router_mode": "parallel" if candidate_router_config is not None else "off",
-        "final_prompt_messages": [dict(message) for message in state.prompt_messages],
-        "final_runtime_state_snapshot": dict(getattr(state.runtime_state, "current_state", {}) or {}),
-        "active_tools": [dict(tool) for tool in state.active_tools],
-    }
-    payload["agent_trace"] = trace
-    payload["task_id"] = record.task_id
-    payload["domain"] = "function_call"
-    payload["instruction"] = record.instruction
-    return payload
+    return _build_bfcl_v3_attempt_payload(
+        state=state,
+        record=record,
+        run=run,
+        sampling_payload=sampling_payload,
+        evaluation=evaluation,
+        trace=trace,
+        history_max_chars=history_max_chars,
+        prompt_max_chars=prompt_max_chars,
+        candidate_router_config=candidate_router_config,
+    )
+
+
+def _run_one_bfcl_v3_attempt_scoreable(
+    *,
+    key: AttemptKey,
+    record: BfclTaskRecord,
+    run: ResolvedFunctionCallingRun,
+    tool_sampling: Any,
+    sampling_payload: Mapping[str, object],
+    max_steps: int,
+    max_tool_errors: int,
+    history_max_chars: int,
+    prompt_max_chars: int,
+    prompt_style: str,
+    tool_routing_config: ToolRoutingConfig,
+    candidate_router_config: ParallelCandidateRouterConfig | None,
+) -> dict[str, object]:
+    try:
+        return _run_one_bfcl_v3_attempt(
+            key=key,
+            record=record,
+            run=run,
+            tool_sampling=tool_sampling,
+            sampling_payload=sampling_payload,
+            max_steps=max_steps,
+            max_tool_errors=max_tool_errors,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+            prompt_style=prompt_style,
+            tool_routing_config=tool_routing_config,
+            candidate_router_config=candidate_router_config,
+        )
+    except Exception as exc:
+        reason = f"inference_error:{type(exc).__name__}:{exc}"
+        _LOG.exception("bfcl_v3 sample %s failed as scoreable zero: %s", key.sample_index, exc)
+        state = _start_bfcl_episode(
+            sample_index=key.sample_index,
+            repeat_index=key.repeat_index,
+            pass_index=key.pass_index,
+            record=record,
+        )
+        state.termination_reason = "inference_error"
+        state.error = reason
+        evaluation = _checker_failure_evaluation(
+            reason=reason,
+            details={
+                "runner_exception_type": type(exc).__name__,
+                "runner_exception": str(exc),
+            },
+        )
+        return _build_bfcl_v3_attempt_payload(
+            state=state,
+            record=record,
+            run=run,
+            sampling_payload=sampling_payload,
+            evaluation=evaluation,
+            trace=[
+                {
+                    "round_num": 0,
+                    "termination_reason": "inference_error",
+                    "error": reason,
+                }
+            ],
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+            candidate_router_config=candidate_router_config,
+        )
 
 
 def _run_bfcl_v3(
@@ -1336,7 +1428,7 @@ def _run_bfcl_v3(
 
                 run_episodes(
                     pending,
-                    lambda item: _run_one_bfcl_v3_attempt(
+                    lambda item: _run_one_bfcl_v3_attempt_scoreable(
                         key=item[0],
                         record=item[1],
                         run=run,
