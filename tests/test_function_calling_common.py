@@ -89,9 +89,9 @@ def test_mcp_context_budget_respects_g1h_10k_and_legacy_8k_contexts() -> None:
 
     assert g1h_budget == {
         "context_tokens": 10240,
-        "history_max_chars": 13000,
-        "final_history_max_chars": 9500,
-        "decision_max_tokens": 640,
+        "history_max_chars": 12000,
+        "final_history_max_chars": 9000,
+        "decision_max_tokens": 512,
         "final_max_tokens": 1024,
     }
     assert old_budget == {
