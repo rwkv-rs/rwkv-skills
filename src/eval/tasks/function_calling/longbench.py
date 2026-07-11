@@ -537,17 +537,13 @@ def _run_longbench(
                     ]
                     prompts = [prompt for prompt, _trace in prompt_rows]
 
-                    def _process_output(output):
-                        index = int(output.prompt_index)
-                        if index < 0 or index >= len(chunk):
-                            return None
+                    completed_indices: set[int] = set()
+
+                    def _enqueue_failed_sample(index: int, reason: str) -> None:
+                        if index < 0 or index >= len(chunk) or index in completed_indices:
+                            return
                         key, record = chunk[index]
                         prompt, trace = prompt_rows[index]
-                        parsed_answer, parsed_call, parsed_call_id, parse_error, extraction_method = (
-                            _extract_longbench_prediction(output.text)
-                        )
-                        prediction = normalize_longbench_answer(parsed_answer)
-                        score = score_longbench_answer(prediction, record.answers)
                         payload = SampleRecord(
                             benchmark_name=run.benchmark_name,
                             dataset_split=run.dataset_split,
@@ -557,35 +553,32 @@ def _run_longbench(
                             stages=[
                                 StageRecord(
                                     prompt=prompt,
-                                    completion=output.text,
-                                    stop_reason=output.finish_reason,
+                                    completion="",
+                                    stop_reason="sample_exception",
                                 )
                             ],
                             sampling_config=sampling_payload,
                         ).as_payload()
                         payload["agent_result"] = {
-                            "reward": score.f1,
+                            "reward": 0.0,
                             "num_turns": 1,
                             "cost": 0.0,
-                            "is_passed": score.passed,
-                            "error": parse_error or None,
+                            "is_passed": False,
+                            "error": reason,
                         }
-                        sandbox_return = (
-                            render_final_answer_call(prediction, call_id=parsed_call_id) if prediction else ""
-                        )
                         payload["agent_info"] = {
                             "dataset": record.dataset,
                             "task_id": record.task_id,
                             "question": record.input,
                             "answers": list(record.answers),
-                            "prediction": prediction,
-                            "best_reference": score.best_reference,
-                            "f1": score.f1,
-                            "exact_match": score.exact_match,
-                            "final_answer_call": sandbox_return,
-                            "decoded_final_answer_call": parsed_call,
-                            "parse_error": parse_error,
-                            "answer_extraction": extraction_method,
+                            "prediction": "",
+                            "best_reference": "",
+                            "f1": 0.0,
+                            "exact_match": 0.0,
+                            "final_answer_call": "",
+                            "decoded_final_answer_call": {},
+                            "parse_error": reason,
+                            "answer_extraction": "sample_exception",
                             "category": record.category,
                             "language": record.language,
                             "length": record.length,
@@ -594,16 +587,89 @@ def _run_longbench(
                         payload["agent_trace"] = [
                             {
                                 "stage": "answer",
-                                "text": prediction,
-                                "raw_completion": output.text,
-                                "sandbox_return": sandbox_return,
-                                "parse_error": parse_error,
+                                "text": "",
+                                "raw_completion": "",
+                                "sandbox_return": "",
+                                "parse_error": reason,
                             }
                         ]
                         payload["task_id"] = record.task_id
                         payload["domain"] = "long_context"
                         payload["instruction"] = record.input
                         writer.enqueue(payload)
+                        completed_indices.add(index)
+
+                    def _process_output(output):
+                        index = int(output.prompt_index)
+                        if index < 0 or index >= len(chunk):
+                            return None
+                        try:
+                            key, record = chunk[index]
+                            prompt, trace = prompt_rows[index]
+                            parsed_answer, parsed_call, parsed_call_id, parse_error, extraction_method = (
+                                _extract_longbench_prediction(output.text)
+                            )
+                            prediction = normalize_longbench_answer(parsed_answer)
+                            score = score_longbench_answer(prediction, record.answers)
+                            payload = SampleRecord(
+                                benchmark_name=run.benchmark_name,
+                                dataset_split=run.dataset_split,
+                                sample_index=key.sample_index,
+                                repeat_index=key.repeat_index,
+                                pass_index=key.pass_index,
+                                stages=[
+                                    StageRecord(
+                                        prompt=prompt,
+                                        completion=output.text,
+                                        stop_reason=output.finish_reason,
+                                    )
+                                ],
+                                sampling_config=sampling_payload,
+                            ).as_payload()
+                            payload["agent_result"] = {
+                                "reward": score.f1,
+                                "num_turns": 1,
+                                "cost": 0.0,
+                                "is_passed": score.passed,
+                                "error": parse_error or None,
+                            }
+                            sandbox_return = (
+                                render_final_answer_call(prediction, call_id=parsed_call_id) if prediction else ""
+                            )
+                            payload["agent_info"] = {
+                                "dataset": record.dataset,
+                                "task_id": record.task_id,
+                                "question": record.input,
+                                "answers": list(record.answers),
+                                "prediction": prediction,
+                                "best_reference": score.best_reference,
+                                "f1": score.f1,
+                                "exact_match": score.exact_match,
+                                "final_answer_call": sandbox_return,
+                                "decoded_final_answer_call": parsed_call,
+                                "parse_error": parse_error,
+                                "answer_extraction": extraction_method,
+                                "category": record.category,
+                                "language": record.language,
+                                "length": record.length,
+                                "long_doc": trace,
+                            }
+                            payload["agent_trace"] = [
+                                {
+                                    "stage": "answer",
+                                    "text": prediction,
+                                    "raw_completion": output.text,
+                                    "sandbox_return": sandbox_return,
+                                    "parse_error": parse_error,
+                                }
+                            ]
+                            payload["task_id"] = record.task_id
+                            payload["domain"] = "long_context"
+                            payload["instruction"] = record.input
+                            writer.enqueue(payload)
+                            completed_indices.add(index)
+                        except Exception as exc:  # noqa: BLE001 - score output processing failures as zero.
+                            _enqueue_failed_sample(index, f"sample_exception: {type(exc).__name__}: {exc}")
                         return None
 
                     with ThreadPoolExecutor(max_workers=max(1, min(4, len(prompts)))) as parse_executor:
@@ -612,23 +678,32 @@ def _run_longbench(
                         def _on_complete(output):
                             payload_futures.append(parse_executor.submit(_process_output, output))
 
-                        outputs = run.engine.generate(
-                            prompts,
-                            sampling=sampling,
-                            batch_size=min(batch_size, len(prompts)),
-                            progress_desc="LongBench",
-                            on_complete=_on_complete,
-                            prompt_stop_suffixes=[list(LONGBENCH_STOP_SUFFIXES) for _ in prompts],
-                            prompt_seeds=[
-                                sample_repeat_seed(
-                                    key.sample_index,
-                                    key.repeat_index,
-                                    pass_index=key.pass_index,
-                                    stage=1,
-                                )
-                                for key, _record in chunk
-                            ],
-                        )
+                        try:
+                            outputs = run.engine.generate(
+                                prompts,
+                                sampling=sampling,
+                                batch_size=min(batch_size, len(prompts)),
+                                progress_desc="LongBench",
+                                on_complete=_on_complete,
+                                prompt_stop_suffixes=[list(LONGBENCH_STOP_SUFFIXES) for _ in prompts],
+                                prompt_seeds=[
+                                    sample_repeat_seed(
+                                        key.sample_index,
+                                        key.repeat_index,
+                                        pass_index=key.pass_index,
+                                        stage=1,
+                                    )
+                                    for key, _record in chunk
+                                ],
+                            )
+                        except Exception as exc:  # noqa: BLE001 - batch infra failures become failed samples.
+                            reason = f"sample_exception: {type(exc).__name__}: {exc}"
+                            print(f"longbench batch failed as scoreable zero rows: {reason}", flush=True)
+                            for future in as_completed(payload_futures):
+                                future.result()
+                            for index in range(len(chunk)):
+                                _enqueue_failed_sample(index, reason)
+                            continue
                         if not payload_futures:
                             for output in outputs:
                                 _on_complete(output)
