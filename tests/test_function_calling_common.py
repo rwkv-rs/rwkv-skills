@@ -739,8 +739,9 @@ def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
     assert planning.startswith("System: Tools:")
     assert '"name": "calendar:search"' in planning
     assert "Output JSON schema:" in planning
+    assert '"type": "array"' in planning
     assert "\nUser: Task:\nBook the meeting" in planning
-    assert planning.endswith("Assistant: ```json\n{")
+    assert planning.endswith("Assistant: ```json\n")
     assert final.endswith("Assistant:")
 
 

@@ -36,6 +36,7 @@ from src.eval.tasks.function_calling.runner_common import (
 )
 from src.eval.tasks.function_calling.rwkv_prompt import (
     JSON_CALL_STOP_SUFFIXES,
+    assistant_json_prefix,
     build_rwkv_json_call_prompt,
     extract_json_call_value_text,
     normalize_function_prompt_style,
@@ -543,7 +544,12 @@ def build_planning_json_call_prompt(
     )
     if not prompt_messages:
         prompt_messages = ({"role": "user", "content": build_mcp_task_user_message(item)},)
-    return build_rwkv_json_call_prompt(system_prompt, prompt_messages, history_max_chars=history_max_chars)
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        prompt_messages,
+        history_max_chars=history_max_chars,
+        assistant_prefix=assistant_json_prefix(prefill_object=False),
+    )
 
 
 def mcp_candidate_router_tools(available_tools: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
