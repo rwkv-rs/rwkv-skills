@@ -327,6 +327,101 @@ def _simple_tool_call_completion_to_eval_payload(payload: dict[str, object]) -> 
     )
 
 
+def _simple_tool_call_payload(
+    *,
+    run: ResolvedFunctionCallingRun,
+    record: SimpleToolCallRecord,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    prompt: str,
+    completion: str,
+    finish_reason: str,
+    evaluation: SimpleToolCallEvaluation,
+    trace_entry: dict[str, Any],
+    sampling_payload: Any,
+) -> dict[str, Any]:
+    stage = StageRecord(prompt=prompt, completion=completion, stop_reason=finish_reason)
+    payload = SampleRecord(
+        benchmark_name=run.benchmark_name,
+        dataset_split=run.dataset_split,
+        sample_index=sample_index,
+        repeat_index=repeat_index,
+        pass_index=pass_index,
+        stages=[stage],
+        sampling_config=sampling_payload,
+    ).as_payload()
+    payload["agent_result"] = {
+        "reward": float(evaluation.reward),
+        "num_turns": 1,
+        "cost": 0.0,
+        "is_passed": bool(evaluation.is_passed),
+        "error": evaluation.fail_reason or None,
+    }
+    payload["agent_info"] = {
+        **dict(evaluation.details),
+        "fail_reason": evaluation.fail_reason,
+        "cot_mode": CoTMode.NO_COT.value,
+    }
+    payload["agent_trace"] = [trace_entry]
+    payload["task_id"] = record.task_id
+    payload["domain"] = "function_call"
+    payload["instruction"] = record.instruction
+    payload["metadata"] = dict(record.metadata)
+    return payload
+
+
+def _simple_tool_call_failure_payload(
+    *,
+    run: ResolvedFunctionCallingRun,
+    record: SimpleToolCallRecord,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    reason: str,
+    sampling_payload: Any,
+) -> dict[str, Any]:
+    expected_calls = [
+        {"name": item.name, "arguments": item.arguments}
+        for item in record.expected_tool_calls
+    ]
+    evaluation = SimpleToolCallEvaluation(
+        reward=0.0,
+        is_passed=False,
+        fail_reason=reason,
+        details={
+            "expected_tool_calls": expected_calls,
+            "decoded_tool_calls": [],
+            "parse_error": reason,
+            "sample_exception": reason,
+        },
+    )
+    trace_entry = {
+        "tool_call_io": "rwkv-json",
+        "request": {
+            "instruction": record.instruction,
+            "tool_names": [str(tool.get("name") or "") for tool in record.tools],
+        },
+        "completion": "",
+        "response_source": "sample_exception",
+        "decoded_calls": [],
+        "parse_error": reason,
+    }
+    return _simple_tool_call_payload(
+        run=run,
+        record=record,
+        sample_index=sample_index,
+        repeat_index=repeat_index,
+        pass_index=pass_index,
+        prompt=record.instruction,
+        completion="",
+        finish_reason="sample_exception",
+        evaluation=evaluation,
+        trace_entry=trace_entry,
+        sampling_payload=sampling_payload,
+    )
+
+
 def _run_simple_tool_call(
     args: argparse.Namespace,
     run: ResolvedFunctionCallingRun,
@@ -435,30 +530,13 @@ def _run_simple_tool_call(
             try:
                 pending = build_pending_attempts(attempt_keys, records, skip_keys=ctx.skip_keys)
                 for key, record in pending:
-                    prompt_seed = sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)
-                    trace_entry: dict[str, Any]
-                    active_candidate_router_config = candidate_router_config
-                    if active_candidate_router_config is None and candidate_router_mode == "auto":
-                        active_candidate_router_config = _auto_candidate_router_config(args, record)
-                    if active_candidate_router_config is not None and record.tools:
-                        (
-                            prompt,
-                            completion,
-                            finish_reason,
-                            decoded_calls,
-                            parse_error,
-                            trace_entry,
-                        ) = _run_candidate_routed_simple_tool_call(
-                            args,
-                            run,
-                            record,
-                            tool_sampling=tool_sampling,
-                            config=active_candidate_router_config,
-                            prompt_seed=prompt_seed,
-                            progress_desc=f"ToolCall-CandidateRouter sample {key.sample_index}",
-                        )
-                    elif record.tools:
-                        if tool_call_io == "rwkv-json":
+                    try:
+                        prompt_seed = sample_repeat_seed(key.sample_index, key.repeat_index, stage=1)
+                        trace_entry: dict[str, Any]
+                        active_candidate_router_config = candidate_router_config
+                        if active_candidate_router_config is None and candidate_router_mode == "auto":
+                            active_candidate_router_config = _auto_candidate_router_config(args, record)
+                        if active_candidate_router_config is not None and record.tools:
                             (
                                 prompt,
                                 completion,
@@ -466,84 +544,103 @@ def _run_simple_tool_call(
                                 decoded_calls,
                                 parse_error,
                                 trace_entry,
-                            ) = _run_json_prompt_simple_tool_call(
+                            ) = _run_candidate_routed_simple_tool_call(
+                                args,
                                 run,
                                 record,
                                 tool_sampling=tool_sampling,
-                                history_max_chars=history_max_chars,
+                                config=active_candidate_router_config,
                                 prompt_seed=prompt_seed,
-                                progress_desc=f"ToolCall-JSON sample {key.sample_index}",
+                                progress_desc=f"ToolCall-CandidateRouter sample {key.sample_index}",
                             )
+                        elif record.tools:
+                            if tool_call_io == "rwkv-json":
+                                (
+                                    prompt,
+                                    completion,
+                                    finish_reason,
+                                    decoded_calls,
+                                    parse_error,
+                                    trace_entry,
+                                ) = _run_json_prompt_simple_tool_call(
+                                    run,
+                                    record,
+                                    tool_sampling=tool_sampling,
+                                    history_max_chars=history_max_chars,
+                                    prompt_seed=prompt_seed,
+                                    progress_desc=f"ToolCall-JSON sample {key.sample_index}",
+                                )
+                            else:
+                                decision = run_native_tool_call_decision(
+                                    engine=run.engine,
+                                    messages=build_simple_tool_call_messages(record),
+                                    tools=record.tools,
+                                    sampling=tool_sampling,
+                                    progress_desc=f"ToolCall-Native sample {key.sample_index}",
+                                    prompt_seed=prompt_seed,
+                                    parallel_tool_calls=True,
+                                    context_label="tool-call selection",
+                                )
+                                prompt = decision.prompt
+                                completion = decision.completion
+                                finish_reason = decision.finish_reason
+                                decoded_calls = decision.decoded_calls
+                                parse_error = decision.parse_error
+                                trace_entry = decision.trace
                         else:
-                            decision = run_native_tool_call_decision(
-                                engine=run.engine,
-                                messages=build_simple_tool_call_messages(record),
-                                tools=record.tools,
-                                sampling=tool_sampling,
-                                progress_desc=f"ToolCall-Native sample {key.sample_index}",
-                                prompt_seed=prompt_seed,
-                                parallel_tool_calls=True,
-                                context_label="tool-call selection",
+                            messages = build_simple_tool_call_messages(record)
+                            prompt = json.dumps(
+                                {"messages": messages, "tools": [], "tool_choice": "auto"},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
                             )
-                            prompt = decision.prompt
-                            completion = decision.completion
-                            finish_reason = decision.finish_reason
-                            decoded_calls = decision.decoded_calls
-                            parse_error = decision.parse_error
-                            trace_entry = decision.trace
-                    else:
-                        messages = build_simple_tool_call_messages(record)
-                        prompt = json.dumps(
-                            {"messages": messages, "tools": [], "tool_choice": "auto"},
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            sort_keys=True,
+                            completion = json.dumps(
+                                {"role": "assistant", "content": "", "tool_calls": []},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            )
+                            finish_reason = "stop"
+                            parse_error = None
+                            decoded_calls = []
+                            trace_entry = {
+                                "tool_call_io": "openai-tools",
+                                "request": {"messages": messages, "tools": [], "tool_choice": "auto"},
+                                "assistant_message": {"role": "assistant", "content": "", "tool_calls": []},
+                                "response_source": "no_tools",
+                                "decoded_calls": [],
+                                "parse_error": "",
+                            }
+                        evaluation = evaluator(record, decoded_calls, parse_error=parse_error)
+                        payload = _simple_tool_call_payload(
+                            run=run,
+                            record=record,
+                            sample_index=key.sample_index,
+                            repeat_index=key.repeat_index,
+                            pass_index=key.pass_index,
+                            prompt=prompt,
+                            completion=completion,
+                            finish_reason=finish_reason,
+                            evaluation=evaluation,
+                            trace_entry=trace_entry,
+                            sampling_payload=sampling_payload,
                         )
-                        completion = json.dumps(
-                            {"role": "assistant", "content": "", "tool_calls": []},
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                            sort_keys=True,
+                    except Exception as exc:  # noqa: BLE001 - sample-level infra failures become failed rows.
+                        reason = f"sample_exception: {type(exc).__name__}: {exc}"
+                        print(
+                            f"{default_job_name} sample {key.sample_index} failed as scoreable zero: {reason}",
+                            flush=True,
                         )
-                        finish_reason = "stop"
-                        parse_error = None
-                        decoded_calls = []
-                        trace_entry = {
-                            "tool_call_io": "openai-tools",
-                            "request": {"messages": messages, "tools": [], "tool_choice": "auto"},
-                            "assistant_message": {"role": "assistant", "content": "", "tool_calls": []},
-                            "response_source": "no_tools",
-                            "decoded_calls": [],
-                            "parse_error": "",
-                        }
-                    evaluation = evaluator(record, decoded_calls, parse_error=parse_error)
-                    stage = StageRecord(prompt=prompt, completion=completion, stop_reason=finish_reason)
-                    payload = SampleRecord(
-                        benchmark_name=run.benchmark_name,
-                        dataset_split=run.dataset_split,
-                        sample_index=key.sample_index,
-                        repeat_index=key.repeat_index,
-                        pass_index=key.pass_index,
-                        stages=[stage],
-                        sampling_config=sampling_payload,
-                    ).as_payload()
-                    payload["agent_result"] = {
-                        "reward": float(evaluation.reward),
-                        "num_turns": 1,
-                        "cost": 0.0,
-                        "is_passed": bool(evaluation.is_passed),
-                        "error": evaluation.fail_reason or None,
-                    }
-                    payload["agent_info"] = {
-                        **dict(evaluation.details),
-                        "fail_reason": evaluation.fail_reason,
-                        "cot_mode": CoTMode.NO_COT.value,
-                    }
-                    payload["agent_trace"] = [trace_entry]
-                    payload["task_id"] = record.task_id
-                    payload["domain"] = "function_call"
-                    payload["instruction"] = record.instruction
-                    payload["metadata"] = dict(record.metadata)
+                        payload = _simple_tool_call_failure_payload(
+                            run=run,
+                            record=record,
+                            sample_index=key.sample_index,
+                            repeat_index=key.repeat_index,
+                            pass_index=key.pass_index,
+                            reason=reason,
+                            sampling_payload=sampling_payload,
+                        )
                     writer.enqueue(payload)
             except Exception:
                 runtime.handle_attempt_stage_failure(
