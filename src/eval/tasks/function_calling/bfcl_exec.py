@@ -176,6 +176,8 @@ def normalize_bfcl_exec_manifest_row(
 
 
 def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) -> str:
+    category = str(record.metadata.get("category") or "").strip().lower()
+    prefill_object = "parallel" not in category
     return build_simple_tool_call_prompt(
         SimpleToolCallRecord(
             task_id=record.task_id,
@@ -185,7 +187,7 @@ def build_bfcl_exec_prompt(record: BfclExecRecord, *, history_max_chars: int) ->
             metadata=record.metadata,
         ),
         history_max_chars=history_max_chars,
-        prefill_object=True,
+        prefill_object=prefill_object,
     )
 
 
