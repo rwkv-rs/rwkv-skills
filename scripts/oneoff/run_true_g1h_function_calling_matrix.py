@@ -386,6 +386,14 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
         config["history_max_chars"] = positive_int(os.getenv("RWKV_COMPLEXFUNCBENCH_HISTORY_MAX_CHARS"), 16000)
         config["prompt_max_chars"] = positive_int(os.getenv("RWKV_COMPLEXFUNCBENCH_PROMPT_MAX_CHARS"), 20000)
         config["tool_router_max_tools"] = positive_int(os.getenv("RWKV_COMPLEXFUNCBENCH_TOOL_ROUTER_MAX_TOOLS"), 16)
+    elif spec.kind == "mcp_bench":
+        config.update(candidate_router_defaults(mode="parallel"))
+        config["candidate_router_chunk_tools"] = 1
+        config["candidate_router_max_candidates"] = positive_int(
+            os.getenv("RWKV_MCP_CANDIDATE_ROUTER_MAX_CANDIDATES"),
+            12,
+        )
+        config["max_rounds"] = 12
     elif spec.kind in {"longbench", "longcodebench"}:
         config["answer_max_tokens"] = 64
         config["history_max_chars"] = 24000
