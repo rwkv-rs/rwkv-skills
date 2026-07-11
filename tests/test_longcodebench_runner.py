@@ -12,6 +12,7 @@ from src.eval.tasks.function_calling.longcodebench import (
     build_longcodeqa_budgeted_prompt,
     load_longcodeqa_rows_from_source,
     normalize_longcodeqa_answer,
+    parse_longcodeqa_final_answer_text,
     score_longcodeqa_answer,
 )
 from src.eval.tasks.function_calling.runner_common import FunctionCallingBenchmarkKind, ResolvedFunctionCallingRun
@@ -70,6 +71,18 @@ def test_longcodeqa_score_uses_exact_letter() -> None:
     assert score.exact_match is True
     assert score.reward == 1.0
     assert score.prediction == "C"
+
+
+def test_parse_longcodeqa_final_answer_falls_back_to_raw_letter_json() -> None:
+    answer, call, call_id, error = parse_longcodeqa_final_answer_text(
+        '```json\n{"answer":"B"}\n```',
+        allowed_letters=("A", "B", "C", "D"),
+    )
+
+    assert answer == "B"
+    assert call == {}
+    assert call_id == ""
+    assert error == ""
 
 
 def test_longcodeqa_default_prompt_preserves_official_prompt() -> None:

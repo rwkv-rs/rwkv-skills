@@ -331,6 +331,36 @@ def _extract_longcodeqa_letter_from_value(value: Any, *, allowed_letters: set[st
     return ""
 
 
+def parse_longcodeqa_final_answer_text(
+    text: str,
+    *,
+    allowed_letters: Sequence[str],
+) -> tuple[str, dict[str, Any], str, str]:
+    parsed_call: dict[str, Any] = {}
+    parsed_call_id = ""
+    parsed_answer = ""
+    parse_error = ""
+    try:
+        final_call = parse_final_answer_call(
+            text,
+            context_label="longcodeqa final answer",
+        )
+        parsed_answer = final_call.answer
+        parsed_call = dict(final_call.call)
+        parsed_call_id = final_call.call_id
+    except Exception as exc:  # noqa: BLE001
+        parse_error = str(exc)
+
+    normalized_answer = normalize_longcodeqa_answer(
+        parsed_answer or text,
+        allowed_letters=allowed_letters,
+    )
+    if normalized_answer:
+        parsed_answer = normalized_answer
+        parse_error = ""
+    return parsed_answer, parsed_call, parsed_call_id, parse_error
+
+
 def score_longcodeqa_answer(
     prediction_text: str,
     correct_letter: str,
@@ -546,20 +576,10 @@ def _run_longcodebench(
                         output = outputs_by_index[index]
                         prompt, trace = prompt_rows[index]
                         allowed_letters = _choice_letters(record.question)
-                        parse_error = ""
-                        parsed_call: dict[str, Any] = {}
-                        parsed_call_id = ""
-                        parsed_answer = ""
-                        try:
-                            final_call = parse_final_answer_call(
-                                output.text,
-                                context_label="longcodeqa final answer",
-                            )
-                            parsed_answer = final_call.answer
-                            parsed_call = dict(final_call.call)
-                            parsed_call_id = final_call.call_id
-                        except Exception as exc:  # noqa: BLE001
-                            parse_error = str(exc)
+                        parsed_answer, parsed_call, parsed_call_id, parse_error = parse_longcodeqa_final_answer_text(
+                            output.text,
+                            allowed_letters=allowed_letters,
+                        )
                         score = score_longcodeqa_answer(
                             parsed_answer,
                             record.correct_letter,
@@ -896,5 +916,6 @@ __all__ = [
     "load_longcodeqa_rows_from_source",
     "normalize_longcodeqa_answer",
     "normalize_longcodeqa_manifest_row",
+    "parse_longcodeqa_final_answer_text",
     "score_longcodeqa_answer",
 ]
