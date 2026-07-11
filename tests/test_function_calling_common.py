@@ -31,11 +31,14 @@ from src.eval.tasks.function_calling.final_answer import (
 )
 from src.eval.tasks.function_calling.rwkv_prompt import build_rwkv_json_call_prompt, extract_json_call_value_text
 from src.eval.tasks.function_calling.mcp_bench import (
+    McpBenchEvaluation,
     McpBenchItem,
     McpBenchTaskSpec,
     build_final_answer_prompt,
     build_planning_json_call_prompt,
     clean_mcp_final_answer,
+    compute_mcp_bench_continuous_metrics,
+    mcp_bench_evaluation_to_dict,
     parse_planning_decision,
     resolve_mcp_context_budget,
     select_mcp_candidate_available_tools,
@@ -154,6 +157,35 @@ def test_mcp_candidate_filter_keeps_multiple_parallel_candidate_tools() -> None:
     )
 
     assert list(filtered) == ["maps:directions", "weather:forecast"]
+
+
+def test_mcp_continuous_metrics_use_official_evaluator_scores() -> None:
+    evaluation = McpBenchEvaluation(
+        task_completion_score=3.0,
+        tool_selection_score=6.0,
+        planning_effectiveness_and_efficiency_score=9.0,
+        task_fulfillment=2.0,
+        grounding=4.0,
+        tool_appropriateness=5.0,
+        parameter_accuracy=7.0,
+        dependency_awareness=8.0,
+        parallelism_and_efficiency=10.0,
+        valid_tool_name_rate=0.5,
+    )
+    payloads = [
+        {
+            "agent_info": {
+                "mcp_evaluation": mcp_bench_evaluation_to_dict(evaluation),
+            }
+        }
+    ]
+
+    metrics = compute_mcp_bench_continuous_metrics(payloads)
+
+    assert metrics["score"] == 6.0
+    assert metrics["avg@1"] == 6.0
+    assert metrics["mcp_avg_llm_judge_combined"] == 6.0
+    assert metrics["mcp_avg_valid_tool_name_rate"] == 0.5
 
 
 def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:

@@ -1103,6 +1103,116 @@ def summarize_mcp_bench_evaluation(evaluation: McpBenchEvaluation) -> str:
     )
 
 
+def mcp_bench_evaluation_to_dict(evaluation: McpBenchEvaluation) -> dict[str, float | None]:
+    return {
+        "task_completion_score": float(evaluation.task_completion_score),
+        "tool_selection_score": float(evaluation.tool_selection_score),
+        "planning_effectiveness_and_efficiency_score": float(evaluation.planning_effectiveness_and_efficiency_score),
+        "task_fulfillment": float(evaluation.task_fulfillment),
+        "grounding": float(evaluation.grounding),
+        "tool_appropriateness": float(evaluation.tool_appropriateness),
+        "parameter_accuracy": float(evaluation.parameter_accuracy),
+        "dependency_awareness": float(evaluation.dependency_awareness),
+        "parallelism_and_efficiency": float(evaluation.parallelism_and_efficiency),
+        "input_schema_compliance": evaluation.input_schema_compliance,
+        "valid_tool_name_rate": evaluation.valid_tool_name_rate,
+        "execution_success_rate": evaluation.execution_success_rate,
+        "planning_json_compliance": evaluation.planning_json_compliance,
+    }
+
+
+def mcp_bench_combined_score(evaluation: McpBenchEvaluation) -> float:
+    return (
+        float(evaluation.task_completion_score)
+        + float(evaluation.tool_selection_score)
+        + float(evaluation.planning_effectiveness_and_efficiency_score)
+    ) / 3.0
+
+
+_MCP_EVAL_SUMMARY_FLOAT_RE = re.compile(r"([a-zA-Z_]+)=(-?\d+(?:\.\d+)?)")
+
+
+def parse_mcp_bench_evaluation_summary(text: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for key, value in _MCP_EVAL_SUMMARY_FLOAT_RE.findall(str(text or "")):
+        try:
+            values[key] = float(value)
+        except ValueError:
+            continue
+    return values
+
+
+def compute_mcp_bench_continuous_metrics(
+    completions_payloads: Sequence[Mapping[str, object]],
+) -> dict[str, float]:
+    field_values: dict[str, list[float]] = {
+        "task_completion_score": [],
+        "tool_selection_score": [],
+        "planning_effectiveness_and_efficiency_score": [],
+        "task_fulfillment": [],
+        "grounding": [],
+        "tool_appropriateness": [],
+        "parameter_accuracy": [],
+        "dependency_awareness": [],
+        "parallelism_and_efficiency": [],
+        "input_schema_compliance": [],
+        "valid_tool_name_rate": [],
+        "execution_success_rate": [],
+        "planning_json_compliance": [],
+    }
+    combined_scores: list[float] = []
+    for payload in completions_payloads:
+        agent_info = payload.get("agent_info")
+        if not isinstance(agent_info, Mapping):
+            agent_info = {}
+        raw_evaluation = agent_info.get("mcp_evaluation")
+        if isinstance(raw_evaluation, Mapping):
+            evaluation_values = {
+                str(key): value
+                for key, value in raw_evaluation.items()
+            }
+        else:
+            evaluation_values = parse_mcp_bench_evaluation_summary(
+                str(agent_info.get("evaluation_summary") or agent_info.get("fail_reason") or "")
+            )
+        sample_aggregates: dict[str, float] = {}
+        for field, values in field_values.items():
+            raw_value = evaluation_values.get(field)
+            if raw_value is None:
+                continue
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            values.append(numeric_value)
+            if field in {
+                "task_completion_score",
+                "tool_selection_score",
+                "planning_effectiveness_and_efficiency_score",
+            }:
+                sample_aggregates[field] = numeric_value
+        if len(sample_aggregates) == 3:
+            combined_scores.append(
+                (
+                    sample_aggregates["task_completion_score"]
+                    + sample_aggregates["tool_selection_score"]
+                    + sample_aggregates["planning_effectiveness_and_efficiency_score"]
+                )
+                / 3.0
+            )
+
+    metrics: dict[str, float] = {}
+    for field, values in field_values.items():
+        if values:
+            metrics[f"mcp_avg_{field}"] = sum(values) / len(values)
+    if combined_scores:
+        combined = sum(combined_scores) / len(combined_scores)
+        metrics["mcp_avg_llm_judge_combined"] = combined
+        metrics["score"] = combined
+        metrics["avg@1"] = combined
+    return metrics
+
+
 def render_tool_catalog(available_tools: Mapping[str, Mapping[str, Any]]) -> str:
     rendered: list[dict[str, Any]] = []
     for tool in available_tools.values():
@@ -1335,6 +1445,7 @@ def _run_mcp_bench(
                     final_answer = ""
                     fail_reason = ""
                     evaluation_summary = ""
+                    evaluation_payload: dict[str, float | None] | None = None
                     is_passed = False
                     tool_call_counts: dict[str, int] = {}
                     worker = McpBenchWorkerClient(runtime_root=runtime_root, worker_script=worker_script)
@@ -1617,6 +1728,7 @@ def _run_mcp_bench(
                             )
                             is_passed = collapse_mcp_bench_pass(evaluation)
                             evaluation_summary = summarize_mcp_bench_evaluation(evaluation)
+                            evaluation_payload = mcp_bench_evaluation_to_dict(evaluation)
                             if not is_passed:
                                 fail_reason = evaluation_summary
                         if final_answer and not fail_reason and not evaluation_summary:
@@ -1645,6 +1757,7 @@ def _run_mcp_bench(
                             )
                             is_passed = collapse_mcp_bench_pass(evaluation)
                             evaluation_summary = summarize_mcp_bench_evaluation(evaluation)
+                            evaluation_payload = mcp_bench_evaluation_to_dict(evaluation)
                             if not is_passed:
                                 fail_reason = evaluation_summary
                         if not final_answer and not fail_reason:
@@ -1671,6 +1784,7 @@ def _run_mcp_bench(
                             "ref_answer": ref_answer,
                             "fail_reason": fail_reason,
                             "evaluation_summary": evaluation_summary,
+                            "mcp_evaluation": evaluation_payload if evaluation_summary else None,
                             "cot_mode": CoTMode.NO_COT.value,
                             "execution_count": len(execution_results),
                         }
@@ -1752,7 +1866,11 @@ def _run_mcp_bench(
                 run.dataset_slug,
                 is_cot=False,
                 model_name=run.model_name,
-                metrics=metrics,
+                metrics={
+                    **metrics,
+                    "avg@1_pass_rate": float(metrics.get("avg@1", metrics.get("success_rate", 0.0))),
+                    **compute_mcp_bench_continuous_metrics(completions_payloads),
+                },
                 samples=len(completions_payloads),
                 problems=len(items),
                 task=job_name,
