@@ -450,6 +450,44 @@ def preflight_mcp_bench_runtime(
     return report
 
 
+def _patch_mcp_bench_runtime_evaluator(runtime_root: str | Path) -> None:
+    evaluator = Path(runtime_root).expanduser().resolve() / "benchmark" / "evaluator.py"
+    if not evaluator.is_file():
+        return
+    text = evaluator.read_text(encoding="utf-8")
+    original = text
+    if "def _score_or_zero(value):" not in text:
+        marker = (
+            "def safe_get(item, key, default=None):\n"
+            "    \"\"\"Safely get a value from a dictionary\"\"\"\n"
+            "    if isinstance(item, dict):\n"
+            "        return item.get(key, default)\n"
+            "    else:\n"
+            "        return default\n"
+        )
+        replacement = marker + (
+            "\n"
+            "def _score_or_zero(value):\n"
+            "    \"\"\"Return a numeric score, treating missing judge fields as zero.\"\"\"\n"
+            "    return value if isinstance(value, (int, float)) else 0\n"
+        )
+        text = text.replace(marker, replacement)
+    text = text.replace(
+        "task_completion_scores = [task_fulfillment, grounding]",
+        "task_completion_scores = [_score_or_zero(task_fulfillment), _score_or_zero(grounding)]",
+    )
+    text = text.replace(
+        "tool_selection_scores = [tool_appropriateness, parameter_accuracy]",
+        "tool_selection_scores = [_score_or_zero(tool_appropriateness), _score_or_zero(parameter_accuracy)]",
+    )
+    text = text.replace(
+        "planning_scores = [dependency_awareness, parallelism_and_efficiency]",
+        "planning_scores = [_score_or_zero(dependency_awareness), _score_or_zero(parallelism_and_efficiency)]",
+    )
+    if text != original:
+        evaluator.write_text(text, encoding="utf-8")
+
+
 def _resolve_mcp_server_cwd(runtime_root: Path, raw_cwd: str) -> Path:
     if not raw_cwd:
         return runtime_root
@@ -792,6 +830,7 @@ def _run_mcp_bench(
 
     runtime_root = Path(items[0].runtime_root or "").expanduser().resolve()
     worker_script = REPO_ROOT / "src" / "eval" / "tasks" / "function_calling" / "mcp_bench_worker.py"
+    _patch_mcp_bench_runtime_evaluator(runtime_root)
     if not bool(getattr(args, "skip_runtime_preflight", False)):
         preflight_mcp_bench_runtime(
             items,
