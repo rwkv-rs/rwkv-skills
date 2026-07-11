@@ -38,6 +38,7 @@ from src.eval.tasks.function_calling.mcp_bench import (
     build_planning_json_call_prompt,
     clean_mcp_final_answer,
     compute_mcp_bench_continuous_metrics,
+    effective_mcp_candidate_filter_limit,
     mcp_bench_evaluation_to_dict,
     parse_planning_decision,
     resolve_mcp_context_budget,
@@ -157,6 +158,44 @@ def test_mcp_candidate_filter_keeps_multiple_parallel_candidate_tools() -> None:
     )
 
     assert list(filtered) == ["maps:directions", "weather:forecast"]
+
+
+def test_mcp_candidate_filter_limit_does_not_nearly_pass_full_catalog() -> None:
+    assert effective_mcp_candidate_filter_limit(full_tool_count=7, requested_max_tools=12) == 7
+    assert effective_mcp_candidate_filter_limit(full_tool_count=13, requested_max_tools=12) == 8
+    assert effective_mcp_candidate_filter_limit(full_tool_count=39, requested_max_tools=12) == 12
+
+
+def test_mcp_candidate_filter_prioritizes_aggregated_selection() -> None:
+    item = McpBenchItem(
+        task_file="demo.json",
+        server_name="maps_weather",
+        combination_name="maps_weather",
+        combination_type="single",
+        servers=("maps", "weather"),
+        task=McpBenchTaskSpec(
+            task_id="demo",
+            task_description="Find weather and directions for Paris.",
+            fuzzy_description="",
+        ),
+        runtime_root="",
+    )
+    available_tools = {
+        f"tool:{index}": {"server": "tool", "name": str(index), "description": f"Tool {index}"}
+        for index in range(12)
+    }
+
+    filtered = select_mcp_candidate_available_tools(
+        available_tools,
+        tuple(CandidateToolCall(f"tool:{index}", confidence=1.0 - index * 0.01) for index in range(12)),
+        item=item,
+        prompt_messages=({"role": "user", "content": "Need evidence."},),
+        max_tools=4,
+        priority_tool_names=("tool:11",),
+    )
+
+    assert list(filtered)[0] == "tool:11"
+    assert len(filtered) == 4
 
 
 def test_mcp_continuous_metrics_use_official_evaluator_scores() -> None:

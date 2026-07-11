@@ -82,6 +82,10 @@ MCP_BENCH_8K_DECISION_MAX_TOKENS = 768
 MCP_BENCH_10K_FINAL_MAX_TOKENS = 1024
 MCP_BENCH_8K_FINAL_MAX_TOKENS = 1024
 MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS = 6
+MCP_BENCH_CANDIDATE_ROUTER_UNFILTERED_TOOL_LIMIT = 8
+MCP_BENCH_CANDIDATE_ROUTER_MIN_FILTERED_TOOLS = 4
+MCP_BENCH_CANDIDATE_ROUTER_FILTER_FRACTION_NUMERATOR = 3
+MCP_BENCH_CANDIDATE_ROUTER_FILTER_FRACTION_DENOMINATOR = 5
 MCP_BENCH_TASK_FILES: tuple[str, ...] = (
     "mcpbench_tasks_single_runner_format.json",
     "mcpbench_tasks_multi_2server_runner_format.json",
@@ -696,9 +700,17 @@ def select_mcp_candidate_available_tools(
     item: McpBenchItem,
     prompt_messages: Sequence[Mapping[str, object]],
     max_tools: int,
+    priority_tool_names: Sequence[str] = (),
 ) -> dict[str, Mapping[str, Any]]:
     selected_names: list[str] = []
     seen: set[str] = set()
+    limit = max(1, int(max_tools))
+    for name in priority_tool_names:
+        if name in available_tools and name not in seen and name not in {NO_CANDIDATE_TOOL_NAME, "final_answer"}:
+            selected_names.append(name)
+            seen.add(name)
+        if len(selected_names) >= limit:
+            break
     real_candidates = [
         candidate
         for candidate in candidates
@@ -708,7 +720,7 @@ def select_mcp_candidate_available_tools(
         if candidate.name not in seen:
             selected_names.append(candidate.name)
             seen.add(candidate.name)
-        if len(selected_names) >= max(1, int(max_tools)):
+        if len(selected_names) >= limit:
             break
     if not selected_names:
         selected_names = _lexical_mcp_tool_candidates(
@@ -718,6 +730,26 @@ def select_mcp_candidate_available_tools(
             max_tools=max_tools,
         )
     return {name: available_tools[name] for name in selected_names if name in available_tools}
+
+
+def effective_mcp_candidate_filter_limit(*, full_tool_count: int, requested_max_tools: int) -> int:
+    requested = max(1, int(requested_max_tools))
+    full_count = max(0, int(full_tool_count))
+    if full_count <= 0:
+        return requested
+    limit = min(full_count, requested)
+    if full_count <= MCP_BENCH_CANDIDATE_ROUTER_UNFILTERED_TOOL_LIMIT:
+        return limit
+    fraction_limit = (
+        full_count * MCP_BENCH_CANDIDATE_ROUTER_FILTER_FRACTION_NUMERATOR
+        + MCP_BENCH_CANDIDATE_ROUTER_FILTER_FRACTION_DENOMINATOR
+        - 1
+    ) // MCP_BENCH_CANDIDATE_ROUTER_FILTER_FRACTION_DENOMINATOR
+    fraction_limit = max(MCP_BENCH_CANDIDATE_ROUTER_MIN_FILTERED_TOOLS, fraction_limit)
+    limit = min(limit, fraction_limit)
+    if limit >= full_count:
+        limit = max(1, full_count - 1)
+    return limit
 
 
 def _lexical_mcp_tool_candidates(
@@ -804,13 +836,17 @@ def run_mcp_candidate_router_tool_filter(
     candidate_pool = list(route.candidates)
     if route.selected is not None:
         candidate_pool.insert(0, route.selected)
-    max_tools = max(1, int(config.max_candidates))
+    max_tools = effective_mcp_candidate_filter_limit(
+        full_tool_count=len(available_tools),
+        requested_max_tools=int(config.max_candidates),
+    )
     available_subset = select_mcp_candidate_available_tools(
         available_tools,
         candidate_pool,
         item=item,
         prompt_messages=prompt_messages,
         max_tools=max_tools,
+        priority_tool_names=([route.selected.name] if route.selected is not None else ()),
     )
     filtered_names = list(available_subset)
     trace = {
@@ -820,6 +856,8 @@ def run_mcp_candidate_router_tool_filter(
             "filtered_tool_names": filtered_names,
             "filtered_tool_count": len(filtered_names),
             "full_tool_count": len(available_tools),
+            "requested_max_candidates": int(config.max_candidates),
+            "effective_max_candidates": int(max_tools),
             "planner_receives_filtered_catalog": True,
         },
     }
@@ -1495,7 +1533,10 @@ def _run_mcp_bench(
                                             item=item,
                                             prompt_messages=prompt_messages,
                                             max_tools=(
-                                                candidate_router_config.max_candidates
+                                                effective_mcp_candidate_filter_limit(
+                                                    full_tool_count=len(available_tools),
+                                                    requested_max_tools=candidate_router_config.max_candidates,
+                                                )
                                                 if candidate_router_config is not None
                                                 else MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS
                                             ),
