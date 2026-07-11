@@ -323,10 +323,27 @@ def _complete_bfcl_exec_forced_prefix(record: BfclExecRecord, completion: str) -
         return completion
     stripped = completion.lstrip()
     if stripped.startswith("["):
+        repaired = _repair_bfcl_exec_array_prefix(completion)
+        if repaired is not None:
+            return repaired
         return completion
     if stripped.startswith("{") and not completion.rstrip().endswith("]"):
         return "[\n" + completion.rstrip() + "\n]"
     return "[\n" + completion
+
+
+def _repair_bfcl_exec_array_prefix(completion: str) -> str | None:
+    stripped = completion.lstrip()
+    leading_ws = completion[: len(completion) - len(stripped)]
+    if not stripped.startswith("["):
+        return None
+    body = stripped[1:].lstrip()
+    if not body.startswith('"name"') and not body.startswith("'name'"):
+        return None
+    repaired = leading_ws + "[\n  {" + body
+    if not repaired.rstrip().endswith("]"):
+        repaired = repaired.rstrip() + "\n]"
+    return repaired
 
 
 class BfclExecSandbox:
