@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from collections import deque
@@ -16,11 +17,17 @@ from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.field_common import build_plan_task_details
 from src.eval.tasks.function_calling.common import (
+    attach_function_calling_context_metadata,
     build_partial_eval_flusher,
     build_pending_attempts,
     clamp_function_calling_sampling,
     finalize_function_calling_run,
     prepare_function_calling_run,
+)
+from src.eval.tasks.function_calling.final_answer import final_answer_tool_schema
+from src.eval.tasks.function_calling.parallel_candidate_router import (
+    ParallelCandidateRouterConfig,
+    route_parallel_candidate_tool_call,
 )
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
@@ -57,9 +64,19 @@ if TYPE_CHECKING:
 
 MCP_BENCH_PASS_THRESHOLD = 7.0
 MCP_BENCH_MAX_TOOL_SCHEMA_CHARS = DEFAULT_TOOL_SCHEMA_MAX_CHARS
-MCP_BENCH_MAX_RESULT_CHARS = DEFAULT_TOOL_RESULT_MAX_CHARS
+MCP_BENCH_MAX_RESULT_CHARS = 2400
 MCP_BENCH_MAX_ERROR_CHARS = DEFAULT_TOOL_ERROR_MAX_CHARS
 MCP_BENCH_MAX_HISTORY_CHARS = DEFAULT_HISTORY_MAX_CHARS
+MCP_BENCH_REPEAT_TOOL_GUARD_LIMIT = 2
+MCP_BENCH_10K_HISTORY_CHARS = 14_000
+MCP_BENCH_8K_HISTORY_CHARS = 11_000
+MCP_BENCH_10K_FINAL_HISTORY_CHARS = 11_000
+MCP_BENCH_8K_FINAL_HISTORY_CHARS = 8_500
+MCP_BENCH_10K_DECISION_MAX_TOKENS = 896
+MCP_BENCH_8K_DECISION_MAX_TOKENS = 768
+MCP_BENCH_10K_FINAL_MAX_TOKENS = 1536
+MCP_BENCH_8K_FINAL_MAX_TOKENS = 1024
+MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS = 6
 MCP_BENCH_TASK_FILES: tuple[str, ...] = (
     "mcpbench_tasks_single_runner_format.json",
     "mcpbench_tasks_multi_2server_runner_format.json",
@@ -527,6 +544,176 @@ def build_planning_json_call_prompt(
     return build_rwkv_json_call_prompt(system_prompt, prompt_messages, history_max_chars=history_max_chars)
 
 
+def mcp_candidate_router_tools(available_tools: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    tools: list[dict[str, Any]] = []
+    for name, tool in sorted(available_tools.items()):
+        server = str(tool.get("server") or "").strip()
+        raw_name = str(tool.get("name") or "").strip()
+        full_name = str(name or "").strip() or (f"{server}:{raw_name}" if server else raw_name)
+        if not full_name:
+            continue
+        schema = tool.get("input_schema")
+        parameters = dict(schema) if isinstance(schema, Mapping) else {"type": "object", "properties": {}}
+        tools.append(
+            {
+                "name": full_name,
+                "description": truncate_text(
+                    str(tool.get("description") or "").strip() or "No description available",
+                    360,
+                ),
+                "parameters": parameters,
+            }
+        )
+    tools.append(final_answer_tool_schema(answer_description="The final answer requested by the MCP task."))
+    return tuple(tools)
+
+
+def _mcp_candidate_router_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "candidate_router_mode", None) or "auto").strip().lower()
+    if mode not in {"off", "auto", "parallel"}:
+        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off, auto, or parallel")
+    return mode
+
+
+def _mcp_candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig | None:
+    mode = _mcp_candidate_router_mode(args)
+    if mode == "off":
+        return None
+    defaults = ParallelCandidateRouterConfig()
+    schema_mode = str(
+        getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode
+    )
+    if schema_mode not in {"minimal", "compact", "full"}:
+        schema_mode = defaults.tool_schema_mode
+    return ParallelCandidateRouterConfig(
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
+        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
+        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
+        prompt_max_chars=_positive_int(
+            getattr(args, "candidate_router_prompt_max_chars", None),
+            defaults.prompt_max_chars,
+        ),
+        candidate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_candidate_max_tokens", None),
+            defaults.candidate_max_tokens,
+        ),
+        aggregate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_aggregate_max_tokens", None),
+            defaults.aggregate_max_tokens,
+        ),
+        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), defaults.max_candidates),
+        tool_schema_mode=schema_mode,
+        include_respond=False,
+        fallback_to_highest_confidence=True,
+        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), defaults.evidence_chars),
+        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), defaults.policy_chars),
+        ground_identifier_arguments=not bool(getattr(args, "disable_candidate_router_grounding", False)),
+    )
+
+
+def _positive_int(raw: object, default: int) -> int:
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(1, value)
+
+
+def _should_use_mcp_candidate_router(
+    *,
+    mode: str,
+    config: ParallelCandidateRouterConfig | None,
+    tools: Sequence[Mapping[str, Any]],
+    prompt_messages: Sequence[Mapping[str, object]],
+    available_tools: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if config is None or not tools:
+        return False
+    if mode == "parallel":
+        return True
+    if mode != "auto":
+        return False
+    real_tool_count = max(0, len(tools) - 1)
+    if real_tool_count >= max(MCP_BENCH_CANDIDATE_ROUTER_MIN_TOOLS, int(config.chunk_tools) * 2):
+        return True
+    if _mcp_message_chars(prompt_messages) > int(config.context_chars):
+        return True
+    if len(render_tool_catalog(available_tools)) > max(1, int(config.prompt_max_chars) // 2):
+        return True
+    return False
+
+
+def _mcp_message_chars(messages: Sequence[Mapping[str, object]]) -> int:
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
+def _mcp_candidate_router_policy(item: McpBenchItem) -> str:
+    return normalize_rwkv_text(
+        "\n".join(
+            [
+                "MCP-Bench policy: choose exactly one next JSON function call for the official MCP runtime.",
+                "Use only listed tool names. Do not invent MCP servers, tools, arguments, or tool outputs.",
+                "Prefer a real MCP tool while more evidence is needed. Use final_answer only when the task is complete and gathered evidence supports the answer.",
+                "If a previous identical tool call failed or returned no useful data, choose a different tool or final_answer instead of repeating it.",
+                f"Task: {presented_task(item)}",
+                f"Servers: {', '.join(item.servers)}",
+            ]
+        )
+    )
+
+
+def _mcp_candidate_router_facts(item: McpBenchItem) -> str:
+    rows = [
+        f"task_id={item.task.task_id}",
+        f"task_file={item.task_file}",
+        f"combination_type={item.combination_type}",
+    ]
+    if item.task.dependency_analysis:
+        rows.append("dependency_analysis=" + truncate_text(item.task.dependency_analysis, 1200))
+    if item.task.task_description and item.task.task_description != item.task.fuzzy_description:
+        rows.append("concrete_task_description=" + truncate_text(item.task.task_description, 1200))
+    return normalize_rwkv_text("\n".join(rows))
+
+
+def run_mcp_candidate_router_decision(
+    *,
+    item: McpBenchItem,
+    engine: Any,
+    sampling: Any,
+    tools: Sequence[Mapping[str, Any]],
+    prompt_messages: Sequence[Mapping[str, object]],
+    config: ParallelCandidateRouterConfig,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    round_num: int,
+) -> tuple[StageRecord, PlanningDecision, dict[str, Any]]:
+    route = route_parallel_candidate_tool_call(
+        tools=tools,
+        messages=prompt_messages,
+        domain_policy=_mcp_candidate_router_policy(item),
+        domain="mcp_bench",
+        facts_text=_mcp_candidate_router_facts(item),
+        engine=engine,
+        sampling=sampling,
+        config=config,
+        progress_desc=f"MCPBench-CandidateRouter sample {sample_index} round {round_num}",
+        prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=40_000 + round_num),
+    )
+    selected = route.selected
+    if selected is None:
+        raise ValueError(str(route.aggregate_error or "candidate router did not select a MCP action"))
+    decision = _planning_decision_from_name_args(selected.name, selected.arguments)
+    decision_text = render_json_function_call(selected.name, selected.arguments)
+    completion = route.aggregate_completion or decision_text
+    finish_reason = route.aggregate_finish_reason or "stop"
+    trace = {
+        "decision_io": "parallel_candidate",
+        "candidate_router": route.trace_payload(include_prompts=True),
+    }
+    return StageRecord(prompt=route.aggregate_prompt, completion=completion, stop_reason=finish_reason), decision, trace
+
+
 def _render_mcp_output_schema() -> str:
     schema = {
         "type": "object",
@@ -551,9 +738,9 @@ def build_mcp_task_user_message(item: McpBenchItem) -> str:
     )
 
 
-def build_final_answer_prompt(item: McpBenchItem, accumulated_information: str) -> str:
+def build_final_answer_prompt(item: McpBenchItem, accumulated_information: str, *, history_max_chars: int) -> str:
     history = (
-        trim_history(accumulated_information, MCP_BENCH_MAX_HISTORY_CHARS)
+        trim_history(accumulated_information, history_max_chars)
         if accumulated_information.strip()
         else "No tool evidence was gathered."
     )
@@ -591,6 +778,8 @@ def append_round_summary(
     round_num: int,
     reasoning: str,
     executions: Sequence[McpBenchExecutionResult],
+    *,
+    history_max_chars: int = MCP_BENCH_MAX_HISTORY_CHARS,
 ) -> str:
     lines = [accumulated_information, "", f"--- Summary of Round {round_num} ---"]
     if reasoning.strip():
@@ -608,7 +797,66 @@ def append_round_summary(
                 f"Tool `{execution.tool}` with Parameter {params} on {execution.server} failed. Error: {rendered}"
             )
     updated = "\n".join(part for part in lines if part is not None)
-    return trim_history(updated, MCP_BENCH_MAX_HISTORY_CHARS)
+    return trim_history(updated, history_max_chars)
+
+
+def clean_mcp_final_answer(text: str) -> str:
+    cleaned = normalize_rwkv_text(text)
+    cleaned = re.sub(r"(?is)<think>.*?</think>", "", cleaned)
+    cleaned = normalize_rwkv_text(cleaned.replace("</think>", ""))
+    if cleaned.startswith("Assistant:"):
+        cleaned = normalize_rwkv_text(cleaned[len("Assistant:") :])
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```\s*$", "", cleaned)
+        cleaned = normalize_rwkv_text(cleaned)
+    try:
+        call = parse_tool_call_text(cleaned, context_label="mcp final answer", recover_partial=True)
+        if call.name == "final_answer":
+            answer = call.arguments.get("answer")
+            if answer is not None:
+                return normalize_rwkv_text(str(answer))
+    except Exception:
+        pass
+    return cleaned
+
+
+def infer_model_context_tokens(model_name: str) -> int:
+    match = re.search(r"ctx(\d+)", str(model_name or ""), flags=re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            pass
+    return 8192
+
+
+def resolve_mcp_context_budget(args: argparse.Namespace, model_name: str) -> dict[str, int]:
+    context_tokens = infer_model_context_tokens(model_name)
+    is_10k = context_tokens >= 10_000
+    history_cap = MCP_BENCH_10K_HISTORY_CHARS if is_10k else MCP_BENCH_8K_HISTORY_CHARS
+    final_history_cap = MCP_BENCH_10K_FINAL_HISTORY_CHARS if is_10k else MCP_BENCH_8K_FINAL_HISTORY_CHARS
+    decision_cap = MCP_BENCH_10K_DECISION_MAX_TOKENS if is_10k else MCP_BENCH_8K_DECISION_MAX_TOKENS
+    final_cap = MCP_BENCH_10K_FINAL_MAX_TOKENS if is_10k else MCP_BENCH_8K_FINAL_MAX_TOKENS
+    raw_history = int(getattr(args, "history_max_chars", DEFAULT_HISTORY_MAX_CHARS) or DEFAULT_HISTORY_MAX_CHARS)
+    raw_decision = int(getattr(args, "decision_max_tokens", 0) or 1024)
+    raw_final = int(getattr(args, "final_max_tokens", 0) or 3072)
+    return {
+        "context_tokens": int(context_tokens),
+        "history_max_chars": max(1, min(raw_history, history_cap)),
+        "final_history_max_chars": max(1, min(raw_history, final_history_cap)),
+        "decision_max_tokens": max(1, min(raw_decision, decision_cap)),
+        "final_max_tokens": max(1, min(raw_final, final_cap)),
+    }
+
+
+def mcp_tool_call_signature(call: PlannedToolCall) -> str:
+    payload = {
+        "server": call.server.strip(),
+        "tool": call.tool.strip(),
+        "arguments": dict(call.arguments),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def render_trace(steps: Sequence[dict[str, Any]]) -> str:
@@ -638,10 +886,12 @@ def parse_planning_decision(response: str) -> PlanningDecision:
         call = parse_tool_call_text(response, context_label="planning", recover_partial=True)
     except ValueError as exc:
         raise ValueError(f"failed to parse planning tool call: {exc}") from exc
-    name = call.name
+    return _planning_decision_from_name_args(call.name, call.arguments)
+
+
+def _planning_decision_from_name_args(name: str, arguments: Mapping[str, Any]) -> PlanningDecision:
     if not name:
         raise ValueError("planning JSON missing name")
-    arguments = call.arguments
     if name == "final_answer":
         return PlanningDecision(
             reasoning="",
@@ -825,8 +1075,13 @@ def _run_mcp_bench(
     if base_sampling is None:
         raise ValueError(f"missing sampling config for dataset={run.dataset_slug}, model={run.model_name}")
     normalize_function_prompt_style(getattr(args, "prompt_style", None))
-    decision_sampling = clamp_function_calling_sampling(base_sampling, args.decision_max_tokens or 2048)
-    final_sampling = base_sampling.clamp(args.final_max_tokens)
+    context_budget = resolve_mcp_context_budget(args, run.model_name)
+    history_max_chars = int(context_budget["history_max_chars"])
+    final_history_max_chars = int(context_budget["final_history_max_chars"])
+    decision_sampling = clamp_function_calling_sampling(base_sampling, int(context_budget["decision_max_tokens"]))
+    final_sampling = base_sampling.clamp(int(context_budget["final_max_tokens"]))
+    candidate_router_mode = _mcp_candidate_router_mode(args)
+    candidate_router_config = _mcp_candidate_router_config_from_args(args)
 
     runtime_root = Path(items[0].runtime_root or "").expanduser().resolve()
     worker_script = REPO_ROOT / "src" / "eval" / "tasks" / "function_calling" / "mcp_bench_worker.py"
@@ -846,7 +1101,7 @@ def _run_mcp_bench(
                 items[0],
                 available_tools,
                 ({"role": "user", "content": build_mcp_task_user_message(items[0])},),
-                history_max_chars=int(args.history_max_chars),
+                history_max_chars=history_max_chars,
             )
             run.engine.generate(
                 [prompt],
@@ -866,7 +1121,13 @@ def _run_mcp_bench(
         raise ValueError("MCP-Bench requires JUDGE_MODEL + JUDGE_API_KEY")
 
     job_name = _resolve_job_name("function_mcp_bench", run_context=run_context)
-    sampling_payload = normalize_sampling_config_by_stage([(1, decision_sampling), (2, final_sampling)])
+    sampling_payload = attach_function_calling_context_metadata(
+        normalize_sampling_config_by_stage([(1, decision_sampling), (2, final_sampling)]),
+        candidate_router_config=candidate_router_config,
+        prompt_max_chars=history_max_chars,
+    )
+    sampling_payload["mcp_context_budget"] = dict(context_budget)
+    sampling_payload["mcp_candidate_router_mode"] = candidate_router_mode
     ctx = prepare_function_calling_run(
         dataset_slug=str(run.dataset_slug),
         model_name=run.model_name,
@@ -916,8 +1177,10 @@ def _run_mcp_bench(
                     fail_reason = ""
                     evaluation_summary = ""
                     is_passed = False
+                    tool_call_counts: dict[str, int] = {}
                     try:
                         available_tools = worker.open_task(item)
+                        candidate_router_tools = mcp_candidate_router_tools(available_tools)
                         prompt_messages: list[dict[str, str]] = [
                             {"role": "user", "content": build_mcp_task_user_message(item)}
                         ]
@@ -925,49 +1188,88 @@ def _run_mcp_bench(
                         valid_planned_tools = 0
                         executed_rounds = 0
                         for round_num in range(1, max_rounds + 1):
-                            decision_prompt = build_planning_json_call_prompt(
-                                item,
-                                available_tools,
-                                prompt_messages,
-                                history_max_chars=int(args.history_max_chars),
-                            )
-                            decision_output = run.engine.generate(
-                                [decision_prompt],
-                                sampling=decision_sampling,
-                                batch_size=1,
-                                progress_desc="MCPBench-Decision",
-                                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                                prompt_seeds=[
-                                    sample_repeat_seed(
-                                        sample_index,
-                                        repeat_index,
-                                        pass_index=key.pass_index,
-                                        stage=round_num,
-                                    )
-                                ],
-                            )[0]
-                            stages.append(
-                                StageRecord(
-                                    prompt=decision_prompt,
-                                    completion=decision_output.text,
-                                    stop_reason=decision_output.finish_reason,
-                                )
-                            )
+                            candidate_trace: dict[str, Any] = {}
+                            decision_raw = ""
                             try:
-                                decision = parse_planning_decision(decision_output.text)
+                                use_candidate_router = _should_use_mcp_candidate_router(
+                                    mode=candidate_router_mode,
+                                    config=candidate_router_config,
+                                    tools=candidate_router_tools,
+                                    prompt_messages=prompt_messages,
+                                    available_tools=available_tools,
+                                ) and candidate_router_config is not None
+                                if use_candidate_router:
+                                    try:
+                                        stage_record, decision, candidate_trace = run_mcp_candidate_router_decision(
+                                            item=item,
+                                            engine=run.engine,
+                                            sampling=decision_sampling,
+                                            tools=candidate_router_tools,
+                                            prompt_messages=prompt_messages,
+                                            config=candidate_router_config,
+                                            sample_index=sample_index,
+                                            repeat_index=repeat_index,
+                                            pass_index=key.pass_index,
+                                            round_num=round_num,
+                                        )
+                                        stages.append(stage_record)
+                                        decision_raw = stage_record.completion
+                                    except Exception as router_exc:
+                                        candidate_trace = {
+                                            "decision_io": "rwkv_json",
+                                            "candidate_router": {
+                                                "routed": True,
+                                                "reason": "candidate_router_error_full_prompt_fallback",
+                                                "error": str(router_exc),
+                                            },
+                                        }
+                                        use_candidate_router = False
+                                if not use_candidate_router:
+                                    decision_prompt = build_planning_json_call_prompt(
+                                        item,
+                                        available_tools,
+                                        prompt_messages,
+                                        history_max_chars=history_max_chars,
+                                    )
+                                    decision_output = run.engine.generate(
+                                        [decision_prompt],
+                                        sampling=decision_sampling,
+                                        batch_size=1,
+                                        progress_desc="MCPBench-Decision",
+                                        prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                                        prompt_seeds=[
+                                            sample_repeat_seed(
+                                                sample_index,
+                                                repeat_index,
+                                                pass_index=key.pass_index,
+                                                stage=round_num,
+                                            )
+                                        ],
+                                    )[0]
+                                    stages.append(
+                                        StageRecord(
+                                            prompt=decision_prompt,
+                                            completion=decision_output.text,
+                                            stop_reason=decision_output.finish_reason,
+                                        )
+                                    )
+                                    decision_raw = decision_output.text
+                                    decision = parse_planning_decision(decision_output.text)
                             except Exception as exc:
                                 fail_reason = str(exc)
                                 steps.append(
                                     {
                                         "round_num": round_num,
                                         "cot": "",
-                                        "decision": {"raw": decision_output.text, "parse_error": fail_reason},
+                                        "decision": {"raw": decision_raw, "parse_error": fail_reason},
+                                        "candidate_router": candidate_trace.get("candidate_router"),
                                         "executions": [],
                                     }
                                 )
                                 break
 
                             round_executions: list[McpBenchExecutionResult] = []
+                            force_final_after_round = False
                             if decision.should_continue:
                                 for raw_call in decision.tool_calls:
                                     prompt_messages.append(
@@ -980,7 +1282,7 @@ def _run_mcp_bench(
                                         }
                                     )
                             else:
-                                final_answer = decision.final_answer.strip()
+                                final_answer = clean_mcp_final_answer(decision.final_answer)
                                 prompt_messages.append(
                                     {
                                         "role": "assistant",
@@ -995,6 +1297,27 @@ def _run_mcp_bench(
                                     total_planned_tools += 1
                                     try:
                                         normalized = normalize_planned_tool_call(raw_call, available_tools)
+                                        signature = mcp_tool_call_signature(normalized)
+                                        seen_count = tool_call_counts.get(signature, 0)
+                                        tool_call_counts[signature] = seen_count + 1
+                                        if seen_count >= MCP_BENCH_REPEAT_TOOL_GUARD_LIMIT:
+                                            force_final_after_round = True
+                                            round_executions.append(
+                                                McpBenchExecutionResult(
+                                                    tool=normalized.full_name,
+                                                    server=normalized.server,
+                                                    parameters=dict(normalized.arguments),
+                                                    round_num=round_num,
+                                                    planned_layer=planned_layer,
+                                                    success=False,
+                                                    error=(
+                                                        "repeated_tool_call_guard: identical MCP tool call was "
+                                                        f"already attempted {seen_count} times; synthesize the "
+                                                        "answer from gathered evidence or choose a different tool"
+                                                    ),
+                                                )
+                                            )
+                                            break
                                         valid_planned_tools += 1
                                         tool_response = worker.call_tool(normalized.full_name, normalized.arguments)
                                         success = bool(tool_response.get("success", False))
@@ -1035,6 +1358,7 @@ def _run_mcp_bench(
                                     "round_num": round_num,
                                     "cot": "",
                                     "decision": {
+                                        "decision_io": candidate_trace.get("decision_io", "rwkv_json"),
                                         "reasoning": decision.reasoning,
                                         "should_continue": decision.should_continue,
                                         "final_answer": decision.final_answer,
@@ -1047,6 +1371,7 @@ def _run_mcp_bench(
                                             for call in decision.tool_calls
                                         ],
                                     },
+                                    "candidate_router": candidate_trace.get("candidate_router"),
                                     "executions": [_execution_to_dict(entry) for entry in round_executions],
                                 }
                             )
@@ -1056,14 +1381,19 @@ def _run_mcp_bench(
                                     round_num,
                                     decision.reasoning,
                                     round_executions,
+                                    history_max_chars=final_history_max_chars,
                                 )
                                 execution_results.extend(round_executions)
                                 executed_rounds = round_num
-                            if not decision.should_continue or not round_executions:
+                            if force_final_after_round or not decision.should_continue or not round_executions:
                                 break
 
                         if not fail_reason and not final_answer:
-                            final_prompt = build_final_answer_prompt(item, accumulated_information)
+                            final_prompt = build_final_answer_prompt(
+                                item,
+                                accumulated_information,
+                                history_max_chars=final_history_max_chars,
+                            )
                             final_output = run.engine.generate(
                                 [final_prompt],
                                 sampling=final_sampling,
@@ -1085,7 +1415,7 @@ def _run_mcp_bench(
                                     stop_reason=final_output.finish_reason,
                                 )
                             )
-                            final_answer = final_output.text.strip()
+                            final_answer = clean_mcp_final_answer(final_output.text)
                             planning_json_compliance = (
                                 valid_planned_tools / total_planned_tools if total_planned_tools > 0 else 1.0
                             )

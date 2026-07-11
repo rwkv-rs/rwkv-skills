@@ -35,7 +35,9 @@ from src.eval.tasks.function_calling.mcp_bench import (
     McpBenchTaskSpec,
     build_final_answer_prompt,
     build_planning_json_call_prompt,
+    clean_mcp_final_answer,
     parse_planning_decision,
+    resolve_mcp_context_budget,
 )
 from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
@@ -71,6 +73,34 @@ def test_repeat_probe_entries_repeats_to_batch_size() -> None:
     repeated = repeat_probe_entries([1, 2], batch_size=5)
 
     assert repeated == [1, 2, 1, 2, 1]
+
+
+def test_mcp_context_budget_respects_g1h_10k_and_legacy_8k_contexts() -> None:
+    args = types.SimpleNamespace(history_max_chars=24000, decision_max_tokens=2048, final_max_tokens=3072)
+
+    g1h_budget = resolve_mcp_context_budget(args, "rwkv7-g1h-7.2b-20260710-ctx10240")
+    old_budget = resolve_mcp_context_budget(args, "rwkv7-g1g-7.2b-20260523-ctx8192")
+
+    assert g1h_budget == {
+        "context_tokens": 10240,
+        "history_max_chars": 14000,
+        "final_history_max_chars": 11000,
+        "decision_max_tokens": 896,
+        "final_max_tokens": 1536,
+    }
+    assert old_budget == {
+        "context_tokens": 8192,
+        "history_max_chars": 11000,
+        "final_history_max_chars": 8500,
+        "decision_max_tokens": 768,
+        "final_max_tokens": 1024,
+    }
+
+
+def test_clean_mcp_final_answer_strips_role_fence_and_final_answer_call() -> None:
+    raw = 'Assistant: ```json\n{"name":"final_answer","arguments":{"answer":"answer text"}}\n```'
+
+    assert clean_mcp_final_answer(raw) == "answer text"
 
 
 def test_simple_tool_call_prompt_uses_rwkv_json_function_call_shape() -> None:
@@ -690,7 +720,7 @@ def test_mcp_prompts_use_rwkv_sections_without_blank_lines() -> None:
         ({"role": "user", "content": "Task:\nBook the meeting"},),
         history_max_chars=4000,
     )
-    final = build_final_answer_prompt(item, "Found A.\n\nFound B.")
+    final = build_final_answer_prompt(item, "Found A.\n\nFound B.", history_max_chars=4000)
 
     assert planning.startswith("System: Tools:")
     assert '"name": "calendar:search"' in planning
