@@ -750,7 +750,7 @@ class McpWorkerExecutor:
         from src.eval.scheduler.config import REPO_ROOT
         from src.eval.tasks.function_calling.mcp_bench import McpBenchWorkerClient
 
-        script = Path(worker_script).expanduser() if worker_script else REPO_ROOT / "src" / "eval" / "function_calling" / "mcp_bench_worker.py"
+        script = Path(worker_script).expanduser() if worker_script else REPO_ROOT / "src" / "eval" / "tasks" / "function_calling" / "mcp_bench_worker.py"
         self._client = McpBenchWorkerClient(runtime_root=Path(runtime_root).expanduser(), worker_script=script)
         self._servers = tuple(str(server) for server in servers)
         self._task_shim = SimpleNamespace(servers=self._servers)

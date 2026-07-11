@@ -791,7 +791,7 @@ def _run_mcp_bench(
     final_sampling = base_sampling.clamp(args.final_max_tokens)
 
     runtime_root = Path(items[0].runtime_root or "").expanduser().resolve()
-    worker_script = REPO_ROOT / "src" / "eval" / "function_calling" / "mcp_bench_worker.py"
+    worker_script = REPO_ROOT / "src" / "eval" / "tasks" / "function_calling" / "mcp_bench_worker.py"
     if not bool(getattr(args, "skip_runtime_preflight", False)):
         preflight_mcp_bench_runtime(
             items,
