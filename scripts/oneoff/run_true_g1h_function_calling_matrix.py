@@ -386,7 +386,7 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
         config["history_max_chars"] = 24000
         config["prompt_max_chars"] = 28000
     elif spec.kind in {"longbench", "longcodebench"}:
-        config["answer_max_tokens"] = 512
+        config["answer_max_tokens"] = 256
         config["history_max_chars"] = 24000
         config["prompt_max_chars"] = 28000
     elif spec.kind.startswith("tau"):
