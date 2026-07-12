@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +40,12 @@ _PROXY_ENV_NAMES = (
     "https_proxy",
     "no_proxy",
     "all_proxy",
+)
+_SANDBOX_GIT_ENV_NAMES = (
+    "GIT_TERMINAL_PROMPT",
+    "GIT_ASKPASS",
+    "GIT_HTTP_LOW_SPEED_LIMIT",
+    "GIT_HTTP_LOW_SPEED_TIME",
 )
 
 WEB_SEARCH_API_URL_ENV = "RWKV_WEB_SEARCH_API_URL"
@@ -96,6 +103,31 @@ def _docker_proxy_build_args() -> list[str]:
         value = os.environ.get(name)
         if value:
             args.extend(["--build-arg", f"{name}={value}"])
+    return args
+
+
+def _sandbox_command_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_ASKPASS", "true")
+    env.setdefault(
+        "GIT_HTTP_LOW_SPEED_LIMIT",
+        os.environ.get("RWKV_AGENT_LOOP_GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+    )
+    env.setdefault(
+        "GIT_HTTP_LOW_SPEED_TIME",
+        os.environ.get("RWKV_AGENT_LOOP_GIT_HTTP_LOW_SPEED_TIME", "20"),
+    )
+    return env
+
+
+def _docker_sandbox_env_args() -> list[str]:
+    env = _sandbox_command_env()
+    args: list[str] = []
+    for name in _SANDBOX_GIT_ENV_NAMES:
+        value = env.get(name)
+        if value:
+            args.extend(["-e", f"{name}={value}"])
     return args
 
 
@@ -428,12 +460,13 @@ class ShellSandboxExecutor:
         lock_path = self._docker_lock_path(f"{self._image}\0{compose_file.resolve()}")
         with lock_path.open("w", encoding="utf-8") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            self._run_with_retries(
-                [*base, "build"],
-                timeout=max(1800.0, self._timeout_s),
-                action=f"docker compose build for {compose_file}",
-                env=env,
-            )
+            if not self._docker_image_exists(self._image):
+                self._run_with_retries(
+                    [*base, "build"],
+                    timeout=max(1800.0, self._timeout_s),
+                    action=f"docker compose build for {compose_file}",
+                    env=env,
+                )
         self._run_checked(
             [*base, "up", "-d", "--no-build"],
             timeout=max(300.0, self._timeout_s),
@@ -455,6 +488,17 @@ class ShellSandboxExecutor:
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_hash = hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:24]
         return lock_dir / f"{lock_hash}.lock"
+
+    def _docker_image_exists(self, image: str) -> bool:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60.0,
+        )
+        return proc.returncode == 0
 
     def _run_with_retries(
         self,
@@ -535,7 +579,7 @@ class ShellSandboxExecutor:
         if self._backend == "subprocess":
             assert self._workspace is not None
             argv: list[str] = ["bash", "-lc", command]
-            cwd: str | None = str(self._workspace)
+            return self._run_subprocess_command(argv, cwd=str(self._workspace), stdin=stdin)
         else:
             assert self._container_id is not None
             argv = [
@@ -544,6 +588,7 @@ class ShellSandboxExecutor:
                 "-i",
                 "-w",
                 self._container_workdir,
+                *_docker_sandbox_env_args(),
                 self._container_id,
                 "bash",
                 "-lc",
@@ -566,6 +611,45 @@ class ShellSandboxExecutor:
         output = proc.stdout
         if proc.stderr:
             output = f"{output}\n{proc.stderr}" if output else proc.stderr
+        return AgentLoopStepOutcome(
+            ok=proc.returncode == 0,
+            output=truncate_text(output, self._max_output_chars),
+            error=None if proc.returncode == 0 else f"exit code {proc.returncode}",
+            details={"exit_code": proc.returncode},
+        )
+
+    def _run_subprocess_command(self, argv: Sequence[str], *, cwd: str, stdin: str | None) -> AgentLoopStepOutcome:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+            env=_sandbox_command_env(),
+        )
+        try:
+            stdout, stderr = proc.communicate(input=stdin, timeout=self._timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+            output = stdout
+            if stderr:
+                output = f"{output}\n{stderr}" if output else stderr
+            return AgentLoopStepOutcome(
+                ok=False,
+                output=truncate_text(output, self._max_output_chars) if output else None,
+                error=f"command timed out after {self._timeout_s:.0f}s",
+            )
+        output = stdout
+        if stderr:
+            output = f"{output}\n{stderr}" if output else stderr
         return AgentLoopStepOutcome(
             ok=proc.returncode == 0,
             output=truncate_text(output, self._max_output_chars),

@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 import importlib
 import json
+import logging
 import os
 from pathlib import Path
 import sys
@@ -61,6 +62,8 @@ COMPLEXFUNCBENCH_TASK_PREFIX = "complexfuncbench_official__"
 DEFAULT_COMPLEXFUNC_PROMPT_MAX_CHARS = 8192
 COMPLEXFUNC_TOOL_DESC_BUDGETS = (360, 180, 80, 0)
 COMPLEXFUNC_ARG_DESC_BUDGETS = (160, 80, 0, 0)
+
+_LOG = logging.getLogger(__name__)
 
 COMPLEXFUNCBENCH_FINAL_SCHEMA: dict[str, Any] = {
     "name": "final_answer",
@@ -1225,7 +1228,7 @@ def _run_complexfuncbench(
                 with ThreadPoolExecutor(max_workers=max(1, int(max_attempt_workers))) as executor:
                     futures = {
                         executor.submit(
-                            _run_complexfuncbench_attempt,
+                            _run_complexfuncbench_attempt_scoreable,
                             record=record,
                             engine=run.engine,
                             sampling=tool_sampling,
@@ -1274,6 +1277,81 @@ def _run_complexfuncbench(
         raise
     print(f"function_complexfuncbench done: {len(completions_payloads)} samples")
     return 0
+
+
+def _run_complexfuncbench_attempt_scoreable(
+    *,
+    record: ComplexFuncBenchRecord,
+    engine: Any,
+    sampling: Any,
+    sample_index: int,
+    repeat_index: int,
+    pass_index: int,
+    max_steps: int,
+    tool_routing_config: "ToolRoutingConfig",
+    history_max_chars: int,
+    prompt_max_chars: int,
+    benchmark_name: str,
+    dataset_split: str,
+    sampling_payload: Sequence[tuple[int, Mapping[str, Any]]],
+) -> dict[str, object]:
+    try:
+        return _run_complexfuncbench_attempt(
+            record=record,
+            engine=engine,
+            sampling=sampling,
+            sample_index=sample_index,
+            repeat_index=repeat_index,
+            pass_index=pass_index,
+            max_steps=max_steps,
+            tool_routing_config=tool_routing_config,
+            history_max_chars=history_max_chars,
+            prompt_max_chars=prompt_max_chars,
+            benchmark_name=benchmark_name,
+            dataset_split=dataset_split,
+            sampling_payload=sampling_payload,
+        )
+    except Exception as exc:  # noqa: BLE001
+        reason = f"inference_error:{type(exc).__name__}:{exc}"
+        _LOG.exception("complexfuncbench sample %s failed as scoreable zero: %s", sample_index, exc)
+        episode = ComplexFuncBenchEpisodeResult(
+            stages=[],
+            completions=[],
+            events=[
+                {
+                    "type": "runner_error",
+                    "metadata": {
+                        "sample_index": sample_index,
+                        "repeat_index": repeat_index,
+                        "pass_index": pass_index,
+                        "exception_type": type(exc).__name__,
+                        "exception": str(exc),
+                    },
+                }
+            ],
+            tool_routes=[],
+            format_bridges=[],
+            success=False,
+            score=0.0,
+            details={
+                "finish_reason": "inference_error",
+                "error": reason,
+                "runner_exception_type": type(exc).__name__,
+                "runner_exception": str(exc),
+                "steps": 0,
+            },
+            final_answer="",
+        )
+        return _complexfuncbench_completion_payload(
+            episode,
+            record=record,
+            benchmark_name=benchmark_name,
+            dataset_split=dataset_split,
+            sample_index=sample_index,
+            repeat_index=repeat_index,
+            pass_index=pass_index,
+            sampling_payload=sampling_payload,
+        )
 
 
 def _run_complexfuncbench_attempt(

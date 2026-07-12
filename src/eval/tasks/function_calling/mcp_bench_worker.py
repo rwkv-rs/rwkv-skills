@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any
 
 
+_DEFAULT_PACKAGE_INDEX_URL = "https://pypi.org/simple"
+_DEFAULT_EVALUATOR_MAX_ATTEMPTS = 8
+_PACKAGE_INDEX_ENV_NAMES = (
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX_URL",
+    "PIP_INDEX_URL",
+)
+_DEFAULT_UV_NO_DEV = "1"
+
+
 class WorkerState:
     def __init__(self, runtime_root: Path) -> None:
         self.runtime_root = runtime_root
@@ -32,6 +42,32 @@ def configure_runtime_paths(runtime_root: Path) -> None:
     sys.path.insert(0, str(runtime_root))
 
 
+def _package_index_url() -> str:
+    return (
+        os.environ.get("RWKV_MCP_PACKAGE_INDEX_URL")
+        or os.environ.get("RWKV_PACKAGE_INDEX_URL")
+        or _DEFAULT_PACKAGE_INDEX_URL
+    )
+
+
+def _uv_python(runtime_root: Path) -> str:
+    override = os.environ.get("RWKV_MCP_UV_PYTHON") or os.environ.get("RWKV_UV_PYTHON")
+    if override:
+        return override
+    runtime_python = runtime_root / ".venv" / "bin" / "python"
+    if runtime_python.is_file():
+        return str(runtime_python)
+    return os.environ.get("UV_PYTHON") or "3.11"
+
+
+def apply_mcp_server_env(env: dict[str, str], runtime_root: Path) -> None:
+    index_url = _package_index_url()
+    for name in _PACKAGE_INDEX_ENV_NAMES:
+        env[name] = index_url
+    env["UV_PYTHON"] = _uv_python(runtime_root)
+    env["UV_NO_DEV"] = os.environ.get("RWKV_MCP_UV_NO_DEV") or os.environ.get("UV_NO_DEV") or _DEFAULT_UV_NO_DEV
+
+
 def load_server_configs(runtime_root: Path, server_names: list[str]) -> list[dict[str, Any]]:
     commands_path = runtime_root / "mcp_servers" / "commands.json"
     api_key_path = runtime_root / "mcp_servers" / "api_key"
@@ -43,6 +79,7 @@ def load_server_configs(runtime_root: Path, server_names: list[str]) -> list[dic
         if not isinstance(raw, dict):
             raise ValueError(f"server config not found: {server_name}")
         env = dict(os.environ)
+        apply_mcp_server_env(env, runtime_root)
         for key in raw.get("env", []) or []:
             if key in api_keys:
                 env[key] = api_keys[key]
@@ -152,7 +189,8 @@ async def handle_evaluate(_state: WorkerState, payload: dict[str, Any]) -> dict[
     evaluator = TaskEvaluator(provider, enable_judge_stability=False)
     last_error: Exception | None = None
     evaluation: Any = None
-    for attempt in range(1, 6):
+    max_attempts = max(1, int(os.environ.get("RWKV_MCP_EVALUATOR_MAX_ATTEMPTS", _DEFAULT_EVALUATOR_MAX_ATTEMPTS)))
+    for attempt in range(1, max_attempts + 1):
         try:
             with contextlib.redirect_stdout(sys.stderr):
                 evaluation = await evaluator.evaluate(
@@ -166,12 +204,17 @@ async def handle_evaluate(_state: WorkerState, payload: dict[str, Any]) -> dict[
                     concrete_task_description=str(request.get("concrete_task_description") or ""),
                     dependency_analysis=str(request.get("dependency_analysis") or ""),
                 )
-            break
+            if isinstance(evaluation, dict):
+                break
+            message = f"official evaluator returned a non-dict payload: {truncate_for_error(evaluation)}"
+            if not _is_transient_evaluator_error(RuntimeError(message)) or attempt >= max_attempts:
+                raise RuntimeError("official evaluator returned a non-dict payload")
+            time.sleep(_retry_sleep_s(attempt))
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            if not _is_transient_evaluator_error(exc) or attempt >= 5:
+            if not _is_transient_evaluator_error(exc) or attempt >= max_attempts:
                 raise
-            time.sleep(min(30.0, 3.0 * (2 ** (attempt - 1))))
+            time.sleep(_retry_sleep_s(attempt))
     if evaluation is None and last_error is not None:
         raise last_error
     if not isinstance(evaluation, dict):
@@ -185,6 +228,10 @@ def _is_transient_evaluator_error(exc: Exception) -> bool:
         marker in message
         for marker in (
             "当前系统繁忙",
+            "database error",
+            "please contact the administrator",
+            "llm judge evaluation failed",
+            "official evaluator returned a non-dict payload",
             "rate limit",
             "timeout",
             "timed out",
@@ -197,6 +244,17 @@ def _is_transient_evaluator_error(exc: Exception) -> bool:
             "error code: 504",
         )
     )
+
+
+def _retry_sleep_s(attempt: int) -> float:
+    return min(60.0, 3.0 * (2 ** (attempt - 1)))
+
+
+def truncate_for_error(value: Any, limit: int = 800) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
 
 
 async def handle_close_task(state: WorkerState, _payload: dict[str, Any]) -> dict[str, Any]:

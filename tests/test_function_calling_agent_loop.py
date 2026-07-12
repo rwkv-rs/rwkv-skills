@@ -509,6 +509,8 @@ def test_shell_sandbox_docker_compose_uses_terminal_bench_env(
 
     def fake_run(argv, **kwargs):  # noqa: ANN001
         calls.append({"argv": list(argv), "env": dict(kwargs.get("env") or {})})
+        if list(argv)[:3] == ["docker", "image", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setenv("RWKV_AGENT_LOOP_DOCKER_BUILD_RETRIES", "1")
@@ -530,6 +532,35 @@ def test_shell_sandbox_docker_compose_uses_terminal_bench_env(
     assert build_env["T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME"] == "rwkv-terminal-bench:compose-demo"  # type: ignore[index]
     assert build_env["T_BENCH_TEST_DIR"] == "/tests"  # type: ignore[index]
     assert build_env["T_BENCH_CONTAINER_LOGS_PATH"] == "/logs"  # type: ignore[index]
+
+
+def test_shell_sandbox_docker_compose_skips_build_for_cached_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.eval.tasks.function_calling import agent_loop_executors
+
+    compose_file = tmp_path / "docker-compose.yaml"
+    compose_file.write_text("services:\n  client:\n    image: ${T_BENCH_TASK_DOCKER_CLIENT_IMAGE_NAME}\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ARG001
+        calls.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(agent_loop_executors.subprocess, "run", fake_run)
+
+    executor = ShellSandboxExecutor(
+        backend="docker",
+        image="rwkv-terminal-bench:cached-demo",
+        docker_compose_file=str(compose_file),
+    )
+    executor.open()
+    executor.close()
+
+    compose_calls = [argv for argv in calls if argv[:2] == ["docker", "compose"]]
+    assert not any("build" in argv for argv in compose_calls)
+    assert any("up" in argv for argv in compose_calls)
 
 
 def test_preflight_fails_for_unsupported_official_and_missing_assets(monkeypatch) -> None:

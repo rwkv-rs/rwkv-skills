@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import select
 import subprocess
 import threading
 from collections import deque
@@ -205,6 +207,9 @@ class McpBenchWorkerClient:
     def __init__(self, *, runtime_root: str | Path, worker_script: str | Path) -> None:
         self.runtime_root = Path(runtime_root).expanduser().resolve()
         self.worker_script = Path(worker_script).expanduser().resolve()
+        configured_timeout = float(os.getenv("RWKV_MCP_WORKER_REQUEST_TIMEOUT_S", "900"))
+        minimum_timeout = float(os.getenv("RWKV_MCP_WORKER_MIN_REQUEST_TIMEOUT_S", "900"))
+        self.request_timeout_s = max(1.0, configured_timeout, minimum_timeout)
         python_bin = self.runtime_root / ".venv" / "bin" / "python"
         if not python_bin.is_file():
             raise FileNotFoundError(f"missing MCP-Bench runtime python: {python_bin}")
@@ -304,6 +309,13 @@ class McpBenchWorkerClient:
             raise RuntimeError(self._worker_failure_message("worker stdin closed")) from exc
 
         while True:
+            ready, _, _ = select.select([self._proc.stdout], [], [], self.request_timeout_s)
+            if not ready:
+                raise RuntimeError(
+                    self._worker_failure_message(
+                        f"worker request timed out after {self.request_timeout_s:.1f}s action={action}"
+                    )
+                )
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._worker_failure_message("worker stdout closed"))
