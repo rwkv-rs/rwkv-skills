@@ -38,9 +38,15 @@ from ..core.selection import (
 )
 from ..core.tables import _make_cell_id, _tooltip_for_entry
 
-# Rows whose best score is below this percentage are hidden (matches the old
-# Gradio behaviour where near-zero rows were dropped to reduce noise).
-MIN_VISIBLE_PERCENT = 10.0
+# Rows are hidden only when they have no score at all. Zero/low scores are still
+# real results and must remain visible after new benchmark runs complete.
+MIN_VISIBLE_PERCENT = 0.0
+
+_METHOD_SUFFIXES = ("_fake_cot", "_nocot", "_cot")
+_FUNCTION_CALL_ALIAS_BASES = {
+    "apibank_l1": "apibank_level1",
+    "apibank_l2": "apibank_level2",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +94,65 @@ def _param_columns(lineages: Iterable[ParamLineage]) -> list[dict[str, Any]]:
             }
         )
     return columns
+
+
+def _split_method_suffix(benchmark_name: str) -> tuple[str, str]:
+    for suffix in _METHOD_SUFFIXES:
+        if benchmark_name.endswith(suffix):
+            return benchmark_name[: -len(suffix)], suffix
+    return benchmark_name, ""
+
+
+def _function_call_canonical_key(row: dict[str, Any]) -> tuple[str, str | None, str | None]:
+    benchmark_name = str(row.get("benchmark_name") or "")
+    base, suffix = _split_method_suffix(benchmark_name)
+    canonical_base = _FUNCTION_CALL_ALIAS_BASES.get(base, base)
+    return (f"{canonical_base}{suffix}", row.get("eval_method"), row.get("k_metric"))
+
+
+def _is_function_call_no_cot_row(row: dict[str, Any]) -> bool:
+    benchmark_name = str(row.get("benchmark_name") or "")
+    _, suffix = _split_method_suffix(benchmark_name)
+    return suffix == "_nocot"
+
+
+def _compact_function_call_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only no_cot FC rows, then hide aliases and duplicate metric rows."""
+
+    rows = [row for row in rows if _is_function_call_no_cot_row(row)]
+    canonical_keys = {_function_call_canonical_key(row) for row in rows}
+    alias_compacted: list[dict[str, Any]] = []
+    for row in rows:
+        benchmark_name = str(row.get("benchmark_name") or "")
+        base, suffix = _split_method_suffix(benchmark_name)
+        canonical_base = _FUNCTION_CALL_ALIAS_BASES.get(base)
+        if canonical_base is not None:
+            canonical_key = (f"{canonical_base}{suffix}", row.get("eval_method"), row.get("k_metric"))
+            if canonical_key in canonical_keys:
+                continue
+        alias_compacted.append(row)
+
+    compacted: list[dict[str, Any]] = []
+    index_by_name: dict[str, int] = {}
+    for row in alias_compacted:
+        benchmark_name = str(row.get("benchmark_name") or "")
+        existing_index = index_by_name.get(benchmark_name)
+        if existing_index is None:
+            index_by_name[benchmark_name] = len(compacted)
+            compacted.append(row)
+            continue
+        if _function_call_metric_rank(row) < _function_call_metric_rank(compacted[existing_index]):
+            compacted[existing_index] = row
+    return compacted
+
+
+def _function_call_metric_rank(row: dict[str, Any]) -> tuple[int, str]:
+    metric = str(row.get("k_metric") or "")
+    if metric == "avg@1":
+        return (0, metric)
+    if metric == "accuracy":
+        return (1, metric)
+    return (2, metric)
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +423,8 @@ def serialize_leaderboard(
                     interaction_meta=interaction_meta,
                     cell_prefix=f"normal_{group['key']}",
                 )
+            if group["key"] == "function_call":
+                rows = _compact_function_call_rows(rows)
             domains_payload.append(
                 {
                     "key": group["key"],

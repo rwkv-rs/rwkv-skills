@@ -106,6 +106,17 @@ class FakeDashboardStore(DashboardStore):
                 "created_at": datetime(2026, 7, 1, 12, 0, 0),
                 "model": model,
                 "dataset": dataset,
+            },
+            {
+                "score_id": 2,
+                "task_id": 124,
+                "cot_mode": "NoCoT",
+                "evaluator": "multi_choice_plain",
+                "metrics": {"avg@1": 0.6},
+                "sampling_config": {"avg_k": 1},
+                "created_at": datetime(2026, 7, 1, 13, 0, 0),
+                "model": model,
+                "dataset": dataset,
             }
         ]
 
@@ -186,7 +197,16 @@ def test_dashboard_api_uses_injected_store(monkeypatch) -> None:
             params={"model": "rwkv7-g1g-1.5b-test", "benchmark": "mmlu_test"},
         ).json()
         assert history["total"] == 1
-        assert history["groups"][0]["points"][0]["percent"] == 50.0
+        assert history["raw_total"] == 2
+        assert history["compact"] is True
+        assert history["groups"][0]["points"][0]["percent"] == 60.0
+
+        full_history = client.get(
+            "/api/score-history",
+            params={"model": "rwkv7-g1g-1.5b-test", "benchmark": "mmlu_test", "compact": "false"},
+        ).json()
+        assert full_history["total"] == 2
+        assert full_history["compact"] is False
 
         detail = client.get("/api/score-history/detail", params={"task_id": 123}).json()
         assert detail["found"] is True

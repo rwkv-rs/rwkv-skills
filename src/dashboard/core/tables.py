@@ -120,7 +120,7 @@ def _render_summary(
         f"- 模型列数：{len(selection.model_sequence)}",
         f"- 基准行数：{benchmark_count}",
         f"- 可见数据集：{len(visible)} / 总分数记录：{len(all_entries)}",
-        "- 排序：架构 > 参数量 > data_version（G0→…→G1d）> domain > dataset / task",
+        "- 排序：架构 > 参数量 > 自动展示 data_version（G0→…→G1g）> domain > dataset / task",
     ]
     if selection.aggregated_models:
         lines.extend(_summarise_snapshots(selection.aggregated_models))

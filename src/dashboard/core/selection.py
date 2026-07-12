@@ -6,6 +6,7 @@ from typing import Any, Iterable, Sequence
 
 from .data import (
     ARCH_VERSIONS,
+    AUTO_DISPLAY_DATA_VERSIONS,
     DATA_VERSIONS,
     NUM_PARAMS,
     ScoreEntry,
@@ -41,6 +42,10 @@ def _rank_token(candidates: Sequence[str], value: str | None) -> int | None:
         return None
 
 
+def _auto_data_rank(value: str | None) -> int | None:
+    return _rank_token(AUTO_DISPLAY_DATA_VERSIONS, value)
+
+
 def _sort_entries(entries: Iterable[ScoreEntry]) -> list[ScoreEntry]:
     def sort_key(item: ScoreEntry) -> tuple[Any, ...]:
         arch_rank = _rank_token(ARCH_VERSIONS, item.arch_version)
@@ -74,6 +79,7 @@ def _series_sort_key(model: str) -> tuple[int, int, int, str]:
 def _snapshot_entry(entry: ScoreEntry) -> dict[str, Any]:
     arch_rank = _rank_token(ARCH_VERSIONS, entry.arch_version)
     data_rank = _rank_token(DATA_VERSIONS, entry.data_version)
+    auto_data_rank = _auto_data_rank(entry.data_version)
     param_rank = _rank_token(NUM_PARAMS, entry.num_params)
     return {
         "model": entry.model,
@@ -82,6 +88,7 @@ def _snapshot_entry(entry: ScoreEntry) -> dict[str, Any]:
         "params": entry.num_params,
         "arch_rank": arch_rank,
         "data_rank": data_rank,
+        "auto_data_rank": auto_data_rank,
         "param_rank": param_rank,
         "created": entry.created_at,
         "has_signature": bool(entry.arch_version and entry.num_params),
@@ -110,10 +117,13 @@ def _select_signature_snapshots(entries: Iterable[ScoreEntry]) -> list[dict[str,
 
     selected: list[dict[str, Any]] = []
     for items in grouped.values():
+        auto_items = [snap for snap in items if snap.get("auto_data_rank") is not None]
+        if not auto_items:
+            continue
         best = max(
-            items,
+            auto_items,
             key=lambda snap: (
-                snap["data_rank"] if snap["data_rank"] is not None else -1,
+                snap["auto_data_rank"] if snap["auto_data_rank"] is not None else -1,
                 snap["created"].timestamp(),
                 snap["model"],
             ),
@@ -124,7 +134,7 @@ def _select_signature_snapshots(entries: Iterable[ScoreEntry]) -> list[dict[str,
         key=lambda snap: (
             snap["arch_rank"] if snap["arch_rank"] is not None else len(ARCH_VERSIONS),
             snap["param_rank"] if snap["param_rank"] is not None else len(NUM_PARAMS),
-            -(snap["data_rank"] if snap["data_rank"] is not None else -1),
+            -(snap["auto_data_rank"] if snap["auto_data_rank"] is not None else -1),
             snap["model"],
         )
     )
@@ -354,13 +364,25 @@ def _resolve_param_lineages(entries: list[ScoreEntry], selection: SelectionState
     for (_, param), items in by_arch_param.items():
         if not items:
             continue
-        by_param.setdefault(param, []).append(items[-1])
+        auto_items = [snap for snap in items if snap.get("auto_data_rank") is not None]
+        if not auto_items:
+            continue
+        by_param.setdefault(param, []).append(
+            max(
+                auto_items,
+                key=lambda snap: (
+                    snap.get("auto_data_rank") if snap.get("auto_data_rank") is not None else -1,
+                    snap["created"].timestamp(),
+                    snap.get("model", ""),
+                ),
+            )
+        )
 
     for param, candidates in by_param.items():
         latest = max(
             candidates,
             key=lambda snap: (
-                snap.get("data_rank") if snap.get("data_rank") is not None else -1,
+                snap.get("auto_data_rank") if snap.get("auto_data_rank") is not None else -1,
                 snap["created"].timestamp(),
                 snap.get("arch_rank") if snap.get("arch_rank") is not None else -1,
                 snap.get("model", ""),

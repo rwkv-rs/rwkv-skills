@@ -178,6 +178,7 @@ export function ScoreHistory() {
   const opts = useQuery({ queryKey: ["score-history-options"], queryFn: api.scoreHistoryOptions, staleTime: 300_000 });
   const [model, setModel] = useState("");
   const [benchmark, setBenchmark] = useState("");
+  const [showAllRuns, setShowAllRuns] = useState(false);
   const [selectedTask, setSelectedTask] = useState<number | null>(null);
 
   // Benchmarks available for the chosen model (from the pairs list).
@@ -196,8 +197,8 @@ export function ScoreHistory() {
   }, [benchmarks]);
 
   const history = useQuery({
-    queryKey: ["score-history", model, benchmark],
-    queryFn: () => api.scoreHistory(model, benchmark),
+    queryKey: ["score-history", model, benchmark, showAllRuns],
+    queryFn: () => api.scoreHistory(model, benchmark, !showAllRuns),
     enabled: !!model && !!benchmark,
   });
 
@@ -226,10 +227,22 @@ export function ScoreHistory() {
               ))}
             </select>
           </div>
+          <label className="checkbox-control">
+            <input
+              type="checkbox"
+              checked={showAllRuns}
+              onChange={(e) => setShowAllRuns(e.target.checked)}
+            />
+            全部重跑
+          </label>
           <button className="btn btn-primary" onClick={() => history.refetch()}>🔄 刷新</button>
           {history.data && (
             <span className="muted" style={{ fontSize: 12 }}>
-              共 {history.data.total} 条分数 · {history.data.groups.length} 张图
+              {history.data.raw_total > history.data.total
+                ? `展示 ${history.data.total} / 共 ${history.data.raw_total} 条分数`
+                : `共 ${history.data.total} 条分数`}
+              {" · "}
+              {history.data.groups.length} 张图
             </span>
           )}
           {history.isFetching && <span className="muted" style={{ fontSize: 12 }}>加载中…</span>}

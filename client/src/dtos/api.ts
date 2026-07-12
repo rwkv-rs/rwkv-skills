@@ -232,6 +232,8 @@ export interface ScoreHistoryResponse {
   model: string;
   benchmark: string;
   total: number;
+  raw_total: number;
+  compact: boolean;
   groups: ScoreHistoryGroup[];
 }
 

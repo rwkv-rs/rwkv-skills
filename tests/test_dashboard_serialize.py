@@ -6,9 +6,9 @@ from pathlib import Path
 from src.dashboard.core.boards import BOARD_NAIVE
 from src.dashboard.core.constants import AUTO_MODEL_LABEL
 from src.dashboard.core.data import ScoreEntry
-from src.dashboard.core.domains import DOMAIN_MMLU
+from src.dashboard.core.domains import DOMAIN_FUNCTION_CALL, DOMAIN_MMLU
 from src.dashboard.core.selection import _prepare_selection
-from src.dashboard.web.serialize import serialize_leaderboard
+from src.dashboard.web.serialize import _compact_function_call_rows, serialize_leaderboard
 
 
 def _entry(
@@ -21,6 +21,7 @@ def _entry(
     prompt_profile: str | None,
     accuracy: float = 0.8,
     cot_mode: str = "no_cot",
+    domain: str = DOMAIN_MMLU,
 ) -> ScoreEntry:
     sampling_config: dict[str, object] = {}
     if prompt_profile is not None:
@@ -39,10 +40,10 @@ def _entry(
         task_details=None,
         path=Path("<test>"),
         relative_path=Path("<test>"),
-        domain=DOMAIN_MMLU,
+        domain=domain,
         extra={"sampling_config": sampling_config, "cot_mode": cot_mode},
         arch_version="RWKV7",
-        data_version="G1G" if "g1g" in model else "G1F",
+        data_version="G1H" if "g1h" in model else "G1G" if "g1g" in model else "G1F",
         num_params="1_5b",
     )
 
@@ -160,6 +161,151 @@ def test_delta_detail_rows_keep_cot_and_nocot_benchmarks_adjacent() -> None:
 
     assert benchmark_names[:2] == ["mmlu_cot", "mmlu_nocot"]
     assert benchmark_names == ["mmlu_cot", "mmlu_nocot", "supergpqa_cot"]
+
+
+def test_detail_rows_keep_zero_scores_visible() -> None:
+    model = "rwkv7-g1g-1.5b-20260527-ctx8192"
+    entries = [
+        _entry(
+            task_id=601,
+            dataset="mmlu_pro",
+            model=model,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            accuracy=0.0,
+        )
+    ]
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+
+    payload = serialize_leaderboard(
+        selection,
+        all_entries=entries,
+        view_mode="benchmark_detail_latest",
+    )
+
+    knowledge = next(domain for domain in payload["domains"] if domain["key"] == "knowledge")
+    assert knowledge["rows"][0]["benchmark_name"] == "mmlu_pro_nocot"
+    assert knowledge["rows"][0]["cells"][0]["percent"] == 0.0
+
+
+def test_auto_latest_holds_at_g1g_until_g1h_rollout_enabled() -> None:
+    entries = [
+        _entry(
+            task_id=701,
+            dataset="mmlu_pro",
+            model="rwkv7-g1g-1.5b-20260527-ctx8192",
+            task="multi_choice_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+        ),
+        _entry(
+            task_id=702,
+            dataset="mmlu_pro",
+            model="rwkv7-g1h-1.5b-20260710-ctx10240",
+            task="multi_choice_plain",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+        ),
+    ]
+
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+
+    assert selection.model_sequence == ["rwkv7-g1g-1.5b-20260527-ctx8192"]
+
+
+def test_function_call_alias_rows_are_compacted() -> None:
+    model = "rwkv7-g1g-1.5b-20260527-ctx8192"
+    entries = [
+        _entry(
+            task_id=801,
+            dataset="apibank_l1_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=802,
+            dataset="apibank_level1_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+    ]
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+
+    payload = serialize_leaderboard(
+        selection,
+        all_entries=entries,
+        view_mode="benchmark_detail_latest",
+    )
+
+    function_call = next(domain for domain in payload["domains"] if domain["key"] == "function_call")
+    assert [row["benchmark_name"] for row in function_call["rows"]] == ["apibank_level1_nocot"]
+
+
+def test_function_call_rows_keep_nocot_only() -> None:
+    model = "rwkv7-g1g-1.5b-20260527-ctx8192"
+    entries = [
+        _entry(
+            task_id=811,
+            dataset="bfcl_simple_python_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="no_cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=812,
+            dataset="bfcl_simple_python_test",
+            model=model,
+            task="function_call_cot",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=813,
+            dataset="bfcl_simple_python_test",
+            model=model,
+            task="function_call_fake_cot",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="fake_cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+    ]
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+
+    payload = serialize_leaderboard(
+        selection,
+        all_entries=entries,
+        view_mode="benchmark_detail_latest",
+    )
+
+    function_call = next(domain for domain in payload["domains"] if domain["key"] == "function_call")
+    assert [row["benchmark_name"] for row in function_call["rows"]] == ["bfcl_simple_python_nocot"]
+
+
+def test_function_call_duplicate_metric_rows_prefer_avg1() -> None:
+    rows = [
+        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@0.394945"},
+        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@1"},
+        {"benchmark_name": "deepsearchqa_cot", "eval_method": "exact_match", "k_metric": "accuracy"},
+    ]
+
+    compacted = _compact_function_call_rows(rows)
+
+    assert compacted == [
+        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@1"},
+    ]
 
 
 def test_normal_and_naive_cells_do_not_overwrite_click_metadata() -> None:

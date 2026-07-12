@@ -1,11 +1,10 @@
 """Score-history page service (DB-backed; does NOT use score_index.jsonl).
 
-For a chosen model + benchmark, returns every official score (no dedup, no
-latest-only) as a time series, split into at most two charts by ``cot_mode``
-(NoCoT / CoT). Within each chart, 朴素榜 (naive) points come first, then the
-rest by ``created_at`` ascending. Each point carries its score_id/task_id so the
-frontend can open a per-task detail (sampling params + representative prompt
-stages).
+For a chosen model + benchmark, returns score points split into at most two
+charts by ``cot_mode`` (NoCoT / CoT). The default response is compact: repeated
+runs for the same cot/evaluator/board/metric group collapse to the latest score.
+Clients can request ``compact=false`` for the full official score history. Each
+point carries its score_id/task_id so the frontend can open per-task detail.
 """
 
 from __future__ import annotations
@@ -74,7 +73,33 @@ def score_history_options(*, store: DashboardStore | None = None) -> dict[str, A
     return {"models": models, "benchmarks": benchmarks, "pairs": pairs}
 
 
-def score_history(*, model: str, benchmark: str, store: DashboardStore | None = None) -> dict[str, Any]:
+def _compact_latest_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for point in points:
+        key = (
+            point.get("cot_mode"),
+            point.get("evaluator"),
+            point.get("board"),
+            point.get("metric"),
+        )
+        previous = latest_by_key.get(key)
+        current_sort = (point.get("created_at") or "", point.get("score_id") or 0)
+        previous_sort = (
+            (previous.get("created_at") or "") if previous else "",
+            (previous.get("score_id") or 0) if previous else 0,
+        )
+        if previous is None or current_sort > previous_sort:
+            latest_by_key[key] = point
+    return list(latest_by_key.values())
+
+
+def score_history(
+    *,
+    model: str,
+    benchmark: str,
+    compact: bool = True,
+    store: DashboardStore | None = None,
+) -> dict[str, Any]:
     rows = _store_or_default(store).list_score_history(model=model, dataset=benchmark)
     points: list[dict[str, Any]] = []
     for row in rows:
@@ -98,6 +123,9 @@ def score_history(*, model: str, benchmark: str, store: DashboardStore | None = 
                 "benchmark": row.get("dataset"),
             }
         )
+    raw_total = len(points)
+    if compact:
+        points = _compact_latest_points(points)
 
     # Split into at most two charts by cot_mode (NoCoT / CoT). Within each chart,
     # naive points first, then created_at ascending.
@@ -114,7 +142,14 @@ def score_history(*, model: str, benchmark: str, store: DashboardStore | None = 
         bucket.sort(key=lambda p: (0 if p["board"] == BOARD_NAIVE else 1, p["created_at"] or ""))
         groups.append({"cot_mode": key, "points": bucket})
 
-    return {"model": model, "benchmark": benchmark, "total": len(points), "groups": groups}
+    return {
+        "model": model,
+        "benchmark": benchmark,
+        "total": len(points),
+        "raw_total": raw_total,
+        "compact": compact,
+        "groups": groups,
+    }
 
 
 def _stop_token_rows(stop_tokens: Any) -> list[dict[str, Any]]:

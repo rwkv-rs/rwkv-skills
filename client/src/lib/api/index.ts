@@ -33,9 +33,9 @@ export const api = {
     return getJson<EvalRecordsPage>(`/api/eval-records?${params.toString()}`);
   },
   scoreHistoryOptions: () => getJson<ScoreHistoryOptions>("/api/score-history/options"),
-  scoreHistory: (model: string, benchmark: string) =>
+  scoreHistory: (model: string, benchmark: string, compact = true) =>
     getJson<ScoreHistoryResponse>(
-      `/api/score-history?model=${encodeURIComponent(model)}&benchmark=${encodeURIComponent(benchmark)}`
+      `/api/score-history?model=${encodeURIComponent(model)}&benchmark=${encodeURIComponent(benchmark)}&compact=${String(compact)}`
     ),
   scoreHistoryDetail: (taskId: number) =>
     getJson<ScoreHistoryDetail>(`/api/score-history/detail?task_id=${taskId}`),

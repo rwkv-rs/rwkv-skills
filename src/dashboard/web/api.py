@@ -161,9 +161,10 @@ def create_app(store: DashboardStore | None = None) -> FastAPI:
     def score_history_endpoint(
         model: str = Query(...),
         benchmark: str = Query(...),
+        compact: bool = Query(default=True),
     ) -> dict[str, Any]:
         try:
-            return score_history(model=model, benchmark=benchmark, store=resolved_store)
+            return score_history(model=model, benchmark=benchmark, compact=compact, store=resolved_store)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"读取分数历史失败：{exc}") from exc
 
