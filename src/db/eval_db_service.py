@@ -1030,6 +1030,11 @@ class EvalDbService:
                         payload[f"prompt{idx}"] = stage.get("prompt")
                         payload[f"completion{idx}"] = stage.get("completion")
                         payload[f"stop_reason{idx}"] = stage.get("stop_reason")
+                strategy_a = context.get("strategy_a")
+                if isinstance(strategy_a, dict):
+                    payload["strategy_a_prompt"] = strategy_a.get("prompt")
+                    payload["strategy_a_completion"] = strategy_a.get("completion")
+                    payload["strategy_a_stop_reason"] = strategy_a.get("stop_reason")
                 stats = context.get("stats")
                 if isinstance(stats, dict):
                     payload["stats"] = stats
@@ -1193,6 +1198,13 @@ class EvalDbService:
             "stages": stages,
             "sampling_config": payload.get("sampling_config", {}),
         }
+        strategy_a = {
+            "prompt": payload.get("strategy_a_prompt"),
+            "completion": payload.get("strategy_a_completion"),
+            "stop_reason": payload.get("strategy_a_stop_reason"),
+        }
+        if any(value is not None for value in strategy_a.values()):
+            context["strategy_a"] = strategy_a
         stats = payload.get("stats")
         if isinstance(stats, Mapping):
             context["stats"] = dict(stats)

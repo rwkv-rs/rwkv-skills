@@ -1,7 +1,24 @@
 from __future__ import annotations
 
 from src.eval.tasks.maths.pipeline import FREE_RESPONSE_STOP_TOKENS, FreeResponsePipeline
+from src.eval.metrics import free_response as fr
 from src.infer.sampling import GenerationOutput, SamplingConfig
+
+
+def _patch_math_verify(monkeypatch) -> None:
+    def parse(text: str):
+        import re
+
+        boxes = re.findall(r"\\boxed\{([^{}]+)\}", text)
+        if boxes:
+            return [("boxed", boxes[-1])]
+        return []
+
+    def verify(gold, pred, *, strict: bool = False):
+        _ = strict
+        return bool(gold and pred and gold[-1][-1] == pred[-1][-1])
+
+    monkeypatch.setattr(fr, "_load_math_verify", lambda: (parse, verify))
 
 
 def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -> None:
@@ -122,6 +139,89 @@ def test_free_response_pipeline_generates_cot_then_final_answer(tmp_path) -> Non
     assert result.payloads[0]["_stage"] == "answer"
 
 
+def test_free_response_pipeline_emits_strategy_a_full_and_two_stage_bc(tmp_path) -> None:
+    dataset = tmp_path / "math.jsonl"
+    dataset.write_text('{"question":"2+5?","answer":"7"}\n', encoding="utf-8")
+    backend = _StrategyAFakeBackend()
+    pipeline = FreeResponsePipeline(backend)
+
+    result = pipeline.run(
+        dataset_path=str(dataset),
+        prompt_template="User: solve\n<Q>\n\nAssistant: <think",
+        generation_sampling=SamplingConfig(max_generate_tokens=32, stop_tokens=(0, 261)),
+        strategy_a_prompt_template="User: solve fully\n<Q>\n\nAssistant: <think",
+        strategy_a_sampling=SamplingConfig(max_generate_tokens=64, temperature=0.25),
+        final_answer_template="<Q><COT>\nTherefore, the answer is \\(\\boxed{",
+        final_sampling=SamplingConfig(max_generate_tokens=8, temperature=1.0, top_p=0.3, stop_tokens=(0, 2402)),
+        batch_size=4,
+        dataset_name="math_test",
+        pass_k=(1,),
+        samples_per_task=1,
+    )
+
+    assert len(backend.calls) == 3
+    assert backend.calls[0]["prompts"] == ["User: solve fully\n2+5?\n\nAssistant: <think"]
+    assert backend.calls[1]["prompts"] == ["User: solve\n2+5?\n\nAssistant: <think"]
+    assert backend.calls[2]["prompts"] == [
+        "User: solve\n2+5?\n\nAssistant: <think</think>\nwork\nTherefore, the answer is \\(\\boxed{"
+    ]
+    payload = result.payloads[0]
+    assert payload["strategy_a_prompt"] == "User: solve fully\n2+5?\n\nAssistant: <think"
+    assert payload["strategy_a_completion"] == "</think>\nfull answer \\(\\boxed{7}\\)."
+    assert payload["completion1"] == "</think>\nwork"
+    assert payload["completion2"] == "8}\\)."
+    assert payload["sampling_config"]["strategy_a"]["max_new_tokens"] == 64
+    assert payload["sampling_config"]["stage1"]["max_new_tokens"] == 32
+    assert payload["sampling_config"]["stage2"]["max_new_tokens"] == 8
+    assert payload["stats"]["strategy_a"]["generated_token_count"] == 4
+    assert payload["stats"]["stage1"]["generated_token_count"] == 1
+    assert payload["stats"]["stage2"]["generated_token_count"] == 2
+
+
+def test_strategy_a_filter_only_runs_two_stage_for_a_failures(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "math.jsonl"
+    dataset.write_text(
+        '{"question":"2+5?","answer":"7"}\n{"question":"4+5?","answer":"9"}\n',
+        encoding="utf-8",
+    )
+    backend = _MixedStrategyAFakeBackend()
+    pipeline = FreeResponsePipeline(backend)
+
+    result = pipeline.run(
+        dataset_path=str(dataset),
+        prompt_template="User: solve\n<Q>\n\nAssistant: <think",
+        generation_sampling=SamplingConfig(max_generate_tokens=32, stop_tokens=(0, 261)),
+        strategy_a_prompt_template="User: solve fully\n<Q>\n\nAssistant: <think",
+        strategy_a_sampling=SamplingConfig(max_generate_tokens=64, temperature=0.25),
+        strategy_a_filter_correct=True,
+        final_answer_template="<Q><COT>\nTherefore, the answer is \\(\\boxed{",
+        final_sampling=SamplingConfig(max_generate_tokens=8, temperature=1.0, top_p=0.3, stop_tokens=(0, 2402)),
+        batch_size=4,
+        dataset_name="math_test",
+        pass_k=(1,),
+        samples_per_task=1,
+    )
+
+    assert len(backend.calls) == 3
+    assert backend.calls[0]["prompts"] == [
+        "User: solve fully\n2+5?\n\nAssistant: <think",
+        "User: solve fully\n4+5?\n\nAssistant: <think",
+    ]
+    assert backend.calls[1]["prompts"] == ["User: solve\n4+5?\n\nAssistant: <think"]
+    assert backend.calls[2]["prompts"] == [
+        "User: solve\n4+5?\n\nAssistant: <think</think>\nwork\nTherefore, the answer is \\(\\boxed{"
+    ]
+
+    by_sample = {payload["sample_index"]: payload for payload in result.payloads}
+    assert set(by_sample) == {0, 1}
+    assert by_sample[0]["strategy_a_completion"] == "</think>\nfull answer \\(\\boxed{7}\\)."
+    assert "completion1" not in by_sample[0]
+    assert by_sample[1]["strategy_a_completion"] == "</think>\nfull answer \\(\\boxed{0}\\)."
+    assert by_sample[1]["completion1"] == "</think>\nwork"
+    assert by_sample[1]["completion2"] == "9}\\)."
+
+
 class _FakeBackend:
     model_name = "fake"
 
@@ -169,6 +269,84 @@ class _TwoStageFakeBackend:
             )
             for idx, prompt in enumerate(prompts)
         ]
+        on_complete = kwargs.get("on_complete")
+        if on_complete is not None:
+            for output in outputs:
+                on_complete(output)
+        return outputs
+
+    def score_choice_tokens(self, *, prompt: str, choice_token_texts):
+        raise NotImplementedError
+
+
+class _StrategyAFakeBackend:
+    model_name = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate(self, prompts, **kwargs):
+        self.calls.append({"prompts": list(prompts), **kwargs})
+        call_idx = len(self.calls)
+        if call_idx == 1:
+            text = "</think>\nfull answer \\(\\boxed{7}\\).\nUser: next"
+            token_ids = [4, 5, 6, 7]
+        elif call_idx == 2:
+            text = "</think>\nwork"
+            token_ids = [1]
+        else:
+            text = "8}\\).\nUser: next"
+            token_ids = [2, 3]
+        outputs = [
+            GenerationOutput(
+                prompt_index=idx,
+                prompt=prompt,
+                token_ids=token_ids,
+                text=text,
+                finish_reason="stop_token",
+            )
+            for idx, prompt in enumerate(prompts)
+        ]
+        on_complete = kwargs.get("on_complete")
+        if on_complete is not None:
+            for output in outputs:
+                on_complete(output)
+        return outputs
+
+    def score_choice_tokens(self, *, prompt: str, choice_token_texts):
+        raise NotImplementedError
+
+
+class _MixedStrategyAFakeBackend:
+    model_name = "fake"
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate(self, prompts, **kwargs):
+        self.calls.append({"prompts": list(prompts), **kwargs})
+        call_idx = len(self.calls)
+        outputs = []
+        for idx, prompt in enumerate(prompts):
+            if call_idx == 1:
+                answer = "7" if idx == 0 else "0"
+                text = f"</think>\nfull answer \\(\\boxed{{{answer}}}\\).\nUser: next"
+                token_ids = [4, 5, 6, 7]
+            elif call_idx == 2:
+                text = "</think>\nwork"
+                token_ids = [1]
+            else:
+                text = "9}\\).\nUser: next"
+                token_ids = [2, 3]
+            outputs.append(
+                GenerationOutput(
+                    prompt_index=idx,
+                    prompt=prompt,
+                    token_ids=token_ids,
+                    text=text,
+                    finish_reason="stop_token",
+                )
+            )
         on_complete = kwargs.get("on_complete")
         if on_complete is not None:
             for output in outputs:

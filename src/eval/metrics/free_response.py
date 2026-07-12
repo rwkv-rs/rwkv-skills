@@ -337,7 +337,7 @@ def _math_verify_input(scoring_text: str) -> str:
     symbolic comparisons even when the answer is plainly present near the end.
     """
 
-    text = scoring_text.strip()
+    text = scoring_text.strip("\r\n")
     if len(text) <= _ANSWER_WINDOW_TAIL_CHARS:
         return text
     boxed_start = text.rfind("\\boxed{")
@@ -470,6 +470,23 @@ def _completion_stop_reason(payload: dict[str, Any]) -> str:
     return _stage_stop_reason(payload, 1)
 
 
+def _strategy_a_text(payload: dict[str, Any]) -> str:
+    text = str(payload.get("strategy_a_completion") or "")
+    if text:
+        return text.split(USER_SENTINEL, 1)[0]
+    return _completion_text(payload)
+
+
+def _strategy_a_prompt(payload: dict[str, Any]) -> str:
+    prompt = str(payload.get("strategy_a_prompt") or "")
+    return prompt if prompt else _completion_prompt(payload)
+
+
+def _strategy_a_stop_reason(payload: dict[str, Any]) -> str:
+    reason = str(payload.get("strategy_a_stop_reason") or "")
+    return reason if reason else _completion_stop_reason(payload)
+
+
 def _stage_is_truncated(payload: dict[str, Any], stage: int) -> bool:
     if _stage_stop_reason(payload, stage) in {"max_tokens", "max_length"}:
         return True
@@ -491,6 +508,23 @@ def _is_truncated(payload: dict[str, Any]) -> bool:
         return True
     stats = payload.get("stats")
     return isinstance(stats, dict) and bool(stats.get("truncated"))
+
+
+def _strategy_a_is_truncated(payload: dict[str, Any]) -> bool:
+    if _strategy_a_stop_reason(payload) in {"max_tokens", "max_length"}:
+        return True
+    stats = payload.get("stats")
+    if isinstance(stats, dict):
+        strategy_stats = stats.get("strategy_a")
+        if isinstance(strategy_stats, dict):
+            return bool(strategy_stats.get("truncated"))
+    return _is_truncated(payload)
+
+
+def _strategy_is_truncated(group: str, payload: dict[str, Any]) -> bool:
+    if group == STRATEGY_A:
+        return _strategy_a_is_truncated(payload)
+    return _is_truncated(payload)
 
 
 def _think_state(prompt: str, text: str) -> tuple[bool, bool]:
@@ -533,7 +567,7 @@ def _repair_two_stage_scoring_text(payload: dict[str, Any], text: str) -> str:
 
 def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
     if group == STRATEGY_A:
-        return _completion_text(payload)
+        return _strategy_a_text(payload)
     if _has_stage(payload, 2):
         two_stage_text = _two_stage_scoring_text(payload)
         if group == STRATEGY_B:
@@ -541,11 +575,11 @@ def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
         if group == STRATEGY_C:
             return _repair_two_stage_scoring_text(payload, two_stage_text)
 
-    text = _completion_text(payload)
-    prompt = _completion_prompt(payload)
+    text = _strategy_a_text(payload)
+    prompt = _strategy_a_prompt(payload)
     has_think, has_close = _think_state(prompt, text)
     unclosed_think = has_think and not has_close
-    truncated = _is_truncated(payload)
+    truncated = _strategy_a_is_truncated(payload)
 
     if group == STRATEGY_B and unclosed_think:
         return f"{text.rstrip()}\n</think>"
@@ -556,10 +590,38 @@ def _strategy_scoring_text(group: str, payload: dict[str, Any]) -> str:
     return text
 
 
-def _stop_rate(payloads: list[dict[str, Any]]) -> float:
+def _stop_rate(payloads: list[dict[str, Any]], *, group: str) -> float:
     if not payloads:
         return 0.0
-    return sum(1 for payload in payloads if _is_truncated(payload)) / len(payloads)
+    return sum(1 for payload in payloads if _strategy_is_truncated(group, payload)) / len(payloads)
+
+
+def score_free_response_strategy(
+    group: str,
+    payload: dict[str, Any],
+    *,
+    sample_index: int,
+    repeat_index: int,
+    question: str,
+    reference: str,
+) -> _ScoredCompletion:
+    scoring_text = _strategy_scoring_text(group, payload)
+    if _is_judgement_reference(reference):
+        verify_result = _judgement_verify(reference, scoring_text)
+    else:
+        verify_result = _math_verify(reference, scoring_text)
+    return _ScoredCompletion(
+        source_payload=payload,
+        sample_index=sample_index,
+        repeat_index=repeat_index,
+        question=question,
+        reference=reference,
+        scoring_text=scoring_text,
+        display_answer=verify_result.answer,
+        math_passed=verify_result.passed,
+        final_passed=verify_result.passed,
+        fail_reason=verify_result.fail_reason,
+    )
 
 
 def evaluate_free_response(
@@ -617,22 +679,13 @@ def evaluate_free_response(
         question: str,
         reference: str,
     ) -> _ScoredCompletion:
-        scoring_text = _strategy_scoring_text(group, payload)
-        if _is_judgement_reference(reference):
-            verify_result = _judgement_verify(reference, scoring_text)
-        else:
-            verify_result = _math_verify(reference, scoring_text)
-        return _ScoredCompletion(
-            source_payload=payload,
+        return score_free_response_strategy(
+            group,
+            payload,
             sample_index=sample_index,
             repeat_index=repeat_index,
             question=question,
             reference=reference,
-            scoring_text=scoring_text,
-            display_answer=verify_result.answer,
-            math_passed=verify_result.passed,
-            final_passed=verify_result.passed,
-            fail_reason=verify_result.fail_reason,
         )
 
     def inherit_from_a(a_record: _ScoredCompletion) -> _ScoredCompletion:
@@ -700,8 +753,6 @@ def evaluate_free_response(
     eval_payloads: list[dict] = []
     eval_payloads_by_group: dict[str, list[dict]] = {}
     samples = len(completion_payloads)
-    stop_rate = _stop_rate(completion_payloads)
-
     for group in STRATEGY_GROUPS:
         records = grouped[group]
         group_payloads: list[dict] = []
@@ -713,6 +764,7 @@ def evaluate_free_response(
         exact_accuracy = (
             sum(1 for record in records if record.math_passed) / samples if samples else 0.0
         )
+        stop_rate = _stop_rate(completion_payloads, group=group)
         metrics: dict[str, float] = {
             "exact_accuracy": exact_accuracy,
             "stop_rate": stop_rate,
@@ -880,4 +932,5 @@ __all__ = [
     "compute_pass_at_k",
     "evaluate_free_response",
     "resolve_reference_answer",
+    "score_free_response_strategy",
 ]

@@ -30,6 +30,7 @@ from src.eval.tasks.maths.common import (
     default_db_drain_every,
     default_db_write_queue,
     default_job_name,
+    resolve_generation_sampling,
     resolve_sampling_pair,
 )
 
@@ -46,9 +47,9 @@ from src.infer.backend import (
 @dataclass(frozen=True, slots=True)
 class MathStageConfig:
     cot_prompt_template: str
-    final_answer_template: str
+    final_answer_template: str | None
     cot_sampling: Any
-    final_sampling: Any
+    final_sampling: Any | None
     prompt_max_chars: int | None = None
 
 
@@ -114,6 +115,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("normal", "naive"),
         help="Prompt profile: normal uses benchmark configs; naive uses only the problem plus final-answer prefill.",
     )
+    parser.add_argument(
+        "--single-generation",
+        action="store_true",
+        help="Compatibility alias for --strategy-a-single-generation.",
+    )
+    parser.add_argument(
+        "--strategy-a-single-generation",
+        action="store_true",
+        help="Generate strategy A as one full response while scoring B/C from the two-stage path.",
+    )
+    parser.add_argument(
+        "--generation-temperature",
+        type=float,
+        help="Override the main generation temperature.",
+    )
+    parser.add_argument(
+        "--generation-repetition-penalty",
+        type=float,
+        help="Override the main generation repetition penalty/alpha_frequency.",
+    )
+    parser.add_argument(
+        "--generation-penalty-decay",
+        type=float,
+        help="Override the main generation penalty decay/alpha_decay.",
+    )
     parser.add_argument("--judge-model", help="LLM judge model name (env: JUDGE_MODEL)")
     parser.add_argument("--judge-api-key", help="API key for judge model (env: JUDGE_API_KEY)")
     parser.add_argument(
@@ -127,6 +153,42 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
     return parser.parse_args(argv)
+
+
+def _apply_generation_sampling_overrides(
+    stage_config: MathStageConfig,
+    args: argparse.Namespace,
+) -> MathStageConfig:
+    from dataclasses import replace
+
+    overrides: dict[str, float] = {}
+    if args.generation_temperature is not None:
+        overrides["temperature"] = float(args.generation_temperature)
+    if args.generation_repetition_penalty is not None:
+        overrides["alpha_frequency"] = float(args.generation_repetition_penalty)
+    if args.generation_penalty_decay is not None:
+        overrides["alpha_decay"] = float(args.generation_penalty_decay)
+    if not overrides:
+        return stage_config
+    return replace(stage_config, cot_sampling=replace(stage_config.cot_sampling, **overrides))
+
+
+def _math_sampling_payload(
+    stage_config: MathStageConfig,
+    *,
+    strategy_a_config: MathStageConfig | None = None,
+) -> dict[str, object]:
+    from src.eval.results.schema import sampling_config_to_dict
+
+    payload: dict[str, object] = {
+        "stage1": sampling_config_to_dict(stage_config.cot_sampling),
+    }
+    if stage_config.final_sampling is None:
+        raise ValueError("final_sampling is required for two-stage math generation")
+    payload["stage2"] = sampling_config_to_dict(stage_config.final_sampling)
+    if strategy_a_config is not None:
+        payload["strategy_a"] = sampling_config_to_dict(strategy_a_config.cot_sampling)
+    return payload
 
 
 def _close_writer_and_mark_failed(
@@ -167,7 +229,6 @@ def main(
         evaluate_free_response,
     )
     from src.eval.results.payloads import make_score_payload
-    from src.eval.results.schema import sampling_config_to_dict
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
     from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
@@ -200,6 +261,20 @@ def main(
         final_max_tokens=args.final_max_tokens,
         prompt_profile=prompt_profile,
     )
+    strategy_a_single_generation = bool(
+        args.strategy_a_single_generation or args.single_generation
+    )
+    strategy_a_config = None
+    if strategy_a_single_generation:
+        strategy_a_config = _resolve_single_generation_stage_config(
+            slug,
+            model_name,
+            max_tokens=args.max_tokens or args.cot_max_tokens,
+            prompt_profile=prompt_profile,
+        )
+        strategy_a_config = _apply_generation_sampling_overrides(strategy_a_config, args)
+    else:
+        stage_config = _apply_generation_sampling_overrides(stage_config, args)
     batch_size = max(1, args.batch_size)
     judge = None
     if judge_mode is JudgeMode.LLM:
@@ -227,10 +302,10 @@ def main(
         sampling_config=build_task_sampling_config(
             cot_mode=CoTMode.COT,
             avg_k=plan.avg_k,
-            sampling_config={
-                "stage1": sampling_config_to_dict(stage_config.cot_sampling),
-                "stage2": sampling_config_to_dict(stage_config.final_sampling),
-            },
+            sampling_config=_math_sampling_payload(
+                stage_config,
+                strategy_a_config=strategy_a_config,
+            ),
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
             judger_model_name=(judge.config.model if judge is not None else None),
@@ -253,6 +328,13 @@ def main(
             dataset_path=str(dataset_path),
             cot_prompt_template=stage_config.cot_prompt_template,
             cot_sampling=stage_config.cot_sampling,
+            strategy_a_prompt_template=(
+                strategy_a_config.cot_prompt_template if strategy_a_config is not None else None
+            ),
+            strategy_a_sampling=(
+                strategy_a_config.cot_sampling if strategy_a_config is not None else None
+            ),
+            strategy_a_filter_correct=strategy_a_config is not None,
             final_answer_template=stage_config.final_answer_template,
             final_sampling=stage_config.final_sampling,
             batch_size=batch_size,
@@ -289,6 +371,13 @@ def main(
                 dataset_path=str(dataset_path),
                 cot_prompt_template=stage_config.cot_prompt_template,
                 cot_sampling=stage_config.cot_sampling,
+                strategy_a_prompt_template=(
+                    strategy_a_config.cot_prompt_template if strategy_a_config is not None else None
+                ),
+                strategy_a_sampling=(
+                    strategy_a_config.cot_sampling if strategy_a_config is not None else None
+                ),
+                strategy_a_filter_correct=strategy_a_config is not None,
                 final_answer_template=stage_config.final_answer_template,
                 final_sampling=stage_config.final_sampling,
                 batch_size=batch_size,
@@ -362,7 +451,11 @@ def main(
             problems=result.problem_count,
             task=job_name,
             task_details=task_details,
-            extra={"cot_mode": CoTMode.COT.value, "prompt_profile": prompt_profile},
+            extra={
+                "cot_mode": CoTMode.COT.value,
+                "prompt_profile": prompt_profile,
+                "strategy_a_single_generation": strategy_a_single_generation,
+            },
         )
         runtime.record_score(score_payload)
     if judge_mode is JudgeMode.LLM:
@@ -384,7 +477,47 @@ def _require_math_prompt_template(
     expected_key = "cot_prompt_template" if stage == "cot" else "final_prompt_template"
     raise ValueError(
         f"math benchmark {slug!r} ({model_name}) requires configs/<benchmark>.toml "
-        f"[{stage}] {expected_key}; formal math runs are two-stage"
+        f"[{stage}] {expected_key}"
+    )
+
+
+def _resolve_single_generation_stage_config(
+    slug: str,
+    model_name: str,
+    *,
+    max_tokens: int | None = None,
+    prompt_profile: str = "normal",
+) -> MathStageConfig:
+    from src.eval.benchmark_config import resolve_benchmark_model_config
+    from src.eval.tasks.maths.pipeline import DEFAULT_COT_PROMPT
+
+    cot_sampling = resolve_generation_sampling(
+        slug,
+        model_name,
+        max_tokens=max_tokens,
+    )
+    root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    prompt_max_chars = getattr(root_config, "prompt_max_chars", None)
+    if prompt_profile == "naive":
+        return MathStageConfig(
+            cot_prompt_template=DEFAULT_COT_PROMPT,
+            final_answer_template=None,
+            cot_sampling=cot_sampling,
+            final_sampling=None,
+            prompt_max_chars=prompt_max_chars,
+        )
+    cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
+    return MathStageConfig(
+        cot_prompt_template=_require_math_prompt_template(
+            slug,
+            model_name,
+            stage="cot",
+            template=getattr(cot_config, "cot_prompt_template", None),
+        ),
+        final_answer_template=None,
+        cot_sampling=cot_sampling,
+        final_sampling=None,
+        prompt_max_chars=prompt_max_chars,
     )
 
 

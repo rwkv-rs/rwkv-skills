@@ -30,6 +30,7 @@ _REMOTE_TRANSIENT_ERRORS = (httpx.RequestError,)
 _RETRYABLE_REMOTE_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 DEFAULT_PREFILL_CHUNK_SIZE = 16
 DEFAULT_REMOTE_MAX_WORKERS = 128
+REMOTE_MIN_TEMPERATURE = 0.001
 _CONTEXT_LENGTH_ERROR_RE = re.compile(
     r"maximum context length is (?P<context>\d+) tokens.*?"
     r"requested (?P<requested>\d+) output tokens.*?"
@@ -636,11 +637,14 @@ def _completion_payload_from_sampling(
         value = float(value)
         return 1e-5 if value == 0.0 else value
 
+    def valid_temperature(value: float) -> float:
+        return max(REMOTE_MIN_TEMPERATURE, nonzero(value))
+
     payload: dict[str, object] = {
         "model": model,
         "prompt": prompt,
         "max_tokens": int(sampling.max_generate_tokens),
-        "temperature": nonzero(sampling.temperature),
+        "temperature": valid_temperature(sampling.temperature),
         "top_p": nonzero(sampling.top_p),
     }
     presence_penalty = float(sampling.alpha_presence)
@@ -677,7 +681,10 @@ def _chat_payload_from_completion_payload(
         "model": payload["model"],
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": payload["max_tokens"],
-        "temperature": float(payload.get("temperature", 1e-5) or 1e-5),
+        "temperature": max(
+            REMOTE_MIN_TEMPERATURE,
+            float(payload.get("temperature", REMOTE_MIN_TEMPERATURE) or REMOTE_MIN_TEMPERATURE),
+        ),
         "stream": False,
     }
     if "top_p" in payload:

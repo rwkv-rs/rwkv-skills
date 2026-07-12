@@ -109,6 +109,45 @@ def test_completion_context_compacts_agent_trace_extras() -> None:
     assert len(context["agent_info"]["final_prompt_messages"]) == 33
 
 
+def test_completion_context_roundtrips_strategy_a_payload() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+    context = EvalDbService._build_completion_context(
+        {
+            **_completion_payload(),
+            "prompt2": "final prompt",
+            "completion2": "final completion",
+            "stop_reason2": "stop_token",
+            "strategy_a_prompt": "full prompt",
+            "strategy_a_completion": "full completion",
+            "strategy_a_stop_reason": "max_length",
+        }
+    )
+    repo.completion_rows = [
+        {
+            "benchmark_name": "free",
+            "benchmark_split": "test",
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "context": context,
+        }
+    ]
+
+    payloads = service.list_completion_payloads(task_id="123", status="Completed")
+
+    assert context["strategy_a"] == {
+        "prompt": "full prompt",
+        "completion": "full completion",
+        "stop_reason": "max_length",
+    }
+    assert payloads[0]["completion2"] == "final completion"
+    assert payloads[0]["strategy_a_prompt"] == "full prompt"
+    assert payloads[0]["strategy_a_completion"] == "full completion"
+    assert payloads[0]["strategy_a_stop_reason"] == "max_length"
+
+
 def test_completion_ingest_uses_batch_repo_method() -> None:
     service = object.__new__(EvalDbService)
     repo = _FakeRepo()
@@ -245,6 +284,7 @@ class _FakeRepo:
         self.inserted: list[int] = []
         self.eval_payloads: list[dict] = []
         self.completion_batches: list[list[tuple[dict, dict]]] = []
+        self.completion_rows: list[dict] = []
         self.checker_batches: list[list[int]] = []
 
     def fetch_completion_id_map(self, *, task_id: int, status: str | None = None):
@@ -255,6 +295,11 @@ class _FakeRepo:
     def fetch_existing_eval_completion_ids(self, *, task_id: int):
         assert task_id == 123
         return set(self.known)
+
+    def fetch_completions(self, *, task_id: int, status: str | None = None):
+        assert task_id == 123
+        assert status == "Completed"
+        return list(self.completion_rows)
 
     def fetch_existing_checker_completion_ids(self, *, task_id: int):
         assert task_id == 123

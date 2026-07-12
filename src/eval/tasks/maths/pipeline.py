@@ -8,7 +8,12 @@ from typing import Callable, Iterable, Sequence
 from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
 from src.eval.datasets.data_struct.free_answer import FreeAnswerRecord
 from src.eval.execution_plan import AttemptKey
-from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
+from src.eval.results.schema import (
+    dataset_slug_parts,
+    normalize_sampling_config_by_stage,
+    prompt_delta,
+    sampling_config_to_dict,
+)
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
@@ -88,6 +93,9 @@ class FreeResponsePipeline:
         *,
         prompt_template: str = DEFAULT_COT_PROMPT,
         generation_sampling: SamplingConfig | None = None,
+        strategy_a_prompt_template: str | None = None,
+        strategy_a_sampling: SamplingConfig | None = None,
+        strategy_a_filter_correct: bool = False,
         cot_prompt_template: str | None = None,
         cot_sampling: SamplingConfig | None = None,
         final_answer_template: str | None = None,
@@ -180,18 +188,43 @@ class FreeResponsePipeline:
             assert final_sampling is not None
             sampling_items.append((2, final_sampling))
         sampling_config = normalize_sampling_config_by_stage(sampling_items)
+        if strategy_a_sampling is not None:
+            sampling_config["strategy_a"] = sampling_config_to_dict(strategy_a_sampling)
 
         if probe_only:
             prompts = [
                 _render_prompt(prompt_template, record.question, prompt_max_chars=prompt_max_chars)
                 for _key, record in remaining_entries
             ]
+            if strategy_a_sampling is not None:
+                strategy_template = strategy_a_prompt_template or prompt_template
+                strategy_a_prompts = [
+                    _render_prompt(strategy_template, record.question, prompt_max_chars=prompt_max_chars)
+                    for _key, record in remaining_entries
+                ]
+                _ = self.backend.generate(
+                    strategy_a_prompts,
+                    sampling=strategy_a_sampling,
+                    batch_size=batch_size,
+                    progress_desc="Probing strategy A full responses",
+                    probe_only=probe_only,
+                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in strategy_a_prompts],
+                    prompt_seeds=[
+                        sample_repeat_seed(
+                            key.sample_index,
+                            key.repeat_index,
+                            pass_index=key.pass_index,
+                            stage=1,
+                        )
+                        for key, _record in remaining_entries
+                    ],
+                )
             probe_seeds = [
                 sample_repeat_seed(
                     key.sample_index,
                     key.repeat_index,
                     pass_index=key.pass_index,
-                    stage=1,
+                    stage=2 if strategy_a_sampling is not None else 1,
                 )
                 for key, _record in remaining_entries
             ]
@@ -232,7 +265,7 @@ class FreeResponsePipeline:
                                 remaining_entries[idx][0].sample_index,
                                 remaining_entries[idx][0].repeat_index,
                                 pass_index=remaining_entries[idx][0].pass_index,
-                                stage=2,
+                                stage=3 if strategy_a_sampling is not None else 2,
                             )
                             for idx in final_source_indices
                         ],
@@ -251,26 +284,109 @@ class FreeResponsePipeline:
             if use_final_stage:
                 assert final_answer_template is not None
                 assert final_sampling is not None
+                strategy_a_by_idx: dict[int, GenerationOutput] = {}
+                strategy_a_prompts: list[str] = []
+                if strategy_a_sampling is not None:
+                    strategy_template = strategy_a_prompt_template or prompt_template
+                    strategy_a_prompts = [
+                        _render_prompt(strategy_template, record.question, prompt_max_chars=prompt_max_chars)
+                        for _key, record in chunk
+                    ]
+                    strategy_a_outputs = self.backend.generate(
+                        strategy_a_prompts,
+                        sampling=strategy_a_sampling,
+                        batch_size=min(batch_size, len(strategy_a_prompts)),
+                        progress_desc="Generating strategy A full responses",
+                        prompt_stop_suffixes=[(USER_SENTINEL,) for _ in strategy_a_prompts],
+                        prompt_seeds=[
+                            sample_repeat_seed(
+                                key.sample_index,
+                                key.repeat_index,
+                                pass_index=key.pass_index,
+                                stage=1,
+                            )
+                            for key, _record in chunk
+                        ],
+                    )
+                    strategy_a_by_idx = {
+                        int(output.prompt_index): output
+                        for output in strategy_a_outputs
+                        if 0 <= int(output.prompt_index) < len(chunk)
+                    }
+
+                def _build_strategy_a_payload(local_idx: int, output: GenerationOutput) -> dict:
+                    key, _record = chunk[local_idx]
+                    strategy_stats = _output_stats(output)
+                    payload = SampleRecord(
+                        benchmark_name=benchmark_name,
+                        dataset_split=dataset_split,
+                        sample_index=key.sample_index,
+                        repeat_index=key.repeat_index,
+                        pass_index=key.pass_index,
+                        sampling_config=sampling_config,
+                        stages=[],
+                    ).as_payload()
+                    payload["strategy_a_prompt"] = strategy_a_prompts[local_idx]
+                    payload["strategy_a_completion"] = _clip_user_sentinel(output.text)
+                    payload["strategy_a_stop_reason"] = output.finish_reason
+                    payload["stats"] = {**strategy_stats, "strategy_a": strategy_stats}
+                    payload["_stage"] = "answer"
+                    return payload
+
+                two_stage_indices = list(range(len(chunk)))
+                if strategy_a_sampling is not None and strategy_a_filter_correct:
+                    from src.eval.metrics.free_response import (
+                        STRATEGY_A,
+                        resolve_reference_answer,
+                        score_free_response_strategy,
+                    )
+
+                    two_stage_indices = []
+                    for local_idx, (key, record) in enumerate(chunk):
+                        strategy_a_output = strategy_a_by_idx.get(local_idx)
+                        if strategy_a_output is None:
+                            two_stage_indices.append(local_idx)
+                            continue
+                        payload = _build_strategy_a_payload(local_idx, strategy_a_output)
+                        scored = score_free_response_strategy(
+                            STRATEGY_A,
+                            payload,
+                            sample_index=key.sample_index,
+                            repeat_index=key.repeat_index,
+                            question=record.question,
+                            reference=resolve_reference_answer(record),
+                        )
+                        if scored.final_passed:
+                            if on_record is not None:
+                                on_record(payload)
+                            payloads.append(payload)
+                        else:
+                            two_stage_indices.append(local_idx)
+
+                if not two_stage_indices:
+                    continue
+
+                cot_prompts = [prompts[local_idx] for local_idx in two_stage_indices]
                 cot_outputs = self.backend.generate(
-                    prompts,
+                    cot_prompts,
                     sampling=generation_sampling,
-                    batch_size=min(batch_size, len(prompts)),
+                    batch_size=min(batch_size, len(cot_prompts)),
                     progress_desc="Generating CoT",
-                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in prompts],
+                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in cot_prompts],
                     prompt_seeds=[
                         sample_repeat_seed(
-                            key.sample_index,
-                            key.repeat_index,
-                            pass_index=key.pass_index,
-                            stage=1,
+                            chunk[local_idx][0].sample_index,
+                            chunk[local_idx][0].repeat_index,
+                            pass_index=chunk[local_idx][0].pass_index,
+                            stage=2 if strategy_a_sampling is not None else 1,
                         )
-                        for key, _record in chunk
+                        for local_idx in two_stage_indices
                     ],
                 )
                 cot_by_idx: dict[int, GenerationOutput] = {
-                    int(output.prompt_index): output
+                    two_stage_indices[int(output.prompt_index)]: output
                     for output in cot_outputs
-                    if 0 <= int(output.prompt_index) < len(chunk)
+                    if 0 <= int(output.prompt_index) < len(two_stage_indices)
                 }
                 final_prompts: list[str] = []
                 final_prompt_indices: list[int] = []
@@ -339,6 +455,12 @@ class FreeResponsePipeline:
                         "stage1": cot_stats,
                         "stage2": final_stats,
                     }
+                    strategy_a_output = strategy_a_by_idx.get(local_idx)
+                    if strategy_a_output is not None and strategy_a_prompts:
+                        payload["strategy_a_prompt"] = strategy_a_prompts[local_idx]
+                        payload["strategy_a_completion"] = _clip_user_sentinel(strategy_a_output.text)
+                        payload["strategy_a_stop_reason"] = strategy_a_output.finish_reason
+                        payload["stats"]["strategy_a"] = _output_stats(strategy_a_output)
                     payload["_stage"] = "answer"
                     if on_record is not None:
                         on_record(payload)
@@ -356,7 +478,7 @@ class FreeResponsePipeline:
                             chunk[local_idx][0].sample_index,
                             chunk[local_idx][0].repeat_index,
                             pass_index=chunk[local_idx][0].pass_index,
-                            stage=2,
+                            stage=3 if strategy_a_sampling is not None else 2,
                         )
                         for local_idx in final_prompt_indices
                     ],

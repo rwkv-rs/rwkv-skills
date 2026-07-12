@@ -37,14 +37,25 @@ def _ensure_database_exists(config: DBConfig) -> None:
     target_db = str(config.dbname or "").strip()
     if not target_db:
         raise ValueError("database name must not be empty")
-    maintenance_db = "template1" if target_db == "postgres" else "postgres"
-    conninfo = _build_conninfo(config, dbname=maintenance_db)
-    with psycopg.connect(conninfo, autocommit=True) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
-            if cur.fetchone() is not None:
-                return
-            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_db)))
+    maintenance_dbs = ("template1",) if target_db == "postgres" else ("postgres", "template1")
+    last_error: Exception | None = None
+    for maintenance_db in maintenance_dbs:
+        conninfo = _build_conninfo(config, dbname=maintenance_db)
+        try:
+            with psycopg.connect(conninfo, autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (target_db,))
+                    if cur.fetchone() is not None:
+                        return
+                    cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(target_db)))
+                    return
+        except psycopg.OperationalError as exc:
+            last_error = exc
+            if maintenance_db != maintenance_dbs[-1]:
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
 
 
 def init_db_pool(
