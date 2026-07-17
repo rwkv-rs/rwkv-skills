@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
 from src.eval.datasets.data_struct.multiple_choice import (
     MultipleChoiceDataset,
     MultipleChoiceRecord,
@@ -8,6 +11,13 @@ from .base import JsonlDatasetLoader
 
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+CANONICAL_CONTEXT_KEYS = ("context", "source_context", "document", "documents", "passage", "passages")
+
+
+def _stringify_context(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
 
 
 class JsonlMultipleChoiceLoader(
@@ -85,17 +95,25 @@ class JsonlMultipleChoiceLoader(
         subject = payload.get("subject")
         if subject is not None and not isinstance(subject, str):
             raise ValueError("subject 字段类型必须为 str 或 None")
+        context = None
+        context_key = None
+        for key in CANONICAL_CONTEXT_KEYS:
+            if key in payload:
+                context_key = key
+                context = _stringify_context(payload[key])
+                break
 
         metadata = {
             k: v
             for k, v in payload.items()
-            if k not in {"question", "answer", "subject", "choices"} and k not in ALPHABET
+            if k not in {"question", "answer", "subject", "choices", context_key} and k not in ALPHABET
         }
 
         return MultipleChoiceRecord(
             question=question,
             choices=choices,
             answer_index=answer_index,
+            context=context,
             subject=subject,
             metadata=metadata,
         )

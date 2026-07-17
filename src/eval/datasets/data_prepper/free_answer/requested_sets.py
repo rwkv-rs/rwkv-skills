@@ -46,6 +46,7 @@ _ANSWER_KEYS = (
 )
 _CONTEXT_KEYS = ("context", "source_context", "document", "documents", "passage", "passages")
 _RUBRIC_KEYS = ("rubrics", "rubric", "grading_rubrics", "grading_scheme", "checklist")
+_EXTRA_REQUIRED_FIELDS = {"aa_lcr": ("context",)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +95,7 @@ class RequestedFreeAnswerDatasetSpec(MaterializingDatasetSpec):
             name,
             output_root,
             split,
-            required_fields=_REQUIRED_FIELDS,
+            required_fields=(*_REQUIRED_FIELDS, *_EXTRA_REQUIRED_FIELDS.get(name, ())),
             source_kind="rwkvc_free_answer_source",
         )
         self._spec = _REQUESTED_FREE_ANSWER_SPECS[name]
@@ -160,7 +161,7 @@ def normalize_free_answer_row(
     index: int,
     source_path: str | Path,
 ) -> dict[str, Any]:
-    problem = _problem_text(row)
+    problem, context = _problem_and_context(row)
     if not problem:
         raise ValueError(f"free-answer row missing problem/question: {row}")
     rubrics = _rubric_lines(row)
@@ -179,6 +180,8 @@ def normalize_free_answer_row(
         "source_benchmark": dataset_name,
         "source_path": str(source_path),
     }
+    if context or "context" in _EXTRA_REQUIRED_FIELDS.get(dataset_name, ()):
+        payload["context"] = context
     if rubrics:
         payload["rubrics"] = rubrics
     for key, value in row.items():
@@ -187,20 +190,20 @@ def normalize_free_answer_row(
     return payload
 
 
-def _problem_text(row: Mapping[str, Any]) -> str:
+def _problem_and_context(row: Mapping[str, Any]) -> tuple[str, str]:
+    """Return (problem, context)。messages 型样本渲染整段对话作 problem，
+    此时不再单独提取 context（避免同一文档在 prompt 中重复出现）。"""
     messages = row.get("messages")
     if isinstance(messages, list) and messages:
         rendered = _render_messages(messages)
         if rendered:
-            return rendered
+            return rendered, ""
     question = _first_present(row, _QUESTION_KEYS)
-    if question is None:
-        return ""
-    question_text = _stringify(question)
     context = _first_present(row, _CONTEXT_KEYS)
-    if context not in (None, ""):
-        return f"Context:\n{_stringify(context)}\n\nQuestion:\n{question_text}"
-    return question_text
+    return (
+        _stringify(question) if question is not None else "",
+        _stringify(context) if context not in (None, "") else "",
+    )
 
 
 def _render_messages(messages: Sequence[Any]) -> str:

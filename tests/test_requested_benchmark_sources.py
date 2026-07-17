@@ -14,6 +14,7 @@ from src.eval.datasets.data_prepper.data_manager import (
     available_function_calling_datasets,
     available_multiple_choice_datasets,
 )
+from src.eval.datasets.data_prepper.free_answer.requested_sets import normalize_free_answer_row
 from src.eval.scheduler.dataset_utils import canonical_slug
 from src.eval.scheduler.jobs import JOB_CATALOGUE, detect_job_from_dataset
 
@@ -112,6 +113,39 @@ def test_requested_benchmark_source_fields_are_intentional() -> None:
     for item in REQUESTED_BENCHMARK_SOURCES:
         metadata = resolve_benchmark_metadata(item.dataset_slug)
         assert metadata.field is fields_by_integration[item.integration]
+
+
+def test_free_answer_context_is_materialized_separately_from_problem() -> None:
+    payload = normalize_free_answer_row(
+        {
+            "question": "What is the answer?",
+            "answer": "42",
+            "context": "SECRET_CONTEXT",
+        },
+        dataset_name="aa_lcr",
+        index=0,
+        source_path="unit.jsonl",
+    )
+
+    assert payload["problem"] == "What is the answer?"
+    assert payload["context"] == "SECRET_CONTEXT"
+    assert "SECRET_CONTEXT" not in payload["problem"]
+
+
+def test_free_answer_messages_row_does_not_extract_context_separately() -> None:
+    payload = normalize_free_answer_row(
+        {
+            "messages": [{"role": "user", "content": "Read DOC_BODY and answer."}],
+            "answer": "42",
+            "context": "DOC_BODY",
+        },
+        dataset_name="cl_bench",
+        index=0,
+        source_path="unit.jsonl",
+    )
+
+    assert "DOC_BODY" in payload["problem"]
+    assert "context" not in payload
 
 
 def test_agent_tool_call_source_catalog_is_derived_from_requested_benchmarks() -> None:
@@ -267,7 +301,8 @@ def test_free_answer_prepper_normalizes_qa_rubric_and_message_rows() -> None:
         index=0,
         source_path="src.jsonl",
     )
-    assert context["problem"].startswith("Context:\nlong doc")
+    assert context["problem"] == "Q?"
+    assert context["context"] == "long doc"
 
     usamo = normalize_free_answer_row(
         {"problem_idx": 1, "problem": "Prove P.", "sample_solution": "Proof.", "grading_scheme": "7 point rubric"},

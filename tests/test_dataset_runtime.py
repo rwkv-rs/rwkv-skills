@@ -80,6 +80,24 @@ def test_static_rows_spec_materializes_jsonl_and_manifest(tmp_path: Path) -> Non
     assert manifest["source_kind"] == "static_rows"
 
 
+def test_required_field_change_rematerializes_stale_jsonl(tmp_path: Path) -> None:
+    stale = tmp_path / "demo_dataset" / "test.jsonl"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"question": "Q", "answer": "A"}) + "\n", encoding="utf-8")
+    spec = StaticRowsDatasetSpec(
+        "demo_dataset",
+        tmp_path,
+        "test",
+        rows=[{"question": "Q", "answer": "A", "context": "C"}],
+        required_fields=("question", "answer", "context"),
+    )
+
+    paths = ensure_dataset_materialized(spec)
+
+    assert paths == [stale]
+    assert read_jsonl_items(stale) == [{"question": "Q", "answer": "A", "context": "C"}]
+
+
 def test_dataset_registry_supports_spec_factories() -> None:
     registry = DatasetRegistry("runtime_test")
 

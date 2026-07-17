@@ -19,6 +19,7 @@ class FreeAnswerRecord(SubjectRecordBase):
 
     question: str
     answer: str
+    context: str | None = None
 
 
 class FreeAnswerDataset(JsonlDataset[FreeAnswerRecord]):

@@ -42,6 +42,14 @@ CANONICAL_SUBJECT_KEYS: Sequence[str] = (
     "tag",
     "group",
 )
+CANONICAL_CONTEXT_KEYS: Sequence[str] = (
+    "context",
+    "source_context",
+    "document",
+    "documents",
+    "passage",
+    "passages",
+)
 
 
 def _stringify(value: Any) -> str:
@@ -109,7 +117,13 @@ class JsonlFreeAnswerLoader(
             field_name="subject",
             optional=True,
         )
-        used_keys = {key for key in (question_key, answer_key, subject_key) if key}
+        context, context_key = self._extract_field(
+            payload,
+            CANONICAL_CONTEXT_KEYS,
+            field_name="context",
+            optional=True,
+        )
+        used_keys = {key for key in (question_key, answer_key, subject_key, context_key) if key}
         metadata = {
             k: v
             for k, v in payload.items()
@@ -118,6 +132,7 @@ class JsonlFreeAnswerLoader(
         return FreeAnswerRecord(
             question=question,
             answer=answer,
+            context=context,
             subject=subject,
             metadata=metadata,
         )

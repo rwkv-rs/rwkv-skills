@@ -21,6 +21,7 @@ class MultipleChoiceRecord(SubjectRecordBase):
     question: str
     choices: list[str]
     answer_index: int
+    context: str | None = None
 
     def __post_init__(self) -> None:
         if not self.choices:
