@@ -815,6 +815,7 @@ def _completion_payload_from_sampling(
                 "top_k": int(sampling.top_k),
                 "repetition_penalty": nonzero(sampling.alpha_frequency),
                 "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
+                "stop_token_ids": [int(token_id) for token_id in sampling.stop_tokens],
                 "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
                 "pad_zero": bool(sampling.pad_zero),
                 "no_penalty_token_ids": [int(token_id) for token_id in sampling.no_penalty_token_ids],
@@ -868,6 +869,8 @@ def _chat_payload_from_completion_payload(
             # The current RWKV chat serving schema accepts token ids as strings,
             # while the local/legacy completion path keeps them as ints.
             chat_payload["stop_tokens"] = [str(token_id) for token_id in payload["stop_tokens"]]  # type: ignore[index]
+        if "stop_token_ids" in payload:
+            chat_payload["stop_token_ids"] = [int(token_id) for token_id in payload["stop_token_ids"]]  # type: ignore[index]
     return chat_payload
 
 

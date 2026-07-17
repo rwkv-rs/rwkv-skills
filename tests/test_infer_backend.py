@@ -225,6 +225,7 @@ def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatc
             top_p=1.0,
             top_k=17,
             alpha_frequency=0.0,
+            stop_tokens=(0, 10060),
         ),
         batch_size=1,
         show_progress=False,
@@ -235,6 +236,8 @@ def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatc
     assert calls[0][1]["prompt"] == "hello"
     assert calls[0][1]["top_k"] == 17
     assert calls[0][1]["repetition_penalty"] == 1e-5
+    assert calls[0][1]["stop_tokens"] == [0, 10060]
+    assert calls[0][1]["stop_token_ids"] == [0, 10060]
 
 
 def test_completions_generation_maps_frequency_to_rwkv_repetition_penalty(monkeypatch) -> None:
