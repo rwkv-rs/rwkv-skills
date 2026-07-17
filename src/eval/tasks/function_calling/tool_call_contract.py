@@ -9,6 +9,7 @@ them against tool schemas, but it does not encode domain planning policy.
 
 import json
 import ast
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -258,6 +259,11 @@ def _coerce_tool_call_mapping(payload: Mapping[str, Any], *, context_label: str)
     candidate_payload = raw.get("candidate")
     if isinstance(candidate_payload, Mapping):
         raw = dict(candidate_payload)
+    action_payload = raw.get("action")
+    if isinstance(action_payload, Mapping) and not any(
+        key in raw for key in ("name", "tool_name", "tool", "function", "function_call", "tool_calls")
+    ):
+        raw = dict(action_payload)
     function_payload = raw.get("function")
     if not isinstance(function_payload, Mapping):
         function_payload = raw.get("function_call")
@@ -299,10 +305,43 @@ def _coerce_arguments(arguments: Any, *, context_label: str) -> dict[str, Any]:
         try:
             arguments = json.loads(raw_arguments)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"{context_label} string arguments must be a JSON object") from exc
+            recovered = _recover_stringified_arguments(raw_arguments)
+            if recovered is None:
+                raise ValueError(f"{context_label} string arguments must be a JSON object") from exc
+            arguments = recovered
     if not isinstance(arguments, Mapping):
         raise ValueError(f"{context_label} arguments must be a JSON object")
     return dict(arguments)
+
+
+_STRING_ARGUMENT_FIELD_RE = re.compile(
+    r'"(?P<key>query|command|answer)"\s*:\s*"(?P<value>(?:\\.|[^"\\])*)"',
+    re.IGNORECASE,
+)
+
+
+def _recover_stringified_arguments(raw_arguments: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(raw_arguments)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, Mapping):
+        trailing = raw_arguments[end:].strip()
+        if not trailing or all(char in '"}]),' for char in trailing):
+            return dict(value)
+
+    match = _STRING_ARGUMENT_FIELD_RE.search(raw_arguments)
+    if match is None:
+        return None
+    raw_value = match.group("value")
+    if "..." in raw_value:
+        return None
+    try:
+        value_text = json.loads(f'"{raw_value}"')
+    except json.JSONDecodeError:
+        return None
+    return {match.group("key"): value_text}
 
 
 def _first_json_field(body: str, keys: Sequence[str]) -> Any:

@@ -42,6 +42,15 @@ from src.eval.tasks.function_calling.final_answer import (
     parse_final_answer_call,
     render_final_answer_call,
 )
+from src.eval.tasks.function_calling.agent_loop import (
+    _agent_loop_candidate_router_config_from_args,
+    _agent_loop_candidate_router_mode,
+    _should_use_agent_loop_candidate_router,
+)
+from src.eval.experiments.parallel_candidate_router.router import (
+    ParallelCandidateRouterConfig,
+    route_parallel_candidate_tool_call,
+)
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
@@ -69,6 +78,7 @@ DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT = Path("/tmp/rwkv-official-refs/BrowseComp
 DEFAULT_BROWSECOMP_PLUS_CHUNK_CHARS = 1400
 DEFAULT_BROWSECOMP_PLUS_CHUNK_OVERLAP = 220
 DEFAULT_BROWSECOMP_PLUS_TOP_K = 5
+DEFAULT_BROWSECOMP_PLUS_RETRIEVE_DOCS = 50
 DEFAULT_BROWSECOMP_PLUS_PROMPT_MAX_CHARS = 8192
 DEFAULT_BROWSECOMP_PLUS_MAX_STEPS = 12
 # The unified function-calling CLI currently defaults --max-steps to tau's
@@ -333,8 +343,9 @@ class BrowseCompPlusEnv:
         )
 
     def search(self, query: str, k: int) -> list[dict[str, Any]]:
-        documents = self._retrieve_documents(query, k=max(20, k))
-        return _top_chunks(documents, query=query, limit=k)
+        expanded_query = _browsecomp_plus_expanded_query(self.record.question, query)
+        documents = self._retrieve_documents(expanded_query, k=max(DEFAULT_BROWSECOMP_PLUS_RETRIEVE_DOCS, k))
+        return _top_chunks(documents, query=expanded_query, limit=k)
 
     def document_chunks(self, docid: str, *, query: str, limit: int) -> list[dict[str, Any]]:
         document = self._document_by_id(docid)
@@ -350,12 +361,15 @@ class BrowseCompPlusEnv:
                 if item.get("docid"):
                     self.retrieved_docids.add(str(item["docid"]))
             return scored[:k]
+        use_bm25 = self._use_bm25()
         if self.index_path.exists() and _pyserini_available():
             documents = _search_bm25(self.index_path, query, k)
             for item in documents:
                 if item.get("docid"):
                     self.retrieved_docids.add(str(item["docid"]))
             return documents
+        if use_bm25:
+            return []
         scored = sorted(record_documents, key=lambda item: _document_score(query, item), reverse=True)
         for item in scored[:k]:
             if item.get("docid"):
@@ -408,6 +422,16 @@ def build_browsecomp_plus_prompt(
     tools: Sequence[Mapping[str, Any]] | None = None,
 ) -> str:
     rendered_tools = [dict(tool) for tool in (tools or BROWSECOMP_PLUS_TOOL_SCHEMAS)]
+    tool_names = {str(tool.get("name") or "") for tool in rendered_tools}
+    if tool_names == {"final_answer"}:
+        action_guidance = [
+            "The search budget is exhausted. Do not call search or get_document again.",
+            "Use final_answer now with the best exact answer supported by the gathered evidence.",
+        ]
+    else:
+        action_guidance = [
+            "Use search and get_document to gather evidence. Use final_answer only when ready to answer.",
+        ]
     bounded_messages = _bound_browsecomp_plus_messages(messages, max_chars=history_max_chars)
     trajectory, current = _render_browsecomp_plus_agent_state(bounded_messages)
     return normalize_rwkv_text(
@@ -416,7 +440,7 @@ def build_browsecomp_plus_prompt(
                 "You are controlling tools in a BrowseComp-Plus deep-research environment.",
                 "Respond with exactly one JSON tool call and no extra text.",
                 'Use this shape: {"name":"ToolName","arguments":{"arg":"value"}}',
-                "Use search and get_document to gather evidence. Use final_answer only when ready to answer.",
+                *action_guidance,
                 'For final_answer, use exactly {"name":"final_answer","arguments":{"answer":"<exact answer>"}}.',
                 "Do not use reason, reasoning, explanation, output, or response keys for final_answer.",
                 "Available tools:",
@@ -446,6 +470,7 @@ def build_browsecomp_plus_budgeted_prompt(
     engine: Any | None = None,
     sampling: Any | None = None,
     prompt_seed: int | None = None,
+    force_final_answer: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     query = infer_query_from_messages(messages, skip_longer_than=max(1, int(long_doc_config.min_long_text_chars)))
     compaction = compact_messages_for_long_context(
@@ -457,23 +482,34 @@ def build_browsecomp_plus_budgeted_prompt(
         progress_desc="BrowseCompPlus-LongDoc",
         prompt_seed=prompt_seed,
     )
-    tool_route = route_tools_for_prompt(
-        BROWSECOMP_PLUS_TOOL_SCHEMAS,
-        compaction.messages,
-        config=tool_routing_config or ToolRoutingConfig(),
-        engine=engine,
-        sampling=sampling,
-        control_tool_names=("final_answer",),
-        progress_desc="BrowseCompPlus-ToolRouter",
-        prompt_seed=None if prompt_seed is None else int(prompt_seed) + 1_000_000,
-    )
+    if force_final_answer:
+        selected_tools = [final_answer_tool_schema(answer_description="The exact BrowseComp-Plus answer.")]
+        tool_route_trace: dict[str, Any] = {
+            "routed": True,
+            "reason": "force_final_answer",
+            "selected_names": ["final_answer"],
+            "total_tool_count": len(BROWSECOMP_PLUS_TOOL_SCHEMAS),
+        }
+    else:
+        tool_route = route_tools_for_prompt(
+            BROWSECOMP_PLUS_TOOL_SCHEMAS,
+            compaction.messages,
+            config=tool_routing_config or ToolRoutingConfig(),
+            engine=engine,
+            sampling=sampling,
+            control_tool_names=("final_answer",),
+            progress_desc="BrowseCompPlus-ToolRouter",
+            prompt_seed=None if prompt_seed is None else int(prompt_seed) + 1_000_000,
+        )
+        selected_tools = tool_route.selected_tools
+        tool_route_trace = tool_route.trace_payload()
     effective_history_chars = max(0, int(history_max_chars))
     if prompt_max_chars > 0:
         effective_history_chars = min(effective_history_chars, max(0, int(prompt_max_chars) - 2048))
     prompt = build_browsecomp_plus_prompt(
         compaction.messages,
         history_max_chars=effective_history_chars,
-        tools=tool_route.selected_tools,
+        tools=selected_tools,
     )
     if prompt_max_chars > 0 and len(prompt) > prompt_max_chars:
         overage = len(prompt) - int(prompt_max_chars)
@@ -481,7 +517,7 @@ def build_browsecomp_plus_budgeted_prompt(
         prompt = build_browsecomp_plus_prompt(
             compaction.messages,
             history_max_chars=effective_history_chars,
-            tools=tool_route.selected_tools,
+            tools=selected_tools,
         )
     trace = {
         "mode": long_doc_config.mode if long_doc_config.enabled else "off",
@@ -493,7 +529,8 @@ def build_browsecomp_plus_budgeted_prompt(
         "effective_history_chars": int(effective_history_chars),
         "prompt_chars": len(prompt),
         "output_format": "rwkv_json_function_call",
-        "tool_route": tool_route.trace_payload(),
+        "force_final_answer": bool(force_final_answer),
+        "tool_route": tool_route_trace,
     }
     return prompt, trace
 
@@ -572,12 +609,19 @@ def _run_browsecomp_plus(
     prompt_max_chars = int(args.prompt_max_chars or DEFAULT_BROWSECOMP_PLUS_PROMPT_MAX_CHARS)
     long_doc_config = _browsecomp_plus_long_doc_config(args)
     tool_routing_config = tool_routing_config_from_args(args)
+    candidate_router_mode = _agent_loop_candidate_router_mode(args)
+    candidate_router_config = _agent_loop_candidate_router_config_from_args(args)
     sampling_payload = attach_function_calling_context_metadata(
         normalize_sampling_config_by_stage([(1, sampling)]),
         long_doc_config=long_doc_config,
         tool_routing_config=tool_routing_config,
+        candidate_router_config=candidate_router_config,
         prompt_max_chars=prompt_max_chars,
     )
+    sampling_payload["browsecomp_plus_adapter"] = {
+        "candidate_router_mode": candidate_router_mode,
+        "decision_io": "rwkv_json_or_parallel_candidate",
+    }
     selected_entries = [(int(index), records[int(index)]) for index in plan.sample_indices]
 
     if args.probe_only:
@@ -692,6 +736,8 @@ def _run_browsecomp_plus(
                         prompt_max_chars=prompt_max_chars,
                         long_doc_config=long_doc_config,
                         tool_routing_config=tool_routing_config,
+                        candidate_router_mode=candidate_router_mode,
+                        candidate_router_config=candidate_router_config,
                         judge=judge,
                         defer_judge=defer_judge,
                     )
@@ -956,6 +1002,8 @@ def _run_one_browsecomp_plus_attempt(
     long_doc_config: LongDocEvidenceConfig,
     tool_routing_config: ToolRoutingConfig,
     judge: BrowseCompJudgeConfig,
+    candidate_router_mode: str = "off",
+    candidate_router_config: ParallelCandidateRouterConfig | None = None,
     defer_judge: bool = False,
 ) -> dict[str, Any]:
     env = BrowseCompPlusEnv(record)
@@ -968,57 +1016,124 @@ def _run_one_browsecomp_plus_attempt(
     decoded_final_answer_call: dict[str, Any] = {}
     max_steps = _resolve_browsecomp_plus_max_steps(getattr(args, "max_steps", None))
     for step_index in range(1, max_steps + 1):
-        prompt, long_doc_trace = build_browsecomp_plus_budgeted_prompt(
-            messages,
-            history_max_chars=history_max_chars,
-            prompt_max_chars=prompt_max_chars,
-            long_doc_config=long_doc_config,
-            tool_routing_config=tool_routing_config,
-            engine=run.engine,
-            sampling=sampling,
-            prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=step_index * 10),
+        force_final_answer = _should_force_browsecomp_plus_final_answer(
+            step_index=step_index,
+            max_steps=max_steps,
+            trace=trace,
         )
-        output = run.engine.generate(
-            [prompt],
-            sampling=sampling,
-            batch_size=1,
-            progress_desc="BrowseCompPlus-Step",
-            prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-            prompt_seeds=[sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=step_index)],
-        )[0]
-        stages.append(StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason))
+        decision_completion = ""
+        decision_stop_reason = ""
+        candidate_trace: dict[str, Any] | None = None
+        decision_io = "rwkv_json"
+        long_doc_trace: dict[str, Any] = {}
         decoded: list[dict[str, Any]] = []
-        try:
-            if _looks_like_template_leak(output.text):
-                raise ValueError("decision stage leaked internal template/control tokens")
-            decoded = decode_simple_tool_call_response(output.text)
-            if not decoded:
-                raise ValueError("model returned no tool call")
-            call = decoded[0]
+        use_candidate_router = _should_use_browsecomp_plus_candidate_router(
+            mode=candidate_router_mode,
+            config=candidate_router_config,
+            messages=messages,
+            force_final_answer=force_final_answer,
+        )
+        if use_candidate_router and candidate_router_config is not None:
+            route = route_parallel_candidate_tool_call(
+                tools=BROWSECOMP_PLUS_TOOL_SCHEMAS,
+                messages=messages,
+                domain_policy=_browsecomp_plus_candidate_policy(),
+                domain="browsecomp_plus",
+                facts_text=_browsecomp_plus_candidate_facts(record, env),
+                engine=run.engine,
+                sampling=sampling,
+                config=candidate_router_config,
+                progress_desc=f"BrowseCompPlus-CandidateRouter sample {sample_index} step {step_index}",
+                prompt_seed=sample_repeat_seed(
+                    sample_index,
+                    repeat_index,
+                    pass_index=pass_index,
+                    stage=50_000 + step_index,
+                ),
+            )
+            decision_io = "parallel_candidate"
+            candidate_trace = route.trace_payload(include_prompts=True)
+            decision_completion = route.aggregate_completion
+            decision_stop_reason = route.aggregate_finish_reason or ("candidate_router_empty" if route.selected is None else "stop")
+            stages.append(
+                StageRecord(
+                    prompt=route.aggregate_prompt,
+                    completion=decision_completion,
+                    stop_reason=decision_stop_reason,
+                )
+            )
+            if route.selected is None:
+                fail_reason = route.aggregate_error or "candidate router did not select a tool call"
+                trace.append(
+                    {
+                        "step": step_index,
+                        "decision_io": decision_io,
+                        "candidate_router": candidate_trace,
+                        "parse_error": fail_reason,
+                    }
+                )
+                break
+            call = {"name": route.selected.name, "arguments": dict(route.selected.arguments)}
             if str(call.get("name") or "").strip() == "final_answer":
-                final_call = parse_final_answer_call(output.text, context_label="browsecomp-plus final answer")
+                final_answer_call_id = "final_answer"
+        else:
+            prompt, long_doc_trace = build_browsecomp_plus_budgeted_prompt(
+                messages,
+                history_max_chars=history_max_chars,
+                prompt_max_chars=prompt_max_chars,
+                long_doc_config=long_doc_config,
+                tool_routing_config=tool_routing_config,
+                engine=run.engine,
+                sampling=sampling,
+                prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=step_index * 10),
+                force_final_answer=force_final_answer,
+            )
+            output = run.engine.generate(
+                [prompt],
+                sampling=sampling,
+                batch_size=1,
+                progress_desc="BrowseCompPlus-Step",
+                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                prompt_seeds=[sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=step_index)],
+            )[0]
+            decision_completion = output.text
+            decision_stop_reason = output.finish_reason
+            stages.append(StageRecord(prompt=prompt, completion=decision_completion, stop_reason=decision_stop_reason))
+            try:
+                if _looks_like_template_leak(decision_completion):
+                    raise ValueError("decision stage leaked internal template/control tokens")
+                decoded = decode_simple_tool_call_response(decision_completion)
+                if not decoded:
+                    raise ValueError("model returned no tool call")
+                call = decoded[0]
+                if str(call.get("name") or "").strip() == "final_answer":
+                    final_call = parse_final_answer_call(decision_completion, context_label="browsecomp-plus final answer")
+                    call = dict(final_call.call)
+                    final_answer_call_id = final_call.call_id
+            except Exception as exc:  # noqa: BLE001
+                final_call = _recover_browsecomp_plus_final_answer_call(decision_completion)
+                if final_call is None:
+                    fail_reason = str(exc)
+                    trace.append({"step": step_index, "raw": decision_completion, "parse_error": fail_reason})
+                    break
                 call = dict(final_call.call)
                 final_answer_call_id = final_call.call_id
-        except Exception as exc:  # noqa: BLE001
-            final_call = _recover_browsecomp_plus_final_answer_call(output.text)
-            if final_call is None:
-                fail_reason = str(exc)
-                trace.append({"step": step_index, "raw": output.text, "parse_error": fail_reason})
-                break
-            call = dict(final_call.call)
-            final_answer_call_id = final_call.call_id
         result = env.step(call)
         messages.append({"role": "assistant", "content": render_json_function_call(call["name"], call["arguments"])})
         messages.append({"role": "user", "content": _render_browsecomp_plus_tool_result_user_content(call, result.observation)})
         trace_entry = {
             "step": step_index,
-            "decision_completion": output.text,
+            "decision_io": decision_io,
+            "decision_completion": decision_completion,
             "decoded_call": call,
             "observation": truncate_text(result.observation, 4000),
             "done": result.done,
             "details": result.details or {},
             "long_doc": long_doc_trace,
+            "force_final_answer": bool(force_final_answer),
         }
+        if candidate_trace is not None:
+            trace_entry["candidate_router"] = candidate_trace
         if result.done:
             final_answer = result.final_answer
             if str(call.get("name") or "").strip() == "final_answer":
@@ -1100,6 +1215,77 @@ def _resolve_browsecomp_plus_max_steps(raw: Any) -> int:
     return max(1, max_steps)
 
 
+def _should_use_browsecomp_plus_candidate_router(
+    *,
+    mode: str,
+    config: ParallelCandidateRouterConfig | None,
+    messages: Sequence[Mapping[str, object]],
+    force_final_answer: bool,
+) -> bool:
+    if force_final_answer:
+        return False
+    raw_message_chars = sum(len(str(message.get("content") or "")) for message in messages)
+    return _should_use_agent_loop_candidate_router(
+        mode=mode,
+        config=config,
+        tools=BROWSECOMP_PLUS_TOOL_SCHEMAS,
+        messages=messages,
+        candidate_context_chars=raw_message_chars,
+        raw_message_chars=raw_message_chars,
+        long_doc_compacted=False,
+    )
+
+
+def _browsecomp_plus_candidate_policy() -> str:
+    return normalize_rwkv_text(
+        "BrowseComp-Plus policy: choose exactly one next JSON function call. "
+        "Use search to retrieve evidence, get_document or get_document_chunks to inspect a known docid, "
+        "and final_answer only when the exact answer is supported or the search budget is nearly exhausted. "
+        "Search queries should preserve the important entities and constraints from the original question. "
+        "Do not invent docids or answers; use only listed tool names and JSON-object arguments."
+    )
+
+
+def _browsecomp_plus_candidate_facts(record: BrowseCompPlusRecord, env: BrowseCompPlusEnv) -> str:
+    payload = {
+        "task_id": record.task_id,
+        "query_id": record.query_id,
+        "question": record.question,
+        "retrieved_docids": sorted(env.retrieved_docids),
+    }
+    return normalize_rwkv_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _should_force_browsecomp_plus_final_answer(
+    *,
+    step_index: int,
+    max_steps: int,
+    trace: Sequence[Mapping[str, Any]],
+) -> bool:
+    if step_index >= max_steps:
+        return True
+    if step_index < max(4, max_steps - 2):
+        return False
+    recent = list(trace[-3:])
+    if len(recent) < 3:
+        return False
+    names = [
+        str((entry.get("decoded_call") or {}).get("name") or "")
+        for entry in recent
+        if isinstance(entry.get("decoded_call"), Mapping)
+    ]
+    if len(names) != 3 or any(name not in {"search", "get_document", "get_document_chunks"} for name in names):
+        return False
+    retrieved_snapshots = [
+        tuple(
+            ((entry.get("details") or {}).get("browsecomp_plus_run") or {}).get("retrieved_docids")
+            or ()
+        )
+        for entry in recent
+    ]
+    return len(set(retrieved_snapshots)) <= 1
+
+
 def _recover_browsecomp_plus_final_answer_call(response: str) -> FinalAnswerCall | None:
     try:
         return parse_final_answer_call(
@@ -1124,14 +1310,17 @@ def _recover_browsecomp_plus_final_answer_call(response: str) -> FinalAnswerCall
                 )
             except Exception:  # noqa: BLE001
                 pass
-        if "answer" in value:
-            answer = normalize_rwkv_text(str(value.get("answer") or ""))
+        for answer_key in ("answer", "final_answer", "response", "output", "final"):
+            if answer_key not in value:
+                continue
+            answer = normalize_rwkv_text(str(value.get(answer_key) or ""))
             if answer:
                 return FinalAnswerCall(
                     answer=answer,
                     call={"name": "final_answer", "arguments": {"answer": answer}, "id": "final_answer"},
                     call_id="final_answer",
                 )
+            break
     answer = _extract_browsecomp_plus_answer_string(response)
     if answer:
         return FinalAnswerCall(
@@ -1222,24 +1411,108 @@ def preflight_browsecomp_plus_runtime(
 ) -> dict[str, Any]:
     errors: list[str] = []
     retriever_mode = _browsecomp_plus_retriever_mode()
-    roots = {
-        str(record.metadata.get("browsecomp_plus_official_root") or DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT)
-        for record in records
-    }
-    for raw_root in sorted(roots):
+    records_by_root: dict[str, list[BrowseCompPlusRecord]] = {}
+    for record in records:
+        raw_root = str(record.metadata.get("browsecomp_plus_official_root") or DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT)
+        records_by_root.setdefault(raw_root, []).append(record)
+    needs_pyserini = False
+    for raw_root, root_records in sorted(records_by_root.items()):
         root = Path(raw_root).expanduser().resolve()
         if not (root / "scripts_evaluation" / "evaluate_run.py").exists():
             errors.append(f"missing_official_evaluator:{root}")
-        if retriever_mode in {"bm25", "auto"}:
+        record_probe = _probe_browsecomp_plus_record_corpus(root_records)
+        if record_probe and retriever_mode == "record":
+            errors.append(record_probe)
+        needs_bm25 = retriever_mode == "bm25" or (retriever_mode == "auto" and record_probe is not None)
+        if needs_bm25:
+            needs_pyserini = True
             index_path = browsecomp_plus_index_path(root)
             if not index_path.exists() or not any(index_path.glob("segments_*")):
                 errors.append(f"missing_bm25_index:{index_path}")
-    if retriever_mode in {"bm25", "auto"} and not _pyserini_available():
+            elif _pyserini_available():
+                probe_error = _probe_browsecomp_plus_bm25_corpus(
+                    index_path,
+                    root_records,
+                    qrel_path=root / "topics-qrels" / "qrel_evidence.txt",
+                )
+                if probe_error:
+                    errors.append(probe_error)
+    if needs_pyserini and not _pyserini_available():
         errors.append("missing_pyserini: install rwkv-skills[function-calling-official] or BrowseComp-Plus pyserini deps")
     report = {"ok": not errors, "errors": errors}
     if errors and raise_on_error:
         raise RuntimeError("BrowseComp-Plus runtime preflight failed: " + "; ".join(errors))
     return report
+
+
+def _probe_browsecomp_plus_record_corpus(records: Sequence[BrowseCompPlusRecord]) -> str | None:
+    for record in records[: min(5, len(records))]:
+        documents = _list_of_dicts(record.metadata.get("browsecomp_plus_documents"))
+        if not documents:
+            root = Path(
+                str(record.metadata.get("browsecomp_plus_official_root") or DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT)
+            ).expanduser().resolve()
+            source_path = Path(
+                str(record.metadata.get("browsecomp_plus_source_path") or browsecomp_plus_source_path(root))
+            ).expanduser().resolve()
+            documents = _load_documents_for_query(str(source_path), record.query_id)
+        if not _has_document_text(documents):
+            return f"empty_record_corpus:{record.task_id}"
+    return None
+
+
+def _probe_browsecomp_plus_bm25_corpus(
+    index_path: Path,
+    records: Sequence[BrowseCompPlusRecord],
+    *,
+    qrel_path: Path | None = None,
+) -> str | None:
+    try:
+        searcher = _lucene_searcher(str(index_path))
+        num_docs = getattr(searcher, "num_docs", None)
+        if callable(num_docs):
+            num_docs = num_docs()
+        if isinstance(num_docs, int) and num_docs <= 0:
+            return f"empty_bm25_index:{index_path}"
+        probe = next((record for record in records if record.question.strip()), records[0] if records else None)
+        if probe is None:
+            return "empty_bm25_probe:no_records"
+        documents = _search_bm25(index_path, probe.question, 1)
+    except Exception as exc:  # noqa: BLE001
+        return f"bm25_probe_failed:{index_path}:{type(exc).__name__}:{exc}"
+    if not _has_document_text(documents):
+        task_id = probe.task_id if probe else "unknown"
+        return f"empty_bm25_corpus:{index_path}:{task_id}"
+    qrels = _load_browsecomp_plus_qrels(qrel_path) if qrel_path else {}
+    if qrels:
+        overlap_error = _probe_browsecomp_plus_bm25_qrel_overlap(index_path, records, qrels)
+        if overlap_error:
+            return overlap_error
+    return None
+
+
+def _has_document_text(documents: Sequence[Mapping[str, Any]]) -> bool:
+    return any(_document_text(document).strip() for document in documents)
+
+
+def _probe_browsecomp_plus_bm25_qrel_overlap(
+    index_path: Path,
+    records: Sequence[BrowseCompPlusRecord],
+    qrels: Mapping[str, set[str]],
+) -> str | None:
+    checked = 0
+    for record in records[: min(10, len(records))]:
+        relevant = qrels.get(str(record.query_id)) or set()
+        if not relevant:
+            continue
+        checked += 1
+        query = _browsecomp_plus_expanded_query(record.question, record.question)
+        retrieved = {str(item.get("docid") or "") for item in _search_bm25(index_path, query, 50)}
+        if retrieved & relevant:
+            return None
+    if checked:
+        return f"bm25_qrel_probe_zero_overlap:{index_path}:checked={checked}"
+    return None
 
 
 def _top_chunks(documents: Sequence[Mapping[str, Any]], *, query: str, limit: int) -> list[dict[str, Any]]:
@@ -1297,6 +1570,16 @@ def _tokenize(text: str) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if token}
 
 
+def _browsecomp_plus_expanded_query(question: str, query: str) -> str:
+    question_text = normalize_rwkv_text(question)
+    query_text = normalize_rwkv_text(query)
+    if not query_text:
+        return question_text
+    if query_text.lower() in question_text.lower():
+        return question_text
+    return normalize_rwkv_text(f"{question_text}\n{query_text}")
+
+
 def _document_text(document: Mapping[str, Any]) -> str:
     for key in ("text", "contents", "content", "snippet", "body"):
         value = document.get(key)
@@ -1323,6 +1606,20 @@ def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, Mapping)]
+
+
+def _load_browsecomp_plus_qrels(path: Path | None) -> dict[str, set[str]]:
+    if path is None or not path.exists():
+        return {}
+    qrels: dict[str, set[str]] = {}
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            query_id, _iteration, docid = parts[:3]
+            qrels.setdefault(str(query_id), set()).add(str(docid))
+    return qrels
 
 
 @lru_cache(maxsize=256)
@@ -1359,8 +1656,12 @@ def _search_bm25(index_path: Path, query: str, k: int) -> list[dict[str, Any]]:
     searcher = _lucene_searcher(str(index_path))
     documents: list[dict[str, Any]] = []
     for hit in searcher.search(query, k):
-        raw = hit.lucene_document.get("raw")
-        documents.append({"docid": str(hit.docid), "text": _raw_lucene_contents(raw), "score": float(hit.score)})
+        raw = _bm25_hit_raw(searcher, hit)
+        text = _raw_lucene_contents(raw)
+        if not text:
+            continue
+        docid = _raw_lucene_docid(raw) or str(hit.docid)
+        documents.append({"docid": docid, "text": text, "score": float(hit.score)})
     return documents
 
 
@@ -1370,6 +1671,31 @@ def _bm25_document(index_path: Path, docid: str) -> dict[str, Any] | None:
     if document is None:
         return None
     return {"docid": str(docid), "text": _raw_lucene_contents(document.raw())}
+
+
+def _bm25_hit_raw(searcher: Any, hit: Any) -> Any:
+    raw = getattr(hit, "raw", None)
+    if raw:
+        return raw
+    try:
+        raw = hit.lucene_document.get("raw")
+    except Exception:  # noqa: BLE001
+        raw = None
+    if raw:
+        return raw
+    try:
+        document = searcher.doc(hit.docid)
+    except Exception:  # noqa: BLE001
+        return None
+    if document is None:
+        return None
+    try:
+        return document.raw()
+    except Exception:  # noqa: BLE001
+        try:
+            return document.contents()
+        except Exception:  # noqa: BLE001
+            return None
 
 
 def _raw_lucene_contents(raw: Any) -> str:
@@ -1384,6 +1710,18 @@ def _raw_lucene_contents(raw: Any) -> str:
         if isinstance(value, str):
             return value
     return raw
+
+
+def _raw_lucene_docid(raw: Any) -> str:
+    if not isinstance(raw, str):
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if isinstance(parsed, Mapping):
+        return str(parsed.get("docid") or parsed.get("id") or "").strip()
+    return ""
 
 
 __all__ = [

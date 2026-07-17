@@ -44,7 +44,7 @@ from src.eval.tasks.function_calling.mcp_bench import (
     resolve_mcp_context_budget,
     select_mcp_candidate_available_tools,
 )
-from src.eval.tasks.function_calling.parallel_candidate_router import CandidateToolCall
+from src.eval.experiments.parallel_candidate_router.router import CandidateToolCall, ParallelCandidateRouterConfig
 from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
@@ -221,8 +221,9 @@ def test_mcp_continuous_metrics_use_official_evaluator_scores() -> None:
 
     metrics = compute_mcp_bench_continuous_metrics(payloads)
 
-    assert metrics["score"] == 6.0
-    assert metrics["avg@1"] == 6.0
+    assert metrics["score"] == 0.6
+    assert metrics["avg@1"] == 0.6
+    assert metrics["official_score"] == 0.6
     assert metrics["mcp_avg_llm_judge_combined"] == 6.0
     assert metrics["mcp_avg_valid_tool_name_rate"] == 0.5
 
@@ -477,6 +478,37 @@ def test_decode_simple_tool_call_response_recovers_truncated_json_object() -> No
     assert calls == [{"name": "lookup", "arguments": {"id": "A1"}}]
 
 
+def test_tool_call_contract_recovers_stringified_arguments_with_extra_tail() -> None:
+    calls = parse_tool_calls_text(
+        """{"name":"execute_sql","arguments":"{\\"query\\":\\"SELECT City FROM Airport WHERE IATA = 'VIE'\\"}\\"}"}"""
+    )
+
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("execute_sql", {"query": "SELECT City FROM Airport WHERE IATA = 'VIE'"})
+    ]
+
+
+def test_tool_call_contract_recovers_nested_action_object() -> None:
+    calls = parse_tool_calls_text(
+        '{"action":{"name":"search","arguments":{"query":"Zurich answer"}}}'
+    )
+
+    assert [(call.name, call.arguments) for call in calls] == [
+        ("search", {"query": "Zurich answer"})
+    ]
+
+
+def test_tool_call_contract_rejects_ellipsized_string_arguments() -> None:
+    try:
+        parse_tool_calls_text(
+            '{"name":"execute_sql","arguments":"{\\"query\\":\\"SELECT DISTINCT League FROM Soccer WHERE Division..."}'
+        )
+    except ValueError as exc:
+        assert "string arguments must be a JSON object" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected ellipsized SQL arguments to fail")
+
+
 def test_tool_call_contract_accepts_openai_tool_calls_shape() -> None:
     calls = parse_tool_calls_text(
         '{"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\\"id\\":\\"A1\\"}"}}]}'
@@ -635,6 +667,84 @@ def test_browsecomp_plus_prefers_record_documents_over_bm25(monkeypatch, tmp_pat
     assert env._details()["retriever"] == "record_documents"
 
 
+def test_browsecomp_plus_preflight_fails_empty_record_corpus(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "official"
+    (root / "scripts_evaluation").mkdir(parents=True)
+    (root / "scripts_evaluation" / "evaluate_run.py").write_text("", encoding="utf-8")
+    record = BrowseCompPlusRecord(
+        task_id="bc-plus-empty-record",
+        query_id="q-empty",
+        question="Which city is the answer?",
+        answer="Zurich",
+        metadata={
+            "browsecomp_plus_official_root": str(root),
+            "browsecomp_plus_source_path": str(root / "data" / "browsecomp_plus_decrypted.jsonl"),
+        },
+    )
+
+    monkeypatch.setenv("RWKV_BROWSECOMP_PLUS_RETRIEVER", "record")
+
+    report = browsecomp_plus_module.preflight_browsecomp_plus_runtime([record], raise_on_error=False)
+
+    assert not report["ok"]
+    assert any("empty_record_corpus:bc-plus-empty-record" in error for error in report["errors"])
+
+
+def test_browsecomp_plus_preflight_fails_empty_bm25_probe(monkeypatch, tmp_path) -> None:
+    root = tmp_path / "official"
+    (root / "scripts_evaluation").mkdir(parents=True)
+    (root / "scripts_evaluation" / "evaluate_run.py").write_text("", encoding="utf-8")
+    index_path = root / "indexes" / "bm25"
+    index_path.mkdir(parents=True)
+    (index_path / "segments_1").write_text("", encoding="utf-8")
+    record = BrowseCompPlusRecord(
+        task_id="bc-plus-empty-bm25",
+        query_id="q-empty",
+        question="Which city is the answer?",
+        answer="Zurich",
+        metadata={"browsecomp_plus_official_root": str(root)},
+    )
+
+    monkeypatch.setenv("RWKV_BROWSECOMP_PLUS_RETRIEVER", "bm25")
+    monkeypatch.setattr(browsecomp_plus_module, "_pyserini_available", lambda: True)
+    monkeypatch.setattr(browsecomp_plus_module, "_lucene_searcher", lambda _path: types.SimpleNamespace(num_docs=1))
+    monkeypatch.setattr(browsecomp_plus_module, "_search_bm25", lambda *_args, **_kwargs: [])
+
+    report = browsecomp_plus_module.preflight_browsecomp_plus_runtime([record], raise_on_error=False)
+
+    assert not report["ok"]
+    assert any("empty_bm25_corpus:" in error for error in report["errors"])
+
+
+def test_browsecomp_plus_bm25_search_falls_back_to_stored_doc(monkeypatch, tmp_path) -> None:
+    class BrokenLuceneDocument:
+        def get(self, _name):
+            raise RuntimeError("java null pointer")
+
+    class Hit:
+        docid = "doc-1"
+        score = 7.5
+        lucene_document = BrokenLuceneDocument()
+
+    class StoredDocument:
+        def raw(self):
+            return '{"contents": "Zurich is the answer."}'
+
+    class Searcher:
+        def search(self, _query, _k):
+            return [Hit()]
+
+        def doc(self, docid):
+            assert docid == "doc-1"
+            return StoredDocument()
+
+    monkeypatch.setattr(browsecomp_plus_module, "_lucene_searcher", lambda _path: Searcher())
+
+    documents = browsecomp_plus_module._search_bm25(tmp_path / "bm25", "Zurich", 5)
+
+    assert documents == [{"docid": "doc-1", "text": "Zurich is the answer.", "score": 7.5}]
+
+
 def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_return(monkeypatch) -> None:
     raw_completion = '```json\n{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"call_42"}\n```'
 
@@ -757,6 +867,7 @@ def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypat
 
     trailing = '{"name":"final_answer","arguments":"{\\"answer\\":\\"Zurich\\"}","id":"call_42"},{"docid":"x"}'
     bare_answer = '{"answer":"Zurich"}'
+    bare_final_answer = '{"final_answer":"Zurich"}'
     malformed_arguments = (
         '{\n'
         '  "name": "final_answer",\n'
@@ -767,14 +878,136 @@ def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypat
 
     trailing_payload = _run(trailing)
     bare_payload = _run(bare_answer)
+    bare_final_payload = _run(bare_final_answer)
     malformed_payload = _run(malformed_arguments)
 
     assert trailing_payload["agent_info"]["final_answer"] == "Zurich"
     assert trailing_payload["agent_info"]["fail_reason"] == ""
     assert bare_payload["agent_info"]["final_answer"] == "Zurich"
     assert bare_payload["agent_info"]["fail_reason"] == ""
+    assert bare_final_payload["agent_info"]["final_answer"] == "Zurich"
+    assert bare_final_payload["agent_info"]["fail_reason"] == ""
     assert malformed_payload["agent_info"]["final_answer"] == "Zurich"
     assert malformed_payload["agent_info"]["fail_reason"] == ""
+
+
+def test_browsecomp_plus_forces_final_answer_on_last_step(monkeypatch) -> None:
+    class FakeEngine:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.outputs = [
+                '{"name":"search","arguments":{"query":"Zurich answer"}}',
+                '{"name":"final_answer","arguments":{"answer":"Zurich"}}',
+            ]
+
+        def generate(
+            self,
+            prompts,
+            sampling,
+            batch_size,
+            progress_desc,
+            prompt_seeds=None,
+            prompt_stop_suffixes=None,
+            constraints=None,
+            constraint_mode="off",
+        ):
+            self.prompts.extend(prompts)
+            return [types.SimpleNamespace(text=self.outputs.pop(0), finish_reason="stop")]
+
+    def _fake_judge(inputs, config):
+        return [BrowseCompJudgeOutcome(is_passed=True, reason="matched")]
+
+    monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
+    engine = FakeEngine()
+    payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
+        args=types.SimpleNamespace(max_steps=2),
+        run=types.SimpleNamespace(engine=engine, benchmark_name="browsecomp_plus", dataset_split="test"),
+        record=BrowseCompPlusRecord(
+            task_id="bc-plus-1",
+            query_id="q1",
+            question="Which city is the answer?",
+            answer="Zurich",
+            metadata={"browsecomp_plus_documents": [{"docid": "doc-1", "text": "Zurich is the answer."}]},
+        ),
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        sampling=object(),
+        sampling_payload={"max_generate_tokens": 64},
+        history_max_chars=4000,
+        prompt_max_chars=4000,
+        long_doc_config=LongDocEvidenceConfig(enabled=False),
+        tool_routing_config=ToolRoutingConfig(mode="off"),
+        judge=BrowseCompJudgeConfig(api_key="", model="judge"),
+    )
+
+    assert payload["agent_info"]["final_answer"] == "Zurich"
+    assert payload["agent_trace"][1]["force_final_answer"] is True
+    assert '"name": "search"' not in engine.prompts[1]
+    assert '"name": "final_answer"' in engine.prompts[1]
+
+
+def test_browsecomp_plus_uses_parallel_candidate_router(monkeypatch) -> None:
+    class FakeEngine:
+        def generate(self, *args, **kwargs):  # pragma: no cover - candidate router is monkeypatched.
+            raise AssertionError("direct prompt generation should not be used")
+
+    class FakeRoute:
+        def __init__(self, selected: CandidateToolCall) -> None:
+            self.selected = selected
+            self.aggregate_prompt = f"candidate prompt for {selected.name}"
+            self.aggregate_completion = selected.layer_payload()["name"]
+            self.aggregate_finish_reason = "stop"
+            self.aggregate_error = None
+
+        def trace_payload(self, *, include_prompts: bool = False):
+            return {
+                "mode": "parallel_candidate",
+                "selected_candidate": self.selected.layer_payload(),
+                "include_prompts": include_prompts,
+            }
+
+    selections = [
+        CandidateToolCall("search", {"query": "Zurich answer"}, confidence=0.8, evidence="question"),
+        CandidateToolCall("final_answer", {"answer": "Zurich"}, confidence=0.9, evidence="doc-1"),
+    ]
+
+    def _fake_route(**kwargs):
+        return FakeRoute(selections.pop(0))
+
+    def _fake_judge(inputs, config):
+        return [BrowseCompJudgeOutcome(is_passed=True, reason="matched")]
+
+    monkeypatch.setattr(browsecomp_plus_module, "route_parallel_candidate_tool_call", _fake_route)
+    monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
+    payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
+        args=types.SimpleNamespace(max_steps=3),
+        run=types.SimpleNamespace(engine=FakeEngine(), benchmark_name="browsecomp_plus", dataset_split="test"),
+        record=BrowseCompPlusRecord(
+            task_id="bc-plus-1",
+            query_id="q1",
+            question="Which city is the answer?",
+            answer="Zurich",
+            metadata={"browsecomp_plus_documents": [{"docid": "doc-1", "text": "Zurich is the answer."}]},
+        ),
+        sample_index=0,
+        repeat_index=0,
+        pass_index=0,
+        sampling=object(),
+        sampling_payload={"max_generate_tokens": 64},
+        history_max_chars=4000,
+        prompt_max_chars=4000,
+        long_doc_config=LongDocEvidenceConfig(enabled=False),
+        tool_routing_config=ToolRoutingConfig(mode="off"),
+        candidate_router_mode="parallel",
+        candidate_router_config=ParallelCandidateRouterConfig(chunk_tools=2),
+        judge=BrowseCompJudgeConfig(api_key="", model="judge"),
+    )
+
+    assert payload["agent_info"]["final_answer"] == "Zurich"
+    assert payload["agent_trace"][0]["decision_io"] == "parallel_candidate"
+    assert payload["agent_trace"][0]["candidate_router"]["selected_candidate"]["name"] == "search"
+    assert payload["agent_trace"][1]["candidate_router"]["selected_candidate"]["name"] == "final_answer"
 
 
 def test_rwkv_json_call_prompt_renders_multi_turn_dialog_by_default() -> None:

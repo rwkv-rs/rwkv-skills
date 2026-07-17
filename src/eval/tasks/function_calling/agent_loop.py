@@ -54,7 +54,7 @@ from src.eval.tasks.function_calling.common import (
 from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_messages_for_long_context, infer_query_from_messages
 from src.eval.tasks.function_calling.context_budget import normalize_rwkv_text, truncate_text
 from src.eval.tasks.function_calling.final_answer import FINAL_ANSWER_TOOL_NAME, final_answer_tool_schema
-from src.eval.tasks.function_calling.parallel_candidate_router import (
+from src.eval.experiments.parallel_candidate_router.router import (
     ParallelCandidateRouterConfig,
     route_parallel_candidate_tool_call,
 )

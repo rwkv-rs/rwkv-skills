@@ -43,7 +43,7 @@ from src.eval.results.schema import make_eval_payload, normalize_sampling_config
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
-    from src.eval.tasks.function_calling.parallel_candidate_router import ParallelCandidateRouterConfig
+    from src.eval.experiments.parallel_candidate_router.router import ParallelCandidateRouterConfig
 
 _MAX_TOOL_DESCRIPTION_CHARS = 700
 _MAX_TOOL_SCHEMA_CHARS = 1200
@@ -845,7 +845,7 @@ def _run_candidate_routed_simple_tool_call(
 
 
 def _parallel_candidate_router_api():
-    from src.eval.tasks.function_calling.parallel_candidate_router import (
+    from src.eval.experiments.parallel_candidate_router.router import (
         ParallelCandidateRouterConfig,
         route_parallel_candidate_tool_call,
     )

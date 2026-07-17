@@ -31,7 +31,7 @@ from src.eval.tasks.function_calling.agent_loop_verifiers import (
     trace_to_mcp_atlas_transcript,
     widesearch_answer_to_official_row,
 )
-from src.eval.tasks.function_calling.parallel_candidate_router import (
+from src.eval.experiments.parallel_candidate_router.router import (
     ParallelCandidateRouterConfig,
     build_candidate_system_prompt,
     route_parallel_candidate_tool_call,

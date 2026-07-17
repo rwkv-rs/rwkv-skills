@@ -44,3 +44,29 @@ def test_agentbench_prompt_compacts_long_document_messages() -> None:
     assert "Which holder matches passport ABC123?" in prompt
     assert "noise row 000 ignore" not in prompt
     assert len(prompt) <= 5000
+
+
+def test_agentbench_prompt_requires_complete_object_arguments() -> None:
+    prompt = build_agentbench_prompt(
+        [{"role": "system", "content": "Operate the database."}, {"role": "user", "content": "Run the SQL."}],
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "execute_sql",
+                    "description": "Execute SQL.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        ],
+        history_max_chars=4000,
+        allow_final_answer_text=False,
+    )
+
+    assert "The `arguments` value must be a JSON object" in prompt
+    assert "Do not abbreviate, summarize, or replace argument values with ellipses" in prompt
+    assert '{"name":"execute_sql","arguments":{"query":"SELECT 1"}}' in prompt

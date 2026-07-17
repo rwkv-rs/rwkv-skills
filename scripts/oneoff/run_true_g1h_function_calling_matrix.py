@@ -113,6 +113,7 @@ DEFAULT_BENCHMARKS: tuple[BenchmarkSpec, ...] = (
     BenchmarkSpec("longbench_qa", "test", "function_longbench", "longbench"),
     BenchmarkSpec("longbench_qa_balanced", "test", "function_longbench", "longbench"),
     BenchmarkSpec("longcodeqa", "test", "function_longcodebench", "longcodebench"),
+    BenchmarkSpec("browsecomp_plus", "test", "function_browsecomp_plus", "browsecomp_plus", batch=False),
 )
 
 
@@ -138,6 +139,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sample-seed", type=int, default=int(os.getenv("SAMPLE_SEED", "20260710")))
     parser.add_argument("--db-write-queue", type=int, default=int(os.getenv("DB_WRITE_QUEUE", "128")))
     parser.add_argument("--judge-max-workers", type=int, default=int(os.getenv("JUDGE_MAX_WORKERS_OVERRIDE", "16")))
+    parser.add_argument(
+        "--sampling-temperature",
+        type=float,
+        default=optional_float_env("TEMPERATURE"),
+        help="Per-run function-calling sampling temperature override.",
+    )
+    parser.add_argument(
+        "--sampling-top-p",
+        type=float,
+        default=optional_float_env("TOP_P"),
+        help="Per-run function-calling sampling top_p override.",
+    )
+    parser.add_argument(
+        "--sampling-top-k",
+        type=int,
+        default=optional_int_env("TOP_K"),
+        help="Per-run function-calling sampling top_k override.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-going", action="store_true", default=True)
     return parser.parse_args(argv)
@@ -154,6 +173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     models = tuple(parse_model_spec(raw) for raw in (args.models or DEFAULT_MODELS))
     benchmarks = select_benchmarks(args)
+    config_override_root = write_sampling_overrides(log_dir, benchmarks, args)
     write_manifest(log_dir / "matrix.json", models=models, benchmarks=benchmarks, args=args)
 
     print(f"matrix_start models={len(models)} benchmarks={len(benchmarks)} log_dir={log_dir}", flush=True)
@@ -175,6 +195,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 log_dir,
                 config_dir,
                 data_dir,
+                config_override_root,
                 model,
                 spec,
             )
@@ -213,11 +234,12 @@ def run_one_guarded(
     log_dir: Path,
     config_dir: Path,
     data_dir: Path,
+    config_override_root: Path | None,
     model: ModelSpec,
     spec: BenchmarkSpec,
 ) -> int:
     with semaphore:
-        return run_one(args, repo_root, log_dir, config_dir, data_dir, model, spec)
+        return run_one(args, repo_root, log_dir, config_dir, data_dir, config_override_root, model, spec)
 
 
 def parse_model_spec(raw: str) -> ModelSpec:
@@ -260,6 +282,7 @@ def run_one(
     log_dir: Path,
     config_dir: Path,
     data_dir: Path,
+    config_override_root: Path | None,
     model: ModelSpec,
     spec: BenchmarkSpec,
 ) -> int:
@@ -275,6 +298,8 @@ def run_one(
     env["RWKV_FUNCTION_CALLING_ALPHA_DECAY"] = "0"
     env["JUDGE_MAX_WORKERS"] = str(int(args.judge_max_workers))
     env.setdefault("JUDGE_TIMEOUT_S", "180")
+    if config_override_root is not None:
+        env["RWKV_BENCHMARK_CONFIG_ROOT"] = str(config_override_root)
     if not spec.needs_checker:
         env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
     print(f"run_start model={model.name} benchmark={spec.name} config={config_path} log={model_log}", flush=True)
@@ -394,10 +419,31 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
             12,
         )
         config["max_rounds"] = 12
+    elif spec.kind == "agentbench":
+        config.update(candidate_router_defaults(mode="parallel"))
+        config["candidate_router_chunk_tools"] = 2
+        config["candidate_router_max_candidates"] = positive_int(
+            os.getenv("RWKV_AGENTBENCH_CANDIDATE_ROUTER_MAX_CANDIDATES"),
+            8,
+        )
+        config["history_max_chars"] = 16000
+        config["prompt_max_chars"] = 24000
+        config["max_steps"] = 20
     elif spec.kind in {"longbench", "longcodebench"}:
         config["answer_max_tokens"] = 64
         config["history_max_chars"] = 24000
         config["prompt_max_chars"] = 28000
+    elif spec.kind == "browsecomp_plus":
+        config["history_max_chars"] = 24000
+        config["prompt_max_chars"] = 28000
+        config["max_steps"] = 12
+        config["max_rounds"] = 12
+        config["candidate_router_mode"] = "parallel"
+        config["candidate_router_chunk_tools"] = 2
+        config["candidate_router_batch_size"] = 16
+        config["candidate_router_max_candidates"] = 6
+        config["candidate_router_prompt_max_chars"] = 12288
+        config["candidate_router_context_chars"] = 8000
     elif spec.kind.startswith("tau"):
         config["history_max_chars"] = 16000 if spec.kind != "tau3_bench" else 12000
         config["prompt_max_chars"] = 28000
@@ -420,6 +466,33 @@ def candidate_router_defaults(*, mode: str) -> dict[str, Any]:
         "candidate_router_evidence_chars": 1200,
         "candidate_router_policy_chars": 2000,
     }
+
+
+def write_sampling_overrides(
+    log_dir: Path,
+    benchmarks: Sequence[BenchmarkSpec],
+    args: argparse.Namespace,
+) -> Path | None:
+    values: dict[str, Any] = {}
+    if args.sampling_temperature is not None:
+        values["temperature"] = float(args.sampling_temperature)
+    if args.sampling_top_p is not None:
+        values["top_p"] = float(args.sampling_top_p)
+    if args.sampling_top_k is not None:
+        values["top_k"] = int(args.sampling_top_k)
+    if not values:
+        return None
+
+    root = log_dir / "benchmark_config_overrides"
+    root.mkdir(parents=True, exist_ok=True)
+    stages = ("default", "tool", "router", "decision", "final", "cot", "ask", "handoff")
+    body = "\n\n".join(
+        f"[{stage}]\n" + "\n".join(f"{key} = {toml_value(value)}" for key, value in values.items())
+        for stage in stages
+    )
+    for spec in benchmarks:
+        (root / f"{safe_name(spec.name).lower()}.toml").write_text(body + "\n", encoding="utf-8")
+    return root
 
 
 def render_toml(payload: Mapping[str, Mapping[str, Any]]) -> str:
@@ -449,6 +522,20 @@ def positive_int(raw: str | None, default: int) -> int:
     if raw is None or raw == "":
         return default
     return max(1, int(raw))
+
+
+def optional_float_env(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return None
+    return float(raw)
+
+
+def optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return None
+    return int(raw)
 
 
 def stable_int(text: str) -> int:

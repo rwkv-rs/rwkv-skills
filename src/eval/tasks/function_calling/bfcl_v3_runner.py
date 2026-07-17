@@ -61,7 +61,7 @@ from src.eval.tasks.function_calling.rwkv_prompt import (
     normalize_function_prompt_style,
 )
 from src.eval.tasks.function_calling.tool_call_contract import parse_tool_calls_text
-from src.eval.tasks.function_calling.parallel_candidate_router import (
+from src.eval.experiments.parallel_candidate_router.router import (
     CandidateToolCall,
     ParallelCandidateRouterConfig,
     route_parallel_candidate_tool_call,

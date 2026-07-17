@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -25,6 +27,10 @@ from src.eval.tasks.function_calling.common import (
     repeat_probe_entries,
 )
 from src.eval.tasks.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text
+from src.eval.experiments.parallel_candidate_router.router import (
+    ParallelCandidateRouterConfig,
+    route_parallel_candidate_tool_call,
+)
 from src.eval.tasks.function_calling.runner_common import (
     ResolvedFunctionCallingRun,
     _looks_like_template_leak,
@@ -39,6 +45,7 @@ from src.eval.tasks.function_calling.simple_tool_call import decode_simple_tool_
 from src.eval.tasks.function_calling.tool_router import (
     ToolRoutingConfig,
     route_tools_for_prompt,
+    tool_catalog_chars,
     tool_routing_config_from_args,
 )
 from src.eval.long_doc_evidence import LongDocEvidenceConfig, compact_messages_for_long_context
@@ -55,6 +62,35 @@ class AgentBenchRecord:
     task_name: str
     index: int
     metadata: dict[str, Any]
+
+
+_AGENTBENCH_CANDIDATE_ROUTER_MIN_TOOLS = 4
+_MYSQL_MULTIWORD_TABLE_REF = re.compile(
+    r"\b(?P<keyword>UPDATE|FROM|JOIN|INTO|DESCRIBE|DESC)\s+"
+    r"(?P<name>(?!`)[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)+?)"
+    r"(?=\s+(?:SET|WHERE|JOIN|ON|VALUES|ORDER|GROUP|LIMIT)\b|$)",
+    flags=re.IGNORECASE,
+)
+_AGENTBENCH_CANDIDATE_ROUTER_POLICY = (
+    "AgentBench policy: choose exactly one next JSON function call for the official controller. "
+    "Use only listed tool names. Do not invent tool names, IDs, entities, tables, columns, or tool outputs. "
+    "For DB tasks, call the SQL execution tool with a complete SQL query; arguments must be a JSON object, not an escaped string. "
+    "For SQL identifiers with spaces, punctuation, reserved words, or mixed case, quote the full identifier with MySQL backticks. "
+    "For example use `Team Information`, not Team Information, and `Season`, not an unverified column spelling. "
+    "For KG tasks, use exploration tools until the target entity is identified, then use final_answer with exactly `Final Answer: #id`."
+)
+
+
+def _agentbench_final_answer_tool() -> dict[str, Any]:
+    return {
+        "name": "final_answer",
+        "description": "Submit the final answer as assistant text content.",
+        "parameters": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        },
+    }
 
 
 def load_agentbench_rows_from_source(
@@ -195,6 +231,11 @@ def build_agentbench_prompt(
                 _render_agentbench_output_schema(),
                 "Return exactly one JSON function call object.",
                 "Use only listed tool names.",
+                "The `arguments` value must be a JSON object, not an escaped JSON string.",
+                "Do not abbreviate, summarize, or replace argument values with ellipses; output complete SQL queries and complete parameter strings.",
+                "For DB tasks using MySQL, quote table or column names containing spaces, punctuation, reserved words, or mixed case with backticks.",
+                "If a tool response shows a table name such as `Team Information`, reuse that exact full name inside backticks; do not split it into `Team`.",
+                "Inspect available tables/schema before writing UPDATE/INSERT/DELETE unless the current conversation already contains the exact table and columns.",
                 "For AgentBench KG final answers, use final_answer with the exact content `Final Answer: #id`.",
                 "Return no prose, no markdown, and no extra text outside the JSON value.",
             ]
@@ -250,12 +291,20 @@ def _run_agentbench(
     prompt_max_chars = _agentbench_prompt_max_chars(args)
     long_doc_config = _agentbench_long_doc_config(args)
     tool_routing_config = tool_routing_config_from_args(args)
+    candidate_router_mode = _agentbench_candidate_router_mode(args)
+    candidate_router_config = _agentbench_candidate_router_config_from_args(args)
     sampling_payload = attach_function_calling_context_metadata(
         normalize_sampling_config_by_stage([(1, sampling)]),
         long_doc_config=long_doc_config,
         tool_routing_config=tool_routing_config,
+        candidate_router_config=candidate_router_config,
         prompt_max_chars=prompt_max_chars,
     )
+    sampling_payload["agentbench_adapter"] = {
+        "candidate_router_mode": candidate_router_mode,
+        "candidate_router_auto_min_tools": _AGENTBENCH_CANDIDATE_ROUTER_MIN_TOOLS,
+        "decision_io": "rwkv_json_or_parallel_candidate",
+    }
     controller_url = _agentbench_controller_url(args)
     controller = AgentBenchControllerClient(controller_url)
     controller.ensure_available()
@@ -346,6 +395,8 @@ def _run_agentbench(
                         prompt_max_chars=prompt_max_chars,
                         long_doc_config=long_doc_config,
                         tool_routing_config=tool_routing_config,
+                        candidate_router_mode=candidate_router_mode,
+                        candidate_router_config=candidate_router_config,
                     )
                     writer.enqueue(payload)
             except Exception:  # noqa: BLE001
@@ -397,6 +448,8 @@ def _run_one_agentbench_attempt(
     prompt_max_chars: int,
     long_doc_config: LongDocEvidenceConfig,
     tool_routing_config: ToolRoutingConfig,
+    candidate_router_mode: str,
+    candidate_router_config: ParallelCandidateRouterConfig | None,
 ) -> dict[str, Any]:
     session_id = ""
     stages: list[StageRecord] = []
@@ -411,6 +464,7 @@ def _run_one_agentbench_attempt(
         messages = [dict(item) for item in data.get("messages") or [] if isinstance(item, Mapping)]
         tools = [dict(item) for item in data.get("tools") or [] if isinstance(item, Mapping)]
         for round_index in range(1, max(1, int(args.max_steps or 20)) + 1):
+            decision_completion = ""
             tool_route = route_tools_for_prompt(
                 tools,
                 messages,
@@ -421,46 +475,105 @@ def _run_one_agentbench_attempt(
                 progress_desc=f"AgentBench tool route {sample_index} round {round_index}",
                 prompt_seed=sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=10_000 + round_index),
             )
-            prompt = build_agentbench_prompt(
-                messages,
+            decision_tools = _agentbench_decision_tools(
                 tool_route.selected_tools,
-                history_max_chars=history_max_chars,
-                allow_final_answer_text=_is_agentbench_kg(record),
-                prompt_max_chars=prompt_max_chars,
-                long_doc_config=long_doc_config,
+                allow_final_answer=_is_agentbench_kg(record),
             )
-            output = run.engine.generate(
-                [prompt],
-                sampling=sampling,
-                batch_size=1,
-                progress_desc=f"AgentBench sample {sample_index} round {round_index}",
-                prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
-                prompt_seeds=[sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=round_index)],
-            )[0]
-            stages.append(StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason))
-            try:
-                if _looks_like_template_leak(output.text):
-                    raise ValueError("decision stage leaked internal template/control tokens")
-                decoded_calls = decode_simple_tool_call_response(output.text)
-                assistant_message = _agentbench_assistant_message(decoded_calls, round_index)
-            except Exception as exc:  # noqa: BLE001
-                error = str(exc)
+            if _should_use_agentbench_candidate_router(
+                mode=candidate_router_mode,
+                config=candidate_router_config,
+                tools=decision_tools,
+                messages=messages,
+                prompt_max_chars=prompt_max_chars,
+            ):
+                route = route_parallel_candidate_tool_call(
+                    tools=decision_tools,
+                    messages=messages,
+                    domain_policy=_agentbench_candidate_policy(record),
+                    domain=record.task_name,
+                    facts_text=_agentbench_candidate_facts(record),
+                    engine=run.engine,
+                    sampling=sampling,
+                    config=candidate_router_config,
+                    progress_desc=f"AgentBench candidate route {sample_index} round {round_index}",
+                    prompt_seed=sample_repeat_seed(
+                        sample_index,
+                        repeat_index,
+                        pass_index=pass_index,
+                        stage=20_000 + round_index,
+                    ),
+                )
+                if route.selected is None:
+                    decoded_calls: list[dict[str, Any]] = []
+                    completion = route.aggregate_completion
+                    stop_reason = route.aggregate_finish_reason or "candidate_router_empty"
+                    error = route.aggregate_error or "candidate router did not select a tool call"
+                else:
+                    decoded_calls = [{"name": route.selected.name, "arguments": dict(route.selected.arguments)}]
+                    completion = route.aggregate_completion or json.dumps(decoded_calls[0], ensure_ascii=False, sort_keys=True)
+                    stop_reason = route.aggregate_finish_reason or "stop"
+                decision_completion = completion
+                stages.append(StageRecord(prompt=route.aggregate_prompt, completion=completion, stop_reason=stop_reason))
                 trace.append(
                     {
                         "round": round_index,
                         "tool_route": tool_route.trace_payload(),
-                        "completion": output.text,
-                        "parse_error": error,
+                        "decision_io": "parallel_candidate",
+                        "candidate_router": route.trace_payload(include_prompts=True),
+                        "decoded_calls": decoded_calls,
+                        "parse_error": error if route.selected is None else "",
                     }
                 )
-                break
+                if route.selected is None:
+                    break
+                if _is_agentbench_db(record):
+                    decoded_calls = _repair_agentbench_db_sql_calls(decoded_calls, messages)
+                assistant_message = _agentbench_assistant_message(decoded_calls, round_index)
+            else:
+                prompt = build_agentbench_prompt(
+                    messages,
+                    decision_tools,
+                    history_max_chars=history_max_chars,
+                    allow_final_answer_text=False,
+                    prompt_max_chars=prompt_max_chars,
+                    long_doc_config=long_doc_config,
+                )
+                output = run.engine.generate(
+                    [prompt],
+                    sampling=sampling,
+                    batch_size=1,
+                    progress_desc=f"AgentBench sample {sample_index} round {round_index}",
+                    prompt_stop_suffixes=[list(JSON_CALL_STOP_SUFFIXES)],
+                    prompt_seeds=[sample_repeat_seed(sample_index, repeat_index, pass_index=pass_index, stage=round_index)],
+                )[0]
+                decision_completion = output.text
+                stages.append(StageRecord(prompt=prompt, completion=output.text, stop_reason=output.finish_reason))
+                try:
+                    if _looks_like_template_leak(output.text):
+                        raise ValueError("decision stage leaked internal template/control tokens")
+                    decoded_calls = decode_simple_tool_call_response(output.text)
+                    if _is_agentbench_db(record):
+                        decoded_calls = _repair_agentbench_db_sql_calls(decoded_calls, messages)
+                    assistant_message = _agentbench_assistant_message(decoded_calls, round_index)
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                    trace.append(
+                        {
+                            "round": round_index,
+                            "tool_route": tool_route.trace_payload(),
+                            "decision_io": "rwkv_json",
+                            "completion": output.text,
+                            "parse_error": error,
+                        }
+                    )
+                    break
             messages.append(assistant_message)
             response = controller.interact(session_id, assistant_message)
             trace.append(
                 {
                     "round": round_index,
                     "tool_route": tool_route.trace_payload(),
-                    "completion": output.text,
+                    "completion": decision_completion,
                     "decoded_calls": decoded_calls,
                     "controller_response": response,
                 }
@@ -509,6 +622,200 @@ def _run_one_agentbench_attempt(
     return payload
 
 
+def _agentbench_candidate_router_mode(args: argparse.Namespace) -> str:
+    mode = str(getattr(args, "candidate_router_mode", None) or "off").strip().lower()
+    if mode not in {"off", "auto", "parallel"}:
+        raise ValueError(f"unsupported candidate_router_mode={mode!r}; expected off, auto, or parallel")
+    return mode
+
+
+def _agentbench_candidate_router_config_from_args(args: argparse.Namespace) -> ParallelCandidateRouterConfig | None:
+    mode = _agentbench_candidate_router_mode(args)
+    if mode == "off":
+        return None
+    defaults = ParallelCandidateRouterConfig()
+    tool_schema_mode = str(
+        getattr(args, "candidate_router_tool_schema_mode", defaults.tool_schema_mode) or defaults.tool_schema_mode
+    )
+    if tool_schema_mode not in {"minimal", "compact", "full"}:
+        tool_schema_mode = defaults.tool_schema_mode
+    return ParallelCandidateRouterConfig(
+        chunk_tools=_positive_int(getattr(args, "candidate_router_chunk_tools", None), defaults.chunk_tools),
+        batch_size=_positive_int(getattr(args, "candidate_router_batch_size", None), defaults.batch_size),
+        context_chars=_positive_int(getattr(args, "candidate_router_context_chars", None), defaults.context_chars),
+        prompt_max_chars=_positive_int(getattr(args, "candidate_router_prompt_max_chars", None), defaults.prompt_max_chars),
+        candidate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_candidate_max_tokens", None),
+            defaults.candidate_max_tokens,
+        ),
+        aggregate_max_tokens=_positive_int(
+            getattr(args, "candidate_router_aggregate_max_tokens", None),
+            defaults.aggregate_max_tokens,
+        ),
+        max_candidates=_positive_int(getattr(args, "candidate_router_max_candidates", None), defaults.max_candidates),
+        tool_schema_mode=tool_schema_mode,
+        include_respond=False,
+        fallback_to_highest_confidence=True,
+        evidence_chars=_positive_int(getattr(args, "candidate_router_evidence_chars", None), defaults.evidence_chars),
+        policy_chars=_positive_int(getattr(args, "candidate_router_policy_chars", None), defaults.policy_chars),
+        ground_identifier_arguments=not bool(getattr(args, "disable_candidate_router_grounding", False)),
+    )
+
+
+def _positive_int(raw: object, default: int) -> int:
+    try:
+        value = int(raw) if raw is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(1, value)
+
+
+def _agentbench_decision_tools(
+    selected_tools: Sequence[Mapping[str, Any]],
+    *,
+    allow_final_answer: bool,
+) -> list[dict[str, Any]]:
+    tools = [dict(tool) for tool in selected_tools]
+    if not allow_final_answer:
+        return tools
+    names = {_agentbench_tool_name(tool) for tool in tools}
+    if "final_answer" not in names:
+        tools.append(_agentbench_final_answer_tool())
+    return tools
+
+
+def _agentbench_tool_name(tool: Mapping[str, Any]) -> str:
+    function = tool.get("function") if isinstance(tool.get("function"), Mapping) else tool
+    return str(function.get("name") or "")
+
+
+def _should_use_agentbench_candidate_router(
+    *,
+    mode: str,
+    config: ParallelCandidateRouterConfig | None,
+    tools: Sequence[Mapping[str, Any]],
+    messages: Sequence[Mapping[str, Any]],
+    prompt_max_chars: int,
+) -> bool:
+    if config is None or not tools:
+        return False
+    if mode == "parallel":
+        return True
+    if mode != "auto":
+        return False
+    if len(tools) >= max(_AGENTBENCH_CANDIDATE_ROUTER_MIN_TOOLS, int(config.chunk_tools) * 2):
+        return True
+    if tool_catalog_chars(list(tools)) > max(1, int(prompt_max_chars) // 3):
+        return True
+    message_chars = sum(len(str(message.get("content") or "")) for message in messages)
+    return message_chars > int(config.context_chars)
+
+
+def _agentbench_candidate_policy(record: AgentBenchRecord) -> str:
+    task_name = record.task_name.lower()
+    lines = [_AGENTBENCH_CANDIDATE_ROUTER_POLICY]
+    if "db" in task_name:
+        lines.append(
+            "DB task: inspect the schema from the conversation or with SHOW TABLES/DESCRIBE before mutating data. "
+            "Use MySQL syntax. Quote every table or column identifier that contains spaces, punctuation, reserved words, or mixed case with backticks, "
+            "for example SELECT * FROM `Team Information` and UPDATE `Team Information` SET `Capacity` = '45,000'. "
+            "If the controller says a table does not exist because an identifier was split, retry with the full table name in backticks."
+        )
+    if "kg" in task_name:
+        lines.append("KG task: entity ids must come from tool output or user-visible graph context; final answer must be exactly `Final Answer: #id`.")
+    return normalize_rwkv_text(" ".join(lines))
+
+
+def _agentbench_candidate_facts(record: AgentBenchRecord) -> str:
+    payload = {
+        "task_id": record.task_id,
+        "task_name": record.task_name,
+        "index": record.index,
+        "metadata": record.metadata,
+    }
+    return normalize_rwkv_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _repair_agentbench_db_sql_calls(
+    decoded_calls: Sequence[Mapping[str, Any]],
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    table_names = _agentbench_db_table_names(messages)
+    repaired: list[dict[str, Any]] = []
+    for raw_call in decoded_calls:
+        call = dict(raw_call)
+        if str(call.get("name") or "").strip() != "execute_sql":
+            repaired.append(call)
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, Mapping):
+            repaired.append(call)
+            continue
+        args = dict(arguments)
+        query = str(args.get("query") or "")
+        if query:
+            args["query"] = _repair_mysql_identifier_quotes(query, table_names)
+            call["arguments"] = args
+        repaired.append(call)
+    return repaired
+
+
+def _agentbench_db_table_names(messages: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    names: list[str] = []
+    for message in messages:
+        if str(message.get("role") or "").lower() != "tool":
+            continue
+        content = str(message.get("content") or "").strip()
+        if not content.startswith("["):
+            continue
+        try:
+            parsed = ast.literal_eval(content)
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(parsed, (list, tuple)):
+            continue
+        parsed_names: list[str] = []
+        for row in parsed:
+            if isinstance(row, (list, tuple)) and len(row) == 1 and isinstance(row[0], str):
+                parsed_names.append(row[0])
+        if parsed_names and len(parsed_names) == len(parsed):
+            names.extend(parsed_names)
+    return tuple(dict.fromkeys(name for name in names if name.strip()))
+
+
+def _repair_mysql_identifier_quotes(query: str, table_names: Sequence[str]) -> str:
+    repaired = _quote_multiword_table_references(query)
+    for table_name in table_names:
+        if _needs_mysql_identifier_quotes(table_name):
+            repaired = _replace_outside_single_quotes(repaired, table_name, f"`{table_name}`")
+    return repaired
+
+
+def _quote_multiword_table_references(query: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("name").strip()
+        if not _needs_mysql_identifier_quotes(name):
+            return match.group(0)
+        return f"{match.group('keyword')} `{name}`"
+
+    return _MYSQL_MULTIWORD_TABLE_REF.sub(replace, query)
+
+
+def _replace_outside_single_quotes(text: str, needle: str, replacement: str) -> str:
+    if not needle or needle not in text:
+        return text
+    parts = text.split("'")
+    pattern = re.compile(rf"(?<![`A-Za-z0-9_]){re.escape(needle)}(?![`A-Za-z0-9_])")
+    for index in range(0, len(parts), 2):
+        parts[index] = pattern.sub(replacement, parts[index])
+    return "'".join(parts)
+
+
+def _needs_mysql_identifier_quotes(identifier: str) -> bool:
+    parts = [part for part in identifier.strip().split() if part]
+    return len(parts) > 1 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier.strip())
+
+
 def _agentbench_assistant_message(decoded_calls: Sequence[Mapping[str, Any]], round_index: int) -> dict[str, Any]:
     if not decoded_calls:
         raise ValueError("missing tool call")
@@ -555,7 +862,12 @@ def _render_agentbench_output_schema() -> str:
             "arguments": {"type": "object"},
         },
     }
-    return json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
+    example = {"name": "execute_sql", "arguments": {"query": "SELECT 1"}}
+    return (
+        json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=False)
+        + "\nExample:\n"
+        + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 def _agentbench_data_count(path: Path) -> int:
@@ -603,6 +915,10 @@ def _agentbench_long_doc_config(args: argparse.Namespace) -> LongDocEvidenceConf
 
 def _is_agentbench_kg(record: AgentBenchRecord) -> bool:
     return "kg" in record.task_name.lower()
+
+
+def _is_agentbench_db(record: AgentBenchRecord) -> bool:
+    return "db" in record.task_name.lower()
 
 
 __all__ = [

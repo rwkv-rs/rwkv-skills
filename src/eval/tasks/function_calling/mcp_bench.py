@@ -28,7 +28,7 @@ from src.eval.tasks.function_calling.common import (
     prepare_function_calling_run,
 )
 from src.eval.tasks.function_calling.final_answer import final_answer_tool_schema
-from src.eval.tasks.function_calling.parallel_candidate_router import (
+from src.eval.experiments.parallel_candidate_router.router import (
     CandidateToolCall,
     NO_CANDIDATE_TOOL_NAME,
     ParallelCandidateRouterConfig,
@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext
 
 MCP_BENCH_PASS_THRESHOLD = 7.0
+MCP_BENCH_JUDGE_SCORE_SCALE = 10.0
 MCP_BENCH_MAX_TOOL_SCHEMA_CHARS = DEFAULT_TOOL_SCHEMA_MAX_CHARS
 MCP_BENCH_MAX_RESULT_CHARS = 2400
 MCP_BENCH_MAX_ERROR_CHARS = DEFAULT_TOOL_ERROR_MAX_CHARS
@@ -1257,9 +1258,11 @@ def compute_mcp_bench_continuous_metrics(
             metrics[f"mcp_avg_{field}"] = sum(values) / len(values)
     if combined_scores:
         combined = sum(combined_scores) / len(combined_scores)
+        normalized_combined = min(max(combined / MCP_BENCH_JUDGE_SCORE_SCALE, 0.0), 1.0)
         metrics["mcp_avg_llm_judge_combined"] = combined
-        metrics["score"] = combined
-        metrics["avg@1"] = combined
+        metrics["official_score"] = normalized_combined
+        metrics["score"] = normalized_combined
+        metrics["avg@1"] = normalized_combined
     return metrics
 
 

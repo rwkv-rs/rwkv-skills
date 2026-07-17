@@ -32,7 +32,7 @@ from src.eval.tasks.function_calling.tool_router import (
     DEFAULT_TOOL_ROUTER_TRIGGER_TOOL_COUNT,
     TOOL_ROUTER_MODE_CHOICES,
 )
-from src.eval.tasks.function_calling.parallel_candidate_router import ParallelCandidateRouterConfig
+from src.eval.experiments.parallel_candidate_router.router import ParallelCandidateRouterConfig
 from src.eval.tasks.function_calling.agent_loop import _run_agent_loop
 from src.eval.tasks.function_calling.agentbench import _run_agentbench
 from src.eval.tasks.function_calling.api_bank import _run_api_bank
