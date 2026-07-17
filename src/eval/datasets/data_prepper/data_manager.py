@@ -29,13 +29,12 @@ except ModuleNotFoundError:  # pragma: no cover
 from . import common
 from .prepper_registry import (
     CODE_GENERATION_REGISTRY,
-    DatasetPreparer,
     FREE_ANSWER_REGISTRY,
     FUNCTION_CALLING_REGISTRY,
     INSTRUCTION_FOLLOWING_REGISTRY,
     MULTIPLE_CHOICE_REGISTRY,
 )
-from src.eval.datasets.runtime import LegacyPreparerDatasetSpec, ensure_dataset_materialized
+from src.eval.datasets.runtime import ensure_dataset_materialized
 
 _FAMILY_MODULES = (
     "multiple_choice",
@@ -113,25 +112,17 @@ def prepare_dataset(name: str, output_root: Path, split: str = "test") -> list[P
         FUNCTION_CALLING_REGISTRY,
     )
     spec_factory = None
-    preparer: DatasetPreparer | None = None
     for registry in registries:
         spec_factory = registry.get_spec_factory(key)
         if spec_factory is not None:
             break
-        preparer = registry.get(key)
-        if preparer is not None:
-            break
-    if spec_factory is None and preparer is None:
+    if spec_factory is None:
         raise ValueError(f"未知的 benchmark 数据集: {name}")
 
     output_root = output_root.expanduser().resolve()
     start = time.perf_counter()
     try:
-        if spec_factory is not None:
-            spec = spec_factory(output_root, split)
-        else:
-            assert preparer is not None
-            spec = LegacyPreparerDatasetSpec(key, output_root, split, preparer=preparer)
+        spec = spec_factory(output_root, split)
         paths = ensure_dataset_materialized(spec)
     except Exception as exc:
         if perf_logger.enabled:

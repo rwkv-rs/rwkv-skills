@@ -318,6 +318,24 @@ class RemoteInferenceBackend:
         outputs: list[GenerationOutput | None] = [None] * len(prompts)
         inflight_cap = int(max_concurrent) if max_concurrent is not None else int(batch_size)
         max_workers = max(1, min(inflight_cap, int(self.config.max_workers), len(prompts)))
+        if len(prompts) > 1 and self._can_generate_completion_batches(
+            prompt_seeds=prompt_seeds,
+            prompt_stop_suffixes=prompt_stop_suffixes,
+        ):
+            return self._generate_completion_batches(
+                prompts,
+                sampling=effective_sampling,
+                batch_size=batch_size,
+                max_workers=max_workers,
+                progress_desc=progress_desc,
+                probe_only=probe_only,
+                on_complete=on_complete,
+                on_token=on_token,
+                prompt_stop_suffixes=prompt_stop_suffixes,
+                prefill_chunk_size=prefill_chunk_size,
+                openai_sampling_compat=openai_sampling_compat,
+                show_progress=show_progress,
+            )
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -345,6 +363,143 @@ class RemoteInferenceBackend:
         finally:
             _safe_tqdm_close(progress)
         return [output for output in outputs if output is not None]
+
+    def _can_generate_completion_batches(
+        self,
+        *,
+        prompt_seeds: Sequence[int | None] | None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+    ) -> bool:
+        if self.config.protocol != "completions":
+            return False
+        if prompt_seeds is not None and any(seed is not None for seed in prompt_seeds):
+            return False
+        if prompt_stop_suffixes is None:
+            return True
+        normalized = [
+            tuple(str(item) for item in suffixes)
+            for suffixes in prompt_stop_suffixes
+            if suffixes
+        ]
+        return len(set(normalized)) <= 1
+
+    def _generate_completion_batches(
+        self,
+        prompts: Sequence[str],
+        *,
+        sampling: SamplingConfig,
+        batch_size: int,
+        max_workers: int,
+        progress_desc: str,
+        probe_only: bool,
+        on_complete: Callable[[GenerationOutput], None] | None,
+        on_token: Callable[[int, GeneratedTextDelta], None] | None,
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+        prefill_chunk_size: int,
+        openai_sampling_compat: bool,
+        show_progress: bool,
+    ) -> list[GenerationOutput]:
+        chunk_size = max(1, int(batch_size))
+        chunks = [
+            (start, list(prompts[start : start + chunk_size]))
+            for start in range(0, len(prompts), chunk_size)
+        ]
+        batch_workers = max(
+            1,
+            min(
+                int(os.environ.get("RWKV_REMOTE_BATCH_INFLIGHT", "4") or "4"),
+                max_workers,
+                len(chunks),
+            ),
+        )
+        outputs: list[GenerationOutput | None] = [None] * len(prompts)
+        progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=batch_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._generate_completion_batch,
+                        start,
+                        chunk,
+                        sampling,
+                        self._common_completion_batch_stop_suffixes(prompt_stop_suffixes),
+                        prefill_chunk_size,
+                        openai_sampling_compat,
+                    ): start
+                    for start, chunk in chunks
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    batch_outputs = future.result()
+                    for output in batch_outputs:
+                        outputs[output.prompt_index] = output
+                        if on_token is not None and output.text:
+                            on_token(output.prompt_index, GeneratedTextDelta(text=output.text, tokens=list(output.tokens)))
+                        if on_complete is not None and not probe_only:
+                            on_complete(output)
+                    _safe_tqdm_update(progress, len(batch_outputs))
+        finally:
+            _safe_tqdm_close(progress)
+        return [output for output in outputs if output is not None]
+
+    def _generate_completion_batch(
+        self,
+        start_index: int,
+        prompts: Sequence[str],
+        sampling: SamplingConfig,
+        stop_suffixes: Sequence[str] | None,
+        prefill_chunk_size: int,
+        openai_sampling_compat: bool,
+    ) -> list[GenerationOutput]:
+        if not prompts:
+            return []
+        include_private_fields = self.config.protocol == "completions" and not openai_sampling_compat
+        payload = _completion_payload_from_sampling(
+            model=self.model_name,
+            prompt=prompts[0],
+            sampling=sampling,
+            seed=None,
+            stop_suffixes=stop_suffixes,
+            prefill_chunk_size=prefill_chunk_size,
+            include_private_fields=include_private_fields,
+            preserve_zero_penalties=openai_sampling_compat,
+        )
+        payload["prompt"] = list(prompts)
+        response = self._post_json_with_context_retry(self.config.completions_url(), payload)
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != len(prompts):
+            raise RuntimeError("remote infer batch response choices do not match prompt batch")
+        outputs: list[GenerationOutput] = []
+        for fallback_index, choice in enumerate(choices):
+            if not isinstance(choice, dict):
+                raise RuntimeError("remote infer response choice format is invalid")
+            raw_index = choice.get("index", fallback_index)
+            try:
+                choice_index = int(raw_index)
+            except (TypeError, ValueError):
+                choice_index = fallback_index
+            if choice_index < 0 or choice_index >= len(prompts):
+                choice_index = fallback_index
+            outputs.append(
+                GenerationOutput(
+                    prompt_index=start_index + choice_index,
+                    prompt=prompts[choice_index],
+                    token_ids=[],
+                    text=_extract_completion_choice_text(choice),
+                    finish_reason=_normalize_remote_finish_reason(choice.get("finish_reason")),
+                )
+            )
+        return outputs
+
+    @staticmethod
+    def _common_completion_batch_stop_suffixes(
+        prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+    ) -> Sequence[str] | None:
+        if prompt_stop_suffixes is None:
+            return None
+        for suffixes in prompt_stop_suffixes:
+            if suffixes:
+                return list(suffixes)
+        return None
 
     def generate_tool_calls(
         self,

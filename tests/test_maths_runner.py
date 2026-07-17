@@ -18,6 +18,34 @@ def test_maths_runner_parser_accepts_judge_mode() -> None:
     assert args.judge_mode == "llm"
     assert args.max_tokens == 128
     assert args.probe_only is True
+    assert args.run_checker is False
+    assert args.primary_only is False
+
+
+def test_maths_runner_checker_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("RWKV_MATH_RUN_CHECKER", raising=False)
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert maths_runner._should_run_checker(args) is False
+
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl", "--run-checker"])
+    assert maths_runner._should_run_checker(args) is True
+
+    monkeypatch.setenv("RWKV_MATH_RUN_CHECKER", "1")
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert maths_runner._should_run_checker(args) is True
+
+
+def test_maths_runner_primary_only_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("RWKV_MATH_PRIMARY_ONLY", raising=False)
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert maths_runner._should_score_primary_only(args) is False
+
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl", "--primary-only"])
+    assert maths_runner._should_score_primary_only(args) is True
+
+    monkeypatch.setenv("RWKV_MATH_PRIMARY_ONLY", "true")
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert maths_runner._should_score_primary_only(args) is True
 
 
 def test_judge_error_summaries_ignores_clean_groups() -> None:

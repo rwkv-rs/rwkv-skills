@@ -200,66 +200,6 @@ def _call_with_optional_context(
     return callback(split)
 
 
-class LegacyPreparerDatasetSpec(DatasetSpec):
-    def __init__(
-        self,
-        name: str,
-        output_root: str | Path,
-        split: str,
-        *,
-        preparer: Callable[[Path, str], list[Path]],
-    ) -> None:
-        super().__init__(name, output_root, split, source_kind="legacy_prepper")
-        self._preparer = preparer
-        self._prepared_paths: list[Path] = []
-        self._row_count = 0
-
-    def _candidate_paths(self) -> list[Path]:
-        return self._prepared_paths or [self.artifact_path]
-
-    def materialized_paths(self) -> list[Path]:
-        return self._candidate_paths()
-
-    def load(self) -> bool:
-        try:
-            self._row_count = validate_jsonl_file(self.artifact_path, self.required_fields)
-        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-            return True
-        return False
-
-    def check(self) -> bool:
-        try:
-            counts = [validate_jsonl_file(path, self.required_fields) for path in self._candidate_paths()]
-        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
-            return True
-        self._row_count = counts[0] if counts else 0
-        return False
-
-    def download(self) -> None:
-        self._prepared_paths = [path.expanduser().resolve() for path in self._preparer(self.context.artifact_root, self.split)]
-
-    def len(self) -> int:
-        return self._row_count
-
-    def iter_records(self) -> Iterable[dict[str, Any]]:
-        return read_jsonl_items(self.artifact_path)
-
-    def materialize(self) -> list[Path]:
-        paths = self._candidate_paths()
-        manifest = DatasetManifest(
-            dataset=self.name,
-            split=self.split,
-            row_count=self._row_count,
-            source_kind=self.source_kind,
-            artifact_path=str(self.artifact_path),
-            cache_dir=str(self.cache_dir),
-            prepared_at=datetime.now(UTC).isoformat(),
-            extra={"prepared_paths": [str(path) for path in paths]},
-        )
-        self.manifest_path.write_text(json.dumps(asdict(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
-        return paths
-
-
 class MaterializingDatasetSpec(DatasetSpec, ABC):
     def __init__(
         self,
@@ -521,7 +461,6 @@ __all__ = [
     "DatasetSpec",
     "HfParquetJsonlDatasetSpec",
     "HfRepoJsonlDatasetSpec",
-    "LegacyPreparerDatasetSpec",
     "MaterializingDatasetSpec",
     "StaticRowsDatasetSpec",
     "UrlFilesJsonlDatasetSpec",

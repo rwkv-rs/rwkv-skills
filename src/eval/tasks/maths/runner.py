@@ -152,7 +152,34 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help="Max judge completion tokens. Defaults to not passing max_tokens.",
     )
+    parser.add_argument(
+        "--run-checker",
+        action="store_true",
+        help="Run the optional wrong-answer checker before writing scores.",
+    )
+    parser.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="Only score the primary strategy group before writing scores.",
+    )
     return parser.parse_args(argv)
+
+
+def _env_enabled(name: str) -> bool:
+    raw = os.getenv(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_run_checker(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "run_checker", False)):
+        return True
+    return _env_enabled("RWKV_MATH_RUN_CHECKER")
+
+
+def _should_score_primary_only(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "primary_only", False)):
+        return True
+    return _env_enabled("RWKV_MATH_PRIMARY_ONLY")
 
 
 def _apply_generation_sampling_overrides(
@@ -400,6 +427,7 @@ def main(
             completions_payloads,
             dataset_path=str(dataset_path),
             judge=judge,
+            primary_only=_should_score_primary_only(args),
         )
         if judge_mode is JudgeMode.LLM and evaluation.judge_accuracy is None:
             raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
@@ -441,7 +469,8 @@ def main(
             for payload in evaluation.payloads
         }
         runtime.state.eval_count = len(runtime.state.task_results)
-        runtime.run_checker(model_name=model_name)
+        if _should_run_checker(args):
+            runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
             is_cot=True,

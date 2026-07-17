@@ -88,7 +88,6 @@ def test_dataset_registry_supports_spec_factories() -> None:
         return StaticRowsDatasetSpec("demo", output_root, split, rows=[{"id": 1}])
 
     assert registry.names() == ("demo",)
-    assert registry.get("demo") is None
     assert registry.get_spec_factory("demo") is _factory
 
 
@@ -143,7 +142,7 @@ def test_benchmark_family_registries_are_now_spec_only(tmp_path: Path) -> None:
         FUNCTION_CALLING_REGISTRY,
     )
 
-    assert all(not getattr(registry, "_preparers") for registry in registries)
+    assert all(not hasattr(registry, "_preparers") for registry in registries)
     assert all(
         registry.get_spec_factory(name)(tmp_path, "test").source_kind != "legacy_prepper"
         for registry in registries

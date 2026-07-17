@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from src.eval.metrics import free_response as fr
 from src.eval.metrics.free_response import (
@@ -32,6 +33,26 @@ def _patch_math_verify(monkeypatch) -> None:
         return gold[-1][-1] == pred[-1][-1]
 
     monkeypatch.setattr(fr, "_load_math_verify", lambda: (parse, verify))
+
+
+def test_math_verify_timeout_marks_completion_wrong(monkeypatch) -> None:
+    def parse(text: str):
+        if text.startswith("$\\boxed{"):
+            return [("gold", "7")]
+        return [("pred", "8")]
+
+    def verify(_gold, _pred, *, strict: bool = False):
+        _ = strict
+        time.sleep(1.0)
+        return True
+
+    monkeypatch.setattr(fr, "_load_math_verify", lambda: (parse, verify))
+    monkeypatch.setenv("RWKV_MATH_VERIFY_TIMEOUT_S", "0.1")
+
+    result = fr._math_verify("7", "Final answer: \\boxed{8}")
+
+    assert not result.passed
+    assert result.fail_reason == "math_verify_timeout"
 
 
 def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch, tmp_path) -> None:

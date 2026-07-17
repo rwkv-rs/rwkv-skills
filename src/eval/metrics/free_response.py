@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import re
+import os
+import signal
 import time
 import unicodedata
+import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -39,6 +43,11 @@ _TRAILING_JUDGEMENT_LABEL_RE = re.compile(
     r"(?:\bjudg(?:e)?ment\s*:\s*)?\b(yes|no)\b\s*[.!。]?\s*$",
     re.IGNORECASE,
 )
+_FINAL_INTEGER_RE = re.compile(
+    r"(?:final\s+answer|answer\s+is|the\s+answer|therefore)[^\n\r]{0,240}?([+-]?\d[\d,]*)",
+    re.IGNORECASE,
+)
+_SIMPLE_INTEGER_RE = re.compile(r"^[+-]?\d+(?:\.0+)?$")
 _PREFERRED_ANSWER_KEYS = (
     "expected_judgement",
     "expected_answer",
@@ -56,6 +65,7 @@ _ANSWER_WINDOW_MARKERS = (
 _ANSWER_WINDOW_PREFIX_CHARS = 400
 _ANSWER_WINDOW_SUFFIX_CHARS = 1800
 _ANSWER_WINDOW_TAIL_CHARS = 2500
+_DEFAULT_MATH_VERIFY_TIMEOUT_S = 2.0
 
 DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE = (
     "You are a rigorous AI judge. Your task is to evaluate whether a student's "
@@ -323,6 +333,46 @@ def _load_math_verify() -> tuple[Callable[..., Any], Callable[..., Any]] | None:
     return parse, verify
 
 
+class _MathVerifyTimeout(TimeoutError):
+    pass
+
+
+def _math_verify_timeout_s() -> float:
+    raw = os.getenv("RWKV_MATH_VERIFY_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        return _DEFAULT_MATH_VERIFY_TIMEOUT_S
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_MATH_VERIFY_TIMEOUT_S
+
+
+def _env_flag(name: str) -> bool:
+    raw = os.getenv(name)
+    return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _math_verify_time_limit() -> Any:
+    timeout_s = _math_verify_timeout_s()
+    if timeout_s <= 0 or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+
+    def _raise_timeout(_signum: int, _frame: Any) -> None:
+        raise _MathVerifyTimeout(f"math_verify timed out after {timeout_s:g}s")
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_s)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _reference_expr(reference: str) -> str:
     if "\\boxed" in reference:
         return reference
@@ -363,6 +413,65 @@ def _math_verify_input(scoring_text: str) -> str:
     return text[-_ANSWER_WINDOW_TAIL_CHARS:]
 
 
+def _last_boxed_content(text: str) -> str | None:
+    boxed_start = text.rfind("\\boxed{")
+    if boxed_start < 0:
+        return None
+    start = boxed_start + len("\\boxed{")
+    depth = 1
+    for offset, char in enumerate(text[start:]):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : start + offset]
+    return None
+
+
+def _canonical_simple_integer(value: str) -> str | None:
+    text = _normalize_text(value)
+    if not text:
+        return None
+    text = text.strip().strip("$").strip()
+    if text.startswith("\\(") and text.endswith("\\)"):
+        text = text[2:-2].strip()
+    if text.startswith("\\[") and text.endswith("\\]"):
+        text = text[2:-2].strip()
+    text = text.strip("{}[]() ").rstrip(".。").replace(",", "")
+    if not _SIMPLE_INTEGER_RE.fullmatch(text):
+        return None
+    try:
+        return str(int(float(text))) if "." in text else str(int(text))
+    except ValueError:
+        return None
+
+
+def _fast_integer_match(reference: str, scoring_text: str) -> tuple[bool, str] | None:
+    if not _env_flag("RWKV_MATH_FAST_INTEGER_MATCH"):
+        return None
+    ref_int = _canonical_simple_integer(reference)
+    if ref_int is None:
+        return None
+
+    verify_text = _math_verify_input(scoring_text)
+    candidates: list[str] = []
+    boxed = _last_boxed_content(verify_text)
+    if boxed is not None:
+        candidates.append(boxed)
+    candidates.extend(match.group(1) for match in _FINAL_INTEGER_RE.finditer(verify_text))
+    for line in reversed(verify_text.splitlines()[-3:]):
+        candidates.append(line)
+    candidates.append(verify_text)
+
+    for candidate in candidates:
+        candidate_int = _canonical_simple_integer(candidate)
+        if candidate_int is None:
+            continue
+        return candidate_int == ref_int, candidate_int
+    return None
+
+
 def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
     api = _load_math_verify()
     display_answer = _short_text(scoring_text)
@@ -372,6 +481,14 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
             answer=display_answer,
             fail_reason="",
         )
+    fast_integer = _fast_integer_match(reference, scoring_text)
+    if fast_integer is not None:
+        passed, answer = fast_integer
+        return _MathVerifyResult(
+            passed=passed,
+            answer=answer,
+            fail_reason="" if passed else "integer_mismatch",
+        )
     if api is None:
         return _MathVerifyResult(
             passed=False,
@@ -380,7 +497,14 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
         )
     parse, verify = api
     try:
-        gold = parse(_reference_expr(reference))
+        with _math_verify_time_limit():
+            gold = parse(_reference_expr(reference))
+    except _MathVerifyTimeout:
+        return _MathVerifyResult(
+            passed=False,
+            answer=display_answer,
+            fail_reason="reference_parse_timeout",
+        )
     except Exception as exc:  # noqa: BLE001
         return _MathVerifyResult(
             passed=False,
@@ -389,7 +513,14 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
         )
     verify_text = _math_verify_input(scoring_text)
     try:
-        pred = parse(verify_text)
+        with _math_verify_time_limit():
+            pred = parse(verify_text)
+    except _MathVerifyTimeout:
+        return _MathVerifyResult(
+            passed=False,
+            answer=display_answer,
+            fail_reason="prediction_parse_timeout",
+        )
     except Exception as exc:  # noqa: BLE001
         return _MathVerifyResult(
             passed=False,
@@ -399,7 +530,14 @@ def _math_verify(reference: str, scoring_text: str) -> _MathVerifyResult:
     if pred:
         display_answer = _short_text(_parsed_answer_text(pred))
     try:
-        passed = bool(pred and verify(gold, pred, strict=False))
+        with _math_verify_time_limit():
+            passed = bool(pred and verify(gold, pred, strict=False))
+    except _MathVerifyTimeout:
+        return _MathVerifyResult(
+            passed=False,
+            answer=display_answer,
+            fail_reason="math_verify_timeout",
+        )
     except Exception as exc:  # noqa: BLE001
         return _MathVerifyResult(
             passed=False,
@@ -629,6 +767,7 @@ def evaluate_free_response(
     *,
     dataset_path: str | Path,
     judge: LLMJudge | None = None,
+    primary_only: bool = False,
 ) -> FreeResponseEvaluation:
     """Evaluate full-generation free-response completions."""
 
@@ -640,8 +779,9 @@ def evaluate_free_response(
     if not judgement_label_dataset and _load_math_verify() is None:
         raise RuntimeError("free-response evaluation requires math-verify; run `uv sync` after updating uv.lock.")
 
-    grouped: dict[str, list[_ScoredCompletion]] = {group: [] for group in STRATEGY_GROUPS}
     primary_group = STRATEGY_C if judgement_label_dataset else STRATEGY_A
+    groups_to_score = (primary_group,) if primary_only else STRATEGY_GROUPS
+    grouped: dict[str, list[_ScoredCompletion]] = {group: [] for group in groups_to_score}
 
     def apply_judge(group: str) -> None:
         if judge is None:
@@ -717,9 +857,10 @@ def evaluate_free_response(
             reference = resolve_reference_answer(record)
 
         record_contexts.append((payload, sample_index, repeat_index, question, reference))
-        grouped[STRATEGY_A].append(
+        group = primary_group if primary_only else STRATEGY_A
+        grouped[group].append(
             score_group(
-                STRATEGY_A,
+                group,
                 payload,
                 sample_index=sample_index,
                 repeat_index=repeat_index,
@@ -728,32 +869,33 @@ def evaluate_free_response(
             )
         )
 
-    apply_judge(STRATEGY_A)
+    apply_judge(primary_group if primary_only else STRATEGY_A)
 
-    for group in (STRATEGY_B, STRATEGY_C):
-        for idx, (payload, sample_index, repeat_index, question, reference) in enumerate(record_contexts):
-            a_record = grouped[STRATEGY_A][idx]
-            if a_record.final_passed:
-                grouped[group].append(inherit_from_a(a_record))
-                continue
-            grouped[group].append(
-                score_group(
-                    group,
-                    payload,
-                    sample_index=sample_index,
-                    repeat_index=repeat_index,
-                    question=question,
-                    reference=reference,
+    if not primary_only:
+        for group in (STRATEGY_B, STRATEGY_C):
+            for idx, (payload, sample_index, repeat_index, question, reference) in enumerate(record_contexts):
+                a_record = grouped[STRATEGY_A][idx]
+                if a_record.final_passed:
+                    grouped[group].append(inherit_from_a(a_record))
+                    continue
+                grouped[group].append(
+                    score_group(
+                        group,
+                        payload,
+                        sample_index=sample_index,
+                        repeat_index=repeat_index,
+                        question=question,
+                        reference=reference,
+                    )
                 )
-            )
-        apply_judge(group)
+            apply_judge(group)
 
     rows_by_group: dict[str, list[tuple[int, int, bool]]] = {}
     metrics_by_group: dict[str, dict[str, float]] = {}
     eval_payloads: list[dict] = []
     eval_payloads_by_group: dict[str, list[dict]] = {}
     samples = len(completion_payloads)
-    for group in STRATEGY_GROUPS:
+    for group in groups_to_score:
         records = grouped[group]
         group_payloads: list[dict] = []
         rows = [

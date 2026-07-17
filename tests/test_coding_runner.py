@@ -21,6 +21,26 @@ def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:
     assert args.benchmark_kind == "mbpp"
     assert args.cot_mode == "no_cot"
     assert args.probe_only is True
+    assert args.run_checker is False
+
+
+def test_coding_runner_checker_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("RWKV_CODING_RUN_CHECKER", raising=False)
+    monkeypatch.delenv("RWKV_SKILLS_DISABLE_CHECKER", raising=False)
+    monkeypatch.delenv("DISABLE_CHECKER", raising=False)
+
+    args = coding_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert coding_runner._should_run_checker(args) is False
+
+    args = coding_runner.parse_args(["--dataset", "dataset.jsonl", "--run-checker"])
+    assert coding_runner._should_run_checker(args) is True
+
+    args = coding_runner.parse_args(["--dataset", "dataset.jsonl"])
+    monkeypatch.setenv("RWKV_CODING_RUN_CHECKER", "1")
+    assert coding_runner._should_run_checker(args) is True
+
+    monkeypatch.setenv("RWKV_SKILLS_DISABLE_CHECKER", "1")
+    assert coding_runner._should_run_checker(args) is False
 
 
 def test_coding_runner_rejects_non_legacy_mbpp_cot_modes() -> None:

@@ -121,7 +121,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         help="pass@k values to report (default: none; can be set in configs/<benchmark>.toml)",
     )
+    parser.add_argument(
+        "--run-checker",
+        action="store_true",
+        help="Run the optional wrong-answer checker before writing scores.",
+    )
     return parser.parse_args(argv)
+
+
+def _env_enabled(name: str) -> bool:
+    raw = os.getenv(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_run_checker(args: argparse.Namespace) -> bool:
+    if _env_enabled("RWKV_SKILLS_DISABLE_CHECKER") or _env_enabled("DISABLE_CHECKER"):
+        return False
+    if bool(getattr(args, "run_checker", False)):
+        return True
+    return _env_enabled("RWKV_CODING_RUN_CHECKER")
 
 
 def _apply_sampling_overrides(sampling, args: argparse.Namespace):
@@ -594,7 +612,7 @@ def main(
             task_details["avg_curve"] = avg_metrics_all
 
         runtime.ingest_eval_payloads(eval_payloads)
-        if eval_payloads:
+        if eval_payloads and _should_run_checker(args):
             runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
