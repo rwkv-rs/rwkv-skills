@@ -19,6 +19,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 MATH_BENCHMARKS = (
+    "aa_lcr",
     "aime24",
     "aime25",
     "algebra222",
@@ -72,6 +73,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--judge-base-url", help="Override judge base URL.")
     parser.add_argument("--judge-max-workers", type=int, help="Override judge worker count.")
     parser.add_argument("--judge-max-tokens", type=int, help="Override judge max completion tokens.")
+    parser.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="Only recompute the primary score group; keep existing strategy child tasks intact.",
+    )
     return parser.parse_args(argv)
 
 
@@ -93,7 +99,7 @@ def connect_from_env():
 def load_candidates(opts: argparse.Namespace) -> list[Candidate]:
     where = [
         "b.benchmark_name = ANY(%s)",
-        "(m.model_name LIKE 'rwkv7-g1f-%%' OR m.model_name LIKE 'rwkv7-g1g-%%')",
+        "(m.model_name LIKE 'rwkv7-g1f-%%' OR m.model_name LIKE 'rwkv7-g1g-%%' OR m.model_name LIKE 'rwkv7-g1h-%%')",
         "t.evaluator = ANY(%s)",
     ]
     params: list[Any] = [list(MATH_BENCHMARKS), list(PRIMARY_EVALUATORS)]
@@ -142,7 +148,7 @@ def load_candidates(opts: argparse.Namespace) -> list[Candidate]:
 
 def current_plan_for(candidate: Candidate):
     from src.eval.field_common import resolve_configured_k_plan
-    from src.eval.maths.common import count_free_answer_records
+    from src.eval.tasks.maths.common import count_free_answer_records
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
     from src.eval.scheduler.dataset_utils import make_dataset_slug
 
@@ -260,7 +266,7 @@ def build_judge(candidate: Candidate, opts: argparse.Namespace, slug: str):
     if candidate.evaluator != "free_response_judge":
         return None
     from src.eval.benchmark_config import resolve_benchmark_model_config
-    from src.eval.maths.common import build_llm_judge
+    from src.eval.tasks.maths.common import build_llm_judge
 
     judge = build_llm_judge(
         judge_model=opts.judge_model,
@@ -309,11 +315,16 @@ def restore_one(candidate: Candidate, opts: argparse.Namespace, *, execute: bool
         )
 
     child_task_ids = find_strategy_children(candidate.task_id)
-    if child_task_ids:
+    if child_task_ids and not opts.primary_only:
         delete_dependent_rows(child_task_ids)
     delete_primary_eval_rows(candidate.task_id)
     judge = build_judge(candidate, opts, slug)
-    evaluation = evaluate_free_response(filtered, dataset_path=dataset_path, judge=judge)
+    evaluation = evaluate_free_response(
+        filtered,
+        dataset_path=dataset_path,
+        judge=judge,
+        primary_only=bool(opts.primary_only),
+    )
     strategy_task_ids = service.ingest_eval_payload_groups(
         task_id=str(candidate.task_id),
         completion_payloads=filtered,
