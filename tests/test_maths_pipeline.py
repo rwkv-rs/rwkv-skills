@@ -5,6 +5,7 @@ import json
 from src.eval.tasks.maths.pipeline import (
     FREE_RESPONSE_STOP_TOKENS,
     G1H_GENERATION_STOP_SUFFIXES,
+    G1H_REMOTE_STOP_SUFFIXES,
     LEGACY_GENERATION_STOP_SUFFIXES,
     FreeResponsePipeline,
 )
@@ -85,7 +86,7 @@ def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -
     ]
 
 
-def test_free_response_pipeline_uses_g1h_sentinel_stops_only_for_g1h_prompt(tmp_path) -> None:
+def test_free_response_pipeline_uses_g1h_remote_stops_only_for_g1h_prompt(tmp_path) -> None:
     dataset = tmp_path / "math.jsonl"
     dataset.write_text('{"question":"2+5?","answer":"7"}\n', encoding="utf-8")
     backend = _FakeBackend()
@@ -101,7 +102,9 @@ def test_free_response_pipeline_uses_g1h_sentinel_stops_only_for_g1h_prompt(tmp_
         samples_per_task=1,
     )
 
-    assert backend.calls[0]["prompt_stop_suffixes"] == [G1H_GENERATION_STOP_SUFFIXES]
+    assert backend.calls[0]["prompt_stop_suffixes"] == [G1H_REMOTE_STOP_SUFFIXES]
+    assert "✿" in G1H_GENERATION_STOP_SUFFIXES
+    assert "✿" not in G1H_REMOTE_STOP_SUFFIXES
     assert result.payloads[0]["prompt1"] == "User✿2+5?✿\nBot✿<think></think>"
     assert result.payloads[0]["completion1"] == "</think>\nTherefore, the final answer is \\(\\boxed{7}\\)."
 

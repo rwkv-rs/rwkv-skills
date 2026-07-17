@@ -33,6 +33,9 @@ G1H_GENERATION_STOP_SUFFIXES = (
     "Assistant:",
     "✿",
 )
+G1H_REMOTE_STOP_SUFFIXES = tuple(
+    suffix for suffix in G1H_GENERATION_STOP_SUFFIXES if suffix != "✿"
+)
 FREE_RESPONSE_STOP_TOKENS = (0,)
 
 DEFAULT_COT_PROMPT = """User: <Q>
@@ -78,8 +81,14 @@ def _generation_stop_suffixes_for_prompt(prompt: str) -> tuple[str, ...]:
     return LEGACY_GENERATION_STOP_SUFFIXES
 
 
+def _remote_stop_suffixes_for_prompt(prompt: str) -> tuple[str, ...]:
+    if "User✿" in prompt or "Bot✿" in prompt:
+        return G1H_REMOTE_STOP_SUFFIXES
+    return LEGACY_GENERATION_STOP_SUFFIXES
+
+
 def _prompt_stop_suffixes(prompts: Sequence[str]) -> list[tuple[str, ...]]:
-    return [_generation_stop_suffixes_for_prompt(prompt) for prompt in prompts]
+    return [_remote_stop_suffixes_for_prompt(prompt) for prompt in prompts]
 
 
 def _clip_user_sentinel(text: str, *, prompt: str = "") -> str:
