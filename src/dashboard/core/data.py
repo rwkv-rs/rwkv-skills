@@ -45,8 +45,8 @@ DATA_VERSIONS = (
     "g1g",
     "g1h",
 )
-# G1h is already parseable in stored scores, but it is intentionally held out
-# of the default dashboard columns until the rollout is complete enough to swap.
+# G1h is part of the default dashboard lineage; delta views compare it against
+# the previous available data generation for the same parameter size.
 AUTO_DISPLAY_DATA_VERSIONS = (
     "g0",
     "g0a",
@@ -66,6 +66,7 @@ AUTO_DISPLAY_DATA_VERSIONS = (
     "g1e",
     "g1f",
     "g1g",
+    "g1h",
 )
 NUM_PARAMS = ("0_1b", "0_4b", "1_5b", "2_9b", "7_2b", "13_3b")
 DB_PLACEHOLDER_PATH = Path("<db>")

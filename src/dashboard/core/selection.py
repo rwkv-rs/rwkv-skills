@@ -303,6 +303,29 @@ def _build_model_entries_cache(entries: list[ScoreEntry]) -> dict[str, list[Scor
     return cache
 
 
+def _previous_generation_model(items: Sequence[dict[str, Any]], target_model: str) -> str | None:
+    target_index: int | None = None
+    target: dict[str, Any] | None = None
+    for idx, snap in enumerate(items):
+        if snap.get("model") == target_model:
+            target_index = idx
+            target = snap
+            break
+    if target_index is None or target is None:
+        return None
+
+    target_data_rank = target.get("data_rank")
+    target_data = target.get("data")
+    for snap in reversed(items[:target_index]):
+        if target_data_rank is not None:
+            if snap.get("data_rank") == target_data_rank:
+                continue
+        elif target_data and snap.get("data") == target_data:
+            continue
+        return str(snap["model"])
+    return None
+
+
 def _resolve_param_lineages(entries: list[ScoreEntry], selection: SelectionState) -> list[ParamLineage]:
     snapshots = [snap for snap in _model_snapshots(entries).values() if snap.get("has_signature")]
     if not snapshots:
@@ -332,13 +355,7 @@ def _resolve_param_lineages(entries: list[ScoreEntry], selection: SelectionState
         sig = parse_model_signature(target_model)
         if sig.arch and sig.params:
             items = by_arch_param.get((sig.arch, sig.params), [])
-            prev_model: str | None = None
-            for idx, snap in enumerate(items):
-                if snap.get("model") != target_model:
-                    continue
-                if idx > 0:
-                    prev_model = str(items[idx - 1]["model"])
-                break
+            prev_model = _previous_generation_model(items, target_model)
             lineages.append(
                 ParamLineage(
                     param=sig.params,
@@ -391,13 +408,7 @@ def _resolve_param_lineages(entries: list[ScoreEntry], selection: SelectionState
         latest_model = str(latest["model"])
         arch = str(latest["arch"])
         chain = by_arch_param.get((arch, param), [])
-        prev_model = None
-        for idx, snap in enumerate(chain):
-            if snap.get("model") != latest_model:
-                continue
-            if idx > 0:
-                prev_model = str(chain[idx - 1]["model"])
-            break
+        prev_model = _previous_generation_model(chain, latest_model)
         lineages.append(
             ParamLineage(
                 param=param,

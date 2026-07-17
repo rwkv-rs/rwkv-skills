@@ -189,7 +189,7 @@ def test_detail_rows_keep_zero_scores_visible() -> None:
     assert knowledge["rows"][0]["cells"][0]["percent"] == 0.0
 
 
-def test_auto_latest_holds_at_g1g_until_g1h_rollout_enabled() -> None:
+def test_auto_latest_advances_to_g1h_when_available() -> None:
     entries = [
         _entry(
             task_id=701,
@@ -211,7 +211,55 @@ def test_auto_latest_holds_at_g1g_until_g1h_rollout_enabled() -> None:
 
     selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
 
-    assert selection.model_sequence == ["rwkv7-g1g-1.5b-20260527-ctx8192"]
+    assert selection.model_sequence == ["rwkv7-g1h-1.5b-20260710-ctx10240"]
+
+
+def test_auto_delta_skips_same_generation_preview_for_previous_column() -> None:
+    g1g = "rwkv7-g1g-2.9b-20260526-ctx8192"
+    g1h_preview = "rwkv7-g1h-preview4673-2.9b-20260701-ctx8192"
+    g1h = "rwkv7-g1h-2.9b-20260710-ctx10240"
+    entries = [
+        _entry(
+            task_id=711,
+            dataset="mmlu_pro",
+            model=g1g,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 5, 26),
+            prompt_profile=None,
+            accuracy=0.4,
+        ),
+        _entry(
+            task_id=712,
+            dataset="mmlu_pro",
+            model=g1h_preview,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 7, 1),
+            prompt_profile=None,
+            accuracy=0.5,
+        ),
+        _entry(
+            task_id=713,
+            dataset="mmlu_pro",
+            model=g1h,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+            accuracy=0.6,
+        ),
+    ]
+
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+    payload = serialize_leaderboard(
+        selection,
+        all_entries=entries,
+        view_mode="benchmark_detail_delta",
+    )
+
+    assert payload["param_columns"][0]["latest_model"] == g1h
+    assert payload["param_columns"][0]["prev_model"] == g1g
+    knowledge = next(domain for domain in payload["domains"] if domain["key"] == "knowledge")
+    assert knowledge["rows"][0]["cells"][0]["prev"] == 40.0
+    assert knowledge["rows"][0]["cells"][0]["latest"] == 60.0
 
 
 def test_function_call_alias_rows_are_compacted() -> None:
