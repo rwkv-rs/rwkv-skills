@@ -34,3 +34,25 @@ def test_sanitize_json_text_converts_non_json_objects_recursively() -> None:
     assert sanitized["details"]["dataclass"]["path"] == "/tmp/a"
     assert sanitized["details"]["dataclass"]["marker"] == "/tmp/bfcl-support"
     json.dumps(sanitized)
+
+
+def test_completion_context_preserves_browsecomp_plus_run_docids() -> None:
+    docids = [str(index) for index in range(80)]
+    payload = {
+        "prompt1": "prompt",
+        "completion1": "completion",
+        "stop_reason1": "stop",
+        "sampling_config": {},
+        "browsecomp_plus_run": {
+            "query_id": "q1",
+            "status": "completed",
+            "retrieved_docids": docids,
+            "tool_call_counts": {"search": 12},
+            "result": [{"type": "output_text", "output": "answer"}],
+        },
+    }
+
+    context = EvalDbService._build_completion_context(payload)
+
+    assert context["browsecomp_plus_run"]["retrieved_docids"] == docids
+    assert context["browsecomp_plus_run"]["result"] == [{"type": "output_text", "output": "answer"}]

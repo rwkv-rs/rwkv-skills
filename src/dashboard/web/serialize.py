@@ -7,6 +7,7 @@ HTML/Plotly figures so a React frontend can render them.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable
 
 from ..core.constants import (
@@ -47,6 +48,20 @@ _FUNCTION_CALL_ALIAS_BASES = {
     "apibank_l1": "apibank_level1",
     "apibank_l2": "apibank_level2",
 }
+_FUNCTION_CALL_SUPPRESSED_ROW_BASES = frozenset(
+    {
+        # Keep the DB scores, but hide the currently contaminated DeepSWE runs.
+        "deepswe",
+    }
+)
+_FUNCTION_CALL_COT_ROW_BASES = frozenset(
+    {
+        "deepsearchqa",
+        "nl2repo",
+        "terminal_bench_2_1",
+        "widesearch",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,16 +125,37 @@ def _function_call_canonical_key(row: dict[str, Any]) -> tuple[str, str | None, 
     return (f"{canonical_base}{suffix}", row.get("eval_method"), row.get("k_metric"))
 
 
-def _is_function_call_no_cot_row(row: dict[str, Any]) -> bool:
+def _is_function_call_visible_row(row: dict[str, Any]) -> bool:
     benchmark_name = str(row.get("benchmark_name") or "")
-    _, suffix = _split_method_suffix(benchmark_name)
-    return suffix == "_nocot"
+    base, suffix = _split_method_suffix(benchmark_name)
+    if base in _FUNCTION_CALL_SUPPRESSED_ROW_BASES:
+        return False
+    return suffix == "_nocot" or (suffix == "_cot" and base in _FUNCTION_CALL_COT_ROW_BASES)
+
+
+def _function_call_score_values(row: dict[str, Any]) -> list[float]:
+    values: list[float] = []
+    for cell in row.get("cells") or ():
+        if not isinstance(cell, dict):
+            continue
+        for key in ("percent", "prev", "latest"):
+            value = cell.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                values.append(float(value))
+    return values
+
+
+def _is_all_zero_function_call_row(row: dict[str, Any]) -> bool:
+    values = _function_call_score_values(row)
+    return bool(values) and all(abs(value) < 1e-12 for value in values)
 
 
 def _compact_function_call_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only no_cot FC rows, then hide aliases and duplicate metric rows."""
+    """Keep compact FC rows, then hide aliases, duplicate metrics, and all-zero rows."""
 
-    rows = [row for row in rows if _is_function_call_no_cot_row(row)]
+    rows = [row for row in rows if _is_function_call_visible_row(row)]
     canonical_keys = {_function_call_canonical_key(row) for row in rows}
     alias_compacted: list[dict[str, Any]] = []
     for row in rows:
@@ -143,7 +179,7 @@ def _compact_function_call_rows(rows: list[dict[str, Any]]) -> list[dict[str, An
             continue
         if _function_call_metric_rank(row) < _function_call_metric_rank(compacted[existing_index]):
             compacted[existing_index] = row
-    return compacted
+    return [row for row in compacted if not _is_all_zero_function_call_row(row)]
 
 
 def _function_call_metric_rank(row: dict[str, Any]) -> tuple[int, str]:

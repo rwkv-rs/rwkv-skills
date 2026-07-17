@@ -296,7 +296,7 @@ def test_function_call_alias_rows_are_compacted() -> None:
     assert [row["benchmark_name"] for row in function_call["rows"]] == ["apibank_level1_nocot"]
 
 
-def test_function_call_rows_keep_nocot_only() -> None:
+def test_function_call_rows_keep_nocot_and_selected_cot_only() -> None:
     model = "rwkv7-g1g-1.5b-20260527-ctx8192"
     entries = [
         _entry(
@@ -329,6 +329,56 @@ def test_function_call_rows_keep_nocot_only() -> None:
             cot_mode="fake_cot",
             domain=DOMAIN_FUNCTION_CALL,
         ),
+        _entry(
+            task_id=814,
+            dataset="deepsearchqa_test",
+            model=model,
+            task="function_call_cot",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=815,
+            dataset="deepswe_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="no_cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=816,
+            dataset="deepswe_test",
+            model=model,
+            task="function_call_cot",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=817,
+            dataset="longcodeqa_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="no_cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=818,
+            dataset="tau_bench_airline_test",
+            model=model,
+            task="function_call_plain",
+            created_at=datetime(2026, 5, 27),
+            prompt_profile=None,
+            cot_mode="no_cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
     ]
     selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
 
@@ -339,21 +389,158 @@ def test_function_call_rows_keep_nocot_only() -> None:
     )
 
     function_call = next(domain for domain in payload["domains"] if domain["key"] == "function_call")
-    assert [row["benchmark_name"] for row in function_call["rows"]] == ["bfcl_simple_python_nocot"]
+    assert [row["benchmark_name"] for row in function_call["rows"]] == [
+        "bfcl_simple_python_nocot",
+        "deepsearchqa_cot",
+        "longcodeqa_nocot",
+        "tau_bench_airline_nocot",
+    ]
 
 
 def test_function_call_duplicate_metric_rows_prefer_avg1() -> None:
     rows = [
-        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@0.394945"},
-        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@1"},
-        {"benchmark_name": "deepsearchqa_cot", "eval_method": "exact_match", "k_metric": "accuracy"},
+        {
+            "benchmark_name": "browsecomp_nocot",
+            "eval_method": "exact_match",
+            "k_metric": "avg@0.394945",
+            "cells": [{"percent": 1.0}],
+        },
+        {
+            "benchmark_name": "browsecomp_nocot",
+            "eval_method": "exact_match",
+            "k_metric": "avg@1",
+            "cells": [{"percent": 2.0}],
+        },
+        {
+            "benchmark_name": "deepsearchqa_cot",
+            "eval_method": "exact_match",
+            "k_metric": "accuracy",
+            "cells": [{"percent": 3.0}],
+        },
     ]
 
     compacted = _compact_function_call_rows(rows)
 
     assert compacted == [
-        {"benchmark_name": "browsecomp_nocot", "eval_method": "exact_match", "k_metric": "avg@1"},
+        {
+            "benchmark_name": "browsecomp_nocot",
+            "eval_method": "exact_match",
+            "k_metric": "avg@1",
+            "cells": [{"percent": 2.0}],
+        },
+        {
+            "benchmark_name": "deepsearchqa_cot",
+            "eval_method": "exact_match",
+            "k_metric": "accuracy",
+            "cells": [{"percent": 3.0}],
+        },
     ]
+
+
+def test_function_call_all_zero_rows_are_hidden() -> None:
+    rows = [
+        {
+            "benchmark_name": "browsecomp_nocot",
+            "eval_method": "exact_match",
+            "k_metric": "avg@1",
+            "cells": [{"percent": 0.0}, {"percent": None}],
+        },
+        {
+            "benchmark_name": "deepsearchqa_cot",
+            "eval_method": "exact_match",
+            "k_metric": "accuracy",
+            "cells": [{"prev": 0.0, "latest": 4.0}],
+        },
+    ]
+
+    compacted = _compact_function_call_rows(rows)
+
+    assert [row["benchmark_name"] for row in compacted] == ["deepsearchqa_cot"]
+
+
+def test_function_call_auto_lineage_follows_global_g1h_vs_g1g() -> None:
+    g1f = "rwkv7-g1f-1.5b-20260419-ctx8192"
+    g1g = "rwkv7-g1g-1.5b-20260526-ctx8192"
+    g1h = "rwkv7-g1h-1.5b-20260710-ctx10240"
+    entries = [
+        _entry(
+            task_id=821,
+            dataset="mmlu_test",
+            model=g1f,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 4, 19),
+            prompt_profile=None,
+            accuracy=0.4,
+        ),
+        _entry(
+            task_id=822,
+            dataset="mmlu_test",
+            model=g1g,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 5, 26),
+            prompt_profile=None,
+            accuracy=0.5,
+        ),
+        _entry(
+            task_id=823,
+            dataset="mmlu_test",
+            model=g1h,
+            task="multi_choice_plain",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+            accuracy=0.6,
+        ),
+        _entry(
+            task_id=824,
+            dataset="deepsearchqa_test",
+            model=g1f,
+            task="function_call_cot",
+            created_at=datetime(2026, 4, 19),
+            prompt_profile=None,
+            accuracy=0.1,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=825,
+            dataset="deepsearchqa_test",
+            model=g1g,
+            task="function_call_cot",
+            created_at=datetime(2026, 5, 26),
+            prompt_profile=None,
+            accuracy=0.2,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+        _entry(
+            task_id=826,
+            dataset="deepsearchqa_test",
+            model=g1h,
+            task="function_call_cot",
+            created_at=datetime(2026, 7, 10),
+            prompt_profile=None,
+            accuracy=0.3,
+            cot_mode="cot",
+            domain=DOMAIN_FUNCTION_CALL,
+        ),
+    ]
+    selection = _prepare_selection(entries, AUTO_MODEL_LABEL)
+
+    payload = serialize_leaderboard(
+        selection,
+        all_entries=entries,
+        view_mode="benchmark_detail_delta",
+    )
+
+    knowledge = next(domain for domain in payload["domains"] if domain["key"] == "knowledge")
+    function_call = next(domain for domain in payload["domains"] if domain["key"] == "function_call")
+    assert knowledge["param_columns"][0]["latest_model"] == g1h
+    assert knowledge["param_columns"][0]["prev_model"] == g1g
+    assert function_call["param_columns"][0]["latest_model"] == g1h
+    assert function_call["param_columns"][0]["prev_model"] == g1g
+    assert [row["benchmark_name"] for row in function_call["rows"]] == ["deepsearchqa_cot"]
+    assert function_call["rows"][0]["cells"][0]["prev"] == 20.0
+    assert function_call["rows"][0]["cells"][0]["latest"] == 30.0
 
 
 def test_normal_and_naive_cells_do_not_overwrite_click_metadata() -> None:

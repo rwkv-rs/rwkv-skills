@@ -198,33 +198,6 @@ def _model_data_param_label(model: str, *, include_params: bool = True) -> str:
     return _model_display_name(model)
 
 
-def _format_combo_label(snapshot: dict[str, Any]) -> str:
-    if snapshot.get("has_signature"):
-        arch = snapshot.get("arch") or "未知架构"
-        params = _format_param(snapshot.get("params"))
-        data = snapshot.get("data") or "?"
-        return f"{arch} · {params} → {data}"
-    return snapshot.get("model") or "未知模型"
-
-
-def _summarise_snapshots(snapshots: Sequence[dict[str, Any]]) -> list[str]:
-    combo_labels = [_format_combo_label(snap) for snap in snapshots if snap.get("has_signature")]
-    extra_labels = [_format_combo_label(snap) for snap in snapshots if not snap.get("has_signature")]
-
-    lines: list[str] = []
-    if combo_labels:
-        preview = " / ".join(combo_labels[:4])
-        if len(combo_labels) > 4:
-            preview += f" 等 {len(combo_labels)} 个组合"
-        lines.append(f"- 覆盖组合：{preview}")
-    if extra_labels:
-        preview = " / ".join(extra_labels[:4])
-        if len(extra_labels) > 4:
-            preview += f" 等 {len(extra_labels)} 个模型"
-        lines.append(f"- 其他未解析模型：{preview}")
-    return lines
-
-
 # ---------------------------------------------------------------------------
 # Selection logic
 # ---------------------------------------------------------------------------

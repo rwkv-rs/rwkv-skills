@@ -113,17 +113,6 @@ def _score_to_percent(value: float | None) -> float | None:
     return value
 
 
-def _max_percent(values: Iterable[float | None]) -> float | None:
-    best: float | None = None
-    for value in values:
-        percent = _score_to_percent(value)
-        if percent is None:
-            continue
-        if best is None or percent > best:
-            best = percent
-    return best
-
-
 def _parse_pass_suffix(key: str) -> int | None:
     token = str(key).strip().lower()
     if not token.startswith("pass"):
@@ -384,126 +373,6 @@ def _primary_metric(metrics: dict[str, Any]) -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# Score formatting (1 decimal place)
-# ---------------------------------------------------------------------------
-
-def _format_score_1dp(value: float | None) -> str:
-    normalized = _score_to_percent(value)
-    if normalized is None:
-        return "—"
-    return f"{normalized:.1f}"
-
-
-def _format_delta_1dp(latest: float | None, previous: float | None) -> str:
-    latest_n = _score_to_percent(latest)
-    prev_n = _score_to_percent(previous)
-    if latest_n is None or prev_n is None:
-        return "—"
-    delta = latest_n - prev_n
-    sign = "+" if delta > 0 else ""
-    return f"{sign}{delta:.1f}"
-
-
-def _format_delta_value(value: float | None) -> str:
-    """Format a delta value with proper sign prefix.
-
-    Uses Unicode minus sign (U+2212) instead of hyphen for negative values.
-    """
-    if value is None:
-        return "—"
-    if abs(value) < 1e-6:
-        return "0.0"
-    sign = "+" if value > 0 else "\u2212"
-    return f"{sign}{abs(value):.1f}"
-
-
-def _parse_display_number(value: Any) -> float | None:
-    if isinstance(value, tuple) and len(value) == 2:
-        value = value[0]
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text or text == "—":
-        return None
-    text = text.replace("%", "").replace(",", "")
-    if text.startswith("+"):
-        text = text[1:]
-    # Handle Unicode minus sign
-    if text.startswith("\u2212"):
-        text = "-" + text[1:]
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Cell styling — simplified (CSS-class based, no box-shadow)
-# ---------------------------------------------------------------------------
-
-def _styled_score_cell(value: float | None) -> str:
-    """Return formatted score text. No inline style — row cycling handles bg."""
-    return _format_score_1dp(value)
-
-
-def _styled_score_cell_norm(value: float | None, min_v: float | None, max_v: float | None) -> str:
-    """Return formatted score text. No inline style — row cycling handles bg."""
-    return _format_score_1dp(value)
-
-
-def _styled_delta_cell(delta_value: float | None) -> tuple[str, str]:
-    """Return ``(formatted_text, css_class)`` for a delta cell.
-
-    css_class is one of ``"cell-delta-pos"``, ``"cell-delta-neg"``, or
-    ``"cell-na"``.
-    """
-    text = _format_delta_value(delta_value)
-    if delta_value is None:
-        return text, "cell-na"
-    if delta_value > 1e-6:
-        return text, "cell-delta-pos"
-    if delta_value < -1e-6:
-        return text, "cell-delta-neg"
-    return text, "cell-na"
-
-
-# ---------------------------------------------------------------------------
-# Cell metric value (for pivot table)
-# ---------------------------------------------------------------------------
-
-def _cell_metric_value(entry: ScoreEntry | None, *, dataset_base: str) -> str:
-    if entry is None:
-        return "—"
-
-    del dataset_base
-    key, value = _display_metric_for_entry(entry)
-    if key is None or value is None:
-        return "—"
-    return f"{key} {_format_metric_value(value)}"
-
-
-def _cell_numeric_value(entry: ScoreEntry | None, *, dataset_base: str) -> float | None:
-    if entry is None:
-        return None
-
-    del dataset_base
-    _, value = _display_metric_for_entry(entry)
-    return value
-
-
-# ---------------------------------------------------------------------------
-# Metric score — promoted to module level (was nested inside loop)
-# ---------------------------------------------------------------------------
-
-def _metric_score(item: ScoreEntry | None) -> float | None:
-    """Return the display metric value from an entry, or None."""
-    _, value = _display_metric_for_entry(item)
-    return value
-
-
-# ---------------------------------------------------------------------------
 # Multi-choice detection & eval-method scoring
 # ---------------------------------------------------------------------------
 
@@ -570,17 +439,6 @@ def _detail_sort_key(row_key: tuple[str, str, str]) -> tuple[Any, ...]:
         kind_rank = 0 if kind == "avg" else 1
         k_rank = (kind_rank, k)
     return benchmark, method_rank, k_rank, k_metric
-
-
-def _field_average_score(entries: Iterable[ScoreEntry]) -> float | None:
-    values: list[float] = []
-    for entry in entries:
-        score = _field_primary_score(entry)
-        if score is not None:
-            values.append(score)
-    if not values:
-        return None
-    return sum(values) / len(values)
 
 
 # ---------------------------------------------------------------------------

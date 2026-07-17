@@ -229,6 +229,27 @@ class EvalDbService:
         except (TypeError, ValueError):
             return cls._bounded_eval_text(value, max_chars=_COMPLETION_EXTRA_TEXT_MAX_CHARS)
 
+    @classmethod
+    def _compact_browsecomp_plus_run(cls, value: Any) -> Any:
+        sanitized = cls._sanitize_json_text(value)
+        if not isinstance(sanitized, dict):
+            return cls._compact_completion_extra(value)
+        result = sanitized.get("result")
+        if isinstance(result, list):
+            bounded_result: list[Any] = []
+            for item in result:
+                if isinstance(item, dict) and "output" in item:
+                    bounded_item = dict(item)
+                    bounded_item["output"] = cls._bounded_eval_text(
+                        bounded_item.get("output"),
+                        max_chars=_EVAL_ANSWER_MAX_CHARS,
+                    )
+                    bounded_result.append(bounded_item)
+                else:
+                    bounded_result.append(item)
+            sanitized["result"] = bounded_result
+        return sanitized
+
     @staticmethod
     def _normalize_reference_value(value: Any) -> str | None:
         if value is None:
@@ -1208,6 +1229,9 @@ class EvalDbService:
         stats = payload.get("stats")
         if isinstance(stats, Mapping):
             context["stats"] = dict(stats)
+        browsecomp_plus_run = payload.get("browsecomp_plus_run")
+        if browsecomp_plus_run is not None:
+            context["browsecomp_plus_run"] = EvalDbService._compact_browsecomp_plus_run(browsecomp_plus_run)
         for key in (
             "agent_result",
             "agent_info",
