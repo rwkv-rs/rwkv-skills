@@ -27,6 +27,7 @@ from .actions import (
     DispatchOptions,
     FunctionCallingConfig,
     InferenceConfig,
+    KnowledgeConfig,
     LogsOptions,
     MathConfig,
     StatusOptions,
@@ -291,6 +292,10 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-active-coding-runners", type=int, help="最多同时运行的 coding runner 数；空出的远端槽可调度非 coding 任务")
     parser.add_argument("--math-judge-max-workers", type=int, help="maths free_response_judge 的 --judge-max-workers")
+    parser.add_argument("--math-prompt-max-chars", type=int, help="maths runner 的 --prompt-max-chars")
+    parser.add_argument("--math-long-doc-mode", choices=("off", "lexical"), help="maths runner 的 --long-doc-mode")
+    parser.add_argument("--knowledge-prompt-max-chars", type=int, help="knowledge runner 的 --prompt-max-chars")
+    parser.add_argument("--knowledge-long-doc-mode", choices=("off", "lexical"), help="knowledge runner 的 --long-doc-mode")
     parser.add_argument(
         "--disable-infer-backpressure",
         action="store_true",
@@ -603,6 +608,20 @@ def _dispatch_options_from_args(
                 if getattr(args, "math_judge_max_workers", None) is not None
                 else None
             ),
+            prompt_max_chars=(
+                int(getattr(args, "math_prompt_max_chars"))
+                if getattr(args, "math_prompt_max_chars", None) is not None
+                else None
+            ),
+            long_doc_mode=getattr(args, "math_long_doc_mode", None),
+        ),
+        knowledge=KnowledgeConfig(
+            prompt_max_chars=(
+                int(getattr(args, "knowledge_prompt_max_chars"))
+                if getattr(args, "knowledge_prompt_max_chars", None) is not None
+                else None
+            ),
+            long_doc_mode=getattr(args, "knowledge_long_doc_mode", None),
         ),
         distributed_claims=bool(getattr(args, "distributed_claims", False)),
         scheduler_node_id=(str(getattr(args, "scheduler_node_id", "") or "").strip() or None),

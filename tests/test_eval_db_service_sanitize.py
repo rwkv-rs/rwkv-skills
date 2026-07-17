@@ -56,3 +56,19 @@ def test_completion_context_preserves_browsecomp_plus_run_docids() -> None:
 
     assert context["browsecomp_plus_run"]["retrieved_docids"] == docids
     assert context["browsecomp_plus_run"]["result"] == [{"type": "output_text", "output": "answer"}]
+
+
+def test_completion_context_preserves_long_doc_trace() -> None:
+    payload = {
+        "prompt1": "prompt",
+        "completion1": "completion",
+        "stop_reason1": "stop",
+        "sampling_config": {},
+        "long_doc": {"mode": "lexical", "compacted": True, "selected_chunk_ids": [2]},
+        "long_context": {"long_doc": {"enabled": True}},
+    }
+
+    context = EvalDbService._build_completion_context(payload)
+
+    assert context["long_doc"] == {"mode": "lexical", "compacted": True, "selected_chunk_ids": [2]}
+    assert context["long_context"] == {"long_doc": {"enabled": True}}

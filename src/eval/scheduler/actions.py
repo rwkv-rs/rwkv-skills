@@ -21,6 +21,7 @@ __all__ = [
     "FunctionCallingConfig",
     "CodingConfig",
     "MathConfig",
+    "KnowledgeConfig",
     "StatusOptions",
     "StopOptions",
     "LogsOptions",

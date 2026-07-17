@@ -14,6 +14,8 @@ from src.eval.prompt_builders import (
     ALPHABET,
     concat_choices,
 )
+from src.eval.context_budget import build_budgeted_context_prompt, fuse_context_question
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
@@ -110,6 +112,8 @@ class MultipleChoicePipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        long_doc_config: LongDocEvidenceConfig | None = None,
+        prompt_max_chars: int | None = None,
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(
             dataset_path,
@@ -151,6 +155,8 @@ class MultipleChoicePipeline:
             dataset_split=dataset_split,
             batch_size=batch_size,
             on_record=on_record,
+            long_doc_config=long_doc_config,
+            prompt_max_chars=prompt_max_chars,
         )
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
 
@@ -172,6 +178,8 @@ class MultipleChoicePipeline:
         resume_start_index: int = 0,
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
+        long_doc_config: LongDocEvidenceConfig | None = None,
+        prompt_max_chars: int | None = None,
     ) -> MultipleChoicePipelineResult:
         records, resolved_name = self._load_records(
             dataset_path,
@@ -239,7 +247,18 @@ class MultipleChoicePipeline:
 
         # 整段一次性构造，去掉分块屏障。每条的 stage-1 seed 由 sample/repeat/pass 决定，
         # 与分块边界无关；prompt_index→entry 映射保持不变。
-        cot_prompts = [self._format_prompt(record, cot_prompt_template) for _key, record in remaining_entries]
+        formatted_prompts = [
+            self._format_prompt(
+                record,
+                cot_prompt_template,
+                long_doc_config=long_doc_config,
+                prompt_max_chars=prompt_max_chars,
+                label=f"{dataset_name}:{key.sample_index}",
+            )
+            for key, record in remaining_entries
+        ]
+        cot_prompts = [prompt for prompt, _trace in formatted_prompts]
+        long_doc_traces = [trace for _prompt, trace in formatted_prompts]
         cot_seeds = [
             sample_repeat_seed(
                 key.sample_index,
@@ -272,6 +291,9 @@ class MultipleChoicePipeline:
                 stages=[cot_stage],
             ).as_payload()
             cot_payload["_stage"] = "cot"
+            trace = long_doc_traces[idx]
+            if trace is not None:
+                cot_payload["long_doc"] = dict(trace)
             if on_record is not None:
                 on_record(cot_payload)
 
@@ -352,6 +374,9 @@ class MultipleChoicePipeline:
                 stages=[cot_stage, final_stage],
             ).as_payload()
             payload["_stage"] = "answer"
+            trace = long_doc_traces[idx]
+            if trace is not None:
+                payload["long_doc"] = dict(trace)
             if on_record is not None:
                 on_record(payload)
             payloads.append(payload)
@@ -376,14 +401,40 @@ class MultipleChoicePipeline:
         dataset_name = infer_dataset_slug_from_path(dataset_path)
         return indexed_records, dataset_name
 
-    def _format_prompt(self, record: MultipleChoiceRecord, template: str) -> str:
+    def _format_prompt(
+        self,
+        record: MultipleChoiceRecord,
+        template: str,
+        *,
+        long_doc_config: LongDocEvidenceConfig | None = None,
+        prompt_max_chars: int | None = None,
+        label: str = "multiple_choice",
+    ) -> tuple[str, dict[str, object] | None]:
         subject = (record.subject or "unknown").replace("_", " ")
         question = record.question.lstrip()
-        return (
-            template.replace("<SUBJECT>", subject)
-            .replace("<Q>", question)
-            .replace("<CHOICES>", concat_choices(record.choices))
-        ).rstrip(" ")
+        choices = concat_choices(record.choices)
+
+        def _render(question_text: str) -> str:
+            return (
+                template.replace("<SUBJECT>", subject)
+                .replace("<Q>", question_text)
+                .replace("<CHOICES>", choices)
+            ).rstrip(" ")
+
+        if not (record.context or "").strip():
+            return _render(question), None
+
+        prompt, trace = build_budgeted_context_prompt(
+            context=record.context,
+            query=f"{question}\n{choices}",
+            render=lambda ctx: _render(fuse_context_question(ctx, question) if ctx else question),
+            long_doc_config=long_doc_config or LongDocEvidenceConfig(enabled=False),
+            prompt_max_chars=prompt_max_chars,
+            label=label,
+        )
+        if trace is not None:
+            trace["query_policy"] = "question_and_choices"
+        return prompt, trace
 
     def _build_direct_payload(
         self,
@@ -393,6 +444,7 @@ class MultipleChoicePipeline:
         key: AttemptKey,
         prompt: str,
         pred_letter: str,
+        long_doc_trace: dict[str, object] | None = None,
     ) -> dict:
         token_text = self.target_token_format.replace("<LETTER>", pred_letter)
         stages = [
@@ -402,7 +454,7 @@ class MultipleChoicePipeline:
                 stop_reason="generated_choice",
             )
         ]
-        return SampleRecord(
+        payload = SampleRecord(
             benchmark_name=benchmark_name,
             dataset_split=dataset_split,
             sample_index=key.sample_index,
@@ -411,6 +463,9 @@ class MultipleChoicePipeline:
             sampling_config={},
             stages=stages,
         ).as_payload()
+        if long_doc_trace is not None:
+            payload["long_doc"] = long_doc_trace
+        return payload
 
     def _run_direct_generation_batches(
         self,
@@ -421,6 +476,8 @@ class MultipleChoicePipeline:
         dataset_split: str,
         batch_size: int,
         on_record: Callable[[dict], None] | None,
+        long_doc_config: LongDocEvidenceConfig | None,
+        prompt_max_chars: int | None,
     ) -> list[dict]:
         payloads: list[dict] = []
         sampling = _multiple_choice_answer_sampling()
@@ -430,7 +487,18 @@ class MultipleChoicePipeline:
         # 一次性提交整段 prompts，去掉分块屏障；但在飞并发上限仍用本 benchmark 自己的
         # batch_size（ThreadPoolExecutor 会持续填充，长尾不阻塞、又不超过该档并发）。
         # prompt_index→record 映射不变，贪心采样 + 原解析逻辑保留 ⇒ 逐条结果等价。
-        prompts = [self._format_prompt(record, prompt_template) for _key, record in entries]
+        formatted = [
+            self._format_prompt(
+                record,
+                prompt_template,
+                long_doc_config=long_doc_config,
+                prompt_max_chars=prompt_max_chars,
+                label=f"{benchmark_name}_{dataset_split}:{key.sample_index}",
+            )
+            for key, record in entries
+        ]
+        prompts = [prompt for prompt, _trace in formatted]
+        long_doc_traces = [trace for _prompt, trace in formatted]
         outputs = self.backend.generate(
             prompts,
             sampling=sampling,
@@ -450,6 +518,7 @@ class MultipleChoicePipeline:
                 key=key,
                 prompt=prompt,
                 pred_letter=pred_letter,
+                long_doc_trace=long_doc_traces[index],
             )
             if on_record is not None:
                 on_record(payload)

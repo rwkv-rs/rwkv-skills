@@ -330,7 +330,13 @@ def _launch_queue_items(
                 dataset_questions=questions,
             )
 
-        extra_args = item.extra_args + _coding_extra_args(opts, job) + _maths_extra_args(opts, job) + _function_calling_extra_args(opts, job)
+        extra_args = (
+            item.extra_args
+            + _knowledge_extra_args(opts, job)
+            + _coding_extra_args(opts, job)
+            + _maths_extra_args(opts, job)
+            + _function_calling_extra_args(opts, job)
+        )
         if opts.run_mode is RunMode.RERUN and item.job_name == "param_search_select" and "--overwrite" not in extra_args:
             extra_args = extra_args + ("--overwrite",)
         infer_timeout_s = opts.inference.timeout_s
@@ -851,11 +857,25 @@ def _coding_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
 def _maths_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
     if job.runner_group is not RunnerGroup.MATHS:
         return ()
-    if job.name != "free_response_judge":
+    args: list[str] = []
+    if job.name == "free_response_judge" and opts.math.judge_max_workers is not None:
+        args.extend(["--judge-max-workers", str(max(1, int(opts.math.judge_max_workers)))])
+    if opts.math.prompt_max_chars is not None:
+        args.extend(["--prompt-max-chars", str(max(1, int(opts.math.prompt_max_chars)))])
+    if opts.math.long_doc_mode:
+        args.extend(["--long-doc-mode", str(opts.math.long_doc_mode)])
+    return tuple(args)
+
+
+def _knowledge_extra_args(opts: QueueOptions, job: JobSpec) -> tuple[str, ...]:
+    if job.runner_group is not RunnerGroup.KNOWLEDGE:
         return ()
-    if opts.math.judge_max_workers is None:
-        return ()
-    return ("--judge-max-workers", str(max(1, int(opts.math.judge_max_workers))))
+    args: list[str] = []
+    if opts.knowledge.prompt_max_chars is not None:
+        args.extend(["--prompt-max-chars", str(max(1, int(opts.knowledge.prompt_max_chars)))])
+    if opts.knowledge.long_doc_mode:
+        args.extend(["--long-doc-mode", str(opts.knowledge.long_doc_mode)])
+    return tuple(args)
 
 
 def _clean_param_swap_records(log_dir: Path) -> None:
@@ -1044,6 +1064,7 @@ __all__ = [
     "_running_job_group_count",
     "_candidate_exceeds_coding_limit",
     "_function_calling_extra_args",
+    "_knowledge_extra_args",
     "_coding_extra_args",
     "_maths_extra_args",
     "_clean_param_swap_records",

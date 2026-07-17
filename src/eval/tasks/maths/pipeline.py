@@ -16,10 +16,23 @@ from src.eval.results.schema import (
 )
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
+from src.eval.context_budget import compose_context_question
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 USER_SENTINEL = "\nUser:"
+LEGACY_GENERATION_STOP_SUFFIXES = (USER_SENTINEL,)
+G1H_GENERATION_STOP_SUFFIXES = (
+    USER_SENTINEL,
+    "\nUser✿",
+    "User✿",
+    "\nBot✿",
+    "Bot✿",
+    "\nAssistant:",
+    "Assistant:",
+    "✿",
+)
 FREE_RESPONSE_STOP_TOKENS = (0,)
 
 DEFAULT_COT_PROMPT = """User: <Q>
@@ -59,8 +72,24 @@ def _truncate_prompt_text(text: str, max_chars: int) -> str:
     return f"{text[:head_budget].rstrip()}{marker}{text[-tail_budget:].lstrip()}"
 
 
-def _clip_user_sentinel(text: str) -> str:
-    return text.split(USER_SENTINEL, 1)[0] if USER_SENTINEL in text else text
+def _generation_stop_suffixes_for_prompt(prompt: str) -> tuple[str, ...]:
+    if "User✿" in prompt or "Bot✿" in prompt:
+        return G1H_GENERATION_STOP_SUFFIXES
+    return LEGACY_GENERATION_STOP_SUFFIXES
+
+
+def _prompt_stop_suffixes(prompts: Sequence[str]) -> list[tuple[str, ...]]:
+    return [_generation_stop_suffixes_for_prompt(prompt) for prompt in prompts]
+
+
+def _clip_user_sentinel(text: str, *, prompt: str = "") -> str:
+    suffixes = _generation_stop_suffixes_for_prompt(prompt)
+    cut = len(text)
+    for sentinel in suffixes:
+        index = text.find(sentinel)
+        if index >= 0:
+            cut = min(cut, index)
+    return text[:cut].rstrip()
 
 
 def _is_truncated(output: GenerationOutput) -> bool:
@@ -113,6 +142,7 @@ class FreeResponsePipeline:
         skip_keys: set[tuple[int, int, int]] | None = None,
         on_record: Callable[[dict], None] | None = None,
         prompt_max_chars: int | None = None,
+        long_doc_config: LongDocEvidenceConfig | None = None,
     ) -> FreeResponsePipelineResult:
         if cot_prompt_template:
             prompt_template = cot_prompt_template
@@ -161,6 +191,28 @@ class FreeResponsePipeline:
             expanded = (expanded * repeat)[:batch_size]
         if not expanded:
             return FreeResponsePipelineResult(dataset_name, 0, problem_count, [])
+        long_doc_cfg = long_doc_config or LongDocEvidenceConfig(enabled=False)
+        question_cache: dict[int, tuple[str, dict[str, object] | None]] = {}
+
+        def _effective_question(key: AttemptKey, record: FreeAnswerRecord) -> tuple[str, dict[str, object] | None]:
+            cached = question_cache.get(int(key.sample_index))
+            if cached is not None:
+                return cached
+            value = compose_context_question(
+                record.context,
+                record.question,
+                long_doc_config=long_doc_cfg,
+                label=f"{dataset_name}:{key.sample_index}",
+            )
+            question_cache[int(key.sample_index)] = value
+            return value
+
+        def _trace_for_prompt(trace: dict[str, object] | None, prompt: str) -> dict[str, object] | None:
+            if trace is None:
+                return None
+            payload = dict(trace)
+            payload["prompt_chars"] = len(prompt)
+            return payload
 
         skipped = total_expected - len(expanded)
         if skipped > 0:
@@ -193,14 +245,14 @@ class FreeResponsePipeline:
 
         if probe_only:
             prompts = [
-                _render_prompt(prompt_template, record.question, prompt_max_chars=prompt_max_chars)
-                for _key, record in remaining_entries
+                _render_prompt(prompt_template, _effective_question(key, record)[0], prompt_max_chars=prompt_max_chars)
+                for key, record in remaining_entries
             ]
             if strategy_a_sampling is not None:
                 strategy_template = strategy_a_prompt_template or prompt_template
                 strategy_a_prompts = [
-                    _render_prompt(strategy_template, record.question, prompt_max_chars=prompt_max_chars)
-                    for _key, record in remaining_entries
+                    _render_prompt(strategy_template, _effective_question(key, record)[0], prompt_max_chars=prompt_max_chars)
+                    for key, record in remaining_entries
                 ]
                 _ = self.backend.generate(
                     strategy_a_prompts,
@@ -208,7 +260,7 @@ class FreeResponsePipeline:
                     batch_size=batch_size,
                     progress_desc="Probing strategy A full responses",
                     probe_only=probe_only,
-                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in strategy_a_prompts],
+                    prompt_stop_suffixes=_prompt_stop_suffixes(strategy_a_prompts),
                     prompt_seeds=[
                         sample_repeat_seed(
                             key.sample_index,
@@ -234,7 +286,7 @@ class FreeResponsePipeline:
                 batch_size=batch_size,
                 progress_desc="Probing CoT" if use_final_stage else "Generating full responses",
                 probe_only=probe_only,
-                prompt_stop_suffixes=[(USER_SENTINEL,) for _ in prompts],
+                prompt_stop_suffixes=_prompt_stop_suffixes(prompts),
                 prompt_seeds=probe_seeds,
             )
             if use_final_stage:
@@ -248,7 +300,7 @@ class FreeResponsePipeline:
                             _render_final_prompt(
                                 final_answer_template,
                                 prompts[output.prompt_index],
-                                _clip_user_sentinel(output.text),
+                                _clip_user_sentinel(output.text, prompt=prompts[output.prompt_index]),
                             )
                         )
                         final_source_indices.append(int(output.prompt_index))
@@ -259,7 +311,7 @@ class FreeResponsePipeline:
                         batch_size=min(batch_size, len(final_prompts)),
                         progress_desc="Probing final answers",
                         probe_only=probe_only,
-                        prompt_stop_suffixes=[(USER_SENTINEL,) for _ in final_prompts],
+                        prompt_stop_suffixes=_prompt_stop_suffixes(final_prompts),
                         prompt_seeds=[
                             sample_repeat_seed(
                                 remaining_entries[idx][0].sample_index,
@@ -276,9 +328,14 @@ class FreeResponsePipeline:
         chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
         for start in range(0, len(remaining_entries), chunk_size):
             chunk = remaining_entries[start : start + chunk_size]
+            effective_questions = [_effective_question(key, record) for key, record in chunk]
             prompts = [
-                _render_prompt(prompt_template, record.question, prompt_max_chars=prompt_max_chars)
-                for _key, record in chunk
+                _render_prompt(prompt_template, question, prompt_max_chars=prompt_max_chars)
+                for question, _trace in effective_questions
+            ]
+            long_doc_traces = [
+                _trace_for_prompt(trace, prompt)
+                for (_question, trace), prompt in zip(effective_questions, prompts)
             ]
 
             if use_final_stage:
@@ -289,15 +346,15 @@ class FreeResponsePipeline:
                 if strategy_a_sampling is not None:
                     strategy_template = strategy_a_prompt_template or prompt_template
                     strategy_a_prompts = [
-                        _render_prompt(strategy_template, record.question, prompt_max_chars=prompt_max_chars)
-                        for _key, record in chunk
+                        _render_prompt(strategy_template, effective_question, prompt_max_chars=prompt_max_chars)
+                        for effective_question, _trace in effective_questions
                     ]
                     strategy_a_outputs = self.backend.generate(
                         strategy_a_prompts,
                         sampling=strategy_a_sampling,
                         batch_size=min(batch_size, len(strategy_a_prompts)),
                         progress_desc="Generating strategy A full responses",
-                        prompt_stop_suffixes=[(USER_SENTINEL,) for _ in strategy_a_prompts],
+                        prompt_stop_suffixes=_prompt_stop_suffixes(strategy_a_prompts),
                         prompt_seeds=[
                             sample_repeat_seed(
                                 key.sample_index,
@@ -327,9 +384,15 @@ class FreeResponsePipeline:
                         stages=[],
                     ).as_payload()
                     payload["strategy_a_prompt"] = strategy_a_prompts[local_idx]
-                    payload["strategy_a_completion"] = _clip_user_sentinel(output.text)
+                    payload["strategy_a_completion"] = _clip_user_sentinel(
+                        output.text,
+                        prompt=strategy_a_prompts[local_idx],
+                    )
                     payload["strategy_a_stop_reason"] = output.finish_reason
                     payload["stats"] = {**strategy_stats, "strategy_a": strategy_stats}
+                    trace = _trace_for_prompt(long_doc_traces[local_idx], strategy_a_prompts[local_idx])
+                    if trace is not None:
+                        payload["long_doc"] = trace
                     payload["_stage"] = "answer"
                     return payload
 
@@ -372,7 +435,7 @@ class FreeResponsePipeline:
                     sampling=generation_sampling,
                     batch_size=min(batch_size, len(cot_prompts)),
                     progress_desc="Generating CoT",
-                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in cot_prompts],
+                    prompt_stop_suffixes=_prompt_stop_suffixes(cot_prompts),
                     prompt_seeds=[
                         sample_repeat_seed(
                             chunk[local_idx][0].sample_index,
@@ -393,7 +456,7 @@ class FreeResponsePipeline:
                 final_prompt_deltas: dict[int, str] = {}
                 cot_texts: dict[int, str] = {}
                 for local_idx, cot_output in sorted(cot_by_idx.items()):
-                    cot_text = _clip_user_sentinel(cot_output.text)
+                    cot_text = _clip_user_sentinel(cot_output.text, prompt=prompts[local_idx])
                     cot_texts[local_idx] = cot_text
                     full_final_prompt = _render_final_prompt(
                         final_answer_template,
@@ -425,7 +488,7 @@ class FreeResponsePipeline:
                         return
                     key, _record = chunk[local_idx]
                     cot_text = cot_texts[local_idx]
-                    final_text = _clip_user_sentinel(output.text)
+                    final_text = _clip_user_sentinel(output.text, prompt=final_prompts[prompt_idx])
                     cot_stage = StageRecord(
                         prompt=prompts[local_idx],
                         completion=cot_text,
@@ -455,10 +518,16 @@ class FreeResponsePipeline:
                         "stage1": cot_stats,
                         "stage2": final_stats,
                     }
+                    trace = long_doc_traces[local_idx]
+                    if trace is not None:
+                        payload["long_doc"] = trace
                     strategy_a_output = strategy_a_by_idx.get(local_idx)
                     if strategy_a_output is not None and strategy_a_prompts:
                         payload["strategy_a_prompt"] = strategy_a_prompts[local_idx]
-                        payload["strategy_a_completion"] = _clip_user_sentinel(strategy_a_output.text)
+                        payload["strategy_a_completion"] = _clip_user_sentinel(
+                            strategy_a_output.text,
+                            prompt=strategy_a_prompts[local_idx],
+                        )
                         payload["strategy_a_stop_reason"] = strategy_a_output.finish_reason
                         payload["stats"]["strategy_a"] = _output_stats(strategy_a_output)
                     payload["_stage"] = "answer"
@@ -472,7 +541,7 @@ class FreeResponsePipeline:
                     batch_size=min(batch_size, len(final_prompts)),
                     progress_desc="Generating final answers",
                     on_complete=_on_final_complete,
-                    prompt_stop_suffixes=[(USER_SENTINEL,) for _ in final_prompts],
+                    prompt_stop_suffixes=_prompt_stop_suffixes(final_prompts),
                     prompt_seeds=[
                         sample_repeat_seed(
                             chunk[local_idx][0].sample_index,
@@ -490,7 +559,7 @@ class FreeResponsePipeline:
                 if local_idx < 0 or local_idx >= len(chunk):
                     return
                 key, _record = chunk[local_idx]
-                clipped_text = _clip_user_sentinel(output.text)
+                clipped_text = _clip_user_sentinel(output.text, prompt=prompts[local_idx])
                 stats = _output_stats(output)
                 stage = StageRecord(
                     prompt=prompts[local_idx],
@@ -507,6 +576,9 @@ class FreeResponsePipeline:
                     stages=[stage],
                 ).as_payload()
                 payload["stats"] = stats
+                trace = long_doc_traces[local_idx]
+                if trace is not None:
+                    payload["long_doc"] = trace
                 payload["_stage"] = "answer"
                 if on_record is not None:
                     on_record(payload)
@@ -518,7 +590,7 @@ class FreeResponsePipeline:
                 batch_size=min(batch_size, len(prompts)),
                 progress_desc="Generating full responses",
                 on_complete=_on_complete,
-                prompt_stop_suffixes=[(USER_SENTINEL,) for _ in prompts],
+                prompt_stop_suffixes=_prompt_stop_suffixes(prompts),
                 prompt_seeds=[
                     sample_repeat_seed(
                         key.sample_index,
@@ -554,6 +626,8 @@ __all__ = [
     "DEFAULT_DIRECT_PROMPT",
     "DEFAULT_FINAL_PROMPT",
     "FREE_RESPONSE_STOP_TOKENS",
+    "G1H_GENERATION_STOP_SUFFIXES",
+    "LEGACY_GENERATION_STOP_SUFFIXES",
     "FreeResponsePipeline",
     "FreeResponsePipelineResult",
     "USER_SENTINEL",

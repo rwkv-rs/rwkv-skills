@@ -14,6 +14,7 @@ from src.eval.common.field_runner import (
     resolve_prompt_profile,
     scoring_stage,
 )
+from src.eval.context_budget import add_long_doc_cli_args, long_doc_config_payload, resolve_long_doc_config
 from src.eval.field_common import (
     build_plan_task_details,
     build_task_sampling_config,
@@ -49,6 +50,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("normal", "naive"),
         help="Prompt profile: normal uses benchmark configs/defaults; naive uses only question/options plus answer prefill.",
     )
+    parser.add_argument("--prompt-max-chars", type=int, help="Clamp rendered prompt length")
+    add_long_doc_cli_args(parser)
     parser.add_argument(
         "--probe-only",
         action="store_true",
@@ -119,12 +122,18 @@ def _task_sampling_config(
     cot_sampling: object | None = None,
     pass_ks: Sequence[int] | None = None,
     prompt_profile: str = "normal",
+    long_doc_config: object | None = None,
+    prompt_max_chars: int | None = None,
 ) -> dict[str, object]:
     from src.eval.results.schema import sampling_config_to_dict
 
     sampling_payload: dict[str, object] = {}
     if cot_mode is CoTMode.COT:
         sampling_payload["stage1"] = sampling_config_to_dict(cot_sampling)
+    if long_doc_config is not None and getattr(long_doc_config, "enabled", False):
+        sampling_payload["long_doc"] = long_doc_config_payload(long_doc_config)  # type: ignore[arg-type]
+    if prompt_max_chars is not None:
+        sampling_payload["prompt_max_chars"] = int(prompt_max_chars)
     return build_task_sampling_config(
         cot_mode=cot_mode,
         avg_k=avg_k,
@@ -189,6 +198,9 @@ def main(
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
+    root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    long_doc_config = resolve_long_doc_config(args, root_config)
+    prompt_max_chars = args.prompt_max_chars if args.prompt_max_chars is not None else getattr(root_config, "prompt_max_chars", None)
     if prompt_profile == "naive":
         direct_prompt_template = _naive_direct_prompt_template()
         cot_prompt_template = _naive_cot_prompt_template()
@@ -232,6 +244,8 @@ def main(
                 min_prompt_count=batch_size,
                 samples_per_task=1,
                 probe_only=True,
+                long_doc_config=long_doc_config,
+                prompt_max_chars=prompt_max_chars,
             )
             print(
                 f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
@@ -255,6 +269,8 @@ def main(
             cot_sampling=cot_sampling,
             pass_ks=k_plan.pass_k,
             prompt_profile=prompt_profile,
+            long_doc_config=long_doc_config,
+            prompt_max_chars=prompt_max_chars,
         ),
     )
     task_run = TaskRunState.from_task_execution(
@@ -281,6 +297,8 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                long_doc_config=long_doc_config,
+                prompt_max_chars=prompt_max_chars,
             )
         else:
             result = pipeline.run_direct(
@@ -293,6 +311,8 @@ def main(
                 attempt_keys=attempt_keys,
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
+                long_doc_config=long_doc_config,
+                prompt_max_chars=prompt_max_chars,
             )
 
     completions_payloads = runtime.complete_attempt_stage(writer)

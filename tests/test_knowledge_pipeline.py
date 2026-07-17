@@ -4,6 +4,7 @@ import json
 
 from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
 from src.eval.metrics.multi_choice import evaluate_multiple_choice
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput
 from src.infer.sampling import SamplingConfig
 
@@ -105,6 +106,52 @@ def test_multiple_choice_pipeline_batches_generation(tmp_path) -> None:
     assert len(result.payloads) == 5
     assert [len(call) for call in backend.generate_calls] == [5]
     assert backend.generate_batch_sizes == [3]
+
+
+def test_multiple_choice_pipeline_compacts_context_with_question_and_choices_query(tmp_path) -> None:
+    dataset_path = tmp_path / "gpqa_demo_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "Which color is tied to catalyst77?",
+                "A": "red",
+                "B": "blue",
+                "C": "green",
+                "D": "yellow",
+                "answer": "B",
+                "subject": "chemistry",
+                "context": "\n".join(
+                    [f"noise row {idx}" for idx in range(20)]
+                    + ["catalyst77 blue pathway evidence"]
+                    + [f"tail row {idx}" for idx in range(20)]
+                ),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend()
+    pipeline = MultipleChoicePipeline(backend)
+
+    result = pipeline.run_direct(
+        str(dataset_path),
+        long_doc_config=LongDocEvidenceConfig(
+            enabled=True,
+            max_chunk_chars=120,
+            overlap_lines=0,
+            min_long_text_chars=100,
+            max_evidence_chunks=1,
+            max_evidence_chars=180,
+        ),
+    )
+
+    prompt = backend.generate_calls[0][0]
+    assert "Context:" in prompt
+    assert "Long document compacted" in prompt
+    assert "catalyst77 blue pathway evidence" in prompt
+    assert result.payloads[0]["long_doc"]["query_policy"] == "question_and_choices"
+    assert result.payloads[0]["long_doc"]["compacted"] is True
 
 
 def test_multiple_choice_pipeline_streams_generated_payloads_in_order(tmp_path) -> None:

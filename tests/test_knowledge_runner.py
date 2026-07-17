@@ -18,6 +18,18 @@ def test_knowledge_runner_parser_accepts_all_modes() -> None:
     assert args.run_checker is False
 
 
+def test_knowledge_runner_parser_long_doc_flags_default_to_none() -> None:
+    args = knowledge_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert args.prompt_max_chars is None
+    assert args.long_doc_mode is None
+
+    args = knowledge_runner.parse_args(
+        ["--dataset", "dataset.jsonl", "--long-doc-mode", "lexical", "--prompt-max-chars", "4096"]
+    )
+    assert args.long_doc_mode == "lexical"
+    assert args.prompt_max_chars == 4096
+
+
 def test_knowledge_runner_checker_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("RWKV_KNOWLEDGE_RUN_CHECKER", raising=False)
     monkeypatch.delenv("RWKV_SKILLS_DISABLE_CHECKER", raising=False)

@@ -132,6 +132,14 @@ class CodingConfig:
 @dataclass(frozen=True, slots=True)
 class MathConfig:
     judge_max_workers: int | None = None
+    prompt_max_chars: int | None = None
+    long_doc_mode: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeConfig:
+    prompt_max_chars: int | None = None
+    long_doc_mode: str | None = None
 
 
 @dataclass(slots=True)
@@ -153,6 +161,7 @@ class QueueOptions:
     functions: FunctionCallingConfig = field(default_factory=FunctionCallingConfig)
     coding: CodingConfig = field(default_factory=CodingConfig)
     math: MathConfig = field(default_factory=MathConfig)
+    knowledge: KnowledgeConfig = field(default_factory=KnowledgeConfig)
     distributed_claims: bool = False
     scheduler_node_id: str | None = None
     lease_duration_s: int = 900
@@ -633,6 +642,7 @@ __all__ = [
     "FunctionCallingConfig",
     "CodingConfig",
     "MathConfig",
+    "KnowledgeConfig",
     "DispatchOptions",
     "StatusOptions",
     "StopOptions",

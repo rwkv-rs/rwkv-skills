@@ -56,6 +56,14 @@ disable_checker = true
 
 [function_calling]
 candidate_router_mode = "auto"
+
+[math]
+prompt_max_chars = 8192
+long_doc_mode = "lexical"
+
+[knowledge]
+prompt_max_chars = 4096
+long_doc_mode = "off"
 """,
         encoding="utf-8",
     )
@@ -88,4 +96,8 @@ candidate_router_mode = "auto"
     assert opts.job_order == ("free_response",)
     assert opts.only_dataset_slugs == ("gsm8k_test",)
     assert opts.disable_checker is True
+    assert opts.math.prompt_max_chars == 8192
+    assert opts.math.long_doc_mode == "lexical"
+    assert opts.knowledge.prompt_max_chars == 4096
+    assert opts.knowledge.long_doc_mode == "off"
     assert (tmp_path / "logs" / "unit_run" / "resolved_config.json").exists()

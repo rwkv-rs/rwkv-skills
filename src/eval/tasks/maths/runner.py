@@ -23,6 +23,8 @@ from src.eval.field_common import (
     resolve_configured_k_plan,
     set_task_env,
 )
+from src.eval.context_budget import add_long_doc_cli_args, long_doc_config_payload, resolve_long_doc_config
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.eval.tasks.maths.common import (
     JudgeMode,
     build_llm_judge,
@@ -51,6 +53,7 @@ class MathStageConfig:
     cot_sampling: Any
     final_sampling: Any | None
     prompt_max_chars: int | None = None
+    long_doc_config: LongDocEvidenceConfig | None = None
 
 
 def _safe_int(value: object) -> int:
@@ -82,6 +85,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
     parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
     parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-max-chars", type=int, help="Clamp rendered prompt length")
+    add_long_doc_cli_args(parser)
     parser.add_argument(
         "--db-drain-every",
         type=int,
@@ -213,6 +218,8 @@ def _math_sampling_payload(
     if stage_config.final_sampling is None:
         raise ValueError("final_sampling is required for two-stage math generation")
     payload["stage2"] = sampling_config_to_dict(stage_config.final_sampling)
+    if stage_config.long_doc_config is not None and stage_config.long_doc_config.enabled:
+        payload["long_doc"] = long_doc_config_payload(stage_config.long_doc_config)
     if strategy_a_config is not None:
         payload["strategy_a"] = sampling_config_to_dict(strategy_a_config.cot_sampling)
     return payload
@@ -282,6 +289,7 @@ def main(
     pipeline = FreeResponsePipeline(backend)
 
     stage_config = _resolve_math_stage_config(
+        args,
         slug,
         model_name,
         cot_max_tokens=args.max_tokens or args.cot_max_tokens,
@@ -294,6 +302,7 @@ def main(
     strategy_a_config = None
     if strategy_a_single_generation:
         strategy_a_config = _resolve_single_generation_stage_config(
+            args,
             slug,
             model_name,
             max_tokens=args.max_tokens or args.cot_max_tokens,
@@ -371,6 +380,7 @@ def main(
             samples_per_task=1,
             probe_only=True,
             prompt_max_chars=stage_config.prompt_max_chars,
+            long_doc_config=stage_config.long_doc_config,
         )
         print(f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}.")
         return 0
@@ -416,6 +426,7 @@ def main(
                 skip_keys=skip_keys,
                 on_record=writer.enqueue,
                 prompt_max_chars=stage_config.prompt_max_chars,
+                long_doc_config=stage_config.long_doc_config,
             )
         except Exception:
             runtime.handle_attempt_stage_failure(writer, timeout_s=close_timeout_s)
@@ -511,6 +522,7 @@ def _require_math_prompt_template(
 
 
 def _resolve_single_generation_stage_config(
+    args: argparse.Namespace,
     slug: str,
     model_name: str,
     *,
@@ -526,7 +538,8 @@ def _resolve_single_generation_stage_config(
         max_tokens=max_tokens,
     )
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    prompt_max_chars = getattr(root_config, "prompt_max_chars", None)
+    prompt_max_chars = args.prompt_max_chars if args.prompt_max_chars is not None else getattr(root_config, "prompt_max_chars", None)
+    long_doc_config = resolve_long_doc_config(args, root_config)
     if prompt_profile == "naive":
         return MathStageConfig(
             cot_prompt_template=DEFAULT_COT_PROMPT,
@@ -534,6 +547,7 @@ def _resolve_single_generation_stage_config(
             cot_sampling=cot_sampling,
             final_sampling=None,
             prompt_max_chars=prompt_max_chars,
+            long_doc_config=long_doc_config,
         )
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     return MathStageConfig(
@@ -547,10 +561,12 @@ def _resolve_single_generation_stage_config(
         cot_sampling=cot_sampling,
         final_sampling=None,
         prompt_max_chars=prompt_max_chars,
+        long_doc_config=long_doc_config,
     )
 
 
 def _resolve_math_stage_config(
+    args: argparse.Namespace,
     slug: str,
     model_name: str,
     *,
@@ -568,7 +584,8 @@ def _resolve_math_stage_config(
         final_max_tokens=final_max_tokens,
     )
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
-    prompt_max_chars = getattr(root_config, "prompt_max_chars", None)
+    prompt_max_chars = args.prompt_max_chars if args.prompt_max_chars is not None else getattr(root_config, "prompt_max_chars", None)
+    long_doc_config = resolve_long_doc_config(args, root_config)
     if prompt_profile == "naive":
         return MathStageConfig(
             cot_prompt_template=DEFAULT_COT_PROMPT,
@@ -576,6 +593,7 @@ def _resolve_math_stage_config(
             cot_sampling=cot_sampling,
             final_sampling=final_sampling,
             prompt_max_chars=prompt_max_chars,
+            long_doc_config=long_doc_config,
         )
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
@@ -595,6 +613,7 @@ def _resolve_math_stage_config(
         cot_sampling=cot_sampling,
         final_sampling=final_sampling,
         prompt_max_chars=prompt_max_chars,
+        long_doc_config=long_doc_config,
     )
 
 

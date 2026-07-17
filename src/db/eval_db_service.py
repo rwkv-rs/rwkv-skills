@@ -1068,6 +1068,12 @@ class EvalDbService:
                 agent_trace = context.get("agent_trace")
                 if isinstance(agent_trace, list):
                     payload["agent_trace"] = agent_trace
+                long_doc = context.get("long_doc")
+                if isinstance(long_doc, dict):
+                    payload["long_doc"] = long_doc
+                long_context = context.get("long_context")
+                if isinstance(long_context, dict):
+                    payload["long_context"] = long_context
                 task_name = context.get("task_id")
                 if isinstance(task_name, str):
                     payload["task_id"] = task_name
@@ -1243,6 +1249,8 @@ class EvalDbService:
             "official_score",
             "success",
             "final_answer",
+            "long_doc",
+            "long_context",
             "metadata",
             "task_id",
             "domain",

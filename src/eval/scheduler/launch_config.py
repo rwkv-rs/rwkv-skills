@@ -19,7 +19,7 @@ from src.eval.benchmark_registry import BenchmarkField
 from src.eval.evaluating import RunMode, collect_benchmark_dataset_slugs
 from src.infer.backend import REMOTE_INFERENCE_PROTOCOL_CHOICES
 
-from .actions_base import CodingConfig, DispatchOptions, FunctionCallingConfig, InferenceConfig, MathConfig
+from .actions_base import CodingConfig, DispatchOptions, FunctionCallingConfig, InferenceConfig, KnowledgeConfig, MathConfig
 from .config import (
     DEFAULT_ADMIN_STATE_DIR,
     DEFAULT_DISPATCH_POLL_SECONDS,
@@ -101,6 +101,10 @@ class SchedulerLaunchRequest:
     max_active_coding_runners: int | None = None
     coding_swebench_max_prompt_chars: int | None = None
     math_judge_max_workers: int | None = None
+    math_prompt_max_chars: int | None = None
+    math_long_doc_mode: str | None = None
+    knowledge_prompt_max_chars: int | None = None
+    knowledge_long_doc_mode: str | None = None
     function_prompt_style: str | None = None
     function_tool_catalog_format: str | None = None
     function_cot_max_tokens: int | None = None
@@ -317,6 +321,20 @@ class SchedulerLaunchRequest:
                     if self.math_judge_max_workers is not None
                     else None
                 ),
+                prompt_max_chars=(
+                    int(self.math_prompt_max_chars)
+                    if self.math_prompt_max_chars is not None
+                    else None
+                ),
+                long_doc_mode=self.math_long_doc_mode,
+            ),
+            knowledge=KnowledgeConfig(
+                prompt_max_chars=(
+                    int(self.knowledge_prompt_max_chars)
+                    if self.knowledge_prompt_max_chars is not None
+                    else None
+                ),
+                long_doc_mode=self.knowledge_long_doc_mode,
             ),
             distributed_claims=bool(self.distributed_claims),
             scheduler_node_id=(str(self.scheduler_node_id or "").strip() or None),
@@ -503,6 +521,12 @@ def _flatten_profile_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         },
         "math": {
             "judge_max_workers": "math_judge_max_workers",
+            "prompt_max_chars": "math_prompt_max_chars",
+            "long_doc_mode": "math_long_doc_mode",
+        },
+        "knowledge": {
+            "prompt_max_chars": "knowledge_prompt_max_chars",
+            "long_doc_mode": "knowledge_long_doc_mode",
         },
         "function_calling": {
             "prompt_style": "function_prompt_style",

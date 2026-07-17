@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from src.bin.param_search_free_response import parse_args as parse_param_search_free_response_args
 from src.bin.param_search_select import parse_args as parse_param_search_select_args
 from src.eval.scheduler import actions, actions_base, action_dispatch, queue
-from src.eval.scheduler.actions import DispatchOptions, FunctionCallingConfig, InferenceConfig, MathConfig
+from src.eval.scheduler.actions import DispatchOptions, FunctionCallingConfig, InferenceConfig, KnowledgeConfig, MathConfig
 from src.eval.scheduler.admin import SchedulerStartRequest
 from src.eval.scheduler.backpressure import (
     RemoteConcurrencyBudget,
@@ -721,6 +721,32 @@ def test_maths_extra_args_only_apply_to_llm_judge_jobs(tmp_path: Path) -> None:
     )
     assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
     assert actions._maths_extra_args(opts, JOB_CATALOGUE["function_browsecomp"]) == ()
+
+
+def test_non_fc_long_doc_extra_args_are_scoped_by_runner_group(tmp_path: Path) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("free_response", "multi_choice_plain"),
+        math=MathConfig(prompt_max_chars=8192, long_doc_mode="lexical"),
+        knowledge=KnowledgeConfig(prompt_max_chars=4096, long_doc_mode="off"),
+    )
+
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == (
+        "--prompt-max-chars",
+        "8192",
+        "--long-doc-mode",
+        "lexical",
+    )
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["multi_choice_plain"]) == ()
+    assert actions._knowledge_extra_args(opts, JOB_CATALOGUE["multi_choice_plain"]) == (
+        "--prompt-max-chars",
+        "4096",
+        "--long-doc-mode",
+        "off",
+    )
+    assert actions._knowledge_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
 
 
 def test_param_search_scripts_accept_remote_inference_args() -> None:

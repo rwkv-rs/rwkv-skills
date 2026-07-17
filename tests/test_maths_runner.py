@@ -22,6 +22,19 @@ def test_maths_runner_parser_accepts_judge_mode() -> None:
     assert args.primary_only is False
 
 
+def test_maths_runner_parser_long_doc_flags_default_to_none() -> None:
+    args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])
+    assert args.prompt_max_chars is None
+    assert args.long_doc_mode is None
+    assert args.long_doc_min_chars is None
+
+    args = maths_runner.parse_args(
+        ["--dataset", "dataset.jsonl", "--long-doc-mode", "lexical", "--prompt-max-chars", "4096"]
+    )
+    assert args.long_doc_mode == "lexical"
+    assert args.prompt_max_chars == 4096
+
+
 def test_maths_runner_checker_is_opt_in(monkeypatch) -> None:
     monkeypatch.delenv("RWKV_MATH_RUN_CHECKER", raising=False)
     args = maths_runner.parse_args(["--dataset", "dataset.jsonl"])

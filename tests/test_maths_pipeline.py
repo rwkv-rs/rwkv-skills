@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-from src.eval.tasks.maths.pipeline import FREE_RESPONSE_STOP_TOKENS, FreeResponsePipeline
+import json
+
+from src.eval.tasks.maths.pipeline import (
+    FREE_RESPONSE_STOP_TOKENS,
+    G1H_GENERATION_STOP_SUFFIXES,
+    LEGACY_GENERATION_STOP_SUFFIXES,
+    FreeResponsePipeline,
+)
 from src.eval.metrics import free_response as fr
+from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput, SamplingConfig
 
 
@@ -40,7 +48,7 @@ def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -
     assert len(backend.calls) == 1
     call = backend.calls[0]
     assert call["sampling"].stop_tokens == FREE_RESPONSE_STOP_TOKENS
-    assert call["prompt_stop_suffixes"] == [("\nUser:",)]
+    assert call["prompt_stop_suffixes"] == [LEGACY_GENERATION_STOP_SUFFIXES]
     assert call["prompts"] == ["User: solve\n2+5?\n\nAssistant: <think"]
     assert result.payloads == [
         {
@@ -77,6 +85,27 @@ def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -
     ]
 
 
+def test_free_response_pipeline_uses_g1h_sentinel_stops_only_for_g1h_prompt(tmp_path) -> None:
+    dataset = tmp_path / "math.jsonl"
+    dataset.write_text('{"question":"2+5?","answer":"7"}\n', encoding="utf-8")
+    backend = _FakeBackend()
+    pipeline = FreeResponsePipeline(backend)
+
+    result = pipeline.run(
+        dataset_path=str(dataset),
+        prompt_template="User✿<Q>✿\nBot✿<think></think>",
+        generation_sampling=SamplingConfig(max_generate_tokens=32, stop_tokens=(0, 261)),
+        batch_size=4,
+        dataset_name="math_test",
+        pass_k=(1,),
+        samples_per_task=1,
+    )
+
+    assert backend.calls[0]["prompt_stop_suffixes"] == [G1H_GENERATION_STOP_SUFFIXES]
+    assert result.payloads[0]["prompt1"] == "User✿2+5?✿\nBot✿<think></think>"
+    assert result.payloads[0]["completion1"] == "</think>\nTherefore, the final answer is \\(\\boxed{7}\\)."
+
+
 def test_free_response_pipeline_clamps_rendered_prompt_chars(tmp_path) -> None:
     dataset = tmp_path / "math.jsonl"
     dataset.write_text(
@@ -103,6 +132,53 @@ def test_free_response_pipeline_clamps_rendered_prompt_chars(tmp_path) -> None:
     assert "[...truncated...]" in prompt
     assert "final question?" in prompt
     assert prompt.endswith("Assistant: <think")
+
+
+def test_free_response_pipeline_uses_context_only_in_generation_prompt(tmp_path) -> None:
+    dataset = tmp_path / "math.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "question": "Which entry answers case77?",
+                "answer": "blue",
+                "context": "\n".join(
+                    [f"noise row {idx}" for idx in range(20)]
+                    + ["case77 answer blue supporting evidence"]
+                    + [f"tail row {idx}" for idx in range(20)]
+                ),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FakeBackend()
+    pipeline = FreeResponsePipeline(backend)
+
+    result = pipeline.run(
+        dataset_path=str(dataset),
+        prompt_template="User: solve\n<Q>\n\nAssistant: <think",
+        generation_sampling=SamplingConfig(max_generate_tokens=32),
+        batch_size=4,
+        dataset_name="math_test",
+        pass_k=(1,),
+        samples_per_task=1,
+        long_doc_config=LongDocEvidenceConfig(
+            enabled=True,
+            max_chunk_chars=120,
+            overlap_lines=0,
+            min_long_text_chars=100,
+            max_evidence_chunks=1,
+            max_evidence_chars=180,
+        ),
+    )
+
+    prompt = backend.calls[0]["prompts"][0]
+    assert "Context:" in prompt
+    assert "Long document compacted" in prompt
+    assert "case77 answer blue supporting evidence" in prompt
+    assert result.payloads[0]["long_doc"]["compacted"] is True
+    assert result.payloads[0]["long_doc"]["selected_chunk_ids"]
 
 
 def test_free_response_pipeline_generates_cot_then_final_answer(tmp_path) -> None:
@@ -235,7 +311,11 @@ class _FakeBackend:
                 prompt_index=idx,
                 prompt=prompt,
                 token_ids=[1],
-                text="</think>\nTherefore, the final answer is \\(\\boxed{7}\\).\nUser: next",
+                text=(
+                    "</think>\nTherefore, the final answer is \\(\\boxed{7}\\).✿clean_length \\(\\boxed{0}\\)"
+                    if "User✿" in prompt or "Bot✿" in prompt
+                    else "</think>\nTherefore, the final answer is \\(\\boxed{7}\\).\nUser: next"
+                ),
                 finish_reason="stop_token",
             )
             for idx, prompt in enumerate(prompts)
