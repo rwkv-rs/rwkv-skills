@@ -109,6 +109,56 @@ def test_strategy_a_scores_raw_full_generation_and_tracks_stop_rate(monkeypatch,
     assert task_details == {}
 
 
+def test_g1h_prompt_clips_flower_sentinel_before_math_scoring(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User✿q✿\nBot✿<think></think>",
+                "completion1": "</think>\nFinal answer: \\boxed{7}✿clean_length \\boxed{0}",
+                "stop_reason1": "stop_token",
+            }
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 1.0
+    assert evaluation.rows_by_group["strategy_a"] == [(0, 0, True)]
+
+
+def test_legacy_prompt_does_not_clip_flower_sentinel_for_g1g(monkeypatch, tmp_path) -> None:
+    _patch_math_verify(monkeypatch)
+    dataset = tmp_path / "free.jsonl"
+    dataset.write_text('{"question":"q","answer":"7"}\n', encoding="utf-8")
+
+    evaluation = evaluate_free_response(
+        [
+            {
+                "benchmark_name": "free",
+                "dataset_split": "test",
+                "sample_index": 0,
+                "repeat_index": 0,
+                "prompt1": "User: q\n\nAssistant: <think",
+                "completion1": "</think>\nFinal answer: \\boxed{7}✿clean_length \\boxed{0}",
+                "stop_reason1": "stop_token",
+            }
+        ],
+        dataset_path=dataset,
+        judge=None,
+    )
+
+    assert evaluation.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert evaluation.rows_by_group["strategy_a"] == [(0, 0, False)]
+
+
 def test_strategy_b_c_inherit_a_passes_and_only_rescore_a_failures(monkeypatch, tmp_path) -> None:
     _patch_math_verify(monkeypatch)
     dataset = tmp_path / "free.jsonl"

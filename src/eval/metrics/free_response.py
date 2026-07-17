@@ -26,6 +26,17 @@ from src.eval.results.io import iter_jsonl
 from src.eval.results.schema import make_eval_payload, strict_nonneg_int
 
 USER_SENTINEL = "\nUser:"
+LEGACY_GENERATION_STOP_SUFFIXES = (USER_SENTINEL,)
+G1H_GENERATION_STOP_SUFFIXES = (
+    USER_SENTINEL,
+    "\nUser✿",
+    "User✿",
+    "\nBot✿",
+    "Bot✿",
+    "\nAssistant:",
+    "Assistant:",
+    "✿",
+)
 REPAIR_FINAL_CUE = "Therefore, the final answer is "
 STRATEGY_A = "strategy_a"
 STRATEGY_B = "strategy_b"
@@ -579,9 +590,24 @@ def _parsed_answer_text(parsed: Any) -> str:
     return str(item)
 
 
+def _generation_stop_suffixes_for_prompt(prompt: str) -> tuple[str, ...]:
+    if "User✿" in prompt or "Bot✿" in prompt:
+        return G1H_GENERATION_STOP_SUFFIXES
+    return LEGACY_GENERATION_STOP_SUFFIXES
+
+
+def _clip_generation_sentinels(text: str, *, prompt: str = "") -> str:
+    cut = len(text)
+    for sentinel in _generation_stop_suffixes_for_prompt(prompt):
+        index = text.find(sentinel)
+        if index >= 0:
+            cut = min(cut, index)
+    return text[:cut].rstrip()
+
+
 def _stage_text(payload: dict[str, Any], stage: int) -> str:
     text = str(payload.get(f"completion{stage}") or "")
-    return text.split(USER_SENTINEL, 1)[0]
+    return _clip_generation_sentinels(text, prompt=_stage_prompt(payload, stage))
 
 
 def _stage_prompt(payload: dict[str, Any], stage: int) -> str:
@@ -611,7 +637,7 @@ def _completion_stop_reason(payload: dict[str, Any]) -> str:
 def _strategy_a_text(payload: dict[str, Any]) -> str:
     text = str(payload.get("strategy_a_completion") or "")
     if text:
-        return text.split(USER_SENTINEL, 1)[0]
+        return _clip_generation_sentinels(text, prompt=_strategy_a_prompt(payload))
     return _completion_text(payload)
 
 
@@ -1058,9 +1084,11 @@ def _records_by_key(payloads: list[dict]) -> dict[tuple[int, int], dict]:
 
 __all__ = [
     "DEFAULT_LLM_JUDGE_PROMPT_TEMPLATE",
+    "G1H_GENERATION_STOP_SUFFIXES",
     "LLMJudge",
     "LLMJudgeConfig",
     "LLMJudgeStats",
+    "LEGACY_GENERATION_STOP_SUFFIXES",
     "REPAIR_FINAL_CUE",
     "STRATEGY_A",
     "STRATEGY_B",
