@@ -224,6 +224,7 @@ def _function_calling(
 
 _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     # Knowledge
+    canonical_slug("mmlu_prox"): _knowledge("mmlu_prox"),
     canonical_slug("include"): _knowledge("include"),
     canonical_slug("mmlu"): _knowledge("mmlu"),
     canonical_slug("cmmlu"): _knowledge("cmmlu"),
