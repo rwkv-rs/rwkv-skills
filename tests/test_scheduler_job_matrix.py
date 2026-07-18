@@ -147,6 +147,14 @@ def test_instruction_following_matrix_includes_rule_scored_datasets_only() -> No
 
 def test_scheduler_matrix_uses_metadata_default_splits() -> None:
     assert canonical_slug("include_test") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
+    for variant in ("question_only", "answer_only", "question_and_answer"):
+        slug = canonical_slug(f"mmlu_sr_{variant}_test")
+        assert slug in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
+        assert slug in JOB_CATALOGUE["multi_choice_cot"].dataset_slugs
+        assert slug in JOB_CATALOGUE["multi_choice_plain_naive"].dataset_slugs
+        assert slug in JOB_CATALOGUE["multi_choice_cot_naive"].dataset_slugs
+        assert DATASET_PREP_SPECS[slug].dataset == f"mmlu_sr_{variant}"
+        assert DATASET_PREP_SPECS[slug].split == "test"
     assert canonical_slug("gpqa_main") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("gpqa_extended") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("gpqa_diamond") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
