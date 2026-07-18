@@ -23,6 +23,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "ceval_test": 12342,
     "college_math_test": 2818,
     "comp_math_24_25_test": 256,
+    "arabicmmlu_test": 14455,
     "gaokao2023en_test": 385,
     "gpqa_main": 448,
     "gsm8k_test": 1319,
