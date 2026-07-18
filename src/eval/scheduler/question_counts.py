@@ -25,6 +25,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "comp_math_24_25_test": 256,
     "gaokao2023en_test": 385,
     "gpqa_main": 448,
+    "medmcqa_validation": 4183,
     "gsm8k_test": 1319,
     "gsm_plus_test": 9204,
     "hendrycks_math_test": 5000,
