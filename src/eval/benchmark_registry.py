@@ -233,6 +233,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("mmlu_sr_question_only"): _knowledge("mmlu_sr_question_only"),
     canonical_slug("mmlu_sr_answer_only"): _knowledge("mmlu_sr_answer_only"),
     canonical_slug("mmlu_sr_question_and_answer"): _knowledge("mmlu_sr_question_and_answer"),
+    canonical_slug("bbh_mcq"): _knowledge("bbh_mcq"),
     canonical_slug("mmmlu"): _knowledge("mmmlu"),
     canonical_slug("gpqa_main"): _knowledge("gpqa_main", dataset_name="gpqa", default_split="main"),
     canonical_slug("gpqa_extended"): _knowledge("gpqa_extended", dataset_name="gpqa", default_split="extended"),
