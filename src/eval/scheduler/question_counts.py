@@ -33,6 +33,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "college_math_test": 2818,
     "kmmlu_test": 35030,
     "comp_math_24_25_test": 256,
+    "arabicmmlu_test": 14455,
     "gaokao2023en_test": 385,
     "gpqa_main": 448,
     "gsm8k_test": 1319,
