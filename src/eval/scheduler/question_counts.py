@@ -43,6 +43,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "minerva_math_test": 272,
     "mmlu_pro_test": 12032,
     "mmlu_redux_test": 5431,
+    "mmlu_cf_val": 10000,
     "mmlu_sr_question_only_test": 14042,
     "mmlu_sr_answer_only_test": 14042,
     "mmlu_sr_question_and_answer_test": 14042,

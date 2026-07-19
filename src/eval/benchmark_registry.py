@@ -230,6 +230,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("ceval"): _knowledge("ceval"),
     canonical_slug("mmlu_pro"): _knowledge("mmlu_pro"),
     canonical_slug("mmlu_redux"): _knowledge("mmlu_redux"),
+    canonical_slug("mmlu_cf"): _knowledge("mmlu_cf", default_split="val"),
     canonical_slug("mmlu_sr_question_only"): _knowledge("mmlu_sr_question_only"),
     canonical_slug("mmlu_sr_answer_only"): _knowledge("mmlu_sr_answer_only"),
     canonical_slug("mmlu_sr_question_and_answer"): _knowledge("mmlu_sr_question_and_answer"),
