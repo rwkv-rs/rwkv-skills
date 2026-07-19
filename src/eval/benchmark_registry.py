@@ -227,6 +227,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("include"): _knowledge("include"),
     canonical_slug("arc_easy"): _knowledge("arc_easy"),
     canonical_slug("mmlu"): _knowledge("mmlu"),
+    canonical_slug("openbookqa"): _knowledge("openbookqa"),
     canonical_slug("cmmlu"): _knowledge("cmmlu"),
     canonical_slug("ceval"): _knowledge("ceval"),
     canonical_slug("mmlu_pro"): _knowledge("mmlu_pro"),
