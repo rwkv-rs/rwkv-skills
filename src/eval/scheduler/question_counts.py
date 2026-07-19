@@ -17,6 +17,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "aime25_test": 30,
     "openbookqa_test": 500,
     "algebra222_test": 222,
+    "commonsense_qa_validation": 1221,
     "amc23_test": 40,
     "answer_judge_test": 200,
     "arc_challenge_test": 1172,
