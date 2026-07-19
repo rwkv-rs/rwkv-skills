@@ -29,6 +29,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "brumo25_test": 30,
     "agieval_mcq_test": 5940,
     "ceval_test": 12342,
+    "bbh_mcq_test": 4070,
     "college_math_test": 2818,
     "comp_math_24_25_test": 256,
     "gaokao2023en_test": 385,
