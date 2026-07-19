@@ -33,6 +33,39 @@ def test_mmlu_metadata_is_two_mode_knowledge_zeroshot() -> None:
     assert metadata.target_eval_attempts == AUTO_TARGET_ATTEMPTS
 
 
+def test_mmlu_sr_metadata_and_group_alias_are_explicit() -> None:
+    expected_names = (
+        "mmlu_sr_question_only",
+        "mmlu_sr_answer_only",
+        "mmlu_sr_question_and_answer",
+    )
+
+    for name in expected_names:
+        metadata = resolve_benchmark_metadata(f"{name}_test")
+        assert metadata.name == name
+        assert metadata.field is BenchmarkField.KNOWLEDGE
+        assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
+        assert metadata.default_split == "test"
+        assert metadata.scheduler_jobs == (
+            "multi_choice_plain",
+            "multi_choice_cot",
+            "multi_choice_plain_naive",
+            "multi_choice_cot_naive",
+        )
+
+    assert expand_benchmark_alias("mmlu_sr") == expected_names
+
+    from src.dashboard.core.domains import DOMAIN_MMLU, domain_for_benchmark_field
+
+    assert (
+        domain_for_benchmark_field(
+            BenchmarkField.KNOWLEDGE,
+            dataset_slug="mmlu_sr_question_and_answer_test",
+        )
+        == DOMAIN_MMLU
+    )
+
+
 def test_include_defaults_to_knowledge_test_split() -> None:
     metadata = resolve_benchmark_metadata("include_test")
 
