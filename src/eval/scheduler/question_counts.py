@@ -17,6 +17,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "algebra222_test": 222,
     "amc23_test": 40,
     "answer_judge_test": 200,
+    "arc_challenge_test": 1172,
     "asdiv_test": 2305,
     "beyond_aime_test": 100,
     "brumo25_test": 30,
