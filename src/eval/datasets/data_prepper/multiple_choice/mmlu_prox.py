@@ -1,83 +1,146 @@
 from __future__ import annotations
 
-import importlib.util
+import re
 from pathlib import Path
-from typing import Dict, List
-from collections.abc import Iterable
+from typing import Any
 
-try:
-    from datasets import load_dataset  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    load_dataset = None  # type: ignore
+from src.eval.datasets.data_prepper.prepper_registry import MULTIPLE_CHOICE_REGISTRY
+from src.eval.datasets.runtime import HfRepoJsonlDatasetSpec, read_parquet_items
 
-from ..data_utils import configure_hf_home, download_file, write_jsonl
-
-LANG_LIBS_URL = (
-    "https://raw.githubusercontent.com/EleutherAI/lm-evaluation-harness/"
-    "refs/heads/main/lm_eval/tasks/mmlu_prox/lang_libs.py"
+_DATASET_ID = "li-lab/MMLU-ProX"
+_DATASET_REVISION = "8e6106a6c6ce1c5027e66cc338143cf997b2aa09"
+_LANGUAGES = (
+    "af",
+    "ar",
+    "bn",
+    "cs",
+    "de",
+    "en",
+    "es",
+    "fr",
+    "hi",
+    "hu",
+    "id",
+    "it",
+    "ja",
+    "ko",
+    "mr",
+    "ne",
+    "pt",
+    "ru",
+    "sr",
+    "sw",
+    "te",
+    "th",
+    "uk",
+    "ur",
+    "vi",
+    "wo",
+    "yo",
+    "zh",
+    "zu",
 )
+_EXPECTED_ROWS_PER_LANGUAGE = 11759
+# The official zh row 3299 has option_8 empty but option_9 populated. The
+# pipeline's canonical MC format cannot preserve a missing I alongside J
+# without relabeling choices, so exclude that one malformed source row.
+_KNOWN_MALFORMED_ROWS = {("zh", 3299)}
+_EXPECTED_ROWS = len(_LANGUAGES) * _EXPECTED_ROWS_PER_LANGUAGE - len(_KNOWN_MALFORMED_ROWS)
 
 
-def _load_lang_libs(cache_dir: Path) -> tuple[dict, dict]:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cache_dir / "lang_libs.py"
-    download_file(LANG_LIBS_URL, target)
-
-    spec = importlib.util.spec_from_file_location("lang_libs", target)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("无法导入 lang_libs 模块")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    if not hasattr(module, "LANG_LIBS") or not hasattr(module, "LANG_SUBJECTS"):
-        raise RuntimeError("lang_libs 缺少期望字段")
-    return module.LANG_LIBS, module.LANG_SUBJECTS
+def _normalize_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_") or "unknown"
 
 
-def _iter_records(split: str, languages: list[str], cache_dir: Path) -> Iterable[dict]:
-    configure_hf_home()
-    if load_dataset is None:  # pragma: no cover - dependency missing
-        raise ModuleNotFoundError(
-            "需要安装 `datasets` 才能准备 mmlu-prox 数据集，请运行 `pip install datasets`"
+def _parse_row(row: dict[str, Any], language: str) -> dict[str, Any]:
+    question = str(row.get("question") or "").strip()
+    answer = str(row.get("answer") or "").strip().upper()
+    if not question:
+        raise ValueError(f"MMLU-ProX {language} contains an empty question")
+    if answer not in "ABCDEFGHIJ" or len(answer) != 1:
+        raise ValueError(f"MMLU-ProX {language} contains invalid answer {answer!r}")
+
+    choices: list[str] = []
+    reached_gap = False
+    for index in range(10):
+        choice = str(row.get(f"option_{index}") or "").strip()
+        if not choice:
+            reached_gap = True
+            continue
+        if reached_gap:
+            raise ValueError(f"MMLU-ProX {language} contains non-contiguous options")
+        choices.append(choice)
+    if not 3 <= len(choices) <= 10:
+        raise ValueError(f"MMLU-ProX {language} contains {len(choices)} choices")
+    answer_index = ord(answer) - ord("A")
+    if answer_index >= len(choices):
+        raise ValueError(f"MMLU-ProX {language} answer {answer!r} is outside {len(choices)} choices")
+
+    category = _normalize_label(str(row.get("category") or "unknown"))
+    source_answer_index = row.get("answer_index")
+    payload: dict[str, Any] = {
+        "question": question,
+        "answer": answer,
+        "subject": category,
+        "subset": language,
+        "language": language,
+        "category": category,
+        "source": str(row.get("src") or "").strip(),
+        "source_id": row.get("question_id"),
+        "source_question_id": row.get("question_id_src"),
+        "source_answer_index": source_answer_index,
+        "answer_index_consistent": source_answer_index == answer_index,
+    }
+    for index, choice in enumerate(choices):
+        payload[chr(ord("A") + index)] = choice
+    return payload
+
+
+def _is_known_malformed(row: dict[str, Any], language: str) -> bool:
+    return (language, row.get("question_id")) in _KNOWN_MALFORMED_ROWS
+
+
+def _load_records(source_root: Path, split: str) -> list[dict[str, Any]]:
+    if split != "test":
+        raise ValueError("MMLU-ProX benchmark only supports the test split")
+
+    records: list[dict[str, Any]] = []
+    for language in _LANGUAGES:
+        path = source_root / language / "test-00000-of-00001.parquet"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        source_rows = [dict(row) for row in read_parquet_items(path)]
+        language_records = [
+            _parse_row(row, language)
+            for row in source_rows
+            if not _is_known_malformed(row, language)
+        ]
+        expected_language_rows = _EXPECTED_ROWS_PER_LANGUAGE - sum(
+            known_language == language for known_language, _source_id in _KNOWN_MALFORMED_ROWS
         )
-    lang_libs, lang_subjects = _load_lang_libs(cache_dir)
-    for language in languages:
-        dataset = load_dataset("li-lab/MMLU-ProX", language, split=split)
-        lib = lang_libs[language]
-        subject_map = lang_subjects[language]
-
-        for row in dataset:
-            category = row.get("category", "").replace(" ", "_")
-            options: list[str] = []
-            for idx in range(10):
-                value = row.get(f"option_{idx}")
-                if value is None:
-                    continue
-                text = str(value).strip()
-                if text:
-                    options.append(text)
-            answer_letter = str(row.get("answer", "")).strip().upper()
-            answer_idx = ord(answer_letter) - ord("A")
-            if not (0 <= answer_idx < len(options)):
-                raise ValueError(f"答案索引越界: {answer_letter}")
-
-            subject = subject_map.get(category, category)
-            description = lib[3].format(subject=subject, ans_suffix=lib[5].format("X")) + "\n"
-            choices = [choice for choice in options if choice]
-            question_text = row.get("question", "").strip()
-            payload: dict[str, object] = {
-                "question": f"{description}{lib[0]}\n{row.get('question', '').strip()}\n{lib[1]}",
-                "answer": answer_letter,
-                "subject": category,
-                "language": language,
-                "subset": language,
-                "category": category,
-            }
-            for idx, choice in enumerate(choices):
-                payload[chr(ord("A") + idx)] = choice
-            payload["description"] = description.strip()
-            yield payload
+        if len(language_records) != expected_language_rows:
+            raise ValueError(
+                f"MMLU-ProX {language} expected {expected_language_rows} test rows, "
+                f"found {len(language_records)}"
+            )
+        records.extend(language_records)
+    if len(records) != _EXPECTED_ROWS:
+        raise ValueError(f"MMLU-ProX expected {_EXPECTED_ROWS} test rows, found {len(records)}")
+    return records
 
 
-# MMLU-ProX 是多模态集，已停用以避免误触发。
-def prepare_mmlu_prox(_output_root: Path, _split: str = "test") -> list[Path]:  # pragma: no cover - disabled
-    raise RuntimeError("mmlu-prox 已被禁用，不再支持调度/准备。")
+@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_prox")
+def prepare_mmlu_prox_spec(output_root: Path, split: str = "test") -> HfRepoJsonlDatasetSpec:
+    return HfRepoJsonlDatasetSpec(
+        "mmlu_prox",
+        output_root,
+        split,
+        repo=_DATASET_ID,
+        revision=_DATASET_REVISION,
+        load_downloaded_records=lambda source_root: _load_records(source_root, split),
+        required_fields=("question", "answer", "A", "B", "C"),
+        allow_patterns=[f"{language}/test-00000-of-00001.parquet" for language in _LANGUAGES],
+    )
+
+
+__all__ = ["prepare_mmlu_prox_spec"]

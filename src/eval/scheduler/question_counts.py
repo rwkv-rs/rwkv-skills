@@ -55,6 +55,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "mbpp_test": 508,
     "minerva_math_test": 272,
     "mmlu_pro_test": 12032,
+    "mmlu_prox_test": 341010,
     "mmlu_redux_test": 5431,
     "mmlu_cf_val": 10000,
     "mmlu_sr_question_only_test": 14042,
