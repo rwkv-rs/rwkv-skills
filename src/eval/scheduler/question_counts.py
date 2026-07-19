@@ -25,6 +25,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "asdiv_test": 2305,
     "hellaswag_validation": 10042,
     "beyond_aime_test": 100,
+    "winogrande_validation": 1267,
     "brumo25_test": 30,
     "ceval_test": 12342,
     "college_math_test": 2818,
