@@ -13,6 +13,7 @@ if TYPE_CHECKING:  # pragma: no cover
 # These represent the full number of questions/samples per dataset.
 HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "aime24_test": 30,
+    "arc_easy_test": 2376,
     "aime25_test": 30,
     "algebra222_test": 222,
     "amc23_test": 40,
