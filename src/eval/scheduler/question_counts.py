@@ -27,6 +27,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "beyond_aime_test": 100,
     "winogrande_validation": 1267,
     "brumo25_test": 30,
+    "agieval_mcq_test": 5940,
     "ceval_test": 12342,
     "college_math_test": 2818,
     "comp_math_24_25_test": 256,
