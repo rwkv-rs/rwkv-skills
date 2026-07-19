@@ -23,6 +23,7 @@ HISTORICAL_QUESTION_COUNTS: dict[str, int] = {
     "answer_judge_test": 200,
     "arc_challenge_test": 1172,
     "asdiv_test": 2305,
+    "hellaswag_validation": 10042,
     "beyond_aime_test": 100,
     "brumo25_test": 30,
     "ceval_test": 12342,
