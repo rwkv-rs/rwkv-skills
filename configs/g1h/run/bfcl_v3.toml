@@ -1,0 +1,38 @@
+[run]
+run_mode = "rerun"
+max_samples = 50
+batch_size = 64
+
+[dataset]
+name = "bfcl_v3"
+split = "test"
+
+[model]
+infer_base_url = "http://127.0.0.1:18081"
+infer_model = "rwkv7-g1e-13.3b-20260309-ctx8192"
+infer_timeout_s = 600
+infer_max_workers = 64
+
+[runner]
+benchmark_kind = "bfcl_v3"
+prompt_style = "rwkv_flower_json"
+tool_catalog_format = "json"
+avg_ks = [1]
+history_max_chars = 24000
+prompt_max_chars = 28000
+tool_router_mode = "lexical"
+tool_router_max_tools = 32
+tool_router_trigger_tool_count = 16
+tool_router_trigger_catalog_chars = 6000
+candidate_router_mode = "parallel"
+candidate_router_chunk_tools = 2
+candidate_router_batch_size = 16
+candidate_router_context_chars = 6000
+candidate_router_prompt_max_chars = 8192
+candidate_router_candidate_max_tokens = 192
+candidate_router_aggregate_max_tokens = 192
+candidate_router_tool_schema_mode = "compact"
+max_steps = 20
+max_tool_errors = 20
+cot_max_tokens = 2048
+decision_max_tokens = 512

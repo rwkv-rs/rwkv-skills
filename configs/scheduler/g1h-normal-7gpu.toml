@@ -1,0 +1,107 @@
+profile = "g1h-normal-7gpu"
+run_tag = "g1h_normal_7gpu_20260719"
+
+[paths]
+log_dir = "logs/scheduler/{run_tag}"
+pid_dir = "logs/scheduler/{run_tag}/pids"
+run_log_dir = "results/logs/{run_tag}"
+
+[inference]
+base_url = "http://127.0.0.1:19083/v1"
+api_key = "rwkv-skills"
+protocol = "vllm"
+seed_policy = "omit"
+timeout_s = 900
+max_workers = 128
+worker_profile = "param-size"
+remote_batch_size = 64
+plain_choice_batch_size = 256
+sample_workers = 32
+slots_per_model = 1
+# The router cannot authenticate its vLLM metrics probes in this deployment.
+# Static per-model budgets are used until authenticated metrics are available.
+backpressure = false
+backpressure_timeout_s = 2.0
+backpressure_pending_high_watermark = 0
+budget_min_workers = 1
+
+[[inference.model_groups]]
+slot_prefix = "g1h15"
+model = "rwkv7-g1h-1.5b-20260710-ctx10240"
+slots = 2
+start = 1
+width = 2
+base_urls = ["http://127.0.0.1:19315/v1", "http://127.0.0.1:19316/v1"]
+
+[[inference.model_groups]]
+slot_prefix = "g1h29"
+model = "rwkv7-g1h-2.9b-20260710-ctx10240"
+slots = 2
+start = 1
+width = 2
+base_urls = ["http://127.0.0.1:19329/v1", "http://127.0.0.1:19330/v1"]
+
+[[inference.model_groups]]
+slot_prefix = "g1h72"
+model = "rwkv7-g1h-7.2b-20260710-ctx10240"
+slots = 1
+start = 1
+width = 2
+base_urls = ["http://127.0.0.1:29572/v1"]
+
+[[inference.model_groups]]
+slot_prefix = "g1h133"
+model = "rwkv7-g1h-13.3b-20260710-ctx10240"
+slots = 2
+start = 1
+width = 2
+base_urls = ["http://127.0.0.1:29533/v1", "http://127.0.0.1:29534/v1"]
+
+[selection]
+model_select = "latest-data"
+benchmark_fields = ["maths", "knowledge", "coding", "instruction_following"]
+only_jobs = [
+  "free_response",
+  "free_response_judge",
+  "multi_choice_plain",
+  "multi_choice_cot",
+  "instruction_following",
+  "code_human_eval",
+  "code_mbpp",
+  "code_livecodebench",
+]
+job_order = [
+  "free_response",
+  "free_response_judge",
+  "multi_choice_plain",
+  "multi_choice_cot",
+  "instruction_following",
+  "code_human_eval",
+  "code_mbpp",
+  "code_livecodebench",
+  "code_swe_bench",
+]
+only_datasets = []
+# These registered items are not runnable in this normal queue: HLE/Hy-Math
+# have no materialized source here, and SWE-bench requires its official
+# external harness rather than the ordinary coding runner.
+skip_datasets = ["hle_all", "hy_math_test"]
+enable_param_search = false
+
+[runtime]
+run_mode = "fresh"
+dispatch_poll_seconds = 10
+gpu_idle_max_mem = 1000
+benchmark_config_root = "configs/g1h"
+skip_missing_dataset = true
+clean_param_swap = false
+disable_checker = true
+distributed_claims = false
+lease_duration_s = 900
+
+[math]
+judge_max_workers = 64
+
+[coding]
+eval_workers = 8
+max_active_runners = 4

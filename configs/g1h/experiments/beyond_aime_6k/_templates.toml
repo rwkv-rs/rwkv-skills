@@ -1,0 +1,30 @@
+[math_cot_6k]
+cot_prompt_template = """User✿<Q>✿
+Bot✿<think>"""
+max_generate_tokens = 6144
+min_think_tokens = 16
+temperature = 0.8
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
+alpha_decay = 0.99
+stop_tokens = [0, 10060]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[free_response_final_default]
+final_prompt_template = """<Q><COT></think>
+Therefore, the answer is \\(\\boxed{"""
+max_generate_tokens = 128
+temperature = 0.8
+top_k = 8
+top_p = 0.30
+alpha_presence = 1e-5
+alpha_frequency = 1e-5
+alpha_decay = 0.99
+stop_tokens = [0, 2402, 4910, 10060]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

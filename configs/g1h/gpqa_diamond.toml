@@ -1,0 +1,22 @@
+[default]
+template = "multi_choice_cot_default"
+pass_k = []
+avg_k = [16]
+report_pass_k = []
+report_avg_k = [16]
+knowledge_cot_strategy = "cascade_a_b"
+missing_prediction_score = 0.25
+
+[cot]
+cot_prompt_template = """User✿<Q>
+<CHOICES>✿
+Bot✿<think"""
+max_generate_tokens = 8192
+min_think_tokens = 16
+temperature = 0.96
+top_p = 0.76
+top_k = 32
+alpha_presence = 1.0
+alpha_frequency = 0.1
+alpha_decay = 0.988
+stop_tokens = [0]

@@ -201,7 +201,10 @@ def _candidate_dataset_paths(repo_root: Path, spec: DatasetSpec) -> tuple[Path, 
 
 
 def load_db_rows(specs: tuple[DatasetSpec, ...], models: tuple[str, ...]) -> tuple[dict[tuple[str, str, str], dict[str, Any]], dict[tuple[str, str, str], dict[str, Any]]]:
-    benchmark_names = sorted({alias for spec in specs for alias in spec.benchmark_aliases})
+    # Query the exact registered benchmark identity.  Cross-spelling and
+    # dataset aliases can collide with a different benchmark and falsely make
+    # a missing pair look scored.
+    benchmark_names = sorted({spec.benchmark for spec in specs})
     splits = sorted({spec.split for spec in specs} | {"test"})
     with connect_from_env() as conn:
         latest_scores = {
@@ -332,11 +335,9 @@ def classify_pairs(repo_root: Path, specs: tuple[DatasetSpec, ...], models: tupl
 
 def _lookup_row(rows: dict[tuple[str, str, str], dict[str, Any]], spec: DatasetSpec, model: str) -> dict[str, Any] | None:
     splits = tuple(dict.fromkeys((spec.split, "test")))
-    for benchmark in spec.benchmark_aliases:
-        for split in splits:
-            row = rows.get((benchmark, split, model))
-            if row is not None:
-                return row
+    row = rows.get((spec.benchmark, spec.split, model))
+    if row is not None:
+        return row
     return None
 
 

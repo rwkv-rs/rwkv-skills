@@ -1,0 +1,21 @@
+[default]
+avg_k = [1]
+report_avg_k = [1]
+template = "instruction_following_default"
+agent_plugin_enabled = true
+max_generate_tokens = 4096
+temperature = 0.8
+top_p = 0.3
+top_k = 50
+tool_router_mode = "lexical"
+tool_router_max_tools = 16
+tool_router_trigger_tool_count = 20
+tool_router_trigger_catalog_chars = 6000
+tool_router_context_chars = 6000
+tool_router_description_chars = 240
+long_context_router_mode = "lexical"
+long_context_min_chars = 4000
+long_context_chunk_chars = 1200
+long_context_overlap_lines = 2
+long_context_max_evidence_chunks = 4
+long_context_max_evidence_chars = 6000

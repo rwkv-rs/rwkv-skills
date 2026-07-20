@@ -1,0 +1,4 @@
+[default]
+temperature = 0.8
+avg_k = [1]
+report_avg_k = [1]

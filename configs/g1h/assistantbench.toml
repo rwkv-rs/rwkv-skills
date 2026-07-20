@@ -1,0 +1,7 @@
+[default]
+template = "function_call_cot_default"
+avg_k = [1]
+function_call_system_template = """Tools:
+<TOOLS>
+Return only a JSON function call."""
+function_call_user_template = """<HISTORY>"""

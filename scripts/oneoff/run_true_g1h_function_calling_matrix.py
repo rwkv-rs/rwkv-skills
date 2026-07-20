@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """Run the true-g1h function-calling matrix with per-model concurrency.
 
 This helper is intentionally separate from the older g1f/g1g matrix runner so
 the true g1h endpoints can use different base URLs and worker budgets.
 """
+
+from __future__ import annotations
 
 import argparse
 import concurrent.futures
@@ -25,9 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.eval.benchmark_registry import resolve_benchmark_metadata
-from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
-from src.eval.scheduler.dataset_utils import make_dataset_slug
+from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset  # noqa: E402
+from src.eval.scheduler.dataset_utils import make_dataset_slug  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,12 +435,12 @@ def runner_config(args: argparse.Namespace, model: ModelSpec, spec: BenchmarkSpe
     elif spec.kind == "browsecomp_plus":
         config["history_max_chars"] = 24000
         config["prompt_max_chars"] = 28000
-        config["max_steps"] = 12
-        config["max_rounds"] = 12
+        config["max_steps"] = 100
+        config["max_rounds"] = 100
         config["candidate_router_mode"] = "parallel"
-        config["candidate_router_chunk_tools"] = 2
+        config["candidate_router_chunk_tools"] = 3
         config["candidate_router_batch_size"] = 16
-        config["candidate_router_max_candidates"] = 6
+        config["candidate_router_max_candidates"] = 3
         config["candidate_router_prompt_max_chars"] = 12288
         config["candidate_router_context_chars"] = 8000
     elif spec.kind.startswith("tau"):

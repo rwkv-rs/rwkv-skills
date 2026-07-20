@@ -1,0 +1,11 @@
+[default]
+pass_k = []
+avg_k = [4]
+report_pass_k = []
+report_avg_k = [4]
+
+[cot]
+template = "full_code_cot_default"
+
+[final]
+template = "full_code_final_default"

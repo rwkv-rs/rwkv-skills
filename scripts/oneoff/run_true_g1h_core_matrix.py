@@ -28,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.eval.benchmark_registry import BenchmarkField, CoTMode, get_benchmarks_with_field
 from src.eval.env_config import load_env_file
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.dataset_utils import make_dataset_slug
+from src.eval.scheduler.dataset_utils import make_dataset_slug, split_benchmark_and_split
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +214,7 @@ def local_dataset_candidates(dataset: str, split: str, *, repo_root: Path) -> tu
 
 def db_state(conn, model_name: str, spec: RunSpec) -> str:
     cot_db_value = "CoT" if spec.cot_mode is CoTMode.COT else "NoCoT"
-    benchmark_names = benchmark_name_candidates(spec)
+    benchmark_name = benchmark_db_name(spec)
     score = conn.execute(
         """
         SELECT 1
@@ -223,14 +223,14 @@ def db_state(conn, model_name: str, spec: RunSpec) -> str:
         JOIN benchmark b ON b.benchmark_id = t.benchmark_id
         JOIN model m ON m.model_id = t.model_id
         WHERE m.model_name = %s
-          AND b.benchmark_name = ANY(%s)
+          AND b.benchmark_name = %s
           AND b.benchmark_split = %s
           AND coalesce(t.is_tmp, false) = false
           AND coalesce(t.sampling_config->>'cot_mode', '') = %s
           AND coalesce(t.sampling_config->>'prompt_profile', '') NOT IN ('naive')
         LIMIT 1
         """,
-        (model_name, list(benchmark_names), spec.split, cot_db_value),
+        (model_name, benchmark_name, spec.split, cot_db_value),
     ).fetchone()
     if score:
         return "scored"
@@ -241,28 +241,36 @@ def db_state(conn, model_name: str, spec: RunSpec) -> str:
         JOIN benchmark b ON b.benchmark_id = t.benchmark_id
         JOIN model m ON m.model_id = t.model_id
         WHERE m.model_name = %s
-          AND b.benchmark_name = ANY(%s)
+          AND b.benchmark_name = %s
           AND b.benchmark_split = %s
           AND coalesce(t.is_tmp, false) = false
           AND t.status = 'Running'
           AND coalesce(t.sampling_config->>'cot_mode', '') = %s
         LIMIT 1
         """,
-        (model_name, list(benchmark_names), spec.split, cot_db_value),
+        (model_name, benchmark_name, spec.split, cot_db_value),
     ).fetchone()
     return "running" if running else "missing"
 
 
-def benchmark_name_candidates(spec: RunSpec) -> tuple[str, ...]:
-    names = [
-        spec.benchmark,
-        spec.dataset,
-        spec.benchmark.replace("_", "-"),
-        spec.benchmark.replace("-", "_"),
-        spec.dataset.replace("_", "-"),
-        spec.dataset.replace("-", "_"),
-    ]
-    return tuple(name for name in dict.fromkeys(names) if name)
+def benchmark_db_name(spec: RunSpec) -> str:
+    """Return the exact DB benchmark identity implied by the dataset path.
+
+    A benchmark display name and its materialized dataset name can differ
+    (for example, ``gpqa_main`` uses ``gpqa`` with split ``main``).  Expanding
+    spelling and dataset aliases here is unsafe: one historical score can then
+    suppress a different registered pair.  Resolve only the canonical
+    dataset-base/split pair that the runner itself will persist.
+    """
+    benchmark_name, dataset_split = split_benchmark_and_split(
+        make_dataset_slug(spec.dataset, spec.split)
+    )
+    if dataset_split != spec.split:
+        raise ValueError(
+            f"dataset identity split mismatch for {spec.benchmark}: "
+            f"expected {spec.split!r}, got {dataset_split!r}"
+        )
+    return benchmark_name
 
 
 def run_one(args: argparse.Namespace, repo_root: Path, log_dir: Path, model: ModelSpec, spec: RunSpec) -> int:
@@ -324,7 +332,7 @@ def base_command(args: argparse.Namespace, model: ModelSpec, spec: RunSpec) -> l
         str(int(args.db_write_queue)),
     ]
     if spec.field is BenchmarkField.MATHS:
-        command.extend(["--max-tokens", "4096", "--strategy-a-single-generation", "--db-close-timeout-s", "120"])
+        command.extend(["--strategy-a-single-generation", "--db-close-timeout-s", "120"])
         if spec.job == "free_response_judge":
             command.extend(["--judge-mode", "llm", "--judge-max-workers", str(int(args.judge_max_workers))])
         else:
@@ -332,7 +340,7 @@ def base_command(args: argparse.Namespace, model: ModelSpec, spec: RunSpec) -> l
     elif spec.field is BenchmarkField.KNOWLEDGE:
         command.extend(["--cot-mode", spec.cot_mode.value, "--target-token-format", " <LETTER>"])
     elif spec.field is BenchmarkField.CODING:
-        command.extend(["--max-tokens", "4096", "--eval-timeout", "30", "--eval-workers", "8"])
+        command.extend(["--eval-timeout", "30", "--eval-workers", "8"])
         if spec.job == "code_human_eval":
             command.extend(["--benchmark-kind", "human_eval"])
         elif spec.job == "code_mbpp":
