@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from typing import Any, Mapping, Sequence
 
 from .context_budget import normalize_rwkv_text, trim_message_history
 
 RWKV_OFFICIAL_JSON_PROMPT_STYLE = "rwkv_official_json"
-FUNCTION_PROMPT_STYLE_CHOICES = (RWKV_OFFICIAL_JSON_PROMPT_STYLE,)
+RWKV_FLOWER_JSON_PROMPT_STYLE = "rwkv_flower_json"
+FUNCTION_PROMPT_STYLE_ENV = "RWKV_FUNCTION_PROMPT_STYLE"
+FUNCTION_PROMPT_STYLE_CHOICES = (RWKV_OFFICIAL_JSON_PROMPT_STYLE, RWKV_FLOWER_JSON_PROMPT_STYLE)
 DEFAULT_FUNCTION_PROMPT_STYLE = RWKV_OFFICIAL_JSON_PROMPT_STYLE
 
 JSON_TOOL_CATALOG_FORMAT = "json"
@@ -21,11 +24,19 @@ JSON_CALL_STOP_SUFFIXES = (
     "\nUser:",
     "\nSystem:",
     "\nAssistant:",
+    "\nUser✿",
+    "User✿",
+    "\nBot✿",
+    "Bot✿",
+    "✿",
 )
 
 USER_HEADER = "User:"
 ASSISTANT_HEADER = "Assistant:"
 SYSTEM_HEADER = "System:"
+FLOWER_USER_HEADER = "User✿"
+FLOWER_ASSISTANT_HEADER = "Bot✿"
+FLOWER_DELIMITER = "✿"
 
 JSON_CALL_OBJECT_PREFILL = "{"
 JSON_CALL_OBJECT_PREFILL_FIELDS = frozenset(
@@ -43,13 +54,24 @@ JSON_CALL_OBJECT_PREFILL_FIELDS = frozenset(
 
 
 def normalize_function_prompt_style(value: str | None) -> str:
-    normalized = str(value or DEFAULT_FUNCTION_PROMPT_STYLE).strip().lower()
+    raw = value
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get(FUNCTION_PROMPT_STYLE_ENV) or DEFAULT_FUNCTION_PROMPT_STYLE
+    normalized = str(raw).strip().lower()
     if normalized not in FUNCTION_PROMPT_STYLE_CHOICES:
         raise ValueError(
             f"unsupported function prompt style {value!r}; "
             f"expected one of {', '.join(FUNCTION_PROMPT_STYLE_CHOICES)}"
         )
     return normalized
+
+
+def active_function_prompt_style(value: str | None = None) -> str:
+    return normalize_function_prompt_style(value)
+
+
+def _uses_flower_prompt_style(value: str | None = None) -> bool:
+    return active_function_prompt_style(value) == RWKV_FLOWER_JSON_PROMPT_STYLE
 
 
 def normalize_tool_catalog_format(value: str | None) -> str:
@@ -62,25 +84,39 @@ def normalize_tool_catalog_format(value: str | None) -> str:
     return normalized
 
 
-def assistant_json_prefix(*, enable_think: bool = False, prefill_object: bool = True) -> str:
+def assistant_json_prefix(
+    *,
+    enable_think: bool = False,
+    prefill_object: bool = True,
+    prompt_style: str | None = None,
+) -> str:
     suffix = "{" if prefill_object else ""
+    if _uses_flower_prompt_style(prompt_style):
+        return f"{FLOWER_ASSISTANT_HEADER}<think></think>\n```json\n{suffix}"
     if not enable_think:
         return f"Assistant: ```json\n{suffix}"
-    return f"Assistant: <think>\n</think>\n```json\n{suffix}"
+    return f"Assistant: <think></think>\n```json\n{suffix}"
 
 
-def render_system_block(content: str) -> str:
-    return f"{SYSTEM_HEADER} {normalize_rwkv_text(content)}".rstrip(" ")
+def render_system_block(content: str, *, prompt_style: str | None = None) -> str:
+    rendered = normalize_rwkv_text(content)
+    if _uses_flower_prompt_style(prompt_style):
+        return f"{FLOWER_USER_HEADER}System:\n{rendered}{FLOWER_DELIMITER}"
+    return f"{SYSTEM_HEADER} {rendered}".rstrip(" ")
 
 
-def render_user_block(content: str) -> str:
+def render_user_block(content: str, *, prompt_style: str | None = None) -> str:
     rendered = _strip_role_prefix(content, USER_HEADER)
     rendered = _sanitize_embedded_role_headers(rendered)
+    if _uses_flower_prompt_style(prompt_style):
+        return f"{FLOWER_USER_HEADER}{rendered}{FLOWER_DELIMITER}"
     return f"{USER_HEADER} {rendered}".rstrip(" ")
 
 
-def render_assistant_text_block(content: str) -> str:
+def render_assistant_text_block(content: str, *, prompt_style: str | None = None) -> str:
     rendered = _strip_role_prefix(content, ASSISTANT_HEADER)
+    if _uses_flower_prompt_style(prompt_style):
+        return f"{FLOWER_ASSISTANT_HEADER}{rendered}{FLOWER_DELIMITER}"
     return f"{ASSISTANT_HEADER} {rendered}".rstrip(" ")
 
 
@@ -92,8 +128,10 @@ def render_json_function_call(name: str, arguments: Mapping[str, Any] | None = N
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def render_assistant_json_block(json_text: str, *, assistant_prefix: str | None = None) -> str:
-    prefix = assistant_prefix if assistant_prefix is not None else assistant_json_prefix()
+def render_assistant_json_block(
+    json_text: str, *, assistant_prefix: str | None = None, prompt_style: str | None = None
+) -> str:
+    prefix = assistant_prefix if assistant_prefix is not None else assistant_json_prefix(prompt_style=prompt_style)
     rendered = normalize_rwkv_text(json_text)
     if prefix.rstrip().endswith("{") and rendered.startswith("{"):
         rendered = rendered[1:]
@@ -102,12 +140,12 @@ def render_assistant_json_block(json_text: str, *, assistant_prefix: str | None 
     return f"{prefix}{rendered}\n```"
 
 
-def render_function_output_user_block(payload: Any) -> str:
+def render_function_output_user_block(payload: Any, *, prompt_style: str | None = None) -> str:
     if isinstance(payload, str):
         rendered = normalize_rwkv_text(payload)
     else:
         rendered = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return render_user_block("Function output:\n" + rendered)
+    return render_user_block("Function output:\n" + rendered, prompt_style=prompt_style)
 
 
 def build_rwkv_json_call_prompt(
@@ -117,14 +155,16 @@ def build_rwkv_json_call_prompt(
     history_max_chars: int,
     assistant_prefix: str | None = None,
     single_user_turn: bool = False,
+    prompt_style: str | None = None,
 ) -> str:
+    style = active_function_prompt_style(prompt_style)
     bounded_messages = trim_message_history(messages, max_chars=max(0, int(history_max_chars)))
-    json_prefix = assistant_prefix if assistant_prefix is not None else assistant_json_prefix()
-    parts = [render_system_block(system_prompt)]
+    json_prefix = assistant_prefix if assistant_prefix is not None else assistant_json_prefix(prompt_style=style)
+    parts = [render_system_block(system_prompt, prompt_style=style)]
     if single_user_turn:
         user_content = _render_single_user_turn_content(bounded_messages)
         if user_content:
-            parts.append(render_user_block(user_content))
+            parts.append(render_user_block(user_content, prompt_style=style))
         parts.append(json_prefix)
         return "\n\n".join(parts)
     for message in bounded_messages:
@@ -133,18 +173,26 @@ def build_rwkv_json_call_prompt(
         if not content:
             continue
         if role in {"tool", "function", "observation"}:
-            parts.append(render_function_output_user_block(content))
+            parts.append(render_function_output_user_block(content, prompt_style=style))
             continue
         if role == "assistant":
             assistant_content = _strip_role_prefix(content, ASSISTANT_HEADER)
             if _looks_like_json_call(assistant_content):
-                parts.append(render_assistant_json_block(_strip_json_fence(assistant_content), assistant_prefix=json_prefix))
+                parts.append(
+                    render_assistant_json_block(
+                        _strip_json_fence(assistant_content), assistant_prefix=json_prefix, prompt_style=style
+                    )
+                )
             elif _looks_like_json_call(content):
-                parts.append(render_assistant_json_block(_strip_json_fence(content), assistant_prefix=json_prefix))
+                parts.append(
+                    render_assistant_json_block(
+                        _strip_json_fence(content), assistant_prefix=json_prefix, prompt_style=style
+                    )
+                )
             else:
-                parts.append(render_assistant_text_block(content))
+                parts.append(render_assistant_text_block(content, prompt_style=style))
             continue
-        parts.append(render_user_block(content))
+        parts.append(render_user_block(content, prompt_style=style))
     parts.append(json_prefix)
     return "\n\n".join(parts)
 
@@ -355,7 +403,9 @@ def _strip_assistant_prefix(text: str) -> str:
     stripped = text.strip()
     if stripped.startswith("Assistant:"):
         return normalize_rwkv_text(stripped[len("Assistant:") :])
-    return stripped
+    if stripped.startswith(FLOWER_ASSISTANT_HEADER):
+        return _strip_flower_closer(stripped[len(FLOWER_ASSISTANT_HEADER) :])
+    return _strip_flower_closer(stripped)
 
 
 def _agentic_tool_call_to_json_text(text: str) -> str | None:
@@ -461,7 +511,16 @@ def _strip_role_prefix(text: str, prefix: str) -> str:
     stripped = normalize_rwkv_text(text)
     if stripped.startswith(prefix):
         return normalize_rwkv_text(stripped[len(prefix) :])
+    if prefix == USER_HEADER and stripped.startswith(FLOWER_USER_HEADER):
+        return _strip_flower_closer(stripped[len(FLOWER_USER_HEADER) :])
+    if prefix == ASSISTANT_HEADER and stripped.startswith(FLOWER_ASSISTANT_HEADER):
+        return _strip_flower_closer(stripped[len(FLOWER_ASSISTANT_HEADER) :])
     return stripped
+
+
+def _strip_flower_closer(text: str) -> str:
+    stripped = normalize_rwkv_text(text)
+    return normalize_rwkv_text(stripped[: -len(FLOWER_DELIMITER)]) if stripped.endswith(FLOWER_DELIMITER) else stripped
 
 
 def _strip_leading_think_block(text: str) -> str:
@@ -499,7 +558,16 @@ def _is_ignorable_json_call_trailing(text: str) -> bool:
         if not rest:
             return True
         normalized = rest
-    return normalized.startswith((USER_HEADER, ASSISTANT_HEADER, SYSTEM_HEADER))
+    return normalized.startswith(
+        (
+            USER_HEADER,
+            ASSISTANT_HEADER,
+            SYSTEM_HEADER,
+            FLOWER_USER_HEADER,
+            FLOWER_ASSISTANT_HEADER,
+            FLOWER_DELIMITER,
+        )
+    )
 
 
 def _recover_leading_json_array_text(text: str) -> str | None:
@@ -581,11 +649,14 @@ __all__ = [
     "DEFAULT_FUNCTION_PROMPT_STYLE",
     "DEFAULT_TOOL_CATALOG_FORMAT",
     "FUNCTION_PROMPT_STYLE_CHOICES",
+    "FUNCTION_PROMPT_STYLE_ENV",
     "FUNCTION_TOOL_CATALOG_FORMAT_CHOICES",
     "JSON_CALL_STOP_SUFFIXES",
     "JSON_CALL_OBJECT_PREFILL",
     "JSON_TOOL_CATALOG_FORMAT",
+    "RWKV_FLOWER_JSON_PROMPT_STYLE",
     "RWKV_OFFICIAL_JSON_PROMPT_STYLE",
+    "active_function_prompt_style",
     "apply_json_call_object_prefill",
     "assistant_json_prefix",
     "build_rwkv_json_call_prompt",

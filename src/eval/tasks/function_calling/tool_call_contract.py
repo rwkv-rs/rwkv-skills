@@ -1,14 +1,14 @@
-from __future__ import annotations
-
 """Shared JSON tool-call parsing and schema-contract helpers.
 
-This module is intentionally benchmark-neutral. It normalizes common model
-output shapes into ``{"name": ..., "arguments": {...}}`` calls and validates
-them against tool schemas, but it does not encode domain planning policy.
+Normal text output uses the strict ``{"name": ..., "arguments": {...}}``
+contract. OpenAI native ``tool_calls`` responses are handled as an explicit,
+separate envelope rather than as aliases for normal output.
 """
 
-import json
+from __future__ import annotations
+
 import ast
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -33,8 +33,14 @@ def parse_tool_call_text(
     *,
     context_label: str = "tool call",
     recover_partial: bool = True,
+    allowed_metadata_keys: Sequence[str] = (),
 ) -> ParsedToolCall:
-    calls = parse_tool_calls_text(text, context_label=context_label, recover_partial=recover_partial)
+    calls = parse_tool_calls_text(
+        text,
+        context_label=context_label,
+        recover_partial=recover_partial,
+        allowed_metadata_keys=allowed_metadata_keys,
+    )
     if not calls:
         raise ValueError(f"{context_label} payload did not contain a tool call")
     return calls[0]
@@ -45,9 +51,14 @@ def parse_tool_calls_text(
     *,
     context_label: str = "tool call",
     recover_partial: bool = True,
+    allowed_metadata_keys: Sequence[str] = (),
 ) -> list[ParsedToolCall]:
     payload = load_tool_call_payload(text, context_label=context_label, recover_partial=recover_partial)
-    return coerce_tool_call_payloads(payload, context_label=context_label)
+    return coerce_tool_call_payloads(
+        payload,
+        context_label=context_label,
+        allowed_metadata_keys=allowed_metadata_keys,
+    )
 
 
 def load_tool_call_payload(
@@ -73,17 +84,31 @@ def load_tool_call_payload(
             return partial_tool_call_payload(text, context_label=context_label, cause=exc)
 
 
-def coerce_tool_call_payloads(payload: Any, *, context_label: str = "tool call") -> list[ParsedToolCall]:
+def coerce_tool_call_payloads(
+    payload: Any,
+    *,
+    context_label: str = "tool call",
+    allowed_metadata_keys: Sequence[str] = (),
+) -> list[ParsedToolCall]:
     if isinstance(payload, list):
         calls: list[ParsedToolCall] = []
         for index, item in enumerate(payload):
             if not isinstance(item, Mapping):
                 raise ValueError(f"{context_label} list item #{index} must be a JSON object")
-            calls.append(_coerce_tool_call_mapping(item, context_label=context_label))
+            calls.append(
+                _coerce_tool_call_mapping(
+                    item,
+                    context_label=context_label,
+                    allowed_metadata_keys=allowed_metadata_keys,
+                )
+            )
         return calls
     if not isinstance(payload, Mapping):
         raise ValueError(f"{context_label} payload must be a JSON object")
     if "tool_calls" in payload:
+        extra_envelope_keys = sorted(key for key in payload if key != "tool_calls")
+        if extra_envelope_keys:
+            raise ValueError(f"{context_label} native envelope has unsupported fields: {extra_envelope_keys}")
         raw_calls = payload.get("tool_calls")
         if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes, bytearray)) or not raw_calls:
             raise ValueError(f"{context_label} tool_calls payload must contain at least one tool call object")
@@ -91,9 +116,15 @@ def coerce_tool_call_payloads(payload: Any, *, context_label: str = "tool call")
         for index, item in enumerate(raw_calls):
             if not isinstance(item, Mapping):
                 raise ValueError(f"{context_label} tool_calls item #{index} must be a JSON object")
-            calls.append(_coerce_tool_call_mapping(item, context_label=context_label))
+            calls.append(_coerce_native_tool_call_mapping(item, context_label=context_label))
         return calls
-    return [_coerce_tool_call_mapping(payload, context_label=context_label)]
+    return [
+        _coerce_tool_call_mapping(
+            payload,
+            context_label=context_label,
+            allowed_metadata_keys=allowed_metadata_keys,
+        )
+    ]
 
 
 def partial_tool_call_payload(text: str, *, context_label: str = "tool call", cause: Exception) -> dict[str, Any]:
@@ -106,13 +137,10 @@ def partial_tool_call_payload(text: str, *, context_label: str = "tool call", ca
         if start < 0:
             raise ValueError(f"{context_label} response missing JSON object: {normalized}") from cause
         body = normalized[start:]
-    name = _first_json_field(body, ("name", "tool_name", "tool", "action"))
+    name = _first_json_field(body, ("name",))
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{context_label} response missing recoverable name: {normalized}") from cause
-    try:
-        arguments = _first_json_field(body, ("arguments", "parameters", "action_input", "input"))
-    except ValueError:
-        arguments = {}
+    arguments = _first_json_field(body, ("arguments",))
     arguments = _coerce_arguments(arguments, context_label=context_label)
     payload: dict[str, Any] = {"name": name, "arguments": arguments}
     for key in ("confidence", "score", "evidence", "reason", "rationale"):
@@ -254,43 +282,63 @@ def strip_requestor_prefix(name: str) -> str:
     return name
 
 
-def _coerce_tool_call_mapping(payload: Mapping[str, Any], *, context_label: str) -> ParsedToolCall:
+def _coerce_tool_call_mapping(
+    payload: Mapping[str, Any],
+    *,
+    context_label: str,
+    allowed_metadata_keys: Sequence[str],
+) -> ParsedToolCall:
     raw = dict(payload)
-    candidate_payload = raw.get("candidate")
-    if isinstance(candidate_payload, Mapping):
-        raw = dict(candidate_payload)
-    action_payload = raw.get("action")
-    if isinstance(action_payload, Mapping) and not any(
-        key in raw for key in ("name", "tool_name", "tool", "function", "function_call", "tool_calls")
-    ):
-        raw = dict(action_payload)
-    function_payload = raw.get("function")
-    if not isinstance(function_payload, Mapping):
-        function_payload = raw.get("function_call")
-    if isinstance(function_payload, Mapping):
-        name = function_payload.get("name") or raw.get("name") or raw.get("tool_name") or raw.get("tool") or raw.get("action")
-        arguments = function_payload.get(
-            "arguments",
-            raw.get("arguments", raw.get("parameters", raw.get("action_input", raw.get("input", {})))),
+    legacy_keys = sorted(
+        key
+        for key in (
+            "tool",
+            "tool_name",
+            "parameters",
+            "action",
+            "action_input",
+            "input",
+            "candidate",
+            "function",
+            "function_call",
         )
-    else:
-        name = raw.get("name") or raw.get("tool_name") or raw.get("tool") or raw.get("action")
-        if "arguments" in raw:
-            arguments = raw.get("arguments")
-        elif "parameters" in raw:
-            arguments = raw.get("parameters")
-        elif "action_input" in raw:
-            arguments = raw.get("action_input")
-        elif "input" in raw:
-            arguments = raw.get("input")
-        else:
-            arguments = {}
+        if key in raw
+    )
+    if legacy_keys:
+        raise ValueError(f"{context_label} uses unsupported legacy fields: {legacy_keys}")
+    allowed_keys = {"name", "arguments", *(str(key) for key in allowed_metadata_keys)}
+    extra_keys = sorted(str(key) for key in raw if str(key) not in allowed_keys)
+    if extra_keys:
+        raise ValueError(f"{context_label} has unsupported extra fields: {extra_keys}")
+    if "name" not in raw:
+        raise ValueError(f"{context_label} missing name")
+    if "arguments" not in raw:
+        raise ValueError(f"{context_label} missing arguments")
+    name = raw.get("name")
+    arguments = raw.get("arguments")
     name_text = strip_requestor_prefix(str(name or "").strip())
     if not name_text:
         raise ValueError(f"{context_label} missing name")
     return ParsedToolCall(
         name=name_text,
         arguments=_coerce_arguments(arguments, context_label=context_label),
+        raw_payload=raw,
+    )
+
+
+def _coerce_native_tool_call_mapping(payload: Mapping[str, Any], *, context_label: str) -> ParsedToolCall:
+    raw = dict(payload)
+    function_payload = raw.get("function")
+    if not isinstance(function_payload, Mapping):
+        raise ValueError(f"{context_label} native tool call missing function")
+    if "name" not in function_payload or "arguments" not in function_payload:
+        raise ValueError(f"{context_label} native function requires name and arguments")
+    name_text = strip_requestor_prefix(str(function_payload.get("name") or "").strip())
+    if not name_text:
+        raise ValueError(f"{context_label} native function missing name")
+    return ParsedToolCall(
+        name=name_text,
+        arguments=_coerce_arguments(function_payload.get("arguments"), context_label=context_label),
         raw_payload=raw,
     )
 

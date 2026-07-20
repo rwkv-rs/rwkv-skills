@@ -24,20 +24,28 @@ def _tool(name: str, *required: str) -> dict:
     }
 
 
-def test_parse_tool_call_text_accepts_common_model_shapes() -> None:
-    prefixed = parse_tool_call_text(
-        '"tool_name":"assistant.lookup","parameters":"{\\"id\\":\\"A1\\"}","confidence":0.9',
+def test_parse_tool_call_text_keeps_normal_and_native_contracts_separate() -> None:
+    normal = parse_tool_call_text(
+        '{"name":"assistant.lookup","arguments":{"id":"A1"},"confidence":0.9}',
         context_label="candidate",
+        allowed_metadata_keys=("confidence",),
     )
     openai = parse_tool_call_text(
         '{"tool_calls":[{"function":{"name":"inspect","arguments":"{\\"id\\":\\"B2\\"}"}}]}'
     )
 
-    assert prefixed.name == "lookup"
-    assert prefixed.arguments == {"id": "A1"}
-    assert prefixed.raw_payload["confidence"] == 0.9
+    assert normal.name == "lookup"
+    assert normal.arguments == {"id": "A1"}
+    assert normal.raw_payload["confidence"] == 0.9
     assert openai.name == "inspect"
     assert openai.arguments == {"id": "B2"}
+
+
+def test_parse_tool_call_text_rejects_legacy_aliases_and_unapproved_metadata() -> None:
+    with pytest.raises(ValueError, match="unsupported legacy fields"):
+        parse_tool_call_text('{"tool_name":"lookup","parameters":{"id":"A1"}}')
+    with pytest.raises(ValueError, match="unsupported extra fields"):
+        parse_tool_call_text('{"name":"lookup","arguments":{"id":"A1"},"unexpected":true}')
 
 
 def test_tool_call_schema_contract_prunes_and_validates_arguments() -> None:

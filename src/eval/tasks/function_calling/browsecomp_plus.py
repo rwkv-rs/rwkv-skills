@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -38,7 +39,6 @@ from src.eval.tasks.function_calling.common import (
 from src.eval.tasks.function_calling.context_budget import DEFAULT_HISTORY_MAX_CHARS, normalize_rwkv_text, truncate_text
 from src.eval.tasks.function_calling.final_answer import (
     FinalAnswerCall,
-    final_answer_tool_schema,
     parse_final_answer_call,
     render_final_answer_call,
 )
@@ -58,8 +58,14 @@ from src.eval.tasks.function_calling.runner_common import (
     _resolve_function_calling_sample_limit,
     _resolve_job_name,
 )
-from src.eval.tasks.function_calling.rwkv_prompt import JSON_CALL_STOP_SUFFIXES, render_json_function_call
-from src.eval.tasks.function_calling.simple_tool_call import decode_simple_tool_call_response
+from src.eval.tasks.function_calling.rwkv_prompt import (
+    JSON_CALL_STOP_SUFFIXES,
+    RWKV_FLOWER_JSON_PROMPT_STYLE,
+    assistant_json_prefix,
+    build_rwkv_json_call_prompt,
+    render_json_function_call,
+)
+from src.eval.tasks.function_calling.tool_call_contract import parse_tool_call_text
 from src.eval.tasks.function_calling.tool_router import (
     ToolRoutingConfig,
     route_tools_for_prompt,
@@ -78,9 +84,22 @@ DEFAULT_OFFICIAL_BROWSECOMP_PLUS_ROOT = Path("/tmp/rwkv-official-refs/BrowseComp
 DEFAULT_BROWSECOMP_PLUS_CHUNK_CHARS = 1400
 DEFAULT_BROWSECOMP_PLUS_CHUNK_OVERLAP = 220
 DEFAULT_BROWSECOMP_PLUS_TOP_K = 5
-DEFAULT_BROWSECOMP_PLUS_RETRIEVE_DOCS = 50
+DEFAULT_BROWSECOMP_PLUS_SNIPPET_CHARS = 2048
 DEFAULT_BROWSECOMP_PLUS_PROMPT_MAX_CHARS = 8192
-DEFAULT_BROWSECOMP_PLUS_MAX_STEPS = 12
+DEFAULT_BROWSECOMP_PLUS_MAX_STEPS = 100
+DEFAULT_BROWSECOMP_PLUS_CANDIDATE_COPIES = 3
+DEFAULT_BROWSECOMP_PLUS_EVIDENCE_MEMORY_CHARS = 20000
+DEFAULT_BROWSECOMP_PLUS_DOCUMENT_PASSAGES = 4
+DEFAULT_BROWSECOMP_PLUS_EVIDENCE_DOCUMENTS = 12
+DEFAULT_BROWSECOMP_PLUS_MIN_FINAL_SEARCHES = 6
+DEFAULT_BROWSECOMP_PLUS_MIN_FINAL_READS = 8
+DEFAULT_BROWSECOMP_PLUS_CONVERGENCE_SEARCHES = 12
+DEFAULT_BROWSECOMP_PLUS_CONVERGENCE_READS = 20
+_BROWSECOMP_PLUS_QUERY_STOPWORDS = frozenset(
+    "a an and are as at be been before between by can could did do does for from had has have he her his how i in "
+    "into is it its later may more most of on one or our over provide she should than that the their them then there "
+    "these they this those to under was we were what when where which who whom whose why with would you your".split()
+)
 # The unified function-calling CLI currently defaults --max-steps to tau's
 # 200-turn budget. Treat that inherited value as "not explicitly set" for
 # BrowseComp-Plus so the benchmark keeps its own episode budget by default.
@@ -108,10 +127,35 @@ class BrowseCompPlusStepResult:
     details: dict[str, Any] | None = None
 
 
+def _browsecomp_plus_final_answer_tool_schema() -> dict[str, Any]:
+    return {
+        "name": "final_answer",
+        "description": "Submit the exact answer after research, with cited evidence and calibrated confidence.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string", "description": "The succinct exact answer."},
+                "explanation": {
+                    "type": "string",
+                    "description": "A concise explanation with inline [docid] citations.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Your confidence percentage from 0 to 100.",
+                },
+            },
+            "required": ["answer", "explanation", "confidence"],
+            "additionalProperties": False,
+        },
+    }
+
+
 BROWSECOMP_PLUS_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "search",
-        "description": "Search the fixed BrowseComp-Plus corpus and return relevant evidence chunks.",
+        "description": "Search the BrowseComp-Plus knowledge base and return the top five documents.",
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -127,19 +171,7 @@ BROWSECOMP_PLUS_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "required": ["docid"],
         },
     },
-    {
-        "name": "get_document_chunks",
-        "description": "Read chunked passages from one retrieved document id.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "docid": {"type": "string"},
-                "query": {"type": "string"},
-            },
-            "required": ["docid"],
-        },
-    },
-    final_answer_tool_schema(answer_description="The exact BrowseComp-Plus answer with concise evidence when useful."),
+    _browsecomp_plus_final_answer_tool_schema(),
 )
 
 
@@ -226,47 +258,6 @@ def load_browsecomp_plus_manifest_records(path: str | Path) -> list[BrowseCompPl
     return records
 
 
-def _bound_browsecomp_plus_messages(
-    messages: Sequence[Mapping[str, Any]],
-    *,
-    max_chars: int,
-) -> list[dict[str, str]]:
-    normalized: list[dict[str, str]] = []
-    for message in messages:
-        role = str(message.get("role") or "user").strip().lower() or "user"
-        content = normalize_rwkv_text(str(message.get("content") or ""))
-        if content:
-            normalized.append({"role": role, "content": content})
-    if max_chars <= 0:
-        return normalized
-    total = 0
-    kept_reversed: list[dict[str, str]] = []
-    for message in reversed(normalized):
-        size = len(message["content"])
-        if kept_reversed and total + size > max_chars:
-            break
-        kept_reversed.append(message)
-        total += size
-    return list(reversed(kept_reversed))
-
-
-def _render_browsecomp_plus_agent_state(messages: Sequence[Mapping[str, str]]) -> tuple[str, str]:
-    if not messages:
-        return "", ""
-    current = str(messages[-1].get("content") or "")
-    trajectory_rows: list[str] = []
-    for message in messages[:-1]:
-        role = str(message.get("role") or "user").strip().lower()
-        content = str(message.get("content") or "")
-        if not content:
-            continue
-        if role == "assistant":
-            trajectory_rows.append(f"Assistant action: {content}")
-        else:
-            trajectory_rows.append(f"Environment: {content}")
-    return "\n".join(trajectory_rows), current
-
-
 class BrowseCompPlusEnv:
     def __init__(self, record: BrowseCompPlusRecord) -> None:
         self.record = record
@@ -280,17 +271,27 @@ class BrowseCompPlusEnv:
             str(record.metadata.get("browsecomp_plus_source_path") or browsecomp_plus_source_path(self.official_root))
         ).expanduser().resolve()
         self.retrieved_docids: set[str] = set()
+        self.retrieved_docids_in_order: list[str] = []
+        self.document_read_docids: list[str] = []
+        self.search_queries: list[str] = []
+        self.search_evidence: list[str] = []
+        self.retrieval_queries_by_docid: dict[str, list[str]] = {}
+        self.document_evidence: dict[str, str] = {}
+        self.duplicate_search_count = 0
         self.tool_call_counts: dict[str, int] = {}
         self.final_answer = ""
+        self.final_explanation = ""
+        self.final_confidence = 0.0
+        self.final_output_text = ""
         self.status = "incomplete"
 
     def initial_user_message(self) -> str:
         return normalize_rwkv_text(
             "\n".join(
                 [
-                    "You are answering a BrowseComp-Plus deep-research question against a fixed corpus.",
-                    "Use search or get_document as needed. When ready, call final_answer.",
-                    "Final answer should include the exact answer and concise evidence citations using [docid] when available.",
+                    "You are a deep research agent using search and get_document.",
+                    "Work step by step and use either tool as many times as needed.",
+                    "When the evidence is sufficient, call final_answer with a cited explanation, the exact answer, and calibrated confidence.",
                     f"Question: {self.record.question}",
                 ]
             )
@@ -303,9 +304,31 @@ class BrowseCompPlusEnv:
         self.tool_call_counts[name] = self.tool_call_counts.get(name, 0) + 1
         if name == "search":
             query = str(arguments.get("query") or "").strip() or self.record.question
-            chunks = self.search(query, DEFAULT_BROWSECOMP_PLUS_TOP_K)
+            query_key = _browsecomp_plus_query_key(query)
+            if query_key in {_browsecomp_plus_query_key(item) for item in self.search_queries}:
+                self.duplicate_search_count += 1
+                return BrowseCompPlusStepResult(
+                    observation=json.dumps(
+                        {
+                            "error": "duplicate_query",
+                            "query": query,
+                            "instruction": "Use a materially different query or finish with the supported answer.",
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    details=self._details(),
+                )
+            self.search_queries.append(query)
+            results = self.search(query, DEFAULT_BROWSECOMP_PLUS_TOP_K)
+            self.search_evidence.append(
+                normalize_rwkv_text(
+                    f"Search query: {query}\n"
+                    + json.dumps(results, ensure_ascii=False, separators=(",", ":"))
+                )
+            )
             return BrowseCompPlusStepResult(
-                observation=json.dumps({"chunks": chunks}, ensure_ascii=False, separators=(",", ":")),
+                observation=json.dumps(results, ensure_ascii=False, indent=2),
                 details=self._details(),
             )
         if name == "get_document":
@@ -314,21 +337,29 @@ class BrowseCompPlusEnv:
             if document is None:
                 observation = json.dumps({"docid": docid, "error": "not_found"}, ensure_ascii=False, separators=(",", ":"))
             else:
+                if docid not in self.document_read_docids:
+                    self.document_read_docids.append(docid)
+                self.document_evidence[docid] = _compact_browsecomp_plus_document(
+                    document,
+                    query=_browsecomp_plus_evidence_query(
+                        self.record.question,
+                        self.retrieval_queries_by_docid.get(docid, ()),
+                    ),
+                )
                 observation = json.dumps(_document_payload(document), ensure_ascii=False, separators=(",", ":"))
             return BrowseCompPlusStepResult(
                 observation=observation,
                 details=self._details(),
             )
-        if name == "get_document_chunks":
-            docid = str(arguments.get("docid") or "").strip()
-            query = str(arguments.get("query") or self.record.question)
-            chunks = self.document_chunks(docid, query=query, limit=DEFAULT_BROWSECOMP_PLUS_TOP_K)
-            return BrowseCompPlusStepResult(
-                observation=json.dumps({"docid": docid, "chunks": chunks}, ensure_ascii=False, separators=(",", ":")),
-                details=self._details(),
-            )
         if name == "final_answer":
             self.final_answer = str(arguments.get("answer") or "").strip()
+            self.final_explanation = normalize_rwkv_text(str(arguments.get("explanation") or ""))
+            self.final_confidence = _browsecomp_plus_confidence_percent(arguments.get("confidence"), fallback=50.0)
+            self.final_output_text = _browsecomp_plus_official_final_output(
+                self.final_answer,
+                explanation=self.final_explanation,
+                confidence=self.final_confidence,
+            )
             self.status = "completed" if self.final_answer else "incomplete"
             return BrowseCompPlusStepResult(
                 observation="Final answer recorded.",
@@ -343,50 +374,52 @@ class BrowseCompPlusEnv:
         )
 
     def search(self, query: str, k: int) -> list[dict[str, Any]]:
-        expanded_query = _browsecomp_plus_expanded_query(self.record.question, query)
-        documents = self._retrieve_documents(expanded_query, k=max(DEFAULT_BROWSECOMP_PLUS_RETRIEVE_DOCS, k))
-        return _top_chunks(documents, query=expanded_query, limit=k)
-
-    def document_chunks(self, docid: str, *, query: str, limit: int) -> list[dict[str, Any]]:
-        document = self._document_by_id(docid)
-        if document is None:
-            return [{"docid": docid, "error": "not_found"}]
-        return _top_chunks([document], query=query, limit=limit)
-
-    def _retrieve_documents(self, query: str, *, k: int) -> list[dict[str, Any]]:
-        record_documents = self._record_documents()
-        if record_documents and not self._use_bm25():
-            scored = sorted(record_documents, key=lambda item: _document_score(query, item), reverse=True)
-            for item in scored[:k]:
-                if item.get("docid"):
-                    self.retrieved_docids.add(str(item["docid"]))
-            return scored[:k]
-        use_bm25 = self._use_bm25()
-        if self.index_path.exists() and _pyserini_available():
-            documents = _search_bm25(self.index_path, query, k)
-            for item in documents:
-                if item.get("docid"):
-                    self.retrieved_docids.add(str(item["docid"]))
-            return documents
-        if use_bm25:
-            return []
-        scored = sorted(record_documents, key=lambda item: _document_score(query, item), reverse=True)
-        for item in scored[:k]:
-            if item.get("docid"):
-                self.retrieved_docids.add(str(item["docid"]))
-        return scored[:k]
+        query_text = normalize_rwkv_text(query) or self.record.question
+        if self._use_bm25() and self.index_path.exists() and _pyserini_available():
+            documents = _search_bm25(self.index_path, query_text, max(1, int(k)))
+        else:
+            documents = sorted(
+                self._record_documents(),
+                key=lambda item: _document_score(query_text, item),
+                reverse=True,
+            )[: max(1, int(k))]
+        results: list[dict[str, Any]] = []
+        for document in documents:
+            docid = str(document.get("docid") or document.get("id") or "").strip()
+            if not docid:
+                continue
+            self._remember_docid(docid)
+            retrieval_queries = self.retrieval_queries_by_docid.setdefault(docid, [])
+            if query_text not in retrieval_queries:
+                retrieval_queries.append(query_text)
+            payload: dict[str, Any] = {
+                "docid": docid,
+                "snippet": truncate_text(normalize_rwkv_text(_document_text(document)), DEFAULT_BROWSECOMP_PLUS_SNIPPET_CHARS),
+            }
+            if document.get("score") is not None:
+                payload["score"] = float(document["score"])
+            results.append(payload)
+        return results
 
     def _document_by_id(self, docid: str) -> dict[str, Any] | None:
         for document in self._record_documents():
             if str(document.get("docid") or document.get("id") or "") == docid:
-                self.retrieved_docids.add(docid)
+                self._remember_docid(docid)
                 return dict(document)
         if self.index_path.exists() and _pyserini_available():
             document = _bm25_document(self.index_path, docid)
             if document is not None:
-                self.retrieved_docids.add(docid)
+                self._remember_docid(docid)
                 return document
         return None
+
+    def _remember_docid(self, docid: str) -> None:
+        normalized = str(docid or "").strip()
+        if not normalized:
+            return
+        self.retrieved_docids.add(normalized)
+        if normalized not in self.retrieved_docids_in_order:
+            self.retrieved_docids_in_order.append(normalized)
 
     def _record_documents(self) -> list[dict[str, Any]]:
         docs = _list_of_dicts(self.record.metadata.get("browsecomp_plus_documents"))
@@ -400,8 +433,17 @@ class BrowseCompPlusEnv:
                 "query_id": self.record.query_id,
                 "status": self.status,
                 "retrieved_docids": sorted(self.retrieved_docids),
+                "document_read_docids": list(self.document_read_docids),
+                "search_queries": list(self.search_queries),
+                "duplicate_search_count": int(self.duplicate_search_count),
                 "tool_call_counts": dict(self.tool_call_counts),
-                "result": [{"type": "output_text", "output": self.final_answer}] if self.final_answer else [],
+                "final_explanation": self.final_explanation,
+                "final_confidence": self.final_confidence,
+                "result": (
+                    [{"type": "output_text", "output": self.final_output_text}]
+                    if self.final_output_text
+                    else []
+                ),
             },
             "retriever": "bm25" if self._use_bm25() and self.index_path.exists() and _pyserini_available() else "record_documents",
         }
@@ -415,6 +457,98 @@ class BrowseCompPlusEnv:
         return False
 
 
+def _browsecomp_plus_query_key(query: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", normalize_rwkv_text(query).lower()))
+
+
+def _browsecomp_plus_confidence_percent(value: Any, *, fallback: float = 50.0) -> float:
+    raw = "" if value is None else str(value).strip().removesuffix("%").strip()
+    try:
+        confidence = float(raw)
+    except (TypeError, ValueError):
+        confidence = float(fallback)
+    if 0.0 <= confidence <= 1.0:
+        confidence *= 100.0
+    return max(0.0, min(100.0, confidence))
+
+
+def _browsecomp_plus_official_final_output(
+    answer: str,
+    *,
+    explanation: str,
+    confidence: Any,
+) -> str:
+    normalized_answer = normalize_rwkv_text(answer)
+    if not normalized_answer:
+        return ""
+    normalized_explanation = normalize_rwkv_text(explanation) or "Answer selected from the retrieved evidence."
+    confidence_percent = _browsecomp_plus_confidence_percent(confidence)
+    rendered_confidence = round(confidence_percent, 1)
+    confidence_text = str(int(rendered_confidence)) if rendered_confidence.is_integer() else f"{rendered_confidence:.1f}"
+    return normalize_rwkv_text(
+        f"Explanation: {normalized_explanation}\n"
+        f"Exact Answer: {normalized_answer}\n"
+        f"Confidence: {confidence_text}%"
+    )
+
+
+def _compact_browsecomp_plus_document(document: Mapping[str, Any], *, query: str) -> str:
+    text = normalize_rwkv_text(_document_text(document))
+    chunks = _top_chunks([document], query=query, limit=DEFAULT_BROWSECOMP_PLUS_DOCUMENT_PASSAGES)
+    return json.dumps(
+        {
+            "docid": str(document.get("docid") or document.get("id") or ""),
+            "header": truncate_text(text, 500),
+            "selected_chunk_ids": [str(chunk.get("chunk_id") or "") for chunk in chunks],
+            "relevant_passages": [
+                _browsecomp_plus_passage_window(
+                    normalize_rwkv_text(str(chunk.get("text") or "")),
+                    query=query,
+                    max_chars=700,
+                )
+                for chunk in chunks
+                if str(chunk.get("text") or "").strip()
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _browsecomp_plus_passage_window(text: str, *, query: str, max_chars: int) -> str:
+    normalized = normalize_rwkv_text(text)
+    budget = max(1, int(max_chars))
+    if len(normalized) <= budget:
+        return normalized
+    separator = "\n...\n"
+    window_chars = max(1, (budget - len(separator)) // 2)
+    stride = max(1, window_chars // 2)
+    starts = list(range(0, max(1, len(normalized) - window_chars + 1), stride))
+    final_start = max(0, len(normalized) - window_chars)
+    if final_start not in starts:
+        starts.append(final_start)
+    ranked_starts = sorted(
+        starts,
+        key=lambda start: (_text_score(query, normalized[start : start + window_chars]), -start),
+        reverse=True,
+    )
+    # The selected retrieval chunk often starts with the unknown answer entity,
+    # which cannot match any term in the question. Keep that anchor while using
+    # the other half of the budget for the strongest clue-bearing window.
+    selected_starts = [0]
+    second_start = next(
+        (start for start in ranked_starts if abs(start - selected_starts[0]) >= window_chars),
+        None,
+    )
+    if second_start is None:
+        return normalized[selected_starts[0] : selected_starts[0] + budget].strip()
+    selected_starts.append(second_start)
+    return separator.join(
+        normalized[start : start + window_chars].strip()
+        for start in sorted(selected_starts)
+    )
+
+
 def build_browsecomp_plus_prompt(
     messages: Sequence[Mapping[str, Any]],
     *,
@@ -424,39 +558,37 @@ def build_browsecomp_plus_prompt(
     rendered_tools = [dict(tool) for tool in (tools or BROWSECOMP_PLUS_TOOL_SCHEMAS)]
     tool_names = {str(tool.get("name") or "") for tool in rendered_tools}
     if tool_names == {"final_answer"}:
-        action_guidance = [
-            "The search budget is exhausted. Do not call search or get_document again.",
-            "Use final_answer now with the best exact answer supported by the gathered evidence.",
-        ]
+        action_guidance = (
+            "Use final_answer now. In answer return only the exact entity, title, or value requested, not a clue or "
+            "sentence; cite supporting [docid] values and report confidence from 0 to 100."
+        )
     else:
-        action_guidance = [
-            "Use search and get_document to gather evidence. Use final_answer only when ready to answer.",
-        ]
-    bounded_messages = _bound_browsecomp_plus_messages(messages, max_chars=history_max_chars)
-    trajectory, current = _render_browsecomp_plus_agent_state(bounded_messages)
-    return normalize_rwkv_text(
+        action_guidance = (
+            "Choose the next research action. Search with a focused query, read a promising docid when useful, "
+            "or use final_answer only when the exact requested entity, title, value, or other answer type is supported."
+        )
+    system_prompt = normalize_rwkv_text(
         "\n".join(
             [
-                "You are controlling tools in a BrowseComp-Plus deep-research environment.",
-                "Respond with exactly one JSON tool call and no extra text.",
-                'Use this shape: {"name":"ToolName","arguments":{"arg":"value"}}',
-                *action_guidance,
-                'For final_answer, use exactly {"name":"final_answer","arguments":{"answer":"<exact answer>"}}.',
-                "Do not use reason, reasoning, explanation, output, or response keys for final_answer.",
-                "Available tools:",
-                json.dumps(rendered_tools, ensure_ascii=False, indent=2),
-                "",
-                "Trajectory:",
-                trajectory,
-                "",
-                "Current observation:",
-                current,
-                "",
-                "Assistant: <think>",
-                "</think>",
-                "```json",
+                "Choose one BrowseComp-Plus action.",
+                'Output only: {"name":"ToolName","arguments":{}}',
+                "Use exactly the keys name and arguments; arguments must be a JSON object.",
+                action_guidance,
+                "Tools:",
+                json.dumps(rendered_tools, ensure_ascii=False, separators=(",", ":")),
             ]
         )
+    )
+    return build_rwkv_json_call_prompt(
+        system_prompt,
+        messages,
+        history_max_chars=history_max_chars,
+        assistant_prefix=assistant_json_prefix(
+            enable_think=False,
+            prefill_object=False,
+            prompt_style=RWKV_FLOWER_JSON_PROMPT_STYLE,
+        ),
+        prompt_style=RWKV_FLOWER_JSON_PROMPT_STYLE,
     )
 
 
@@ -483,7 +615,7 @@ def build_browsecomp_plus_budgeted_prompt(
         prompt_seed=prompt_seed,
     )
     if force_final_answer:
-        selected_tools = [final_answer_tool_schema(answer_description="The exact BrowseComp-Plus answer.")]
+        selected_tools = [_browsecomp_plus_final_answer_tool_schema()]
         tool_route_trace: dict[str, Any] = {
             "routed": True,
             "reason": "force_final_answer",
@@ -971,20 +1103,403 @@ def _browsecomp_plus_score_payload(
 
 def _render_browsecomp_plus_tool_result_user_content(call: Mapping[str, Any], observation: str) -> str:
     tool_name = str(call.get("name") or "tool").strip() or "tool"
-    return normalize_rwkv_text(
-        "\n".join(
-            [
-                f"Tool result from {tool_name}.",
-                "This is read-only evidence, not the next assistant JSON object.",
-                "Do not copy the evidence JSON shape or its chunk fields.",
-                "Next assistant message must be exactly one JSON tool call with keys name and arguments.",
-                "Valid tool names are search, get_document, and final_answer.",
-                'For final_answer, arguments must contain answer, for example {"answer":"<exact answer>"}.',
-                "",
-                str(observation),
-            ]
+    return normalize_rwkv_text(f"Result from {tool_name}:\n{observation}")
+
+
+def _browsecomp_plus_candidate_messages(
+    messages: Sequence[Mapping[str, object]],
+    *,
+    env: BrowseCompPlusEnv,
+    max_chars: int = DEFAULT_BROWSECOMP_PLUS_EVIDENCE_MEMORY_CHARS,
+    force_final_answer: bool = False,
+    include_documents: bool = True,
+    include_search: bool = True,
+    action_guidance: Sequence[str] | None = None,
+) -> list[Mapping[str, object]]:
+    question = next(
+        (
+            dict(message)
+            for message in messages
+            if str(message.get("role") or "").strip().lower() == "user"
+            and str(message.get("content") or "").strip()
+        ),
+        {"role": "user", "content": env.initial_user_message()},
+    )
+    budget = max(1000, int(max_chars))
+    question_chars = len(str(question.get("content") or "")) + len(str(question.get("role") or "user")) + 4
+    evidence_budget = max(0, budget - question_chars - 24)
+    default_action_guidance = (
+        [
+            "Final step: return final_answer now.",
+            "Answer with only the exact requested entity, title, or value supported by the documents; do not call search or get_document.",
+        ]
+        if force_final_answer
+        else [
+            "Next action: return one name/arguments tool call.",
+            "After search, read a promising unread [docid] with get_document; do not repeat an identical query.",
+        ]
+    )
+    resolved_action_guidance = list(action_guidance or default_action_guidance)
+    payload_budget = max(
+        0,
+        evidence_budget - sum(len(row) for row in resolved_action_guidance) - len(resolved_action_guidance),
+    )
+    document_rows: list[str] = []
+    search_rows: list[str] = []
+    read_docids = (
+        [
+            docid
+            for docid in env.document_read_docids
+            if env.document_evidence.get(docid)
+        ]
+        if include_documents
+        else []
+    )
+    if read_docids:
+        read_docids.sort(
+            key=lambda docid: _text_coverage_score(env.record.question, env.document_evidence[docid])
+        )
+        read_docids = read_docids[-DEFAULT_BROWSECOMP_PLUS_EVIDENCE_DOCUMENTS :]
+        document_budget = payload_budget if not include_search else int(payload_budget * 0.8)
+        per_document = max(120, document_budget // len(read_docids))
+        document_rows.append("Documents read (most relevant last):")
+        document_rows.extend(
+            _fit_browsecomp_plus_document_evidence(
+                env.document_evidence[docid],
+                per_document,
+                query=env.record.question,
+            )
+            for docid in read_docids
+        )
+    if include_search and env.search_evidence:
+        used = sum(len(row) for row in document_rows)
+        search_budget = max(0, payload_budget - used - len(document_rows) - 24)
+        recent_searches = env.search_evidence[-4:]
+        if search_budget >= 120:
+            per_search = max(80, search_budget // len(recent_searches))
+            search_rows.append("Recent search results:")
+            search_rows.extend(
+                _fit_browsecomp_plus_search_evidence(row, per_search)
+                for row in recent_searches
+            )
+    evidence_rows = [*search_rows, *document_rows]
+    if not evidence_rows:
+        return [question]
+    evidence_rows.extend(resolved_action_guidance)
+    evidence = truncate_text(normalize_rwkv_text("\n".join(evidence_rows)), evidence_budget)
+    return [question, {"role": "user", "content": "Evidence memory:\n" + evidence}]
+
+
+def _browsecomp_plus_candidate_message_shards(
+    messages: Sequence[Mapping[str, object]],
+    *,
+    env: BrowseCompPlusEnv,
+    max_chars: int,
+    force_final_answer: bool,
+) -> list[list[Mapping[str, object]]]:
+    document_messages = _browsecomp_plus_candidate_messages(
+        messages,
+        env=env,
+        max_chars=max_chars,
+        force_final_answer=force_final_answer,
+        include_search=False,
+    )
+    if force_final_answer:
+        return [list(document_messages) for _ in range(DEFAULT_BROWSECOMP_PLUS_CANDIDATE_COPIES)]
+    return [
+        _browsecomp_plus_candidate_messages(
+            messages,
+            env=env,
+            max_chars=max_chars,
+            include_documents=False,
+            action_guidance=(
+                "Inspect the recent search results only. Select get_document for the most promising unread [docid].",
+                "Do not submit final_answer from a search snippet; use a focused search only if no result is promising.",
+            ),
+        ),
+        _browsecomp_plus_candidate_messages(
+            messages,
+            env=env,
+            max_chars=max_chars,
+            include_search=False,
+            action_guidance=(
+                "Inspect the read documents only. Identify the central named subject shared by the clues.",
+                "If the requested answer is not explicit, search for that exact subject plus the missing answer type; do not repeat a broad clue query.",
+            ),
+        ),
+        _browsecomp_plus_candidate_messages(
+            messages,
+            env=env,
+            max_chars=max_chars,
+        ),
+    ]
+
+
+def _fit_browsecomp_plus_document_evidence(
+    raw: str,
+    max_chars: int,
+    *,
+    query: str = "",
+) -> str:
+    budget = max(1, int(max_chars))
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return truncate_text(normalize_rwkv_text(str(raw or "")), budget)
+    if not isinstance(payload, Mapping):
+        return truncate_text(normalize_rwkv_text(str(raw or "")), budget)
+    docid = normalize_rwkv_text(str(payload.get("docid") or "unknown"))
+    passages = [
+        normalize_rwkv_text(str(item))
+        for item in payload.get("relevant_passages", ())
+        if normalize_rwkv_text(str(item))
+    ]
+    header = normalize_rwkv_text(str(payload.get("header") or ""))
+    prefix = f"[{docid}]"
+    if not passages:
+        return truncate_text(f"{prefix}\n{header}", budget)
+    passages.sort(key=lambda passage: _text_score(query, passage))
+    max_passages = max(1, budget // 600)
+    passages = passages[-max_passages:]
+    evidence_section_count = len(passages) + bool(header)
+    section_budget = max(
+        20,
+        (budget - len(prefix) - evidence_section_count - 1) // max(1, evidence_section_count),
+    )
+    rows = [prefix]
+    if header:
+        rows.append(truncate_text(header, section_budget))
+    rows.extend(
+        _browsecomp_plus_passage_window(passage, query=query, max_chars=section_budget)
+        for passage in passages
+    )
+    rendered = normalize_rwkv_text("\n".join(rows))
+    return truncate_text(rendered, budget)
+
+
+def _fit_browsecomp_plus_search_evidence(raw: str, max_chars: int) -> str:
+    budget = max(1, int(max_chars))
+    normalized = normalize_rwkv_text(str(raw or ""))
+    query_line, separator, payload_text = normalized.partition("\n")
+    if not separator:
+        return truncate_text(normalized, budget)
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return truncate_text(normalized, budget)
+    results = [item for item in payload if isinstance(item, Mapping)] if isinstance(payload, list) else []
+    if not results:
+        return truncate_text(query_line, budget)
+    available = max(1, budget - len(query_line) - len(results) - 1)
+    per_result = max(20, available // len(results))
+    rows = [query_line]
+    for item in results:
+        docid = normalize_rwkv_text(str(item.get("docid") or "unknown"))
+        snippet = normalize_rwkv_text(str(item.get("snippet") or ""))
+        rows.append(truncate_text(f"[{docid}] {snippet}", per_result))
+    return truncate_text(normalize_rwkv_text("\n".join(rows)), budget)
+
+
+def _browsecomp_plus_parallel_candidate_inputs(
+    config: ParallelCandidateRouterConfig,
+    *,
+    final_only: bool = False,
+) -> tuple[list[dict[str, Any]], ParallelCandidateRouterConfig]:
+    tool_group = (
+        [_browsecomp_plus_final_answer_tool_schema()]
+        if final_only
+        else [dict(tool) for tool in BROWSECOMP_PLUS_TOOL_SCHEMAS]
+    )
+    tools = [dict(tool) for _ in range(DEFAULT_BROWSECOMP_PLUS_CANDIDATE_COPIES) for tool in tool_group]
+    return tools, replace(
+        config,
+        chunk_tools=len(tool_group),
+        include_respond=False,
+        ground_identifier_arguments=False,
+        max_candidates=DEFAULT_BROWSECOMP_PLUS_CANDIDATE_COPIES,
+        prompt_max_chars=(max(16_384, int(config.prompt_max_chars)) if final_only else config.prompt_max_chars),
+        candidate_max_tokens=(max(384, int(config.candidate_max_tokens)) if final_only else config.candidate_max_tokens),
+        aggregate_max_tokens=(max(384, int(config.aggregate_max_tokens)) if final_only else config.aggregate_max_tokens),
+    )
+
+
+def _browsecomp_plus_call_from_candidate(candidate: Any, *, env: BrowseCompPlusEnv) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    name = str(candidate.name or "").strip()
+    arguments = dict(candidate.arguments or {})
+    if name == "search":
+        raw_query = arguments.get("query")
+        query_candidates = (
+            raw_query
+            if isinstance(raw_query, Sequence) and not isinstance(raw_query, (str, bytes, bytearray))
+            else [raw_query]
+        )
+        prior_query_keys = {_browsecomp_plus_query_key(item) for item in env.search_queries}
+        for query_value in query_candidates:
+            query = normalize_rwkv_text(str(query_value or ""))
+            if query and _browsecomp_plus_query_key(query) not in prior_query_keys:
+                return {"name": name, "arguments": {"query": query}}
+        return None
+    if name == "get_document":
+        docid = normalize_rwkv_text(str(arguments.get("docid") or ""))
+        if not docid or docid not in env.retrieved_docids or docid in env.document_read_docids:
+            return None
+        return {"name": name, "arguments": {"docid": docid}}
+    if name != "final_answer" or not env.search_queries:
+        return None
+    grounded_arguments = _browsecomp_plus_ground_final_answer_arguments(arguments, env=env)
+    if grounded_arguments is None:
+        return None
+    return {"name": name, "arguments": grounded_arguments}
+
+
+def _browsecomp_plus_ground_final_answer_arguments(
+    arguments: Mapping[str, Any],
+    *,
+    env: BrowseCompPlusEnv,
+) -> dict[str, Any] | None:
+    answer = normalize_rwkv_text(str(arguments.get("answer") or ""))
+    explanation = normalize_rwkv_text(str(arguments.get("explanation") or ""))
+    confidence = arguments.get("confidence")
+    if not answer or not explanation or confidence is None:
+        return None
+    cited_docids = set(re.findall(r"\[([^\[\]]+)\]", explanation))
+    answer_terms = {
+        term
+        for term in _tokenize(answer)
+        if len(term) > 1 and term not in _BROWSECOMP_PLUS_QUERY_STOPWORDS
+    }
+    explanation_terms = {
+        term
+        for term in _tokenize(re.sub(r"\[[^\[\]]+\]", " ", explanation))
+        if len(term) > 2 and term not in _BROWSECOMP_PLUS_QUERY_STOPWORDS
+    }
+
+    def _supports(docid: str) -> bool:
+        evidence_terms = set(_tokenize(env.document_evidence.get(docid, "")))
+        return bool(answer_terms & evidence_terms) or len(explanation_terms & evidence_terms) >= 2
+
+    ordered_docids = [
+        *[docid for docid in env.document_read_docids if docid in cited_docids],
+        *[docid for docid in env.document_read_docids if docid not in cited_docids],
+    ]
+    supporting_docid = next((docid for docid in ordered_docids if _supports(docid)), "")
+    if not supporting_docid:
+        return None
+    if supporting_docid not in cited_docids:
+        explanation = normalize_rwkv_text(f"{explanation.rstrip()} [{supporting_docid}]")
+    return {
+        "answer": answer,
+        "explanation": explanation,
+        "confidence": _browsecomp_plus_confidence_percent(confidence),
+    }
+
+
+def _browsecomp_plus_call_from_candidate_route(route: Any, *, env: BrowseCompPlusEnv) -> dict[str, Any] | None:
+    ordered = []
+    if getattr(route, "selected", None) is not None:
+        ordered.append(route.selected)
+    ordered.extend(
+        sorted(
+            (
+                candidate
+                for candidate in getattr(route, "candidates", ())
+                if candidate is not getattr(route, "selected", None)
+            ),
+            key=lambda candidate: float(candidate.confidence),
+            reverse=True,
         )
     )
+    for candidate in ordered:
+        call = _browsecomp_plus_call_from_candidate(candidate, env=env)
+        if call is not None:
+            return call
+    return None
+
+
+def _browsecomp_plus_unread_document_fallback(env: BrowseCompPlusEnv) -> dict[str, Any] | None:
+    docid = next(
+        (docid for docid in env.retrieved_docids_in_order if docid not in env.document_read_docids),
+        "",
+    )
+    if not docid:
+        return None
+    return {"name": "get_document", "arguments": {"docid": docid}}
+
+
+def _browsecomp_plus_latest_search_unread_document(env: BrowseCompPlusEnv) -> dict[str, Any] | None:
+    if not env.search_evidence:
+        return None
+    _query_line, separator, payload_text = env.search_evidence[-1].partition("\n")
+    if not separator:
+        return None
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for item in payload:
+        if not isinstance(item, Mapping):
+            continue
+        docid = normalize_rwkv_text(str(item.get("docid") or ""))
+        if docid and docid not in env.document_read_docids:
+            return {"name": "get_document", "arguments": {"docid": docid}}
+    return None
+
+
+def _browsecomp_plus_read_after_consecutive_search(
+    env: BrowseCompPlusEnv,
+    trace: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if not trace:
+        return None
+    prior_call = trace[-1].get("decoded_call")
+    if not isinstance(prior_call, Mapping) or str(prior_call.get("name") or "") != "search":
+        return None
+    return _browsecomp_plus_latest_search_unread_document(env) or _browsecomp_plus_unread_document_fallback(env)
+
+
+def _browsecomp_plus_focused_search_fallback(env: BrowseCompPlusEnv) -> dict[str, Any] | None:
+    prior_query_keys = {_browsecomp_plus_query_key(query) for query in env.search_queries}
+    clues = _browsecomp_plus_query_clues(env.record.question)
+    candidates = [*reversed(clues)]
+    for clue in reversed(clues):
+        ordered_terms = [
+            token
+            for token in re.findall(r"[a-z0-9]+", clue.lower())
+            if len(token) >= 3 and token not in _BROWSECOMP_PLUS_QUERY_STOPWORDS
+        ]
+        distinctive_terms = sorted(dict.fromkeys(ordered_terms), key=lambda token: (-len(token), token))[:12]
+        if distinctive_terms:
+            candidates.append(" ".join(distinctive_terms))
+    for query in candidates[:6]:
+        normalized = normalize_rwkv_text(query)
+        if normalized and _browsecomp_plus_query_key(normalized) not in prior_query_keys:
+            return {"name": "search", "arguments": {"query": normalized}}
+    return None
+
+
+def _browsecomp_plus_research_fallback(
+    env: BrowseCompPlusEnv,
+    trace: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    consecutive_adapter_reads = 0
+    for entry in reversed(trace):
+        adapter = str((entry.get("candidate_router") or {}).get("browsecomp_plus_adapter") or "")
+        if adapter != "read_top_unread_document":
+            break
+        consecutive_adapter_reads += 1
+    unread_call = _browsecomp_plus_unread_document_fallback(env)
+    if unread_call is not None and consecutive_adapter_reads < 2:
+        return unread_call, "read_top_unread_document"
+    search_call = _browsecomp_plus_focused_search_fallback(env)
+    if search_call is not None:
+        return search_call, "focused_search_after_stagnation"
+    if unread_call is not None:
+        return unread_call, "read_top_unread_document"
+    return None, None
 
 
 def _run_one_browsecomp_plus_attempt(
@@ -1020,13 +1535,13 @@ def _run_one_browsecomp_plus_attempt(
             step_index=step_index,
             max_steps=max_steps,
             trace=trace,
+            env=env,
         )
         decision_completion = ""
         decision_stop_reason = ""
         candidate_trace: dict[str, Any] | None = None
         decision_io = "rwkv_json"
         long_doc_trace: dict[str, Any] = {}
-        decoded: list[dict[str, Any]] = []
         use_candidate_router = _should_use_browsecomp_plus_candidate_router(
             mode=candidate_router_mode,
             config=candidate_router_config,
@@ -1034,15 +1549,31 @@ def _run_one_browsecomp_plus_attempt(
             force_final_answer=force_final_answer,
         )
         if use_candidate_router and candidate_router_config is not None:
+            candidate_tools, browse_candidate_config = _browsecomp_plus_parallel_candidate_inputs(
+                candidate_router_config,
+                final_only=force_final_answer,
+            )
+            candidate_message_shards = _browsecomp_plus_candidate_message_shards(
+                messages,
+                env=env,
+                max_chars=browse_candidate_config.context_chars,
+                force_final_answer=force_final_answer,
+            )
+            candidate_messages = candidate_message_shards[-1]
             route = route_parallel_candidate_tool_call(
-                tools=BROWSECOMP_PLUS_TOOL_SCHEMAS,
-                messages=messages,
-                domain_policy=_browsecomp_plus_candidate_policy(),
+                tools=candidate_tools,
+                messages=candidate_messages,
+                messages_by_chunk=candidate_message_shards,
+                domain_policy=(
+                    _browsecomp_plus_final_candidate_policy()
+                    if force_final_answer
+                    else _browsecomp_plus_candidate_policy()
+                ),
                 domain="browsecomp_plus",
                 facts_text=_browsecomp_plus_candidate_facts(record, env),
                 engine=run.engine,
                 sampling=sampling,
-                config=candidate_router_config,
+                config=browse_candidate_config,
                 progress_desc=f"BrowseCompPlus-CandidateRouter sample {sample_index} step {step_index}",
                 prompt_seed=sample_repeat_seed(
                     sample_index,
@@ -1062,26 +1593,51 @@ def _run_one_browsecomp_plus_attempt(
                     stop_reason=decision_stop_reason,
                 )
             )
-            if route.selected is None:
-                fail_reason = route.aggregate_error or "candidate router did not select a tool call"
+            call = _browsecomp_plus_call_from_candidate_route(route, env=env)
+            if call is None and not force_final_answer:
+                call, adapter = _browsecomp_plus_research_fallback(env, trace)
+                if adapter is not None:
+                    candidate_trace["browsecomp_plus_adapter"] = adapter
+            if call is None:
+                fail_reason = route.aggregate_error or "candidate router did not produce a grounded next action"
                 trace.append(
                     {
                         "step": step_index,
                         "decision_io": decision_io,
                         "candidate_router": candidate_trace,
                         "parse_error": fail_reason,
+                        "force_final_answer": bool(force_final_answer),
                     }
                 )
+                prior_final_attempts = sum(bool(entry.get("force_final_answer")) for entry in trace[:-1])
+                if force_final_answer and prior_final_attempts < 2:
+                    continue
                 break
-            call = {"name": route.selected.name, "arguments": dict(route.selected.arguments)}
             if str(call.get("name") or "").strip() == "final_answer":
                 final_answer_call_id = "final_answer"
         else:
-            prompt, long_doc_trace = build_browsecomp_plus_budgeted_prompt(
+            decision_context_chars = min(
+                DEFAULT_BROWSECOMP_PLUS_EVIDENCE_MEMORY_CHARS,
+                history_max_chars,
+                (
+                    candidate_router_config.context_chars
+                    if candidate_router_config is not None
+                    else DEFAULT_BROWSECOMP_PLUS_EVIDENCE_MEMORY_CHARS
+                ),
+            )
+            decision_messages = _browsecomp_plus_candidate_messages(
                 messages,
+                env=env,
+                max_chars=decision_context_chars,
+                force_final_answer=force_final_answer,
+            )
+            prompt, long_doc_trace = build_browsecomp_plus_budgeted_prompt(
+                decision_messages,
                 history_max_chars=history_max_chars,
                 prompt_max_chars=prompt_max_chars,
-                long_doc_config=long_doc_config,
+                # BrowseComp-Plus already selected and balanced document evidence above.
+                # Running the generic lexical compactor again can drop the answer-bearing passage.
+                long_doc_config=replace(long_doc_config, enabled=False),
                 tool_routing_config=tool_routing_config,
                 engine=run.engine,
                 sampling=sampling,
@@ -1102,10 +1658,13 @@ def _run_one_browsecomp_plus_attempt(
             try:
                 if _looks_like_template_leak(decision_completion):
                     raise ValueError("decision stage leaked internal template/control tokens")
-                decoded = decode_simple_tool_call_response(decision_completion)
-                if not decoded:
-                    raise ValueError("model returned no tool call")
-                call = decoded[0]
+                parsed_call = parse_tool_call_text(
+                    decision_completion,
+                    context_label="browsecomp-plus tool-call selection",
+                    recover_partial=True,
+                    allowed_metadata_keys=("id",),
+                )
+                call = parsed_call.layer_payload()
                 if str(call.get("name") or "").strip() == "final_answer":
                     final_call = parse_final_answer_call(decision_completion, context_label="browsecomp-plus final answer")
                     call = dict(final_call.call)
@@ -1118,6 +1677,59 @@ def _run_one_browsecomp_plus_attempt(
                     break
                 call = dict(final_call.call)
                 final_answer_call_id = final_call.call_id
+        call_name = str(call.get("name") or "").strip()
+        if (
+            call_name == "final_answer"
+            and not force_final_answer
+            and not _browsecomp_plus_research_ready_for_final(env)
+        ):
+            fallback_call, adapter = _browsecomp_plus_research_fallback(env, trace)
+            if fallback_call is not None:
+                call = fallback_call
+                call_name = str(call.get("name") or "").strip()
+                if candidate_trace is not None:
+                    candidate_trace["browsecomp_plus_adapter"] = f"defer_early_final:{adapter or 'research'}"
+        if call_name == "search":
+            read_call = _browsecomp_plus_read_after_consecutive_search(env, trace)
+            if read_call is not None:
+                call = read_call
+                call_name = "get_document"
+                if candidate_trace is not None:
+                    candidate_trace["browsecomp_plus_adapter"] = "read_after_consecutive_search"
+        if force_final_answer and call_name != "final_answer":
+            fail_reason = f"forced final-answer stage returned {call_name or 'no action'}"
+            trace.append(
+                {
+                    "step": step_index,
+                    "decision_io": decision_io,
+                    "decision_completion": decision_completion,
+                    "decoded_call": call,
+                    "parse_error": fail_reason,
+                    "force_final_answer": True,
+                }
+            )
+            prior_final_attempts = sum(bool(entry.get("force_final_answer")) for entry in trace[:-1])
+            if prior_final_attempts >= 2:
+                break
+            continue
+        if call_name == "final_answer":
+            grounded_arguments = _browsecomp_plus_ground_final_answer_arguments(
+                call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {},
+                env=env,
+            )
+            if grounded_arguments is None:
+                fail_reason = "browsecomp-plus final answer is not grounded in read document evidence"
+                trace.append(
+                    {
+                        "step": step_index,
+                        "decision_io": decision_io,
+                        "decision_completion": decision_completion,
+                        "decoded_call": call,
+                        "parse_error": fail_reason,
+                    }
+                )
+                break
+            call = {"name": "final_answer", "arguments": grounded_arguments}
         result = env.step(call)
         messages.append({"role": "assistant", "content": render_json_function_call(call["name"], call["arguments"])})
         messages.append({"role": "user", "content": _render_browsecomp_plus_tool_result_user_content(call, result.observation)})
@@ -1223,7 +1835,7 @@ def _should_use_browsecomp_plus_candidate_router(
     force_final_answer: bool,
 ) -> bool:
     if force_final_answer:
-        return False
+        return config is not None and str(mode or "").strip().lower() in {"auto", "parallel"}
     raw_message_chars = sum(len(str(message.get("content") or "")) for message in messages)
     return _should_use_agent_loop_candidate_router(
         mode=mode,
@@ -1238,22 +1850,40 @@ def _should_use_browsecomp_plus_candidate_router(
 
 def _browsecomp_plus_candidate_policy() -> str:
     return normalize_rwkv_text(
-        "BrowseComp-Plus policy: choose exactly one next JSON function call. "
-        "Use search to retrieve evidence, get_document or get_document_chunks to inspect a known docid, "
-        "and final_answer only when the exact answer is supported or the search budget is nearly exhausted. "
-        "Search queries should preserve the important entities and constraints from the original question. "
-        "Do not invent docids or answers; use only listed tool names and JSON-object arguments."
+        "Choose one next action under the official BrowseComp-Plus loop. Use focused search queries, read promising "
+        "documents, and stop when the exact requested answer type is supported. The 100-step value is only a maximum, "
+        "not a search quota. Do not invent docids, citations, answers, or confidence."
+    )
+
+
+def _browsecomp_plus_final_candidate_policy() -> str:
+    return normalize_rwkv_text(
+        "Research is complete. Return final_answer now. Its arguments object must begin with answer, then explanation, "
+        "then confidence; omitting answer is invalid. Answer with only the exact entity, title, or value requested. "
+        "Cite read [docid] evidence in a short explanation and give calibrated confidence. Distinguish the requested "
+        "answer from nearby clues, related works, people, or examples. First resolve the central subject across all "
+        "clues. If asked for a book, game, paper, or other title, return the title tied to that subject rather than a "
+        "different visible title that only shares topic words. Do not search or read another document."
     )
 
 
 def _browsecomp_plus_candidate_facts(record: BrowseCompPlusRecord, env: BrowseCompPlusEnv) -> str:
-    payload = {
-        "task_id": record.task_id,
-        "query_id": record.query_id,
-        "question": record.question,
-        "retrieved_docids": sorted(env.retrieved_docids),
-    }
-    return normalize_rwkv_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    unread_docids = [docid for docid in env.retrieved_docids_in_order if docid not in env.document_read_docids]
+    return normalize_rwkv_text(
+        "\n".join(
+            [
+                f"Question: {record.question}",
+                f"Searches completed: {len(env.search_queries)}",
+                f"Documents read: {len(env.document_read_docids)}",
+                "Retrieved docids: "
+                + json.dumps(env.retrieved_docids_in_order[-20:], ensure_ascii=False, separators=(",", ":")),
+                "Unread retrieved docids: "
+                + json.dumps(unread_docids[:20], ensure_ascii=False, separators=(",", ":")),
+                "Prior queries: "
+                + json.dumps(env.search_queries[-6:], ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+    )
 
 
 def _should_force_browsecomp_plus_final_answer(
@@ -1261,29 +1891,37 @@ def _should_force_browsecomp_plus_final_answer(
     step_index: int,
     max_steps: int,
     trace: Sequence[Mapping[str, Any]],
+    env: BrowseCompPlusEnv | None = None,
 ) -> bool:
     if step_index >= max_steps:
         return True
-    if step_index < max(4, max_steps - 2):
-        return False
-    recent = list(trace[-3:])
-    if len(recent) < 3:
-        return False
-    names = [
-        str((entry.get("decoded_call") or {}).get("name") or "")
-        for entry in recent
-        if isinstance(entry.get("decoded_call"), Mapping)
-    ]
-    if len(names) != 3 or any(name not in {"search", "get_document", "get_document_chunks"} for name in names):
-        return False
-    retrieved_snapshots = [
-        tuple(
-            ((entry.get("details") or {}).get("browsecomp_plus_run") or {}).get("retrieved_docids")
-            or ()
-        )
-        for entry in recent
-    ]
-    return len(set(retrieved_snapshots)) <= 1
+    if any(bool(entry.get("force_final_answer")) for entry in trace):
+        return True
+    if env is not None and env.search_queries and env.document_read_docids:
+        if (
+            len(env.search_queries) >= DEFAULT_BROWSECOMP_PLUS_CONVERGENCE_SEARCHES
+            and len(env.document_read_docids) >= DEFAULT_BROWSECOMP_PLUS_MIN_FINAL_READS
+        ):
+            return True
+        if len(env.document_read_docids) >= DEFAULT_BROWSECOMP_PLUS_CONVERGENCE_READS:
+            return True
+    if (
+        env is not None
+        and env.search_queries
+        and env.document_read_docids
+        and _browsecomp_plus_focused_search_fallback(env) is None
+    ):
+        return True
+    return False
+
+
+def _browsecomp_plus_research_ready_for_final(env: BrowseCompPlusEnv) -> bool:
+    if len(_browsecomp_plus_query_clues(env.record.question)) < 3:
+        return True
+    return (
+        len(env.search_queries) >= DEFAULT_BROWSECOMP_PLUS_MIN_FINAL_SEARCHES
+        and len(env.document_read_docids) >= DEFAULT_BROWSECOMP_PLUS_MIN_FINAL_READS
+    )
 
 
 def _recover_browsecomp_plus_final_answer_call(response: str) -> FinalAnswerCall | None:
@@ -1515,6 +2153,16 @@ def _probe_browsecomp_plus_bm25_qrel_overlap(
     return None
 
 
+def _browsecomp_plus_evidence_query(question: str, retrieval_queries: Sequence[str]) -> str:
+    rows = [normalize_rwkv_text(question)]
+    rows.extend(
+        query
+        for query in (normalize_rwkv_text(str(item)) for item in retrieval_queries[-3:])
+        if query and query.casefold() != rows[0].casefold()
+    )
+    return normalize_rwkv_text("\n".join(rows))
+
+
 def _top_chunks(documents: Sequence[Mapping[str, Any]], *, query: str, limit: int) -> list[dict[str, Any]]:
     chunks: list[dict[str, Any]] = []
     for document in documents:
@@ -1528,8 +2176,49 @@ def _top_chunks(documents: Sequence[Mapping[str, Any]], *, query: str, limit: in
                     "text": text,
                 }
             )
+    if not chunks:
+        return []
+    selected: list[dict[str, Any]] = []
+    seen_chunk_ids: set[str] = set()
+    clue_winners: list[tuple[float, float, dict[str, Any]]] = []
+    for clue in _browsecomp_plus_query_clues(query):
+        clue_terms = _tokenize(clue)
+        if not clue_terms:
+            continue
+        winner = max(chunks, key=lambda item: _text_score(clue, str(item["text"])))
+        winner_score = _text_score(clue, str(winner["text"]))
+        if winner_score <= 0:
+            continue
+        clue_winners.append((winner_score / math.sqrt(len(clue_terms)), winner_score, winner))
+    clue_winners.sort(key=lambda item: (item[0], item[1], str(item[2]["chunk_id"])), reverse=True)
+    for _normalized_score, _score, item in clue_winners:
+        chunk_id = str(item["chunk_id"])
+        if chunk_id in seen_chunk_ids:
+            continue
+        selected.append(item)
+        seen_chunk_ids.add(chunk_id)
+        if len(selected) >= max(1, int(limit)):
+            return selected
     chunks.sort(key=lambda item: (float(item["score"]), str(item["docid"])), reverse=True)
-    return chunks[: max(1, int(limit))]
+    for item in chunks:
+        chunk_id = str(item["chunk_id"])
+        if chunk_id in seen_chunk_ids:
+            continue
+        selected.append(item)
+        seen_chunk_ids.add(chunk_id)
+        if len(selected) >= max(1, int(limit)):
+            break
+    return selected
+
+
+def _browsecomp_plus_query_clues(query: str) -> list[str]:
+    normalized = normalize_rwkv_text(query)
+    segments = [
+        normalize_rwkv_text(item)
+        for item in re.split(r"(?:\n+|(?<=[.!?])\s+|\s+-\s+)", normalized)
+    ]
+    clues = [segment for segment in segments if len(_tokenize(segment)) >= 2]
+    return clues or [normalized]
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -1562,12 +2251,48 @@ def _text_score(query: str, text: str) -> float:
     tokens = _tokenize(query)
     if not tokens:
         return 0.0
-    lowered = text.lower()
-    return float(sum(1 for token in tokens if token in lowered))
+    text_tokens = re.findall(r"[a-z0-9]+", text.lower())
+    counts: dict[str, int] = {}
+    for token in text_tokens:
+        counts[token] = counts.get(token, 0) + 1
+    score = 0.0
+    for token in tokens:
+        hits = counts.get(token, 0)
+        if not hits and len(token) >= 5:
+            hits = sum(
+                count
+                for candidate, count in counts.items()
+                if len(candidate) >= 3 and (candidate.startswith(token) or token.startswith(candidate))
+            )
+        if hits:
+            score += min(hits, 3) * (1.0 + min(len(token), 12) / 6.0)
+    return score
+
+
+def _text_coverage_score(query: str, text: str) -> float:
+    tokens = _tokenize(query)
+    if not tokens:
+        return 0.0
+    text_tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    score = 0.0
+    for token in tokens:
+        matched = token in text_tokens
+        if not matched and len(token) >= 5:
+            matched = any(
+                len(candidate) >= 3 and (candidate.startswith(token) or token.startswith(candidate))
+                for candidate in text_tokens
+            )
+        if matched:
+            score += 1.0 + min(len(token), 12) / 6.0
+    return score
 
 
 def _tokenize(text: str) -> set[str]:
-    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if token}
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if len(token) >= 3 and token not in _BROWSECOMP_PLUS_QUERY_STOPWORDS
+    }
 
 
 def _browsecomp_plus_expanded_query(question: str, query: str) -> str:

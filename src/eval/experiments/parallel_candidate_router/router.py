@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Experimental parallel candidate router for TAU-style tool decisions.
 
 This module intentionally does not touch task persistence or DB services. It
@@ -9,6 +7,8 @@ set into one candidate-layer JSON object:
 
 {"name":"...","arguments":{...},"confidence":0.0,"evidence":"..."}
 """
+
+from __future__ import annotations
 
 import json
 import re
@@ -31,6 +31,7 @@ from src.eval.tasks.function_calling.rwkv_prompt import (
 )
 from src.eval.tasks.function_calling.tool_call_contract import (
     allowed_arguments_by_tool_name,
+    load_tool_call_payload,
     normalize_argument_aliases,
     normalize_tool_schema,
     parse_tool_call_text,
@@ -40,7 +41,7 @@ from src.eval.tasks.function_calling.tool_call_contract import (
 
 CANDIDATE_LAYER_KEYS = ("name", "arguments", "confidence", "evidence")
 NO_CANDIDATE_TOOL_NAME = "__no_candidate__"
-PARALLEL_CANDIDATE_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=True)
+PARALLEL_CANDIDATE_ASSISTANT_PREFIX = assistant_json_prefix(enable_think=False, prefill_object=False)
 _RESERVATION_ID_RE = re.compile(r"\b(?=[A-Z0-9]{6}\b)(?=[A-Z0-9]*\d)[A-Z0-9]{6}\b", re.IGNORECASE)
 _USER_ID_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z][a-z0-9]*_\d+\b", re.IGNORECASE)
 _FLIGHT_NUMBER_RE = re.compile(r"\b[A-Z]{2,4}\d{2,4}\b", re.IGNORECASE)
@@ -162,6 +163,7 @@ def route_parallel_candidate_tool_call(
     *,
     tools: Sequence[Any],
     messages: Sequence[Mapping[str, object]],
+    messages_by_chunk: Sequence[Sequence[Mapping[str, object]]] | None = None,
     domain_policy: str,
     domain: str | None,
     facts_text: str | None,
@@ -173,16 +175,25 @@ def route_parallel_candidate_tool_call(
 ) -> ParallelCandidateRouteResult:
     cfg = config or ParallelCandidateRouterConfig()
     tool_chunks = _chunk_tools(tools, chunk_size=max(1, int(cfg.chunk_tools)))
+    if messages_by_chunk is not None and len(messages_by_chunk) != len(tool_chunks):
+        raise ValueError(
+            f"messages_by_chunk count={len(messages_by_chunk)} does not match tool chunk count={len(tool_chunks)}"
+        )
+    chunk_messages = (
+        [list(chunk) for chunk in messages_by_chunk]
+        if messages_by_chunk is not None
+        else [list(messages) for _ in tool_chunks]
+    )
     prompts = [
         build_candidate_prompt(
             chunk,
-            messages=messages,
+            messages=chunk_messages[chunk_index],
             domain_policy=domain_policy,
             domain=domain,
             facts_text=facts_text,
             config=cfg,
         )
-        for chunk in tool_chunks
+        for chunk_index, chunk in enumerate(tool_chunks)
     ]
     required_args_by_name = _required_args_by_tool_name(tools, include_respond=cfg.include_respond)
     allowed_args_by_name = _allowed_args_by_tool_name(tools, include_respond=cfg.include_respond)
@@ -220,13 +231,14 @@ def route_parallel_candidate_tool_call(
             ),
             show_progress=False,
         )
-    context_hint = _last_context_hint(messages)
     for output_index, (chunk_index, chunk, prompt) in enumerate(allowed_rows):
         output = outputs[output_index] if output_index < len(outputs) else None
         completion = _generation_text(output)
         finish_reason = _generation_finish_reason(output) if output is not None else "missing_output"
         valid_names = _chunk_valid_names(chunk, include_respond=cfg.include_respond)
         candidate_valid_names = set(valid_names)
+        candidate_messages = chunk_messages[chunk_index]
+        context_hint = _last_context_hint(candidate_messages)
         if not cfg.include_respond:
             candidate_valid_names.add(NO_CANDIDATE_TOOL_NAME)
         try:
@@ -240,8 +252,8 @@ def route_parallel_candidate_tool_call(
                 candidate = _prune_candidate_arguments(candidate, allowed_args_by_name=allowed_args_by_name)
                 _validate_candidate_arguments(candidate, required_args_by_name=required_args_by_name)
                 if cfg.ground_identifier_arguments:
-                    _validate_candidate_grounded_identifiers(candidate, messages=messages)
-                _validate_candidate_domain_intent(candidate, messages=messages, domain=domain)
+                    _validate_candidate_grounded_identifiers(candidate, messages=candidate_messages)
+                _validate_candidate_domain_intent(candidate, messages=candidate_messages, domain=domain)
                 candidate = _complete_candidate_layer(
                     candidate,
                     fallback_confidence=0.5,
@@ -497,13 +509,129 @@ def build_candidate_aggregate_prompt(
 
 
 def parse_candidate_tool_call(text: str) -> CandidateToolCall:
-    parsed = parse_tool_call_text(text, context_label="candidate")
+    try:
+        parsed = parse_tool_call_text(
+            text,
+            context_label="candidate",
+            allowed_metadata_keys=(
+                "id",
+                "confidence",
+                "score",
+                "evidence",
+                "explanation",
+                "reason",
+                "rationale",
+                "annotations",
+                "citations",
+            ),
+        )
+    except ValueError:
+        direct_final = _parse_direct_final_answer_candidate(text)
+        if direct_final is not None:
+            return direct_final
+        raise
     raw = parsed.raw_payload
+    arguments = dict(parsed.arguments)
+    misplaced_explanation = raw.get("explanation")
+    if parsed.name == "final_answer":
+        # G1h occasionally closes a stringified arguments object after `answer`
+        # and emits the remaining final-answer fields in the candidate envelope.
+        # They are tool arguments here, not router metadata.
+        if misplaced_explanation is None:
+            misplaced_explanation = _recover_escaped_candidate_string_field(text, "explanation")
+        if "explanation" not in arguments and misplaced_explanation:
+            arguments["explanation"] = misplaced_explanation
+        if "confidence" not in arguments and raw.get("confidence") is not None:
+            arguments["confidence"] = raw["confidence"]
     return CandidateToolCall(
         name=parsed.name,
-        arguments=dict(parsed.arguments),
+        arguments=arguments,
         confidence=_coerce_confidence(raw.get("confidence", raw.get("score", 0.0))),
-        evidence=normalize_rwkv_text(str(raw.get("evidence") or raw.get("reason") or raw.get("rationale") or "")),
+        evidence=normalize_rwkv_text(
+            str(raw.get("evidence") or misplaced_explanation or raw.get("reason") or raw.get("rationale") or "")
+        ),
+    )
+
+
+def _recover_escaped_candidate_string_field(text: str, field: str) -> str:
+    marker = f'"{field}\\":\\"'
+    source = str(text or "")
+    start = source.find(marker)
+    if start < 0:
+        return ""
+    escaped = source[start + len(marker) :]
+    for match in re.finditer(r'\\"', escaped):
+        suffix = escaped[match.end() :]
+        if not (
+            re.match(r'\s*,\s*"confidence"\s*:', suffix)
+            or re.fullmatch(r"\s*\}\s*\}\s*", suffix)
+        ):
+            continue
+        encoded_value = escaped[: match.start()]
+        try:
+            value = json.loads(f'"{encoded_value}"')
+        except json.JSONDecodeError:
+            return ""
+        return normalize_rwkv_text(str(value))
+    return ""
+
+
+def _parse_direct_final_answer_candidate(text: str) -> CandidateToolCall | None:
+    try:
+        value = load_tool_call_payload(text, context_label="candidate")
+    except ValueError:
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    name = normalize_rwkv_text(str(value.get("name") or ""))
+    arguments: dict[str, Any] = {}
+    raw_arguments = value.get("arguments")
+    if isinstance(raw_arguments, Mapping):
+        arguments.update(raw_arguments)
+    elif isinstance(raw_arguments, str) and raw_arguments.strip():
+        try:
+            decoded_arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            decoded_arguments = None
+        if isinstance(decoded_arguments, Mapping):
+            arguments.update(decoded_arguments)
+    explanation_value = (
+        arguments.get("explanation")
+        or value.get("explanation")
+        or value.get("evidence")
+        or _recover_escaped_candidate_string_field(text, "explanation")
+        or ""
+    )
+    explanation = (
+        normalize_rwkv_text(json.dumps(explanation_value, ensure_ascii=False, separators=(",", ":")))
+        if isinstance(explanation_value, (Mapping, list))
+        else normalize_rwkv_text(str(explanation_value))
+    )
+    confidence_value = arguments.get("confidence", value.get("confidence", value.get("score")))
+    explicit_final = name == "final_answer" or "answer" in value or "final_answer" in value
+    if not explicit_final:
+        if name and not arguments and explanation and confidence_value is not None:
+            return CandidateToolCall(
+                name=name,
+                confidence=_coerce_confidence(confidence_value),
+                evidence=explanation,
+            )
+        return None
+    answer = normalize_rwkv_text(
+        str(arguments.get("answer") or value.get("answer") or value.get("final_answer") or "")
+    )
+    if not answer:
+        return None
+    arguments = {"answer": answer}
+    if explanation:
+        arguments["explanation"] = explanation
+    if confidence_value is not None:
+        arguments["confidence"] = confidence_value
+    return CandidateToolCall(
+        name="final_answer",
+        arguments=arguments,
+        confidence=_coerce_confidence(confidence_value),
+        evidence=explanation,
     )
 
 
@@ -575,6 +703,24 @@ def _normalize_candidate_name_alias(
     *,
     valid_names: set[str],
 ) -> CandidateToolCall:
+    real_valid_names = valid_names.difference({NO_CANDIDATE_TOOL_NAME})
+    if (
+        real_valid_names == {"final_answer"}
+        and candidate.name not in valid_names
+        and not candidate.arguments
+        and candidate.name
+        and candidate.evidence
+    ):
+        return CandidateToolCall(
+            name="final_answer",
+            arguments={
+                "answer": candidate.name,
+                "explanation": candidate.evidence,
+                "confidence": candidate.confidence,
+            },
+            confidence=candidate.confidence,
+            evidence=candidate.evidence,
+        )
     normalized_name = _candidate_name_alias(candidate, valid_names=valid_names)
     if normalized_name == candidate.name:
         return candidate

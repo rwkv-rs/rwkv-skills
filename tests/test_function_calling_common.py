@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import types
 
 from src.eval.evaluating import RunContext, RunMode, TaskExecutionState
@@ -44,7 +45,13 @@ from src.eval.tasks.function_calling.mcp_bench import (
     resolve_mcp_context_budget,
     select_mcp_candidate_available_tools,
 )
-from src.eval.experiments.parallel_candidate_router.router import CandidateToolCall, ParallelCandidateRouterConfig
+from src.eval.experiments.parallel_candidate_router.router import (
+    CandidateToolCall,
+    ParallelCandidateRouterConfig,
+    _normalize_candidate_name_alias,
+    build_candidate_prompt,
+    parse_candidate_tool_call,
+)
 from src.eval.tasks.function_calling.simple_tool_call import (
     SimpleToolCallRecord,
     ToolCallExpectation,
@@ -488,14 +495,13 @@ def test_tool_call_contract_recovers_stringified_arguments_with_extra_tail() -> 
     ]
 
 
-def test_tool_call_contract_recovers_nested_action_object() -> None:
-    calls = parse_tool_calls_text(
-        '{"action":{"name":"search","arguments":{"query":"Zurich answer"}}}'
-    )
-
-    assert [(call.name, call.arguments) for call in calls] == [
-        ("search", {"query": "Zurich answer"})
-    ]
+def test_tool_call_contract_rejects_nested_action_object() -> None:
+    try:
+        parse_tool_calls_text('{"action":{"name":"search","arguments":{"query":"Zurich answer"}}}')
+    except ValueError as exc:
+        assert "unsupported legacy fields" in str(exc)
+    else:  # pragma: no cover - defensive
+        raise AssertionError("expected nested action alias to fail")
 
 
 def test_tool_call_contract_rejects_ellipsized_string_arguments() -> None:
@@ -606,8 +612,8 @@ def test_browsecomp_plus_budgeted_prompt_compacts_long_tool_output() -> None:
     assert "Long document compacted" in prompt
     assert "Conversation transcript JSON" not in prompt
     assert "target evidence: Zurich is the answer" in prompt
-    assert '"name": "search"' in prompt
-    assert '"name": "final_answer"' in prompt
+    assert '"name":"search"' in prompt
+    assert '"name":"final_answer"' in prompt
     assert '"name": "get_document_chunks"' not in prompt
     assert trace["compacted_message_count"] == 1
     assert trace["tool_route"]["routed"] is True
@@ -626,12 +632,12 @@ def test_browsecomp_plus_prompt_uses_agent_state_shape() -> None:
     )
 
     assert "Conversation transcript JSON" not in prompt
-    assert '"name": "get_document"' in prompt
-    assert '"name":"final_answer","arguments":{"answer":"<exact answer>"}' in prompt
-    assert "Do not use reason, reasoning, explanation, output, or response keys" in prompt
-    assert 'Assistant action: {"name":"search"' in prompt
-    assert "Current observation:\nFunction output:\n[]" in prompt
-    assert prompt.endswith("Assistant: <think>\n</think>\n```json")
+    assert '"name":"get_document"' in prompt
+    assert '"name":"final_answer"' in prompt
+    assert "exact requested entity, title, value" in prompt
+    assert 'Bot✿<think></think>\n```json' in prompt
+    assert '{"name":"search","arguments":{"query":"Who"}}' in prompt
+    assert "Function output:\n[]" in prompt
 
 
 def test_browsecomp_plus_prefers_record_documents_over_bm25(monkeypatch, tmp_path) -> None:
@@ -746,11 +752,19 @@ def test_browsecomp_plus_bm25_search_falls_back_to_stored_doc(monkeypatch, tmp_p
 
 
 def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_return(monkeypatch) -> None:
-    raw_completion = '```json\n{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"call_42"}\n```'
+    raw_completion = (
+        '```json\n{"name":"final_answer","arguments":{"answer":"Zurich",'
+        '"explanation":"The document names Zurich [doc-1].","confidence":91},"id":"call_42"}\n```'
+    )
 
     class FakeEngine:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
+            self.outputs = [
+                '{"name":"search","arguments":{"query":"Zurich answer"}}',
+                '{"name":"get_document","arguments":{"docid":"doc-1"}}',
+                raw_completion,
+            ]
 
         def generate(
             self,
@@ -775,7 +789,7 @@ def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_retu
                     "constraint_mode": constraint_mode,
                 }
             )
-            return [types.SimpleNamespace(text=raw_completion, finish_reason="stop")]
+            return [types.SimpleNamespace(text=self.outputs.pop(0), finish_reason="stop")]
 
     def _fake_judge(inputs, config):
         assert config.model == "judge"
@@ -786,14 +800,14 @@ def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_retu
 
     engine = FakeEngine()
     payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
-        args=types.SimpleNamespace(max_steps=1),
+        args=types.SimpleNamespace(max_steps=3),
         run=types.SimpleNamespace(engine=engine, benchmark_name="browsecomp_plus", dataset_split="test"),
         record=BrowseCompPlusRecord(
             task_id="bc-plus-1",
             query_id="q1",
             question="Which city is the answer?",
             answer="Zurich",
-            metadata={},
+            metadata={"browsecomp_plus_documents": [{"docid": "doc-1", "text": "Zurich is the answer."}]},
         ),
         sample_index=0,
         repeat_index=0,
@@ -808,19 +822,22 @@ def test_browsecomp_plus_attempt_keeps_raw_completion_separate_from_sandbox_retu
     )
 
     sandbox_return = '{"name":"final_answer","arguments":{"answer":"Zurich"},"id":"call_42"}'
-    assert payload["completion1"] == raw_completion
+    assert payload["completion3"] == raw_completion
     assert payload["agent_info"]["final_answer"] == "Zurich"
     assert payload["agent_info"]["final_answer_call"] == sandbox_return
     assert payload["agent_info"]["decoded_final_answer_call"] == {
         "name": "final_answer",
-        "arguments": {"answer": "Zurich"},
-        "id": "call_42",
+        "arguments": {
+            "answer": "Zurich",
+            "explanation": "The document names Zurich [doc-1].",
+            "confidence": 91.0,
+        },
     }
-    assert payload["agent_trace"][0]["decision_completion"] == raw_completion
-    assert payload["agent_trace"][0]["sandbox_return"] == sandbox_return
+    assert payload["agent_trace"][2]["decision_completion"] == raw_completion
+    assert payload["agent_trace"][2]["sandbox_return"] == sandbox_return
 
 
-def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypatch) -> None:
+def test_browsecomp_plus_attempt_rejects_historical_final_answer_formats(monkeypatch) -> None:
     class FakeEngine:
         def __init__(self, raw_completion: str) -> None:
             self.raw_completion = raw_completion
@@ -881,14 +898,9 @@ def test_browsecomp_plus_attempt_recovers_final_answer_format_variants(monkeypat
     bare_final_payload = _run(bare_final_answer)
     malformed_payload = _run(malformed_arguments)
 
-    assert trailing_payload["agent_info"]["final_answer"] == "Zurich"
-    assert trailing_payload["agent_info"]["fail_reason"] == ""
-    assert bare_payload["agent_info"]["final_answer"] == "Zurich"
-    assert bare_payload["agent_info"]["fail_reason"] == ""
-    assert bare_final_payload["agent_info"]["final_answer"] == "Zurich"
-    assert bare_final_payload["agent_info"]["fail_reason"] == ""
-    assert malformed_payload["agent_info"]["final_answer"] == "Zurich"
-    assert malformed_payload["agent_info"]["fail_reason"] == ""
+    for payload in (trailing_payload, bare_payload, bare_final_payload, malformed_payload):
+        assert payload["agent_info"]["final_answer"] == ""
+        assert payload["agent_info"]["fail_reason"]
 
 
 def test_browsecomp_plus_forces_final_answer_on_last_step(monkeypatch) -> None:
@@ -897,7 +909,9 @@ def test_browsecomp_plus_forces_final_answer_on_last_step(monkeypatch) -> None:
             self.prompts: list[str] = []
             self.outputs = [
                 '{"name":"search","arguments":{"query":"Zurich answer"}}',
-                '{"name":"final_answer","arguments":{"answer":"Zurich"}}',
+                '{"name":"get_document","arguments":{"docid":"doc-1"}}',
+                '{"name":"final_answer","arguments":{"answer":"Zurich",'
+                '"explanation":"The document names Zurich [doc-1].","confidence":91}}',
             ]
 
         def generate(
@@ -920,7 +934,7 @@ def test_browsecomp_plus_forces_final_answer_on_last_step(monkeypatch) -> None:
     monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
     engine = FakeEngine()
     payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
-        args=types.SimpleNamespace(max_steps=2),
+        args=types.SimpleNamespace(max_steps=3),
         run=types.SimpleNamespace(engine=engine, benchmark_name="browsecomp_plus", dataset_split="test"),
         record=BrowseCompPlusRecord(
             task_id="bc-plus-1",
@@ -942,9 +956,9 @@ def test_browsecomp_plus_forces_final_answer_on_last_step(monkeypatch) -> None:
     )
 
     assert payload["agent_info"]["final_answer"] == "Zurich"
-    assert payload["agent_trace"][1]["force_final_answer"] is True
-    assert '"name": "search"' not in engine.prompts[1]
-    assert '"name": "final_answer"' in engine.prompts[1]
+    assert payload["agent_trace"][2]["force_final_answer"] is True
+    assert '"name":"search"' not in engine.prompts[2]
+    assert '"name":"final_answer"' in engine.prompts[2]
 
 
 def test_browsecomp_plus_uses_parallel_candidate_router(monkeypatch) -> None:
@@ -967,9 +981,23 @@ def test_browsecomp_plus_uses_parallel_candidate_router(monkeypatch) -> None:
                 "include_prompts": include_prompts,
             }
 
+        @property
+        def candidates(self):
+            return (self.selected,)
+
     selections = [
         CandidateToolCall("search", {"query": "Zurich answer"}, confidence=0.8, evidence="question"),
-        CandidateToolCall("final_answer", {"answer": "Zurich"}, confidence=0.9, evidence="doc-1"),
+        CandidateToolCall("get_document", {"docid": "doc-1"}, confidence=0.85, evidence="search result"),
+        CandidateToolCall(
+            "final_answer",
+            {
+                "answer": "Zurich",
+                "explanation": "The document identifies Zurich [doc-1].",
+                "confidence": 90,
+            },
+            confidence=0.9,
+            evidence="doc-1",
+        ),
     ]
 
     def _fake_route(**kwargs):
@@ -981,7 +1009,7 @@ def test_browsecomp_plus_uses_parallel_candidate_router(monkeypatch) -> None:
     monkeypatch.setattr(browsecomp_plus_module, "route_parallel_candidate_tool_call", _fake_route)
     monkeypatch.setattr(browsecomp_plus_module, "judge_browsecomp_answers", _fake_judge)
     payload = browsecomp_plus_module._run_one_browsecomp_plus_attempt(
-        args=types.SimpleNamespace(max_steps=3),
+        args=types.SimpleNamespace(max_steps=4),
         run=types.SimpleNamespace(engine=FakeEngine(), benchmark_name="browsecomp_plus", dataset_split="test"),
         record=BrowseCompPlusRecord(
             task_id="bc-plus-1",
@@ -1007,7 +1035,665 @@ def test_browsecomp_plus_uses_parallel_candidate_router(monkeypatch) -> None:
     assert payload["agent_info"]["final_answer"] == "Zurich"
     assert payload["agent_trace"][0]["decision_io"] == "parallel_candidate"
     assert payload["agent_trace"][0]["candidate_router"]["selected_candidate"]["name"] == "search"
-    assert payload["agent_trace"][1]["candidate_router"]["selected_candidate"]["name"] == "final_answer"
+    assert payload["agent_trace"][1]["candidate_router"]["selected_candidate"]["name"] == "get_document"
+    assert payload["agent_trace"][2]["candidate_router"]["selected_candidate"]["name"] == "final_answer"
+
+
+def test_browsecomp_plus_preserves_question_and_all_read_evidence_for_candidates() -> None:
+    record = BrowseCompPlusRecord("bc-plus-memory", "q-memory", "Which title is requested?", "Title", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    for index in range(12):
+        docid = f"doc-{index}"
+        env.document_read_docids.append(docid)
+        env.document_evidence[docid] = json.dumps(
+            {"docid": docid, "relevant_passages": [f"evidence-marker-{index}"]}
+        )
+
+    candidate_messages = browsecomp_plus_module._browsecomp_plus_candidate_messages(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=3000,
+    )
+    candidate_prompt = build_candidate_prompt(
+        browsecomp_plus_module.BROWSECOMP_PLUS_TOOL_SCHEMAS,
+        messages=candidate_messages,
+        domain_policy="Use the evidence.",
+        domain="browsecomp_plus",
+        facts_text=None,
+        config=ParallelCandidateRouterConfig(
+            context_chars=3000,
+            prompt_max_chars=10000,
+            chunk_tools=3,
+            include_respond=False,
+        ),
+    )
+
+    assert "Which title is requested?" in candidate_prompt
+    assert "evidence-marker-0" in candidate_prompt
+    assert "evidence-marker-11" in candidate_prompt
+
+
+def test_browsecomp_plus_document_compaction_selects_each_question_clue() -> None:
+    padding = "unrelated archive material " * 80
+    target = "King Jaja of Opobo was a merchant who died on the return route from exile. " + padding
+    document = {
+        "docid": "doc-jaja",
+        "text": "\n".join(
+            [
+                "Eastern regional politics and art education. " + padding,
+                "A book was published in a politically significant year. " + padding,
+                target,
+                "General history of African countries. " + padding,
+            ]
+        ),
+    }
+    compact = browsecomp_plus_module._compact_browsecomp_plus_document(
+        document,
+        query=(
+            "A slave in Africa later became a merchant and died en route while returning from exile. "
+            "They came from an eastern region. What is the title of the book about this merchant?"
+        ),
+    )
+
+    assert "King Jaja of Opobo" in compact
+
+
+def test_browsecomp_plus_document_score_prefers_distinct_clue_coverage() -> None:
+    question = "Which enslaved merchant died while returning from exile?"
+    repeated_generic = "enslaved " * 20
+    multiple_clues = "The merchant died while returning."
+
+    assert browsecomp_plus_module._text_coverage_score(
+        question, multiple_clues
+    ) > browsecomp_plus_module._text_coverage_score(question, repeated_generic)
+
+
+def test_browsecomp_plus_fitted_document_keeps_answer_window_from_passage_tail() -> None:
+    question = "Which book title describes the enslaved merchant who returned from exile?"
+    passage = "generic archive notes " * 80 + "King Jaja of Opobo was the merchant returning from exile."
+    raw = json.dumps(
+        {
+            "docid": "doc-jaja",
+            "header": "African history bibliography",
+            "relevant_passages": [passage, "unrelated regional notes " * 40],
+        }
+    )
+
+    fitted = browsecomp_plus_module._fit_browsecomp_plus_document_evidence(
+        raw,
+        500,
+        query=question,
+    )
+
+    assert "King Jaja of Opobo" in fitted
+
+
+def test_browsecomp_plus_fitted_document_keeps_unknown_answer_at_passage_start() -> None:
+    question = "Which book describes the enslaved merchant who returned from exile?"
+    passage = (
+        "King Jaja of Opobo was an African legend. "
+        + "generic regional archive notes " * 30
+        + "The merchant overcame enslavement and died while returning from exile."
+    )
+    raw = json.dumps(
+        {
+            "docid": "doc-jaja",
+            "header": "African history bibliography",
+            "relevant_passages": [passage, "unrelated regional notes " * 40],
+        }
+    )
+
+    fitted = browsecomp_plus_module._fit_browsecomp_plus_document_evidence(
+        raw,
+        500,
+        query=question,
+    )
+
+    assert "King Jaja of Opobo" in fitted
+    assert "returning from exile" in fitted
+
+
+def test_browsecomp_plus_candidate_shards_keep_all_tools_together() -> None:
+    tools, config = browsecomp_plus_module._browsecomp_plus_parallel_candidate_inputs(
+        ParallelCandidateRouterConfig(chunk_tools=1, include_respond=True)
+    )
+    names = [tool["name"] for tool in tools]
+
+    assert config.chunk_tools == 3
+    assert config.include_respond is False
+    assert names == ["search", "get_document", "final_answer"] * 3
+
+
+def test_browsecomp_plus_final_candidate_shards_generate_three_independent_answers() -> None:
+    tools, config = browsecomp_plus_module._browsecomp_plus_parallel_candidate_inputs(
+        ParallelCandidateRouterConfig(chunk_tools=3),
+        final_only=True,
+    )
+
+    assert [tool["name"] for tool in tools] == ["final_answer"] * 3
+    assert config.chunk_tools == 1
+    assert config.max_candidates == 3
+    assert config.prompt_max_chars >= 16_384
+    assert browsecomp_plus_module._should_use_browsecomp_plus_candidate_router(
+        mode="parallel",
+        config=config,
+        messages=[],
+        force_final_answer=True,
+    )
+
+
+def test_browsecomp_plus_final_candidate_messages_keep_all_balanced_documents() -> None:
+    record = BrowseCompPlusRecord("bc-plus-shards", "q-shards", "Which title?", "", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    for index in range(3):
+        docid = f"doc-{index}"
+        env.document_read_docids.append(docid)
+        env.document_evidence[docid] = json.dumps(
+            {
+                "docid": docid,
+                "relevant_passages": [f"evidence-marker-{index}-{passage}" for passage in range(4)],
+            }
+        )
+
+    messages = browsecomp_plus_module._browsecomp_plus_candidate_messages(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=3000,
+        force_final_answer=True,
+    )
+    rendered = "\n".join(str(message["content"]) for message in messages)
+
+    assert all(f"[doc-{index}]" in rendered for index in range(3))
+    assert "evidence-marker-0-3" in rendered
+    assert "evidence-marker-0-0" not in rendered
+    assert "Which title?" in rendered
+    assert "return final_answer now" in rendered
+
+
+def test_browsecomp_plus_candidate_search_evidence_is_plain_and_action_oriented() -> None:
+    record = BrowseCompPlusRecord("bc-plus-search", "q-search", "Which title?", "Title", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    env.search_evidence.append(
+        'Search query: title clues\n[{"docid":"doc-1","snippet":"Promising title evidence"}]'
+    )
+
+    messages = browsecomp_plus_module._browsecomp_plus_candidate_messages(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=2000,
+    )
+    rendered = "\n".join(str(message["content"]) for message in messages)
+
+    assert "[doc-1] Promising title evidence" in rendered
+    assert '{"docid"' not in rendered
+    assert "read a promising unread [docid] with get_document" in rendered
+
+
+def test_browsecomp_plus_candidate_shards_separate_search_and_document_evidence() -> None:
+    record = BrowseCompPlusRecord("bc-plus-shards", "q-shards", "Which title?", "Title", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    env.search_evidence.append(
+        'Search query: title clues\n[{"docid":"doc-search","snippet":"promising unread title"}]'
+    )
+    env.document_read_docids.append("doc-read")
+    env.document_evidence["doc-read"] = json.dumps(
+        {"docid": "doc-read", "relevant_passages": ["identified central subject"]}
+    )
+
+    shards = browsecomp_plus_module._browsecomp_plus_candidate_message_shards(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=3000,
+        force_final_answer=False,
+    )
+    rendered = ["\n".join(str(message["content"]) for message in shard) for shard in shards]
+
+    assert len(rendered) == 3
+    assert "doc-search" in rendered[0] and "doc-read" not in rendered[0]
+    assert "doc-read" in rendered[1] and "doc-search" not in rendered[1]
+    assert "doc-search" in rendered[2] and "doc-read" in rendered[2]
+    assert "most promising unread [docid]" in rendered[0]
+    assert "central named subject" in rendered[1]
+    assert "do not repeat a broad clue query" in rendered[1]
+
+
+def test_browsecomp_plus_final_candidate_shards_exclude_search_snippets() -> None:
+    record = BrowseCompPlusRecord("bc-plus-final-shards", "q-final-shards", "Which title?", "Title", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    env.search_evidence.append(
+        'Search query: title clues\n[{"docid":"doc-search","snippet":"distracting nearby title"}]'
+    )
+    env.document_read_docids.append("doc-read")
+    env.document_evidence["doc-read"] = json.dumps(
+        {"docid": "doc-read", "relevant_passages": ["grounded exact title"]}
+    )
+
+    shards = browsecomp_plus_module._browsecomp_plus_candidate_message_shards(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=3000,
+        force_final_answer=True,
+    )
+    rendered = ["\n".join(str(message["content"]) for message in shard) for shard in shards]
+
+    assert len(rendered) == 3
+    assert all("doc-read" in item for item in rendered)
+    assert all("doc-search" not in item for item in rendered)
+
+
+def test_browsecomp_plus_final_evidence_memory_does_not_request_more_reads() -> None:
+    record = BrowseCompPlusRecord("bc-plus-final", "q-final", "Which title?", "Sleepwalker", {})
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    env.document_read_docids.append("doc-1")
+    env.document_evidence["doc-1"] = json.dumps(
+        {"docid": "doc-1", "header": "Title: Sleepwalker", "relevant_passages": ["The game is Sleepwalker."]}
+    )
+
+    messages = browsecomp_plus_module._browsecomp_plus_candidate_messages(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=2000,
+        force_final_answer=True,
+    )
+    rendered = "\n".join(str(message["content"]) for message in messages)
+
+    assert "Sleepwalker" in rendered
+    assert "return final_answer now" in rendered
+    assert "read a promising unread" not in rendered
+    assert "do not call search or get_document" in rendered
+
+
+def test_browsecomp_plus_places_most_relevant_read_evidence_near_final_action() -> None:
+    record = BrowseCompPlusRecord(
+        "bc-plus-order",
+        "q-order",
+        "Which video game title is Sleepwalker?",
+        "Sleepwalker",
+        {},
+    )
+    env = browsecomp_plus_module.BrowseCompPlusEnv(record)
+    env.document_read_docids.extend(["doc-relevant", "doc-distractor"])
+    env.document_evidence["doc-relevant"] = json.dumps(
+        {"docid": "doc-relevant", "relevant_passages": ["The video game title is Sleepwalker."]}
+    )
+    env.document_evidence["doc-distractor"] = json.dumps(
+        {"docid": "doc-distractor", "relevant_passages": ["Unrelated archive notes."]}
+    )
+    env.search_evidence.append('Search query: game title\n[{"docid":"doc-relevant","snippet":"Sleepwalker"}]')
+
+    messages = browsecomp_plus_module._browsecomp_plus_candidate_messages(
+        [{"role": "user", "content": env.initial_user_message()}],
+        env=env,
+        max_chars=4000,
+        force_final_answer=True,
+    )
+    rendered = "\n".join(str(message["content"]) for message in messages)
+    document_section = rendered.split("Documents read (most relevant last):", 1)[1]
+
+    assert rendered.index("Recent search results:") < rendered.index("Documents read (most relevant last):")
+    assert document_section.index("[doc-distractor]") < document_section.index("[doc-relevant]")
+    assert document_section.index("[doc-relevant]") < document_section.index("Final step: return final_answer now")
+
+
+def test_browsecomp_plus_candidate_falls_back_to_grounded_unread_document() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-fallback", "q-fallback", "Which title?", "Title", {})
+    )
+    env.retrieved_docids.update({"doc-1", "doc-2"})
+    env.retrieved_docids_in_order.extend(["doc-1", "doc-2"])
+    env.document_read_docids.append("doc-1")
+
+    assert browsecomp_plus_module._browsecomp_plus_unread_document_fallback(env) == {
+        "name": "get_document",
+        "arguments": {"docid": "doc-2"},
+    }
+
+
+def test_browsecomp_plus_reads_top_latest_result_after_consecutive_searches() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-latest", "q-latest", "Which title?", "Title", {})
+    )
+    env.retrieved_docids_in_order.extend(["old-doc", "top-doc", "second-doc"])
+    env.search_evidence.append(
+        'Search query: exact subject title\n'
+        '[{"docid":"top-doc","snippet":"strong"},{"docid":"second-doc","snippet":"other"}]'
+    )
+    trace = [{"decoded_call": {"name": "search", "arguments": {"query": "prior"}}}]
+
+    assert browsecomp_plus_module._browsecomp_plus_read_after_consecutive_search(env, trace) == {
+        "name": "get_document",
+        "arguments": {"docid": "top-doc"},
+    }
+
+
+def test_browsecomp_plus_candidate_searches_after_two_adapter_reads() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord(
+            "bc-plus-fallback",
+            "q-fallback",
+            "An enslaved merchant returned from exile. Which book title describes this person?",
+            "",
+            {},
+        )
+    )
+    env.search_queries.append("enslaved merchant book")
+    env.retrieved_docids_in_order.extend(["doc-1", "doc-2", "doc-3"])
+    env.document_read_docids.extend(["doc-1", "doc-2"])
+    trace = [
+        {"candidate_router": {"browsecomp_plus_adapter": "read_top_unread_document"}},
+        {"candidate_router": {"browsecomp_plus_adapter": "read_top_unread_document"}},
+    ]
+
+    call, adapter = browsecomp_plus_module._browsecomp_plus_research_fallback(env, trace)
+
+    assert call is not None
+    assert call["name"] == "search"
+    assert call["arguments"]["query"] != env.search_queries[0]
+    assert adapter == "focused_search_after_stagnation"
+
+
+def test_browsecomp_plus_grounding_accepts_inferred_title_from_cited_evidence() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-ground", "q-ground", "Which book?", "", {})
+    )
+    env.document_read_docids.append("doc-jaja")
+    env.document_evidence["doc-jaja"] = (
+        "King Jaja of Opobo was an enslaved merchant who became a king and later returned from exile."
+    )
+
+    grounded = browsecomp_plus_module._browsecomp_plus_ground_final_answer_arguments(
+        {
+            "answer": "Jaja of Opobo: The slave who became a king",
+            "explanation": "The clues identify King Jaja of Opobo [doc-jaja].",
+            "confidence": 92,
+        },
+        env=env,
+    )
+
+    assert grounded == {
+        "answer": "Jaja of Opobo: The slave who became a king",
+        "explanation": "The clues identify King Jaja of Opobo [doc-jaja].",
+        "confidence": 92.0,
+    }
+
+
+def test_browsecomp_plus_grounding_rejects_unrelated_citation() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-ground", "q-ground", "Which book?", "", {})
+    )
+    env.document_read_docids.append("doc-1")
+    env.document_evidence["doc-1"] = "A history of maritime trade in West Africa."
+
+    assert (
+        browsecomp_plus_module._browsecomp_plus_ground_final_answer_arguments(
+            {
+                "answer": "The Moon",
+                "explanation": "An unrelated astronomical claim [doc-1].",
+                "confidence": 99,
+            },
+            env=env,
+        )
+        is None
+    )
+
+
+def test_parallel_candidate_parses_direct_browsecomp_final_answer() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"final_answer":"Zurich","explanation":"The source names Zurich [doc-1].","confidence":91}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments == {
+        "answer": "Zurich",
+        "explanation": "The source names Zurich [doc-1].",
+        "confidence": 91,
+    }
+    assert candidate.confidence == 0.91
+
+
+def test_parallel_candidate_accepts_explanation_as_current_evidence_metadata() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"get_document","arguments":{"docid":"doc-1"},'
+        '"confidence":0.9,"explanation":"The search result identifies doc-1."}'
+    )
+
+    assert candidate.name == "get_document"
+    assert candidate.evidence == "The search result identifies doc-1."
+
+
+def test_parallel_candidate_recovers_misplaced_final_answer_arguments() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"final_answer","arguments":"{\\"answer\\":\\"Zurich\\"}",'
+        '"explanation":"The source names Zurich [doc-1].","confidence":0.94}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments == {
+        "answer": "Zurich",
+        "explanation": "The source names Zurich [doc-1].",
+        "confidence": 0.94,
+    }
+    assert candidate.confidence == 0.94
+
+
+def test_parallel_candidate_recovers_escaped_misplaced_final_explanation() -> None:
+    candidate = parse_candidate_tool_call(
+        r'''{
+  "name": "final_answer",
+  "arguments": "{\"answer\":\"Zurich\"}",
+  "explanation\":\"The source names Zurich [doc-1].\",
+  "confidence": 0.94
+}'''
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments == {
+        "answer": "Zurich",
+        "explanation": "The source names Zurich [doc-1].",
+        "confidence": 0.94,
+    }
+    assert candidate.evidence == "The source names Zurich [doc-1]."
+
+
+def test_parallel_candidate_recovers_flat_final_answer_with_current_metadata() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"final_answer","answer":"Zurich",'
+        '"explanation":"The source names Zurich [doc-1].","confidence":0.96,'
+        '"tool_call_id":"call-1"}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments == {
+        "answer": "Zurich",
+        "explanation": "The source names Zurich [doc-1].",
+        "confidence": 0.96,
+    }
+
+
+def test_parallel_candidate_recovers_final_arguments_with_current_metadata() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"final_answer","arguments":"{\\"answer\\":\\"Zurich\\",'
+        '\\"explanation\\":\\"The source names Zurich [doc-1].\\",'
+        '\\"confidence\\":0.97}","metadata":{"source":"candidate"}}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments["answer"] == "Zurich"
+    assert candidate.arguments["confidence"] == 0.97
+
+
+def test_parallel_candidate_recovers_direct_answer_without_name() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"answer":"Zurich","explanation":"The source names Zurich [doc-1].",'
+        '"confidence":0.95}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments["answer"] == "Zurich"
+
+
+def test_parallel_candidate_recovers_answer_in_name_for_final_only_shard() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"Zurich","explanation":"The source names Zurich [doc-1].",'
+        '"confidence":0.95}'
+    )
+
+    normalized = _normalize_candidate_name_alias(
+        candidate,
+        valid_names={"final_answer", "__no_candidate__"},
+    )
+
+    assert normalized.name == "final_answer"
+    assert normalized.arguments == {
+        "answer": "Zurich",
+        "explanation": "The source names Zurich [doc-1].",
+        "confidence": 0.95,
+    }
+
+
+def test_browsecomp_plus_candidate_search_uses_one_unseen_query_from_list() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-query", "q-query", "Question", "Answer", {})
+    )
+    env.search_queries.append("first focused query")
+    candidate = CandidateToolCall(
+        name="search",
+        arguments={"query": ["first focused query", "second focused query"]},
+    )
+
+    call = browsecomp_plus_module._browsecomp_plus_call_from_candidate(candidate, env=env)
+
+    assert call == {"name": "search", "arguments": {"query": "second focused query"}}
+
+
+def test_browsecomp_plus_candidate_search_rejects_repeated_query_list() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-query", "q-query", "Question", "Answer", {})
+    )
+    env.search_queries.extend(["first focused query", "second focused query"])
+    candidate = CandidateToolCall(
+        name="search",
+        arguments={"query": ["first focused query", "second focused query"]},
+    )
+
+    assert browsecomp_plus_module._browsecomp_plus_call_from_candidate(candidate, env=env) is None
+
+
+def test_parallel_candidate_ignores_responses_style_output_metadata() -> None:
+    candidate = parse_candidate_tool_call(
+        '{"name":"final_answer","arguments":{"answer":"Zurich",'
+        '"explanation":"The source names Zurich [doc-1].","confidence":91},'
+        '"annotations":null,"citations":["doc-1"]}'
+    )
+
+    assert candidate.name == "final_answer"
+    assert candidate.arguments["answer"] == "Zurich"
+
+
+def test_browsecomp_plus_does_not_force_final_after_adapter_reads() -> None:
+    trace = [
+        {
+            "decoded_call": {"name": "get_document"},
+            "candidate_router": {"browsecomp_plus_adapter": "read_top_unread_document"},
+        },
+        {
+            "decoded_call": {"name": "get_document"},
+            "candidate_router": {"browsecomp_plus_adapter": "read_top_unread_document"},
+        },
+        {"decoded_call": {"name": "search"}, "candidate_router": {}},
+    ]
+
+    assert not browsecomp_plus_module._should_force_browsecomp_plus_final_answer(
+        step_index=8,
+        max_steps=100,
+        trace=trace,
+    )
+
+
+def test_browsecomp_plus_complex_question_requires_minimum_research_before_final() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord(
+            "bc-plus-depth",
+            "q-depth",
+            "The subject was exiled. The subject became a merchant. Which book title describes the subject?",
+            "",
+            {},
+        )
+    )
+    env.search_queries.extend(f"query-{index}" for index in range(5))
+    env.document_read_docids.extend(f"doc-{index}" for index in range(8))
+
+    assert not browsecomp_plus_module._browsecomp_plus_research_ready_for_final(env)
+    env.search_queries.append("query-5")
+    assert browsecomp_plus_module._browsecomp_plus_research_ready_for_final(env)
+
+
+def test_browsecomp_plus_forces_final_at_convergence_depth() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord("bc-plus-converge", "q-converge", "Which title?", "", {})
+    )
+    env.search_queries.extend(f"query-{index}" for index in range(12))
+    env.document_read_docids.extend(f"doc-{index}" for index in range(8))
+
+    assert browsecomp_plus_module._should_force_browsecomp_plus_final_answer(
+        step_index=20,
+        max_steps=100,
+        trace=[],
+        env=env,
+    )
+
+
+def test_browsecomp_plus_forces_final_after_focused_searches_are_exhausted() -> None:
+    env = browsecomp_plus_module.BrowseCompPlusEnv(
+        BrowseCompPlusRecord(
+            "bc-plus-exhausted",
+            "q-exhausted",
+            "An enslaved merchant returned from exile. Which book title describes this person?",
+            "",
+            {},
+        )
+    )
+    while call := browsecomp_plus_module._browsecomp_plus_focused_search_fallback(env):
+        env.search_queries.append(call["arguments"]["query"])
+    env.document_read_docids.append("doc-1")
+
+    assert browsecomp_plus_module._should_force_browsecomp_plus_final_answer(
+        step_index=12,
+        max_steps=100,
+        trace=[],
+        env=env,
+    )
+
+
+def test_browsecomp_plus_final_stage_is_sticky_after_invalid_final_attempt() -> None:
+    trace = [
+        {
+            "decoded_call": {"name": "get_document"},
+            "force_final_answer": True,
+            "parse_error": "forced final-answer stage returned get_document",
+        }
+    ]
+
+    assert browsecomp_plus_module._should_force_browsecomp_plus_final_answer(
+        step_index=7,
+        max_steps=100,
+        trace=trace,
+    )
+
+
+def test_browsecomp_plus_uses_official_iteration_limit_and_output_shape() -> None:
+    assert browsecomp_plus_module._resolve_browsecomp_plus_max_steps(None) == 100
+    assert browsecomp_plus_module._resolve_browsecomp_plus_max_steps(200) == 100
+    assert browsecomp_plus_module._resolve_browsecomp_plus_max_steps(12) == 12
+    assert browsecomp_plus_module._browsecomp_plus_official_final_output(
+        "Zurich",
+        explanation="The document names Zurich [doc-1].",
+        confidence=0.92,
+    ) == (
+        "Explanation: The document names Zurich [doc-1].\n"
+        "Exact Answer: Zurich\n"
+        "Confidence: 92%"
+    )
 
 
 def test_rwkv_json_call_prompt_renders_multi_turn_dialog_by_default() -> None:

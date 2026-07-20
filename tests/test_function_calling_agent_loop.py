@@ -331,6 +331,60 @@ def test_parallel_candidate_router_allows_shard_abstention_without_respond() -> 
     assert [candidate.name for candidate in route.candidates] == ["search"]
 
 
+def test_parallel_candidate_router_accepts_distinct_context_per_chunk() -> None:
+    tools = (_SEARCH_TOOL, _SEARCH_TOOL)
+
+    class CandidateEngine:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate(self, prompts, **kwargs):  # noqa: ANN001
+            self.calls += 1
+            if self.calls == 1:
+                assert "evidence-marker-a" in prompts[0]
+                assert "evidence-marker-b" not in prompts[0]
+                assert "evidence-marker-b" in prompts[1]
+                assert "evidence-marker-a" not in prompts[1]
+                return [
+                    SimpleNamespace(
+                        text='{"name":"search","arguments":{"query":"alpha"},"confidence":0.8,"evidence":"a"}',
+                        finish_reason="stop",
+                    ),
+                    SimpleNamespace(
+                        text='{"name":"search","arguments":{"query":"beta"},"confidence":0.7,"evidence":"b"}',
+                        finish_reason="stop",
+                    ),
+                ]
+            return [
+                SimpleNamespace(
+                    text='{"name":"search","arguments":{"query":"alpha"},"confidence":0.9,"evidence":"best"}',
+                    finish_reason="stop",
+                )
+            ]
+
+    route = route_parallel_candidate_tool_call(
+        tools=tools,
+        messages=({"role": "user", "content": "shared aggregate context"},),
+        messages_by_chunk=(
+            ({"role": "user", "content": "evidence-marker-a"},),
+            ({"role": "user", "content": "evidence-marker-b"},),
+        ),
+        domain_policy="Search the relevant evidence shard.",
+        domain="test",
+        facts_text=None,
+        engine=CandidateEngine(),
+        sampling=object(),
+        config=ParallelCandidateRouterConfig(
+            chunk_tools=1,
+            include_respond=False,
+            ground_identifier_arguments=False,
+        ),
+    )
+
+    assert route.selected is not None
+    assert route.selected.arguments == {"query": "alpha"}
+
+
 def test_agent_loop_auto_candidate_router_uses_long_metadata_context() -> None:
     record = AgentLoopRecord(
         task_id="metadata-context-1",

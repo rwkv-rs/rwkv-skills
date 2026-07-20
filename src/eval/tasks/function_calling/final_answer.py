@@ -104,7 +104,7 @@ def parse_final_answer_call(
     context_label: str = "final answer",
 ) -> FinalAnswerCall:
     payload = load_tool_call_payload(response, context_label=context_label, recover_partial=True)
-    calls = coerce_tool_call_payloads(payload, context_label=context_label)
+    calls = coerce_tool_call_payloads(payload, context_label=context_label, allowed_metadata_keys=("id",))
     for call in calls:
         if call.name != FINAL_ANSWER_TOOL_NAME:
             continue
