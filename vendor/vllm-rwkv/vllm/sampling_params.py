@@ -8,7 +8,7 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import msgspec
 from pydantic import BeforeValidator
@@ -161,6 +161,22 @@ class RepetitionDetectionParams:
     detection. Must be >= 2. Example: 3 for detecting a phrase repeated
     3 times. Must be used together with max_pattern_size."""
 
+    mode: Literal["consecutive", "occurrence"] = "consecutive"
+    """Detection mode.
+
+    - "consecutive" detects tail patterns repeated back-to-back.
+    - "occurrence" detects the tail N-gram when it has occurred min_count
+      times anywhere in the output token stream.
+    """
+
+    occurrence_rules: list[tuple[int, int]] | None = None
+    """Optional occurrence-mode rules as ``(ngram_size, min_count)`` pairs.
+
+    This allows shorter N-grams to require higher counts while preserving
+    the stricter long N-gram rule. When set, these rules replace
+    min_pattern_size/max_pattern_size/min_count for occurrence mode.
+    """
+
     def __post_init__(self):
         if (
             self.max_pattern_size < 0
@@ -178,6 +194,30 @@ class RepetitionDetectionParams:
                 "in engine output. If you do not wish to detect repetitive "
                 "patterns, set max_pattern_size to 0."
             )
+        if self.mode not in ("consecutive", "occurrence"):
+            raise ValueError(
+                f"mode must be either 'consecutive' or 'occurrence', got {self.mode!r}."
+            )
+        if self.occurrence_rules is not None:
+            if self.mode != "occurrence":
+                raise ValueError(
+                    "occurrence_rules can only be used with mode='occurrence'."
+                )
+            normalized_rules = []
+            for ngram_size, min_count in self.occurrence_rules:
+                if ngram_size <= 0:
+                    raise ValueError(
+                        "occurrence rule ngram_size must be positive, "
+                        f"got {ngram_size}."
+                    )
+                if min_count < 2:
+                    raise ValueError(
+                        f"occurrence rule min_count must be >= 2, got {min_count}."
+                    )
+                normalized_rules.append((int(ngram_size), int(min_count)))
+            if not normalized_rules:
+                raise ValueError("occurrence_rules must contain at least one rule.")
+            self.occurrence_rules = normalized_rules
 
 
 class RequestOutputKind(Enum):
@@ -387,14 +427,34 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        logprob_token_ids: list[int] | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
-            # Convert token_id to integer
-            # Clamp the bias between -100 and 100 per OpenAI API spec
-            logit_bias = {
-                int(token): min(100.0, max(-100.0, bias))
-                for token, bias in logit_bias.items()
-            }
+            # Fast path uses a dict comprehension; on failure we iterate once
+            # to identify the exact offending entry for the error message.
+            try:
+                logit_bias = {
+                    int(token): min(100.0, max(-100.0, bias))
+                    for token, bias in logit_bias.items()
+                }
+            except (ValueError, TypeError):
+                invalid_keys = []
+                converted_logit_bias = {}
+                for token, bias in logit_bias.items():
+                    try:
+                        token_id = int(token)
+                    except (ValueError, TypeError):
+                        invalid_keys.append(token)
+                        continue
+                    converted_logit_bias[token_id] = min(100.0, max(-100.0, bias))
+                if invalid_keys:
+                    raise VLLMValidationError(
+                        f"logit_bias contains key(s) that cannot be "
+                        f"converted to integer token IDs: {invalid_keys!r}",
+                        parameter="logit_bias",
+                        value=invalid_keys,
+                    ) from None
+                logit_bias = converted_logit_bias
 
         return SamplingParams(
             n=1 if n is None else n,
@@ -421,6 +481,7 @@ class SamplingParams(
             min_tokens=min_tokens,
             logprobs=logprobs,
             prompt_logprobs=prompt_logprobs,
+            logprob_token_ids=logprob_token_ids,
             detokenize=detokenize,
             skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=spaces_between_special_tokens,
@@ -755,6 +816,7 @@ class SamplingParams(
         self._validate_logits_processors(model_config)
         self._validate_allowed_token_ids(tokenizer)
         self._validate_spec_decode(speculative_config)
+        self._validate_diffusion(model_config)
         self._validate_structured_outputs(
             model_config, structured_outputs_config, tokenizer
         )
@@ -888,6 +950,28 @@ class SamplingParams(
                 "are not yet supported with speculative decoding."
             )
 
+    def _validate_diffusion(self, model_config: ModelConfig) -> None:
+        if not model_config.is_diffusion:
+            return
+
+        # Diffusion models denoise a whole canvas per step with a fixed
+        # temperature schedule, so per-request sampling parameters are not
+        # supported. Penalties are ignored by the sampler with a warning.
+        if (
+            self.temperature != 1.0
+            or self.min_p > _SAMPLING_EPS
+            or self.seed is not None
+            or self.min_tokens > 0
+            or self.logit_bias
+            or self.bad_words
+            or self.allowed_token_ids
+        ):
+            raise ValueError(
+                "The temperature, min_p, seed, min_tokens, logit_bias, "
+                "bad_words, and allowed_token_ids sampling parameters "
+                "are not yet supported with diffusion models."
+            )
+
     def _validate_structured_outputs(
         self,
         model_config: ModelConfig,
@@ -948,6 +1032,18 @@ class SamplingParams(
             and self.structured_outputs.grammar.strip() == ""
         ):
             raise ValueError("structured_outputs.grammar cannot be an empty string")
+        # Reject empty string json schema early to avoid engine-side crashes
+        if (
+            isinstance(self.structured_outputs.json, str)
+            and self.structured_outputs.json.strip() == ""
+        ):
+            raise ValueError("structured_outputs.json cannot be an empty string")
+        # Reject json_object=False early to avoid engine-side crashes
+        if self.structured_outputs.json_object is False:
+            raise ValueError(
+                "structured_outputs.json_object must be True if set; omit "
+                "structured_outputs to disable structured outputs"
+            )
 
         from vllm.v1.structured_output.backend_guidance import (
             has_guidance_unsupported_json_features,
@@ -1087,8 +1183,8 @@ class SamplingParams(
             min_tokens=2,
             logit_bias={0: -1.0, 1: 0.5},
             _bad_words_token_ids=[[0], [1, 2]],
-            logprobs=5,
-            prompt_logprobs=1,
+            logprobs=None if use_rapid_sampler else 5,
+            prompt_logprobs=None if use_rapid_sampler else 1,
         )
 
 

@@ -31,10 +31,77 @@ endif()
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+set(VLLM_BUILD_PROFILE "full" CACHE STRING "Native extension build profile")
+set_property(CACHE VLLM_BUILD_PROFILE PROPERTY STRINGS full rwkv)
+if(NOT VLLM_BUILD_PROFILE STREQUAL "full" AND
+   NOT VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  message(FATAL_ERROR
+    "Invalid VLLM_BUILD_PROFILE='${VLLM_BUILD_PROFILE}'; accepted values: full, rwkv")
+endif()
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv" AND
+   NOT VLLM_TARGET_DEVICE STREQUAL "cuda")
+  message(FATAL_ERROR "VLLM_BUILD_PROFILE='rwkv' requires VLLM_TARGET_DEVICE='cuda'")
+endif()
+set(VLLM_RWKV_ONLY_BUILD OFF)
+if(VLLM_BUILD_PROFILE STREQUAL "rwkv")
+  set(VLLM_RWKV_ONLY_BUILD ON)
+endif()
+set(VLLM_EXTERNAL_PROJECTS "")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+message(STATUS "Build profile: ${VLLM_BUILD_PROFILE}")
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+
+function(vllm_write_build_profile_manifest)
+  get_property(_configured_targets GLOBAL PROPERTY VLLM_EXTENSION_TARGETS)
+  list(SORT _configured_targets)
+  set(_targets_json "")
+  foreach(_target IN LISTS _configured_targets)
+    if(NOT _targets_json STREQUAL "")
+      string(APPEND _targets_json ", ")
+    endif()
+    string(APPEND _targets_json "\"${_target}\"")
+  endforeach()
+  set(_projects_json "")
+  foreach(_project IN LISTS VLLM_EXTERNAL_PROJECTS)
+    if(NOT _projects_json STREQUAL "")
+      string(APPEND _projects_json ", ")
+    endif()
+    string(APPEND _projects_json "\"${_project}\"")
+  endforeach()
+  file(WRITE "${CMAKE_BINARY_DIR}/vllm_build_profile.json"
+    "{\n"
+    "  \"profile\": \"${VLLM_BUILD_PROFILE}\",\n"
+    "  \"configured_targets\": [${_targets_json}],\n"
+    "  \"external_projects\": [${_projects_json}],\n")
+  if(VLLM_RWKV_ONLY_BUILD)
+    file(APPEND "${CMAKE_BINARY_DIR}/vllm_build_profile.json"
+      "  \"unrestricted\": false,\n"
+      "  \"supported_architectures\": [\"RWKV7ForCausalLM\"],\n"
+      "  \"supported_weight_suffixes\": [\".pth\"],\n"
+      "  \"supported_device_types\": [\"cuda\"],\n"
+      "  \"supported_runner_types\": [\"generate\"],\n"
+      "  \"supported_serving_features\": [\"text_generation\", \"openai_chat\", \"openai_completions\", \"streaming\", \"stop\", \"prometheus_metrics\", \"rapid_sampling\"],\n"
+      "  \"supported_tensor_parallel_sizes\": [1],\n"
+      "  \"supported_pipeline_parallel_sizes\": [1],\n"
+      "  \"supported_data_parallel_sizes\": [1]\n")
+  else()
+    file(APPEND "${CMAKE_BINARY_DIR}/vllm_build_profile.json"
+      "  \"unrestricted\": true,\n"
+      "  \"supported_architectures\": [],\n"
+      "  \"supported_weight_suffixes\": [],\n"
+      "  \"supported_device_types\": [],\n"
+      "  \"supported_runner_types\": [],\n"
+      "  \"supported_serving_features\": [],\n"
+      "  \"supported_tensor_parallel_sizes\": [],\n"
+      "  \"supported_pipeline_parallel_sizes\": [],\n"
+      "  \"supported_data_parallel_sizes\": []\n")
+  endif()
+  file(APPEND "${CMAKE_BINARY_DIR}/vllm_build_profile.json" "}\n")
+  message(STATUS "Configured native targets: ${_configured_targets}")
+  message(STATUS "Configured external projects: ${VLLM_EXTERNAL_PROJECTS}")
+endfunction()
 
 # Suppress potential warnings about unused manually-specified variables
 set(ignoreMe "${VLLM_PYTHON_PATH}")
@@ -70,6 +137,15 @@ endif()
 #
 set(TORCH_SUPPORTED_VERSION_CUDA "2.11.0")
 set(TORCH_SUPPORTED_VERSION_ROCM "2.11.0")
+# TORCH_NIGHTLY=1 builds run against unpinned nightly wheels, so the supported-
+# version check would always warn. Only treat it as a nightly build when the
+# value is exactly "1" (the bootstrap exports TORCH_NIGHTLY=0 by default, which
+# must NOT suppress the warning for normal builds).
+if (DEFINED ENV{TORCH_NIGHTLY} AND "$ENV{TORCH_NIGHTLY}" STREQUAL "1")
+  set(TORCH_NIGHTLY_BUILD TRUE)
+else()
+  set(TORCH_NIGHTLY_BUILD FALSE)
+endif()
 
 #
 # Try to find python package with an executable that exactly matches
@@ -124,7 +200,7 @@ endif()
 # failure is handled gracefully on vLLM side for lower Python versions.
 # Skip the target entirely on Python < 3.11 so the build doesn't break.
 #
-if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
+if(Python_VERSION VERSION_GREATER_EQUAL "3.11" AND NOT VLLM_RWKV_ONLY_BUILD)
   set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
   set(SPINLOOP_COMPILE_FLAGS "")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
@@ -141,15 +217,29 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
 endif()
 
 #
+# fs_io extension (pure CXX; must stay above the non-CUDA device branch
+# so CPU builds define the target before the early return).
+# GIL-releasing filesystem helpers for FileSystemTierManager.
+#
+if(Python_VERSION VERSION_GREATER_EQUAL "3.11" AND NOT VLLM_RWKV_ONLY_BUILD)
+  define_extension_target(
+    fs_io_C
+    DESTINATION vllm
+    LANGUAGE CXX
+    SOURCES csrc/fs_io.cpp
+    USE_SABI 3.11
+    WITH_SOABI)
+endif()
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND
     NOT VLLM_TARGET_DEVICE STREQUAL "rocm")
     if (VLLM_TARGET_DEVICE STREQUAL "cpu")
         include(${CMAKE_CURRENT_LIST_DIR}/cmake/cpu_extension.cmake)
-    else()
-        return()
     endif()
+    vllm_write_build_profile_manifest()
     return()
 endif()
 
@@ -160,7 +250,7 @@ endif()
 if (NOT HIP_FOUND AND NOT PYTORCH_FOUND_HIP AND CUDA_FOUND)
   set(VLLM_GPU_LANG "CUDA")
 
-  if (NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
+  if (NOT TORCH_NIGHTLY_BUILD AND NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
     message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
       "expected for CUDA build, saw ${Torch_VERSION} instead.")
   endif()
@@ -173,7 +263,7 @@ elseif(HIP_FOUND OR PYTORCH_FOUND_HIP)
   enable_language(HIP)
 
   # ROCm 5.X and 6.X
-  if (ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 5 AND
+  if (NOT TORCH_NIGHTLY_BUILD AND ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 5 AND
       Torch_VERSION VERSION_LESS ${TORCH_SUPPORTED_VERSION_ROCM})
     message(WARNING "Pytorch version >= ${TORCH_SUPPORTED_VERSION_ROCM} "
       "expected for ROCm build, saw ${Torch_VERSION} instead.")
@@ -297,7 +387,8 @@ set_gencode_flags_for_srcs(
   SRCS "${VLLM_CUMEM_EXT_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")
 
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
+   NOT VLLM_RWKV_ONLY_BUILD)
   message(STATUS "Enabling cumem allocator extension.")
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     # link against cuda driver library
@@ -328,6 +419,88 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     WITH_SOABI)
 endif()
 
+# RWKV7 operators are self-contained and do not use CUTLASS or the full generic
+# stable operator bundle. Keep this target before the full-only FetchContent
+# path so the reduced profile never downloads those sources. The reduced
+# profile carries the one generic runtime helper required by Model Runner V2.
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  set(RWKV7_CUDA_SRCS
+    "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
+    "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu")
+
+  if(VLLM_RWKV_ONLY_BUILD)
+    list(APPEND RWKV7_CUDA_SRCS
+      "csrc/libtorch_stable/cuda_view.cu")
+  endif()
+
+  set(RWKV7_EXT_SRC
+    "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cpp"
+    ${RWKV7_CUDA_SRCS}
+    "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp"
+    "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cpp"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp")
+
+  set_source_files_properties(${RWKV7_CUDA_SRCS}
+    PROPERTIES COMPILE_FLAGS "-std=c++17 -O3 --extra-device-vectorization -Xptxas -O3")
+  set_source_files_properties(
+    "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
+    "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu"
+    PROPERTIES COMPILE_FLAGS "-std=c++17 -O3 --use_fast_math --extra-device-vectorization -Xptxas -O3")
+  set_source_files_properties(
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp"
+    "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu"
+    PROPERTIES COMPILE_DEFINITIONS "_IO_FP16_")
+  set_gencode_flags_for_srcs(
+    SRCS "${RWKV7_CUDA_SRCS}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+
+  define_extension_target(
+    rwkv7_ops
+    DESTINATION vllm
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES ${RWKV7_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
+    WITH_SOABI)
+  target_compile_definitions(rwkv7_ops PRIVATE USE_CUDA)
+  if(VLLM_RWKV_ONLY_BUILD)
+    target_compile_definitions(rwkv7_ops PRIVATE VLLM_RWKV_RUNTIME_OPS)
+  endif()
+
+  set(RAPID_SAMPLING_CUDA_SRC
+    "vllm/v1/sample/ops/rapid_sampling/sampling.cu")
+  set(RAPID_SAMPLING_EXT_SRC
+    "vllm/v1/sample/ops/rapid_sampling/sampling.cpp"
+    ${RAPID_SAMPLING_CUDA_SRC})
+  set_source_files_properties(${RAPID_SAMPLING_CUDA_SRC}
+    PROPERTIES COMPILE_FLAGS "-O3 --extra-device-vectorization -Xptxas -O3")
+  set_gencode_flags_for_srcs(
+    SRCS "${RAPID_SAMPLING_CUDA_SRC}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+
+  define_extension_target(
+    _rapid_sampling
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${RAPID_SAMPLING_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    WITH_SOABI)
+  find_library(TORCH_PYTHON_LIBRARY
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib"
+    NO_DEFAULT_PATH)
+  if(NOT TORCH_PYTHON_LIBRARY)
+    message(FATAL_ERROR "libtorch_python is required by _rapid_sampling")
+  endif()
+  target_link_libraries(_rapid_sampling PRIVATE "${TORCH_PYTHON_LIBRARY}")
+endif()
+
 #
 # Legacy _C extension (ROCm only — CUDA ops migrated to _C_stable_libtorch)
 #
@@ -335,9 +508,7 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_EXT_SRC
     "csrc/torch_bindings.cpp"
-    "csrc/custom_quickreduce.cu"
-    "csrc/cuda_view.cu"
-    "csrc/libtorch_stable/cuda_utils_kernels.cu")
+    "csrc/custom_quickreduce.cu")
 
   message(STATUS "Enabling C extension.")
   define_extension_target(
@@ -359,13 +530,17 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 endif() # _C HIP endif
 
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
+   NOT VLLM_RWKV_ONLY_BUILD)
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
   #
   set(VLLM_STABLE_EXT_SRC
     "csrc/libtorch_stable/torch_bindings.cpp"
+    "csrc/libtorch_stable/cuda_view.cu"
+    "csrc/libtorch_stable/cuda_utils_kernels.cu"
     "csrc/libtorch_stable/activation_kernels.cu"
+    "csrc/libtorch_stable/ngram_embedding_kernels.cu"
     "csrc/libtorch_stable/quantization/activation_kernels.cu"
     "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"
     "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"
@@ -384,9 +559,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/libtorch_stable/sampler.cu"
     "csrc/libtorch_stable/topk.cu"
     "csrc/libtorch_stable/mamba/selective_scan_fwd.cu"
-    "csrc/libtorch_stable/attention/paged_attention_v1.cu"
-    "csrc/libtorch_stable/attention/paged_attention_v2.cu"
-    "csrc/libtorch_stable/cache_kernels.cu"
     "csrc/libtorch_stable/cache_kernels.cu"
     "csrc/libtorch_stable/cache_kernels_fused.cu"
     "csrc/libtorch_stable/custom_all_reduce.cu"
@@ -443,50 +615,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     endif()
     FetchContent_MakeAvailable(cutlass)
 
-    set(RWKV7_CUDA_SRCS
-      "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu")
-
-    set(RWKV7_EXT_SRC
-      "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cpp"
-      ${RWKV7_CUDA_SRCS}
-      "csrc/libtorch_stable/rwkv7/rwkv7_registration.cpp"
-      "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cpp"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp16_v2.cpp"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp")
-
-    set_source_files_properties(${RWKV7_CUDA_SRCS}
-      PROPERTIES COMPILE_FLAGS "-std=c++17 -O3 --extra-device-vectorization -Xptxas -O3")
-    set_source_files_properties(
-      "csrc/libtorch_stable/rwkv7/rwkv7_fast_ops_fp16.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_v3a_ops.cu"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu"
-      PROPERTIES COMPILE_FLAGS "-std=c++17 -O3 --use_fast_math --extra-device-vectorization -Xptxas -O3")
-    set_source_files_properties(
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cpp"
-      "csrc/libtorch_stable/rwkv7/rwkv7_wkv_fp32_v2.cu"
-      PROPERTIES COMPILE_DEFINITIONS "_IO_FP16_")
-    set_gencode_flags_for_srcs(
-      SRCS "${RWKV7_CUDA_SRCS}"
-      CUDA_ARCHS "${CUDA_ARCHS}")
-
-    define_extension_target(
-      rwkv7_ops
-      DESTINATION vllm
-      LANGUAGE ${VLLM_GPU_LANG}
-      SOURCES ${RWKV7_EXT_SRC}
-      COMPILE_FLAGS ${VLLM_GPU_FLAGS}
-      ARCHITECTURES ${VLLM_GPU_ARCHES}
-      INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR} ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
-      USE_SABI 3
-      WITH_SOABI)
-    target_compile_definitions(rwkv7_ops PRIVATE USE_CUDA)
+    # Preserve the full profile's historical RWKV target include paths. The
+    # reduced profile deliberately avoids fetching CUTLASS and does not need
+    # these headers.
+    target_include_directories(rwkv7_ops PRIVATE
+      ${CUTLASS_INCLUDE_DIR}
+      ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR})
 
     list(APPEND VLLM_STABLE_EXT_SRC
-      "csrc/libtorch_stable/cuda_view.cu"
-      "csrc/libtorch_stable/cuda_utils_kernels.cu"
       "csrc/libtorch_stable/cutlass_extensions/common.cpp"
       "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_entry.cu"
       "csrc/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu"
@@ -1117,14 +1253,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     USE_SABI 3
     WITH_SOABI)
 
+  # Set TORCH_TARGET_VERSION for stable ABI compatibility.
+  # This ensures we only use C-shim APIs available in PyTorch 2.11.
+  # _C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+  # which is currently set to 2.11.
+  target_compile_definitions(_C_stable_libtorch PRIVATE
+    TORCH_TARGET_VERSION=0x020B000000000000ULL)
+
   # Needed to use cuda/hip APIs from C-shim
   if(VLLM_GPU_LANG STREQUAL "CUDA")
-    # Set TORCH_TARGET_VERSION for stable ABI compatibility.
-    # This ensures we only use C-shim APIs available in PyTorch 2.11.
-    # _C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
-    # which is currently set to 2.11.
-    target_compile_definitions(_C_stable_libtorch PRIVATE
-      TORCH_TARGET_VERSION=0x020B000000000000ULL)
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_CUDA)
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
@@ -1134,12 +1271,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_C_stable_libtorch PRIVATE
       CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
   elseif(VLLM_GPU_LANG STREQUAL "HIP")
-    # Set TORCH_TARGET_VERSION for stable ABI compatibility.
-    # This ensures we only use C-shim APIs available in PyTorch 2.10.
-    # _C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
-    # which is currently set to 2.10.
-    target_compile_definitions(_C_stable_libtorch PRIVATE
-      TORCH_TARGET_VERSION=0x020A000000000000ULL)
     target_compile_definitions(_C_stable_libtorch PRIVATE USE_ROCM)
   endif()
 
@@ -1167,6 +1298,7 @@ endif()
 # _moe_C_stable_libtorch extension
 #
 
+if(NOT VLLM_RWKV_ONLY_BUILD)
 set(VLLM_MOE_EXT_SRC
   "csrc/libtorch_stable/moe/torch_bindings.cpp"
   "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"
@@ -1347,25 +1479,20 @@ define_extension_target(
   USE_SABI 3
   WITH_SOABI)
 
+# Set TORCH_TARGET_VERSION for stable ABI compatibility.
+# This ensures we only use C-shim APIs available in PyTorch 2.11.
+# _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+# which is currently set to 2.11.
+target_compile_definitions(_moe_C_stable_libtorch PRIVATE
+  TORCH_TARGET_VERSION=0x020B000000000000ULL)
+
 # Needed to use cuda/hip APIs from C-shim
 if(VLLM_GPU_LANG STREQUAL "CUDA")
-  # Set TORCH_TARGET_VERSION for stable ABI compatibility.
-  # This ensures we only use C-shim APIs available in PyTorch 2.11.
-  # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
-  # which is currently set to 2.11.
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE
-    TORCH_TARGET_VERSION=0x020B000000000000ULL)
   target_compile_definitions(_moe_C_stable_libtorch PRIVATE USE_CUDA)
   # Needed by CUTLASS kernels
   target_compile_definitions(_moe_C_stable_libtorch PRIVATE
     CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
 elseif(VLLM_GPU_LANG STREQUAL "HIP")
-  # Set TORCH_TARGET_VERSION for stable ABI compatibility.
-  # This ensures we only use C-shim APIs available in PyTorch 2.10.
-  # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
-  # which is currently set to 2.10.
-  target_compile_definitions(_moe_C_stable_libtorch PRIVATE
-    TORCH_TARGET_VERSION=0x020A000000000000ULL)
   target_compile_definitions(_moe_C_stable_libtorch PRIVATE USE_ROCM)
 endif()
 
@@ -1387,6 +1514,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_link_libraries(_moe_C_stable_libtorch PRIVATE ${_MOE_STABLE_TORCH_AMDHIP64})
   endif()
 endif()
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #
@@ -1395,6 +1523,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
+    "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/attention.cu")
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)
@@ -1428,17 +1557,24 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 # For CUDA and HIP builds also build the triton_kernels external package.
-if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+if((VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP") AND
+   NOT VLLM_RWKV_ONLY_BUILD)
+    list(APPEND VLLM_EXTERNAL_PROJECTS "triton_kernels")
     include(cmake/external_projects/triton_kernels.cmake)
 endif()
 
 # For CUDA we also build and ship some external projects.
-if (VLLM_GPU_LANG STREQUAL "CUDA")
+if (VLLM_GPU_LANG STREQUAL "CUDA" AND NOT VLLM_RWKV_ONLY_BUILD)
+    list(APPEND VLLM_EXTERNAL_PROJECTS
+      "deepgemm" "fmha_sm100" "flashmla" "qutlass" "vllm-flash-attn")
     include(cmake/external_projects/deepgemm.cmake)
     include(cmake/external_projects/fmha_sm100.cmake)
     include(cmake/external_projects/flashmla.cmake)
     include(cmake/external_projects/qutlass.cmake)
+    include(cmake/external_projects/tml_fa4.cmake)
 
     # vllm-flash-attn should be last as it overwrites some CMake functions
     include(cmake/external_projects/vllm_flash_attn.cmake)
 endif ()
+
+vllm_write_build_profile_manifest()

@@ -56,6 +56,147 @@ class Gemma3TextModelConfig(VerifyAndUpdateConfig):
         hf_config.is_causal = not hf_config.use_bidirectional_attention
 
 
+class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        """Configure Unlimited-OCR attention backends for R-SWA and vision.
+
+        Backend selection — controlled by the standard ``--attention-config``
+        CLI argument (priority order):
+
+          1. ``--attention-config '{"backend": "FLASH_ATTN"}'``
+             → FA4 + rswa_mask_mod.  Exact token-level R-SWA.
+               ``flash_attn_version`` is forced to 4 if not already set (R-SWA
+               mask_mod requires FA4; FA3 cannot express it).  Raises if FA4 is
+               not available on this device.
+
+          2. ``--attention-config '{"backend": "FLEX_ATTENTION"}'``
+             → FlexAttention R-SWA via Triton block mask.
+
+          3. ``--attention-config '{"backend": "TRITON_ATTN"}'``
+             → Triton unified attention with an R-SWA decode mask.
+
+          4. ``--attention-config '{"backend": "auto"}'`` (or omitted)
+             → Auto-detect: FA4 if available (H20/H100 SM90), else TritonAttention.
+
+        Regardless of backend, prefix caching is disabled for this model: R-SWA
+        decode-phase KV is not a pure causal function of the prefix (so decode
+        blocks are not reusable), and single-turn image-led OCR prompts rarely
+        hit the prefix cache.
+
+        Example — force FlexAttention even on a machine with FA4::
+
+            vllm serve baidu/Unlimited-OCR \\
+                --attention-config '{"backend": "FLEX_ATTENTION"}'
+        """
+        from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        attn_config = vllm_config.attention_config
+        fa4_available = is_fa_version_supported(4)
+
+        # ── step 1: resolve backend ─────────────────────────────────────────
+        # None means the user did not explicitly specify a backend; auto-select.
+        if attn_config.backend is None:
+            attn_config.backend = (
+                AttentionBackendEnum.FLASH_ATTN
+                if fa4_available
+                else AttentionBackendEnum.TRITON_ATTN
+            )
+            logger.info(
+                "Unlimited-OCR: auto-selected attention backend=%s (fa4_available=%s).",
+                attn_config.backend.value,
+                fa4_available,
+            )
+
+        # ── step 2: configure the chosen backend ────────────────────────────
+        if attn_config.backend == AttentionBackendEnum.FLASH_ATTN:
+            if not fa4_available:
+                raise RuntimeError(
+                    "Unlimited-OCR: --attention-config backend=FLASH_ATTN "
+                    "requires FA4 (rswa_mask_mod), but FA4 is not available on "
+                    "this device/installation. Use backend=TRITON_ATTN or "
+                    "FLEX_ATTENTION, or upgrade vllm-flash-attn."
+                )
+            # On SM90 (H20), the default FA version is FA3 regardless of FA4
+            # availability (FA4 is only auto-upgraded when head_size > 256).
+            # The R-SWA mask_mod requires FA4, so force the version globally.
+            if attn_config.flash_attn_version is None:
+                attn_config.flash_attn_version = 4
+            elif attn_config.flash_attn_version < 4:
+                logger.warning(
+                    "Unlimited-OCR: flash_attn_version=%d cannot express the "
+                    "R-SWA mask_mod; upgrading to 4.",
+                    attn_config.flash_attn_version,
+                )
+                attn_config.flash_attn_version = 4
+            logger.info(
+                "Unlimited-OCR: FlashAttention FA%d + rswa_mask_mod — exact R-SWA.",
+                attn_config.flash_attn_version,
+            )
+
+        elif attn_config.backend == AttentionBackendEnum.TRITON_ATTN:
+            logger.info(
+                "Unlimited-OCR: TritonAttention — R-SWA via unified attention mask."
+            )
+
+        elif attn_config.backend == AttentionBackendEnum.FLEX_ATTENTION:
+            logger.info(
+                "Unlimited-OCR: FlexAttention — R-SWA via Triton block mask%s.",
+                ""
+                if not fa4_available
+                else (
+                    " (FA4 available but not used; pass backend=FLASH_ATTN to upgrade)"
+                ),
+            )
+
+        else:
+            raise ValueError(
+                f"Unlimited-OCR: unsupported attention backend "
+                f"{attn_config.backend!r} for R-SWA. "
+                "Use FLASH_ATTN (FA4), TRITON_ATTN or FLEX_ATTENTION."
+            )
+
+        # R-SWA windows the *generated* tokens, so a decode-token's KV is not a
+        # pure causal function of the prefix and cannot be safely reused across
+        # requests via prefix caching. Only the prompt/image prefix is cacheable,
+        # but OCR is single-turn with image-led prompts that rarely share a
+        # prefix, so prefix caching brings little benefit while complicating the
+        # KV cache manager. Disable it for this model.
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+            logger.info(
+                "Unlimited-OCR: disabling prefix caching (R-SWA decode KV is not "
+                "cacheable, and single-turn image-led prompts rarely hit the "
+                "prefix cache)."
+            )
+
+        mm_config = getattr(vllm_config.model_config, "multimodal_config", None)
+        if mm_config is not None:
+            if mm_config.mm_encoder_attn_backend is None:
+                mm_config.mm_encoder_attn_backend = AttentionBackendEnum.FLASH_ATTN
+            elif mm_config.mm_encoder_attn_backend == AttentionBackendEnum.FLASHINFER:
+                logger.warning(
+                    "Unlimited-OCR: FlashInfer is not supported for the vision "
+                    "encoder (the CLIP stage runs full attention without "
+                    "cu_seqlens); falling back to FlashAttention."
+                )
+                mm_config.mm_encoder_attn_backend = AttentionBackendEnum.FLASH_ATTN
+
+    @staticmethod
+    def verify_and_update_model_config(model_config: "ModelConfig") -> None:
+        text_config = model_config.hf_config.text_config
+        text_config.architectures = ["DeepseekV2ForCausalLM"]
+        if getattr(model_config.hf_config, "rswa_window", None) is None:
+            model_config.hf_config.rswa_window = 128
+        # Propagate rswa_window to text_config so that DeepseekAttention (which
+        # receives text_config as its vllm_config.model_config.hf_config via
+        # init_vllm_registered_model) can read it and create RSWAAttention.
+        rswa_window = model_config.hf_config.rswa_window
+        text_config.rswa_window = rswa_window
+
+
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -360,7 +501,7 @@ class LlamaBidirectionalConfig(VerifyAndUpdateConfig):
             "last": "LAST",
         }
 
-        pooling_type = pooling_type_map.get(hf_config.pooling, None)
+        pooling_type = pooling_type_map.get(hf_config.pooling)
         if pooling_type is None:
             raise ValueError(f"pool_type {hf_config.pooling!r} not supported")
 
@@ -466,34 +607,28 @@ class MambaModelConfig(VerifyAndUpdateConfig):
 class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        rwkv_knobs = {
-            "VLLM_RWKV7_WKV_MODE": (
-                envs.VLLM_RWKV7_WKV_MODE,
-                {"fp16", "fp32io16"},
-            ),
-            "VLLM_RWKV7_EMB_DEVICE": (
-                envs.VLLM_RWKV7_EMB_DEVICE,
-                {"cpu", "gpu"},
-            ),
-            "VLLM_RWKV7_RKV_MODE": (
-                envs.VLLM_RWKV7_RKV_MODE,
-                {"auto", "on", "off", "batched"},
-            ),
-            "VLLM_RWKV7_CMIX_SPARSE": (
-                envs.VLLM_RWKV7_CMIX_SPARSE,
-                {"auto", "no-fc", "off"},
-            ),
-            "VLLM_RWKV7_LOW_RANK_WEIGHT": (
-                envs.VLLM_RWKV7_LOW_RANK_WEIGHT,
-                {"orig", "transpose", "both"},
-            ),
-        }
-        for name, (value, allowed) in rwkv_knobs.items():
-            if value not in allowed:
-                allowed_values = ", ".join(sorted(allowed))
+        wkv_mode = envs.VLLM_RWKV7_WKV_MODE
+        if wkv_mode not in {"fp16", "fp32io16"}:
+            raise ValueError(
+                f"VLLM_RWKV7_WKV_MODE={wkv_mode!r} is invalid for RWKV7. "
+                "Expected one of: fp16, fp32io16."
+            )
+
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is not None:
+            cache_config.enable_prefix_caching = False
+
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if scheduler_config is not None:
+            token_budget = scheduler_config.max_num_scheduled_tokens
+            if token_budget is None:
+                token_budget = scheduler_config.max_num_batched_tokens
+            if scheduler_config.max_num_seqs > token_budget:
                 raise ValueError(
-                    f"{name}={value!r} is invalid for RWKV7. "
-                    f"Expected one of: {allowed_values}."
+                    "RWKV7 native decode wave requires max_num_seqs to fit "
+                    "within max_num_scheduled_tokens or max_num_batched_tokens. "
+                    f"Got max_num_seqs={scheduler_config.max_num_seqs} and "
+                    f"token_budget={token_budget}."
                 )
 
         compilation_config = vllm_config.compilation_config
@@ -514,8 +649,8 @@ class RWKV7ForCausalLMConfig(VerifyAndUpdateConfig):
 
         if cudagraph_mode not in (None, CUDAGraphMode.FULL_DECODE_ONLY):
             logger.warning_once(
-                "RWKV7 supports decode-only CUDAGraph without torch.compile. "
-                "Overriding cudagraph_mode to FULL_DECODE_ONLY."
+                "RWKV7 supports decode-only CUDAGraph with persistent slot "
+                "indices. Overriding cudagraph_mode to FULL_DECODE_ONLY."
             )
         compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
 
@@ -727,6 +862,23 @@ class VoyageQwen3BidirectionalEmbedModelConfig(VerifyAndUpdateConfig):
         model_config.hf_config.embedding_size = model_config.hf_config.num_labels
 
 
+class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # LongCat-Flash-Lite's zero-expert MoE trips a data-dependent assert
+        # under torch.compile, and its n-gram inputs_embeds are only wired for
+        # FULL cudagraph capture (PIECEWISE prefill drops them). Default to
+        # no-compile + FULL cudagraph (prefill runs eager) unless the user
+        # configured compilation explicitly.
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        if compilation_config.mode is None:
+            compilation_config.mode = CompilationMode.NONE
+        if compilation_config.cudagraph_mode is None:
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
@@ -740,6 +892,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Gemma4ForConditionalGeneration": Gemma4Config,
     "Gemma4UnifiedForConditionalGeneration": Gemma4Config,
     "GptOssForCausalLM": GptOssForCausalLMConfig,
+    "LongcatFlashNgramForCausalLM": LongcatFlashNgramForCausalLMConfig,
     "GteModel": SnowflakeGteNewModelConfig,
     "GteNewForSequenceClassification": GteNewModelConfig,
     "GteNewModel": GteNewModelConfig,
@@ -763,6 +916,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "Qwen3_5MoeForConditionalGeneration": Qwen3_5ForConditionalGenerationConfig,
     "RWKV7ForCausalLM": RWKV7ForCausalLMConfig,
+    "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
     "XLMRobertaModel": JinaRobertaModelConfig,
 }

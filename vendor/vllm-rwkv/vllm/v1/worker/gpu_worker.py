@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
@@ -16,6 +17,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.build_profile import get_build_profile_metadata
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.device_allocator import get_mem_allocator_instance
@@ -49,12 +51,11 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
     PYNVVIDEOCODEC_MAX_RETAINED_DECODERS,
-    PYNVVIDEOCODEC_VIDEO_BACKEND,
+    VIDEO_LOADER_REGISTRY,
 )
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
@@ -74,17 +75,30 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.worker.startup_plan import (
+    maybe_apply_startup_plan,
+    maybe_save_startup_plan,
+)
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import should_skip_v2_kernel_warmup, warmup_kernels
 from .utils import request_memory
+
+if get_build_profile_metadata().profile == "rwkv":
+
+    def kernel_warmup(worker: "Worker") -> None:
+        """Skip attention/MoE kernel warmups omitted by the RWKV artifact."""
+
+else:
+    from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -148,13 +162,12 @@ class Worker(WorkerBase):
 
         # Buffers saved before sleep
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._sleep_rebuild_draft_metadata_buffers = False
 
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
-        self._is_checkpoint_format = True
-        self._model_handles_weight_update = False
 
         # Torch/CUDA profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
@@ -170,8 +183,23 @@ class Worker(WorkerBase):
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
 
+        # Resolved lazily on first sleep/wake; persists worker-process state.
+        self._sleep_mode_backend: SleepModeBackend | None = None
+
+    def _get_sleep_mode_backend(self) -> "SleepModeBackend":
+        if self._sleep_mode_backend is None:
+            from vllm.device_allocator.sleep_mode_backend import (
+                SleepModeBackendFactory,
+            )
+
+            self._sleep_mode_backend = SleepModeBackendFactory.create_backend(
+                self.vllm_config.model_config
+            )
+        return self._sleep_mode_backend
+
     def sleep(self, level: int = 1) -> None:
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+        torch.accelerator.synchronize()
+        free_bytes_before_sleep = torch.accelerator.get_memory_info()[0]
 
         # Save the buffers before level 2 sleep
         if level == 2:
@@ -179,11 +207,23 @@ class Worker(WorkerBase):
             self._sleep_saved_buffers = {
                 name: buffer.cpu().clone() for name, buffer in model.named_buffers()
             }
+            draft = self.get_draft_model()
+            inner = getattr(draft, "model", None) if draft is not None else None
+            self._sleep_rebuild_draft_metadata_buffers = inner is not None and hasattr(
+                inner, "_build_fused_kv_buffers"
+            )
 
-        allocator = get_mem_allocator_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
-        free_bytes_after_sleep, total = torch.cuda.mem_get_info()
-        freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        self._get_sleep_mode_backend().suspend(level)
+
+        torch.accelerator.synchronize()
+        deadline = time.monotonic() + (5.0 if current_platform.is_rocm() else 0)
+        while True:
+            free_bytes_after_sleep, total = torch.accelerator.get_memory_info()
+            freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+            if freed_bytes >= 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
         used_bytes = total - free_bytes_after_sleep
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
         logger.info(
@@ -193,8 +233,7 @@ class Worker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
-        allocator = get_mem_allocator_instance()
-        allocator.wake_up(tags)
+        self._get_sleep_mode_backend().resume(tags)
 
         # Restore the buffers after level 2 sleep
         if len(self._sleep_saved_buffers):
@@ -203,6 +242,14 @@ class Worker(WorkerBase):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+
+        if self._sleep_rebuild_draft_metadata_buffers:
+            draft = self.get_draft_model()
+            if draft is not None:
+                inner = getattr(draft, "model", None)
+                if inner is not None and hasattr(inner, "_build_fused_kv_buffers"):
+                    inner._build_fused_kv_buffers()
+            self._sleep_rebuild_draft_metadata_buffers = False
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
@@ -353,7 +400,7 @@ class Worker(WorkerBase):
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
             )
         else:
-            raise RuntimeError(f"Not support device type: {self.device_config.device}")
+            raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
 
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
@@ -394,7 +441,8 @@ class Worker(WorkerBase):
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
-                self.vllm_config.parallel_config,
+                self.vllm_config,
+                self.device,
                 self.model_runner.get_model(),
             )
 
@@ -417,6 +465,8 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        maybe_apply_startup_plan(self)
+
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
@@ -450,11 +500,14 @@ class Worker(WorkerBase):
             )
 
             # Profile CUDA graph memory if graphs will be captured.
-            # Skip on ROCm/HIP/XPU as graph pool handles and mem_get_info behave
-            # differently and can produce incorrect/negative estimates.
+            # ROCm is included: #44825 moved the profiler to
+            # torch.accelerator.get_memory_info (reliable on ROCm, as used by
+            # the AMD-CI mem tests), and graph_pool_handle resolves to the same
+            # torch.cuda handle the live capture path already uses on ROCm.
+            # XPU stays excluded (see #39977).
             cudagraph_memory_estimate = 0
             if (
-                current_platform.is_cuda()
+                current_platform.is_cuda_alike()
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
@@ -470,8 +523,7 @@ class Worker(WorkerBase):
             + profile_result.weights_memory
         )
 
-        # On ROCm, cudagraph_memory_estimate is always 0 so this is a no-op.
-        # On CUDA, respect the opt-in flag as originally designed.
+        # Respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
@@ -562,15 +614,15 @@ class Worker(WorkerBase):
         )
 
     @staticmethod
-    def _uses_pynvvideocodec_video_backend(mm_config) -> bool:
+    def _uses_gpu_video_backend(mm_config) -> bool:
         video_kwargs = mm_config.media_io_kwargs.get("video", {})
         video_loader_backend = (
             video_kwargs.get("video_backend") or envs.VLLM_VIDEO_LOADER_BACKEND
         )
         codec_backend = video_kwargs.get("backend")
-        return (
-            video_loader_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
-            or codec_backend == PYNVVIDEOCODEC_VIDEO_BACKEND
+        return VIDEO_LOADER_REGISTRY.backend_requires_gpu(video_loader_backend) or (
+            codec_backend is not None
+            and VIDEO_LOADER_REGISTRY.backend_requires_gpu(codec_backend)
         )
 
     def _reserve_mm_ipc_gpu_memory(self, available_kv_cache_memory_bytes: int) -> int:
@@ -601,7 +653,7 @@ class Worker(WorkerBase):
         )
         decoder_reserved_bytes = (
             num_api_servers * per_server_decoder_bytes
-            if self._uses_pynvvideocodec_video_backend(mm_config)
+            if self._uses_gpu_video_backend(mm_config)
             else 0
         )
         reserved_bytes = raw_frame_reserved_bytes + decoder_reserved_bytes
@@ -810,11 +862,18 @@ class Worker(WorkerBase):
                 f"{format_gib(self.available_kv_cache_memory_bytes)} GiB."
             )
 
-            logger.debug(msg)
+            logger.info(msg)
+
+            maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            if should_skip_v2_kernel_warmup(self.model_runner):
+                logger.info("Skipping the incompatible V2 kernel warmup for RWKV7.")
+            else:
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -882,6 +941,29 @@ class Worker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+
+    def get_draft_model(self) -> nn.Module | None:
+        return self.model_runner.get_draft_model()
+
+    def _set_draft_weight_update_target(self) -> None:
+        assert self.weight_transfer_engine is not None
+
+        draft_model = self.get_draft_model()
+        if draft_model is None:
+            raise RuntimeError(
+                "Draft model weight update requested, but no draft model is configured."
+            )
+
+        speculative_config = self.speculative_config
+        if speculative_config is None or speculative_config.draft_model_config is None:
+            raise RuntimeError(
+                "Draft model weight update requested, but no draft model "
+                "config is configured."
+            )
+
+        self.weight_transfer_engine.set_weight_update_target(
+            draft_model, speculative_config.draft_model_config
+        )
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
@@ -1139,31 +1221,32 @@ class Worker(WorkerBase):
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
         self.weight_transfer_engine.init_transfer_engine(typed_init_info)
 
-    def _abort_model_weight_update(self) -> None:
-        abort_weight_update = getattr(
-            self.model_runner.model, "abort_weight_update", None
-        )
-        if callable(abort_weight_update):
-            try:
-                abort_weight_update()
-            except Exception:
-                logger.exception("Failed to abort model weight update")
-
-    def _reset_weight_update_state(self) -> None:
-        self._weight_update_active = False
-        self._is_checkpoint_format = True
-        self._model_handles_weight_update = False
-
-    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+    def start_weight_update(self) -> None:
         """
         Start a new weight update session.
 
-        Args:
-            is_checkpoint_format: Whether incoming weights are in checkpoint
-                format (need layerwise processing) or kernel format (direct
-                copy / sparse patch application).
+        Delegates engine-specific preparation (e.g. layerwise reload setup) to
+        the configured weight transfer engine. The worker only tracks that a
+        session is active.
         """
+        self._start_weight_update()
+
+    def start_draft_weight_update(self) -> None:
+        """
+        Like start_weight_update, but retargets the engine at the speculative
+        draft model for this session.
+        """
+        self._start_weight_update(is_draft=True)
+
+    def _start_weight_update(self, is_draft: bool = False) -> None:
         self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
+
+        if is_draft and not self.weight_transfer_engine.supports_draft_weight_update:
+            raise RuntimeError(
+                f"{type(self.weight_transfer_engine).__name__} does not support "
+                "draft model weight updates."
+            )
 
         if self._weight_update_active:
             raise RuntimeError(
@@ -1171,33 +1254,13 @@ class Worker(WorkerBase):
                 "active. Call finish_weight_update first."
             )
 
-        model_handles_weight_update = False
-        if is_checkpoint_format:
-            from vllm.model_executor.model_loader.reload import (
-                initialize_layerwise_reload,
-            )
-
-            model = self.model_runner.model
-            with torch.device(self.device):
-                start_model_update = getattr(model, "start_weight_update", None)
-                if callable(start_model_update):
-                    model_handles_weight_update = bool(start_model_update())
-                if model_handles_weight_update:
-                    world_size = getattr(
-                        getattr(self, "parallel_config", None), "world_size", 1
-                    )
-                    if world_size != 1:
-                        self._abort_model_weight_update()
-                        self._reset_weight_update_state()
-                        raise NotImplementedError(
-                            "RWKV7 checkpoint-format weight updates currently "
-                            "require TP=1 and PP=1"
-                        )
-                if not model_handles_weight_update:
-                    initialize_layerwise_reload(model)
-
-        self._is_checkpoint_format = is_checkpoint_format
-        self._model_handles_weight_update = model_handles_weight_update
+        try:
+            if is_draft:
+                self._set_draft_weight_update_target()
+            self.weight_transfer_engine.start_weight_update()
+        except BaseException:
+            self.weight_transfer_engine.reset_weight_update_target()
+            raise
         self._weight_update_active = True
 
     def update_weights(self, update_info: dict) -> None:
@@ -1206,6 +1269,8 @@ class Worker(WorkerBase):
 
         start_weight_update must be called before update_weights and
         finish_weight_update must be called after all chunks have been sent.
+        Every chunk loads into whichever model the session's start_weight_update
+        / start_draft_weight_update call selected.
 
         Args:
             update_info: Dictionary containing backend-specific update info
@@ -1218,102 +1283,31 @@ class Worker(WorkerBase):
                 "start_weight_update must be called before update_weights."
             )
 
-        update_succeeded = False
         try:
-            # Parse dict into backend-specific typed dataclass
-            typed_update_info = self.weight_transfer_engine.parse_update_info(
-                update_info
-            )
-
-            with torch.device(self.device):
-                if self._is_checkpoint_format:
-                    if typed_update_info.update_kind != "dense":
-                        raise ValueError(
-                            "Sparse weight updates require "
-                            "`start_weight_update(is_checkpoint_format=False)`."
-                        )
-
-                    model = self.model_runner.model
-
-                    # Use layerwise reload pattern for checkpoint format weights
-                    self.weight_transfer_engine.receive_weights(
-                        typed_update_info,
-                        load_weights=model.load_weights,
-                    )
-                elif typed_update_info.update_kind == "sparse_flat":
-                    if self.parallel_config.world_size != 1:
-                        raise NotImplementedError(
-                            "Sparse weight updates currently require TP=1 and PP=1"
-                        )
-                    self.weight_transfer_engine.receive_sparse_weights(
-                        typed_update_info,
-                        apply_patches=self.model_runner.apply_sparse_weight_patches,
-                    )
-                else:
-                    model = self.model_runner.model
-
-                    # Weights are already in kernel format, copy directly.
-                    def load_weights_direct(
-                        weights: list[tuple[str, torch.Tensor]],
-                    ) -> None:
-                        for name, weight in weights:
-                            param = model.get_parameter(name)
-                            param.copy_(weight)
-
-                    self.weight_transfer_engine.receive_weights(
-                        typed_update_info,
-                        load_weights=load_weights_direct,
-                    )
-
-            # NCCL broadcast/packed path are asynchronous.
-            # Sync here so the next step uses the new weights.
-            torch.accelerator.synchronize()
-            update_succeeded = True
-        finally:
-            if not update_succeeded:
-                if self._is_checkpoint_format and getattr(
-                    self, "_model_handles_weight_update", False
-                ):
-                    self._abort_model_weight_update()
-                self._reset_weight_update_state()
+            self.weight_transfer_engine.update_weights(update_info)
+        except BaseException:
+            self._weight_update_active = False
+            self.weight_transfer_engine.reset_weight_update_target()
+            raise
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
         self._check_weight_transfer_engine()
+        assert self.weight_transfer_engine is not None
 
         if not self._weight_update_active:
             raise RuntimeError(
                 "finish_weight_update called without a matching start_weight_update."
             )
 
-        finish_succeeded = False
-        try:
-            if self._is_checkpoint_format:
-                from vllm.model_executor.model_loader.reload import (
-                    finalize_layerwise_reload,
-                )
-
-                model = self.model_runner.model
-                with torch.device(self.device):
-                    if self._model_handles_weight_update:
-                        model.finish_weight_update()
-                    else:
-                        finalize_layerwise_reload(model, self.model_config)
-
-                model_state = getattr(self.model_runner, "model_state", None)
-                reset_state = getattr(model_state, "reset_after_weight_update", None)
-                if callable(reset_state):
-                    reset_state()
-            finish_succeeded = True
-        finally:
-            if not finish_succeeded:
-                if self._is_checkpoint_format and getattr(
-                    self, "_model_handles_weight_update", False
-                ):
-                    self._abort_model_weight_update()
-                self._reset_weight_update_state()
-
-        self._reset_weight_update_state()
+        self.weight_transfer_engine.finish_weight_update()
+        self.weight_transfer_engine.reset_weight_update_target()
+        model_runner = getattr(self, "model_runner", None)
+        model_state = getattr(model_runner, "model_state", None)
+        reset_state = getattr(model_state, "reset_after_weight_update", None)
+        if callable(reset_state):
+            reset_state()
+        self._weight_update_active = False
 
     def shutdown(self) -> None:
         gc.unfreeze()
@@ -1337,10 +1331,11 @@ class Worker(WorkerBase):
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to
         # interpreter finalization (pytorch/pytorch#145168).
-        from vllm.device_allocator.cumem import CuMemAllocator
+        if current_platform.is_cuda_alike():
+            from vllm.device_allocator.cumem import CuMemAllocator
 
-        if CuMemAllocator.instance is not None:
-            CuMemAllocator.instance.release_pools()
+            if CuMemAllocator.instance is not None:
+                CuMemAllocator.instance.release_pools()
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

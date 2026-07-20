@@ -23,6 +23,7 @@ from vllm.model_executor.models.registry import (
     _SPECULATIVE_DECODING_MODELS,
     _TEXT_GENERATION_MODELS,
     ModelRegistry,
+    _LazyRegisteredModel,
 )
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import get_config
@@ -50,6 +51,12 @@ def test_registry_imports(model_arch):
                 "temporarily skipped while PyPI has `lightning` quarantined "
                 "(see #41376)"
             )
+
+    # DSpark draft model is supported on CUDA and ROCm; stubbed to None on XPU.
+    if model_arch == "DSparkDraftModel" and not (
+        current_platform.is_cuda() or current_platform.is_rocm()
+    ):
+        pytest.skip("DSparkDraftModel is only supported on CUDA and ROCm")
 
     # Ensure all model classes can be imported successfully
     model_cls = ModelRegistry._try_load_model_cls(model_arch)
@@ -131,6 +138,22 @@ def test_registry_is_pp(model_arch, is_pp, init_cuda):
             )
 
 
+def test_lazy_modelinfo_package_hash_includes_submodules(tmp_path):
+    package_dir = tmp_path / "model_package"
+    package_dir.mkdir()
+    init_file = package_dir / "__init__.py"
+    init_file.write_text("from .model import Model\n", encoding="utf-8")
+    model_file = package_dir / "model.py"
+    model_file.write_text("class Model: pass\n", encoding="utf-8")
+
+    first_hash = _LazyRegisteredModel._get_modelinfo_module_hash(init_file)
+
+    model_file.write_text("class Model:\n    supports_pp = True\n", encoding="utf-8")
+    second_hash = _LazyRegisteredModel._get_modelinfo_module_hash(init_file)
+
+    assert first_hash != second_hash
+
+
 def test_hf_registry_coverage():
     untested_archs = (
         ModelRegistry.get_supported_archs() - HF_EXAMPLE_MODELS.get_supported_archs()
@@ -166,6 +189,7 @@ def test_rwkv7_hf_registry_uses_blinkdl_raw_pth(tmp_path):
 
     assert arch == "RWKV7ForCausalLM"
     assert model_cls.__name__ == "RWKV7ForCausalLM"
+    assert is_text_generation_model(model_cls)
 
 
 def test_rwkv7_registry_load_does_not_import_ops_with_unspecified_platform():

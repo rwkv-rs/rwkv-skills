@@ -66,6 +66,7 @@ from vllm.logger import init_logger
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.sampling_params import (
     RAPID_PENALTY_DECAY_DEFAULT,
+    RepetitionDetectionParams,
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
@@ -162,6 +163,15 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
     reasoning: Reasoning | None = None
+    include_reasoning: bool = Field(
+        default=True,
+        description=(
+            "Whether to include reasoning content in the response. "
+            "When false, reasoning tokens are still generated but "
+            "excluded from the output. This reduces network traffic "
+            "without affecting model inference."
+        ),
+    )
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] = "auto"
     store: bool | None = True
     stream: bool | None = False
@@ -264,6 +274,10 @@ class ResponsesRequest(OpenAIBaseModel):
 
     repetition_penalty: float | None = None
     penalty_decay: float | None = None
+    repetition_detection: RepetitionDetectionParams | None = Field(
+        default=None,
+        description="Parameters for detecting repetitive N-gram patterns in output.",
+    )
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: str | list[str] | None = []
     ignore_eos: bool = False
@@ -277,6 +291,12 @@ class ResponsesRequest(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
+    )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "ECTransfer parameters used for encoder-cache disaggregated serving."
+        ),
     )
     chat_template_kwargs: dict[str, Any] | None = Field(
         default=None,
@@ -403,12 +423,21 @@ class ResponsesRequest(OpenAIBaseModel):
                 )
 
         stop = self.stop if self.stop else []
+        if not stop and "stop" not in self.model_fields_set:
+            stop = default_sampling_params.get("stop", stop)
         if isinstance(stop, str):
             stop = [stop]
+        elif isinstance(stop, list):
+            stop = list(stop)
+        stop_token_ids = default_sampling_params.get("stop_token_ids")
+        if isinstance(stop_token_ids, list):
+            stop_token_ids = list(stop_token_ids)
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.ec_transfer_params:
+            extra_args["ec_transfer_params"] = self.ec_transfer_params
 
         return SamplingParams.from_optional(
             temperature=temperature,
@@ -421,8 +450,10 @@ class ResponsesRequest(OpenAIBaseModel):
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             penalty_decay=penalty_decay,
+            repetition_detection=self.repetition_detection,
             seed=self.seed,
             ignore_eos=self.ignore_eos,
+            stop_token_ids=stop_token_ids,
             output_kind=(
                 RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
             ),
@@ -602,10 +633,19 @@ class ResponsesRequest(OpenAIBaseModel):
                 )
         elif is_named_tool_choice and tools is not None:
             tool_name = tool_choice.get("name")
-            tool_names = {
-                t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
-                for t in tools
-            }
+            tool_names = set()
+            for tool in tools:
+                if isinstance(tool, dict):
+                    if tool.get("type") == "namespace":
+                        namespace = tool.get("name")
+                        for namespaced_tool in tool.get("tools", []):
+                            namespaced_name = namespaced_tool.get("name")
+                            tool_names.add(namespaced_name)
+                            tool_names.add(f"{namespace}__{namespaced_name}")
+                    else:
+                        tool_names.add(tool.get("name"))
+                else:
+                    tool_names.add(getattr(tool, "name", None))
             if not tool_name or tool_name not in tool_names:
                 raise VLLMValidationError(
                     "Tool choice 'function' not found in 'tools' parameter.",
@@ -667,6 +707,9 @@ class ResponsesResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    ec_transfer_params: dict[str, Any] | None = Field(
+        default=None, description="ECTransfer parameters."
+    )
 
     # --8<-- [start:responses-response-extra-params]
     # These are populated when enable_response_messages is set to True
@@ -712,6 +755,7 @@ class ResponsesResponse(OpenAIBaseModel):
         input_messages: ResponseInputOutputMessage | None = None,
         output_messages: ResponseInputOutputMessage | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
     ) -> "ResponsesResponse":
         incomplete_details: IncompleteDetails | None = None
         if status == "incomplete":
@@ -729,7 +773,9 @@ class ResponsesResponse(OpenAIBaseModel):
             output=output,
             input_messages=input_messages,
             output_messages=output_messages,
-            parallel_tool_calls=request.parallel_tool_calls,
+            parallel_tool_calls=request.parallel_tool_calls
+            if request.parallel_tool_calls is not None
+            else ResponsesRequest.model_fields["parallel_tool_calls"].default,
             temperature=sampling_params.temperature,
             tool_choice=request.tool_choice,
             tools=request.tools,
@@ -750,6 +796,7 @@ class ResponsesResponse(OpenAIBaseModel):
             user=request.user,
             usage=usage,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
         )
 
 

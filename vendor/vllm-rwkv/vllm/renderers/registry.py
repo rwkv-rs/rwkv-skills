@@ -27,6 +27,7 @@ _VLLM_RENDERERS = {
     "mistral": ("mistral", "MistralRenderer"),
     "rwkv": ("hf", "HfRenderer"),
     "terratorch": ("terratorch", "TerratorchRenderer"),
+    "inkling": ("inkling", "InklingRenderer"),
 }
 
 

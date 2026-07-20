@@ -7,11 +7,26 @@ from vllm.tokenizers.registry import TokenizerRegistry, get_tokenizer
 def test_rwkv_tokenizer_matches_world_vocab_golden_ids():
     tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
 
-    assert tokenizer.encode("Hello world") == [33155, 40213]
-    assert tokenizer.encode("你好") == [10464, 11685]
-    assert tokenizer.encode(" 42") == [3515]
+    assert tokenizer.encode("Hello world", add_special_tokens=False) == [33155, 40213]
+    assert tokenizer.encode("你好", add_special_tokens=False) == [10464, 11685]
+    assert tokenizer.encode(" 42", add_special_tokens=False) == [3515]
+    assert tokenizer.encode("Hello world") == [0, 33155, 40213]
+    assert tokenizer.num_special_tokens_to_add() == 1
     assert tokenizer.decode([33155, 40213]) == "Hello world"
+    assert tokenizer.decode([0, 33155, 40213]) == "Hello world"
     assert tokenizer.decode([10464, 11685]) == "你好"
+
+
+def test_rwkv_tokenizer_left_truncation_can_drop_bos_when_budget_is_too_small():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    assert tokenizer.encode("Hello world", truncation=True, max_length=2) == [
+        33155,
+        40213,
+    ]
+    encoded = tokenizer("Hello world", truncation=True, max_length=2)
+    assert encoded["input_ids"] == [33155, 40213]
+    assert encoded["attention_mask"] == [1, 1]
 
 
 def test_rwkv_tokenizer_decode_replaces_invalid_utf8_tokens():
@@ -21,6 +36,30 @@ def test_rwkv_tokenizer_decode_replaces_invalid_utf8_tokens():
     assert tokenizer.decode([196]) == "\ufffd"
     assert tokenizer.decode([256]) == "\ufffd"
     assert tokenizer.decode([129, 196, 256]) == "\ufffd\ufffd\ufffd"
+
+
+def test_rwkv_tokenizer_pads_unused_logits_ids():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    assert tokenizer.vocab_size == 65536
+    assert tokenizer.max_token_id == 65535
+    assert tokenizer.decode([65530, 65535]) == "\ufffd\ufffd"
+
+
+def test_rwkv_tokenizer_exposes_lossless_byte_vocab_tokens():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    raw_byte_token = tokenizer.convert_ids_to_tokens([129])[0]
+    assert raw_byte_token == "\x80"
+    assert tokenizer.convert_tokens_to_ids(raw_byte_token) == 129
+    assert tokenizer.get_vocab()["\x80"] == 129
+    assert tokenizer.get_vocab()["\x81"] == 130
+
+
+def test_rwkv_tokenizer_reports_slow_until_offsets_are_supported():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    assert tokenizer.is_fast is False
 
 
 def test_rwkv_tokenizer_exposes_cached_metadata():
@@ -52,7 +91,7 @@ def test_rwkv_chat_template_renders_basic_dialogue_from_training_template():
         "User: Hello\nworld\n\n"
         "Assistant: Hi\nthere\n\n"
         "User: Continue\nplease\n\n"
-        "Assistant:"
+        "Assistant: <think"
     )
 
 
@@ -71,7 +110,52 @@ def test_rwkv_chat_template_tokenizes_rendered_prompt():
     )
 
     assert isinstance(token_ids, list)
+    assert token_ids[0] == tokenizer.bos_token_id
     assert tokenizer.decode(token_ids) == rendered
+    assert (
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Hi"}],
+            tokenize=True,
+            add_generation_prompt=True,
+            add_special_tokens=False,
+        )[0]
+        != tokenizer.bos_token_id
+    )
+
+
+def test_rwkv_chat_template_can_render_fake_think_generation_prompt():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Hi"}],
+        tokenize=False,
+        add_generation_prompt=True,
+        rwkv_generation_prompt="fake_think",
+    )
+
+    assert rendered == "User: Hi\n\nAssistant: <think></think"
+
+
+def test_rwkv_chat_template_strips_dapo_math_prompt_wrapper():
+    tokenizer = get_tokenizer("BlinkDL/rwkv7-g1", tokenizer_mode="rwkv")
+    problem = "已知 x+y=3, 求 x。"
+    wrapped_problem = (
+        "Solve the following math problem step by step. The last line of your "
+        "response should be of the form "
+        "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n"
+        f"{problem}\n"
+        'Remember to put your answer on its own line after "Answer:".'
+    )
+
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": wrapped_problem}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    assert rendered == f"User: {problem}\n\nAssistant: <think"
+    assert "Solve the following math problem" not in rendered
+    assert "Remember to put your answer" not in rendered
 
 
 def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_template():
@@ -141,6 +225,12 @@ def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_templat
         "  ]\n"
         "}\n"
         "```\n"
+        "To call one of these tools, write exactly this format:\n"
+        "**Tool Call:**\n"
+        "```json\n"
+        '{"name": "tool_name", "arguments": {"key": "value"}}\n'
+        "```\n"
+        "Do not invent tool call IDs or write tool outputs yourself.\n"
         "### User\n"
         "Weather in Paris?\n"
         "Use Celsius.\n"
@@ -162,4 +252,5 @@ def test_rwkv_chat_template_renders_tools_and_tool_outputs_from_training_templat
         "}\n"
         "```\n"
         "### Assistant\n"
+        "<think"
     )

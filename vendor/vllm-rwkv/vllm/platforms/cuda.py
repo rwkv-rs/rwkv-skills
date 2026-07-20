@@ -6,6 +6,7 @@ pynvml. However, it should not initialize cuda context.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 from collections.abc import Callable
@@ -18,14 +19,23 @@ from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from typing_extensions import ParamSpec
 
-# import custom ops, trigger op registration
-import vllm._C_stable_libtorch  # noqa
-import vllm.envs as envs
-from vllm.logger import init_logger
-from vllm.utils.import_utils import import_pynvml
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.build_profile import get_build_profile_metadata
 
-from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
+# Import custom ops and trigger registration. Legacy/full artifacts keep the
+# original mandatory import; a reduced artifact declares exactly which native
+# targets exist in its immutable manifest.
+_build_profile = get_build_profile_metadata()
+if _build_profile.profile == "full" or _build_profile.has_target("_C_stable_libtorch"):
+    import vllm._C_stable_libtorch  # noqa
+
+with contextlib.suppress(ImportError):
+    import vllm._qutlass_C  # noqa
+import vllm.envs as envs  # noqa: E402
+from vllm.logger import init_logger  # noqa: E402
+from vllm.utils.import_utils import import_pynvml  # noqa: E402
+from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: E402
+
+from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl  # noqa: E402
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -38,11 +48,6 @@ else:
     CacheDType = None
 
 logger = init_logger(__name__)
-
-try:
-    import vllm._qutlass_C  # noqa: F401
-except ImportError as e:
-    logger.warning("Failed to import from vllm._qutlass_C: %r", e)
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -86,6 +91,7 @@ def _get_backend_priorities(
     device_capability: DeviceCapability,
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
+    use_non_causal: bool = False,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     from vllm.utils.torch_utils import is_quantized_kv_cache
@@ -142,7 +148,10 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
-        if device_capability.major == 10:
+        # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
+        # cutlass path (used for dflash attention) is known to have problems.
+        # So prefer FlashAttention when non-causal on SM100f.
+        if device_capability.major == 10 and not use_non_causal:
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
@@ -217,24 +226,21 @@ class CudaPlatformBase(Platform):
     @classmethod
     def import_kernels(cls) -> None:
         """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
-        try:
-            import vllm._C_stable_libtorch  # noqa: F401
-        except ImportError as e:
-            logger.warning_once("Failed to import from vllm._C_stable_libtorch: %r", e)
-        try:
+        if _build_profile.profile == "full" or _build_profile.has_target(
+            "_C_stable_libtorch"
+        ):
+            try:
+                import vllm._C_stable_libtorch  # noqa: F401
+            except ImportError as e:
+                logger.warning_once(
+                    "Failed to import from vllm._C_stable_libtorch: %r", e
+                )
+        with contextlib.suppress(ImportError):
             import vllm._moe_C_stable_libtorch  # noqa: F401
-        except ImportError as e:
-            logger.warning_once(
-                "Failed to import from vllm._moe_C_stable_libtorch: %r", e
-            )
-        try:
+        with contextlib.suppress(ImportError):
             import vllm._qutlass_C  # noqa: F401
-        except ImportError as e:
-            logger.warning_once("Failed to import from vllm._qutlass_C: %r", e)
-        try:
+        with contextlib.suppress(ImportError):
             import vllm.rwkv7_ops  # noqa: F401
-        except ImportError as e:
-            logger.warning_once("Failed to import from vllm.rwkv7_ops: %r", e)
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
@@ -379,6 +385,7 @@ class CudaPlatformBase(Platform):
             device_capability,
             num_heads,
             attn_selector_config.kv_cache_dtype,
+            attn_selector_config.use_non_causal,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -738,7 +745,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
     @with_nvml_context
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         try:
-            physical_device_id = cls.device_id_to_physical_device_id(device_id)
+            physical_device_id = cls.visible_device_id_to_physical_device_id(device_id)
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
             major, minor = pynvml.nvmlDeviceGetCudaComputeCapability(handle)
             return DeviceCapability(major=major, minor=minor)

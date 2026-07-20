@@ -16,10 +16,14 @@ _RWKV7_ARCHITECTURE = "RWKV7ForCausalLM"
 @dataclass
 class RWKVDecodeWavePlan:
     pending_decode_request_ids: set[str] = field(default_factory=set)
+    block_decode: bool = False
 
     def allows_running_request(self, request: Request) -> bool:
         if self._is_live_decode_request(request):
-            return request.request_id in self.pending_decode_request_ids
+            return (
+                not self.block_decode
+                and request.request_id in self.pending_decode_request_ids
+            )
         return not self.pending_decode_request_ids
 
     def on_running_request_scheduled(
@@ -63,18 +67,23 @@ class RWKVNativeDecodeWavePolicy:
         num_sampled_tokens_per_step: int,
     ) -> RWKVDecodeWavePlan:
         decode_wave: list[Request] = []
+        has_lower_running_prefill = False
 
         for request in running_requests:
             if request.is_prefill_chunk:
+                if not decode_wave:
+                    has_lower_running_prefill = True
                 continue
+            if has_lower_running_prefill:
+                return RWKVDecodeWavePlan(block_decode=True)
             if current_step < request.next_decode_eligible_step:
-                return RWKVDecodeWavePlan()
+                return RWKVDecodeWavePlan(block_decode=True)
             if (
                 request.num_output_placeholders > 0
                 and request.num_computed_tokens + 2 - request.num_output_placeholders
                 >= request.num_prompt_tokens + request.max_tokens
             ):
-                return RWKVDecodeWavePlan()
+                return RWKVDecodeWavePlan(block_decode=True)
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -90,7 +99,7 @@ class RWKVNativeDecodeWavePolicy:
             if num_new_tokens == 1:
                 decode_wave.append(request)
             elif num_new_tokens == 0:
-                return RWKVDecodeWavePlan()
+                return RWKVDecodeWavePlan(block_decode=True)
             elif num_new_tokens > 1:
                 raise ValueError(
                     "RWKV7 native decode wave only supports one-token decode "

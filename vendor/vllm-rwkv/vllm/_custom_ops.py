@@ -29,531 +29,7 @@ else:
     except ImportError:
         from torch.library import impl_abstract as register_fake
 
-
-def _register_fake_if_exists(name):
-    namespace, op_name = name.split("::", 1)
-    if hasattr(getattr(torch.ops, namespace), op_name):
-        return register_fake(name)
-    return lambda fn: fn
-
-
-def _rwkv7_empty_like(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-def _rwkv7_empty_like_last_dim(x: torch.Tensor, last_dim: int) -> torch.Tensor:
-    return torch.empty((*x.shape[:-1], last_dim), device=x.device, dtype=x.dtype)
-
-
-def _rwkv7_linear_out(x: torch.Tensor, out_features: int) -> torch.Tensor:
-    return _rwkv7_empty_like_last_dim(x, out_features)
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16_small")
-@_register_fake_if_exists("rwkv7_v3a_ops::layer_norm_f16_small512")
-def _rwkv7_layer_norm_f16_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::emb_ln0_bf16_to_f16")
-def _rwkv7_emb_ln0_bf16_to_f16_fake(
-    emb: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    return torch.empty(emb.shape, device=emb.device, dtype=torch.float16)
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_lt")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk")
-def _rwkv7_linear_f16_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_wmma16_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig_lt")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_t_f16")
-def _rwkv7_linear_orig_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_f16")
-def _rwkv7_linear_orig_rows_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    row_tile: int,
-    out_tile: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_cfg_f16")
-def _rwkv7_linear_orig_rows_cfg_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    threads: int,
-    row_tile: int,
-    out_tile: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_orig_rows_exact_f16")
-def _rwkv7_linear_orig_rows_exact_f16_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    threads: int,
-    out_tile: int,
-    use4: bool,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_orig_lt_cfg")
-def _rwkv7_linear_f16_orig_lt_cfg_fake(
-    x: torch.Tensor,
-    weight_orig: torch.Tensor,
-    workspace_mb: int,
-    algo_index: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_orig.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_cfg")
-def _rwkv7_linear_f16_m1_splitk_cfg_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_tile")
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_m1_splitk_warpred_tile")
-def _rwkv7_linear_f16_m1_splitk_tile_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-    tile_cols: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_f16_rows_splitk")
-def _rwkv7_linear_f16_rows_splitk_fake(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    chunk_k: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight.shape[1])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_t_act_f16")
-def _rwkv7_linear_t_act_f16_fake(
-    x: torch.Tensor,
-    weight_t: torch.Tensor,
-    act: int,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_t.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_t_vres_f16")
-def _rwkv7_linear_t_vres_f16_fake(
-    x: torch.Tensor,
-    weight_t: torch.Tensor,
-    v: torch.Tensor,
-    v_first: torch.Tensor,
-    v0: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_linear_out(x, weight_t.shape[0])
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_wag_rank_in_f16")
-def _rwkv7_linear_wag_rank_in_f16_fake(
-    xw: torch.Tensor,
-    xa: torch.Tensor,
-    xg: torch.Tensor,
-    w1_t: torch.Tensor,
-    a1_t: torch.Tensor,
-    g1_t: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [
-        _rwkv7_linear_out(xw, w1_t.shape[0]),
-        _rwkv7_linear_out(xa, a1_t.shape[0]),
-        _rwkv7_linear_out(xg, g1_t.shape[0]),
-    ]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_wagv_rank_in_f16")
-def _rwkv7_linear_wagv_rank_in_f16_fake(
-    xw: torch.Tensor,
-    xa: torch.Tensor,
-    xg: torch.Tensor,
-    xv: torch.Tensor,
-    w1_t: torch.Tensor,
-    a1_t: torch.Tensor,
-    g1_t: torch.Tensor,
-    v1_t: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [
-        _rwkv7_linear_out(xw, w1_t.shape[0]),
-        _rwkv7_linear_out(xa, a1_t.shape[0]),
-        _rwkv7_linear_out(xg, g1_t.shape[0]),
-        _rwkv7_linear_out(xv, v1_t.shape[0]),
-    ]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_wag_rank_out_f16")
-def _rwkv7_linear_wag_rank_out_f16_fake(
-    w1: torch.Tensor,
-    a1: torch.Tensor,
-    g1: torch.Tensor,
-    w2_t: torch.Tensor,
-    a2_t: torch.Tensor,
-    g2_t: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [
-        _rwkv7_linear_out(w1, w2_t.shape[0]),
-        _rwkv7_linear_out(a1, a2_t.shape[0]),
-        _rwkv7_linear_out(g1, g2_t.shape[0]),
-    ]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::linear_wagv_rank_out_f16")
-def _rwkv7_linear_wagv_rank_out_f16_fake(
-    w1: torch.Tensor,
-    a1: torch.Tensor,
-    g1: torch.Tensor,
-    v1: torch.Tensor,
-    w2_t: torch.Tensor,
-    a2_t: torch.Tensor,
-    g2_t: torch.Tensor,
-    v2_t: torch.Tensor,
-    v: torch.Tensor,
-    v_first: torch.Tensor,
-    v0: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [
-        _rwkv7_linear_out(w1, w2_t.shape[0]),
-        _rwkv7_linear_out(a1, a2_t.shape[0]),
-        _rwkv7_linear_out(g1, g2_t.shape[0]),
-        _rwkv7_linear_out(v1, v2_t.shape[0]),
-    ]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_f16")
-def _rwkv7_add_f16_fake(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_f16")
-def _rwkv7_add_layer_norm_f16_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-5,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_last_layer_norm_f16")
-def _rwkv7_add_last_layer_norm_f16_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    eps: float = 1e-5,
-) -> torch.Tensor:
-    return torch.empty((x.shape[0], x.shape[2]), device=x.device, dtype=x.dtype)
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_scalar_stats")
-def _rwkv7_add_layer_norm_cmix_mix_f16_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    shift_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    x_k: torch.Tensor,
-    eps: float = 1e-5,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_cmix_mix_f16_cfg")
-def _rwkv7_add_layer_norm_cmix_mix_f16_cfg_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    shift_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    x_k: torch.Tensor,
-    eps: float,
-    threads: int,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x), _rwkv7_empty_like(x)]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16")
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_scalar_stats")
-def _rwkv7_add_layer_norm_tmix_mix6_f16_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    shift_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-    eps: float = 1e-5,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x) for _ in range(7)]
-
-
-@_register_fake_if_exists("rwkv7_v3a_ops::add_layer_norm_tmix_mix6_f16_cfg")
-def _rwkv7_add_layer_norm_tmix_mix6_f16_cfg_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    shift_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-    eps: float,
-    threads: int,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x) for _ in range(7)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6")
-def _rwkv7_tmix_mix6_fake(
-    B: int,
-    T: int,
-    C: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x) for _ in range(6)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_cfg")
-def _rwkv7_tmix_mix6_cfg_fake(
-    B: int,
-    T: int,
-    C: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-    threads: int,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x) for _ in range(6)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_mix6_t1_c4096")
-def _rwkv7_tmix_mix6_t1_c4096_fake(
-    B: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_r: torch.Tensor,
-    x_w: torch.Tensor,
-    x_k: torch.Tensor,
-    x_v: torch.Tensor,
-    x_a: torch.Tensor,
-    x_g: torch.Tensor,
-    threads: int,
-    vec: int,
-    half_math: bool = False,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(x) for _ in range(6)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate")
-def _rwkv7_tmix_kk_a_gate_fake(
-    B: int,
-    T: int,
-    C: int,
-    H: int,
-    k: torch.Tensor,
-    k_k: torch.Tensor,
-    a0: torch.Tensor,
-    a12: torch.Tensor,
-    k_a: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(k) for _ in range(3)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_kk_a_gate_update_shift")
-def _rwkv7_tmix_kk_a_gate_update_shift_fake(
-    B: int,
-    T: int,
-    C: int,
-    H: int,
-    k: torch.Tensor,
-    k_k: torch.Tensor,
-    a0: torch.Tensor,
-    a12: torch.Tensor,
-    k_a: torch.Tensor,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-) -> list[torch.Tensor]:
-    return [_rwkv7_empty_like(k) for _ in range(3)]
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_lnx_rkvres_xg")
-def _rwkv7_tmix_lnx_rkvres_xg_fake(
-    B: int,
-    T: int,
-    C: int,
-    H: int,
-    x: torch.Tensor,
-    r: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    r_k: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    g: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::tmix_vres_gate")
-def _rwkv7_tmix_vres_gate_fake(
-    B: int,
-    T: int,
-    C: int,
-    v: torch.Tensor,
-    v_first: torch.Tensor,
-    v0: torch.Tensor,
-    v12: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_empty_like(v)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_one")
-def _rwkv7_cmix_sparse_one_fake(
-    C: int,
-    F: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-    key_fc: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((1, 1, C), device=x.device, dtype=x.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_rows")
-def _rwkv7_cmix_sparse_rows_fake(
-    B: int,
-    T: int,
-    C: int,
-    F: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-    key_fc: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((B, T, C), device=x.device, dtype=x.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_one")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_one")
-def _rwkv7_cmix_sparse_down_one_fake(
-    C: int,
-    F: int,
-    act: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((C,), device=act.device, dtype=act.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_rows")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_sparse_down_relu_rows_t512")
-def _rwkv7_cmix_sparse_down_rows_fake(
-    B: int,
-    T: int,
-    C: int,
-    F: int,
-    act: torch.Tensor,
-    value_fc: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty((B, T, C), device=act.device, dtype=act.dtype)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix")
-def _rwkv7_cmix_mix_fake(
-    B: int,
-    T: int,
-    C: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::cmix_mix_cfg")
-def _rwkv7_cmix_mix_cfg_fake(
-    B: int,
-    T: int,
-    C: int,
-    x: torch.Tensor,
-    shift_state: torch.Tensor,
-    x_k: torch.Tensor,
-    threads: int,
-) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::relu_square")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::act_tanh")
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::act_sigmoid")
-def _rwkv7_unary_fake(x: torch.Tensor) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
-
-@_register_fake_if_exists("rwkv7_fast_ops_fp16::add_vec")
-def _rwkv7_add_vec_fake(C: int, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
-    return _rwkv7_empty_like(x)
-
+from vllm import rwkv7_custom_ops  # noqa: E402, F401
 
 # scaled_fp4_quant functional + out variant for torch.compile buffer management
 
@@ -582,7 +58,13 @@ def create_fp4_scale_tensor(
         rounded_m = round_up(m, 128)
         scale_n = n // block_size
         rounded_n = round_up(scale_n, 4)
-        return torch.empty(
+        # Must be zero-initialized: the swizzled scale buffer is padded to
+        # (round_up(m, 128), round_up(scale_n, 4) // 4) but the NVFP4 quant
+        # kernel does not write every padded element that the downstream
+        # NVFP4 GEMM reads. torch.empty leaves those padded scale factors
+        # uninitialized, which corrupts dequantization and causes a severe
+        # Blackwell NVFP4 decode throughput/output-length regression.
+        return torch.zeros(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
     else:
@@ -636,100 +118,6 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
 
 
 # page attention ops
-def paged_attention_v1(
-    out: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
-    alibi_slopes: torch.Tensor | None,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    tp_rank: int = 0,
-    blocksparse_local_blocks: int = 0,
-    blocksparse_vert_stride: int = 0,
-    blocksparse_block_size: int = 64,
-    blocksparse_head_sliding_step: int = 0,
-) -> None:
-    torch.ops._C.paged_attention_v1(
-        out,
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        scale,
-        block_tables,
-        seq_lens,
-        block_size,
-        max_seq_len,
-        alibi_slopes,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-        tp_rank,
-        blocksparse_local_blocks,
-        blocksparse_vert_stride,
-        blocksparse_block_size,
-        blocksparse_head_sliding_step,
-    )
-
-
-def paged_attention_v2(
-    out: torch.Tensor,
-    exp_sum: torch.Tensor,
-    max_logits: torch.Tensor,
-    tmp_out: torch.Tensor,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    num_kv_heads: int,
-    scale: float,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    block_size: int,
-    max_seq_len: int,
-    alibi_slopes: torch.Tensor | None,
-    kv_cache_dtype: str,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    tp_rank: int = 0,
-    blocksparse_local_blocks: int = 0,
-    blocksparse_vert_stride: int = 0,
-    blocksparse_block_size: int = 64,
-    blocksparse_head_sliding_step: int = 0,
-) -> None:
-    torch.ops._C.paged_attention_v2(
-        out,
-        exp_sum,
-        max_logits,
-        tmp_out,
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        scale,
-        block_tables,
-        seq_lens,
-        block_size,
-        max_seq_len,
-        alibi_slopes,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-        tp_rank,
-        blocksparse_local_blocks,
-        blocksparse_vert_stride,
-        blocksparse_block_size,
-        blocksparse_head_sliding_step,
-    )
-
-
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sum: torch.Tensor,
@@ -846,6 +234,37 @@ def rms_norm(
     epsilon: float,
 ) -> None:
     torch.ops._C.rms_norm(out, input, weight, epsilon)
+
+
+# LongCat n-gram embedding index kernel (see csrc/.../ngram_embedding_kernels.cu).
+def ngram_compute_n_gram_ids(
+    ne_n: int,
+    ne_k: int,
+    ne_weights: torch.Tensor,
+    ne_mods: torch.Tensor,
+    exclusive_ne_embedder_size_sums: torch.Tensor,
+    exclusive_req_len_sums: torch.Tensor,
+    ne_token_table: torch.Tensor,
+    row_indices: torch.Tensor,
+    column_starts: torch.Tensor,
+    n_gram_ids: torch.Tensor,
+) -> None:
+    """Compute concatenated (offset) n-gram ids for a ragged prefill batch.
+
+    Writes ``n_gram_ids`` of shape ``[token_num, (ne_n-1)*ne_k]``.
+    """
+    torch.ops._C.ngram_compute_n_gram_ids(
+        ne_n,
+        ne_k,
+        ne_weights,
+        ne_mods,
+        exclusive_ne_embedder_size_sums,
+        exclusive_req_len_sums,
+        ne_token_table,
+        row_indices,
+        column_starts,
+        n_gram_ids,
+    )
 
 
 def fused_add_rms_norm(
@@ -2121,7 +1540,11 @@ def scaled_fp4_quant(
     Args:
         input: The input tensor to be quantized to FP4
         input_global_scale: A scalar scaling factor for the entire tensor.
-        use_8x4_sf_layout: Whether to use the 8x4 or 128x4 layout for the scaling
+        is_sf_swizzled_layout: Whether to store the scaling factors in the
+            swizzled layout (default `True`).
+        backend: Quantization kernel backend to dispatch to. For `"trtllm"`
+            backends the 8x4 scale-factor layout is selected for small
+            batches (m <= 32) instead of the 128x4 layout.
         padded_n: Optional padded K dimension. When provided, the quantized
             output and scale tensors are allocated for ``padded_n``
 
@@ -2659,6 +2082,42 @@ def wvSplitK(
     return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
 
 
+def wvSplitK_int4_g(
+    weight: torch.Tensor,
+    activation: torch.Tensor,
+    scale: torch.Tensor,
+    cu_count: int,
+    group_size: int,
+    zero_points: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # NOTE: the kernel is weight-major; `weight` is the packed int4 operand
+    # (in_a, [out_features, K/2]) and `activation` is in_b ([num_tokens, K]).
+    return torch.ops._rocm_C.wvSplitK_int4_g(
+        weight, activation, scale, zero_points, bias, cu_count, group_size
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"):
+
+    @register_fake("_rocm_C::wvSplitK_int4_g")
+    def _wvSplitK_int4_g_fake(
+        in_a: torch.Tensor,  # packed int4 weight [out_features, K/2]
+        in_b: torch.Tensor,  # activation [num_tokens, K]
+        in_scale: torch.Tensor,
+        in_zero_points: torch.Tensor | None,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        # Kernel returns {in_b.size(0), in_a.size(0)} = [num_tokens, out_features].
+        num_tokens = in_b.size(0)
+        out_features = in_a.size(0)
+        return torch.empty(
+            (num_tokens, out_features), dtype=in_b.dtype, device=in_b.device
+        )
+
+
 def wvSplitKrc(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:
@@ -2680,8 +2139,13 @@ def wvSplitKQ(
 
 
 # moe
-def moe_sum(input: torch.Tensor, output: torch.Tensor):
-    torch.ops._moe_C.moe_sum(input, output)
+def moe_sum(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+):
+    torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
 
 
 def moe_align_block_size(
@@ -2857,6 +2321,7 @@ def topk_sigmoid(
     gating_output: torch.Tensor,
     renormalize: bool = False,
     e_score_correction_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
 ) -> None:
     torch.ops._moe_C.topk_sigmoid(
         topk_weights,
@@ -2865,6 +2330,7 @@ def topk_sigmoid(
         gating_output,
         renormalize,
         e_score_correction_bias,
+        routed_scaling_factor,
     )
 
 
@@ -3096,6 +2562,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     q_out: torch.Tensor | None = None,
     index_q_out: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
+    skip_index_branch: bool = False,
 ) -> None:
     """Fused MiniMax-M3 attention pre-processing (in-place).
 
@@ -3117,6 +2584,11 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
     instead of in place — folding the de-interleave into this kernel's store so
     callers skip a separate ``.contiguous()`` copy before the SM100 sparse
     attention's flat TMA descriptor.
+
+    When ``skip_index_branch`` is true, sparse rows still keep their packed
+    ``[index_q | index_k]`` tail, but the kernel only processes the main q/k/v
+    branches and main KV cache. This is used by MiniMax-M3 index-topk reuse
+    layers that consume top-k block ids selected by an earlier sparse layer.
     """
     torch.ops._C.fused_minimax_m3_qknorm_rope_kv_insert(
         qkv,
@@ -3139,6 +2611,7 @@ def fused_minimax_m3_qknorm_rope_kv_insert(
         q_out,
         index_q_out,
         kv_cache_dtype,
+        skip_index_branch,
     )
 
 
@@ -3587,6 +3060,24 @@ if hasattr(torch.ops._C, "fused_experts_cpu"):
         return torch.empty_like(hidden_states)
 
 
+if hasattr(torch.ops._C, "dynamic_4bit_int_moe"):
+
+    @register_fake("_C::dynamic_4bit_int_moe")
+    def dynamic_4bit_int_moe_fake(
+        x: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        w13_packed: torch.Tensor,
+        w2_packed: torch.Tensor,
+        hidden_size: int,
+        intermediate_size: int,
+        group_size: int,
+        apply_router_weight_on_input: bool,
+        activation_kind: int,
+    ) -> torch.Tensor:
+        return x.new_empty((x.size(0), hidden_size))
+
+
 def fused_experts_cpu(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -3800,6 +3291,40 @@ def fused_sigmoid_gating_delta_rule_update_cpu(
         b,
         initial_state_source,
         initial_state_indices,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel,
+        softplus_beta,
+        softplus_threshold,
+    )
+
+
+def fused_sigmoid_gating_delta_rule_update_spec_cpu(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    spec_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    use_qk_l2norm_in_kernel: bool,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+) -> torch.Tensor:
+    return torch.ops._C.fused_sigmoid_gating_delta_rule_update_spec_cpu(
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        a,
+        b,
+        initial_state_source,
+        spec_state_indices,
+        num_accepted_tokens,
         cu_seqlens,
         use_qk_l2norm_in_kernel,
         softplus_beta,
@@ -4308,20 +3833,6 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
-
-
-if hasattr(torch.ops._C, "minimax_allreduce_rms"):
-
-    @register_fake("_C::minimax_allreduce_rms")
-    def _minimax_allreduce_rms_fake(
-        input: torch.Tensor,
-        norm_weight: torch.Tensor,
-        workspace: torch.Tensor,
-        rank: int,
-        nranks: int,
-        eps: float,
-    ) -> torch.Tensor:
-        return torch.empty_like(input)
 
 
 if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
