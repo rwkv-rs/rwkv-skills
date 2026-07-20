@@ -684,6 +684,8 @@ table.pivot.bench-table tbody tr:hover .axis-kmetric {
 .stage pre {
   margin: 0;
   padding: 12px;
+  max-height: 420px;
+  overflow: auto;
   font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;
@@ -705,6 +707,55 @@ table.pivot.bench-table tbody tr:hover .axis-kmetric {
   color: var(--text-muted);
   font-family: var(--mono);
   font-size: 11px;
+}
+.context-audit {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  font-size: 12px;
+}
+.context-audit > div {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.context-audit code {
+  display: block;
+  max-height: 180px;
+  overflow: auto;
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+.stage-part + .stage-part {
+  border-top: 1px solid var(--border);
+}
+.stage-part-label {
+  padding: 6px 12px 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+}
+.extra-context {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.extra-context-item {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.extra-context-item .kv {
+  max-height: 360px;
+  overflow: auto;
 }
 .outcome-pass {
   color: var(--good);
