@@ -32,6 +32,7 @@ from src.infer.backend import (
 
 if TYPE_CHECKING:
     from src.eval.evaluating.contracts import RunContext, TaskSpec
+    from src.infer.sampling import SamplingConfig
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -114,6 +115,17 @@ def _print_done_message(cot_mode: CoTMode, sample_count: int) -> None:
     print(f"✅ CoT multiple-choice done: {sample_count} samples")
 
 
+def _resolve_cot_sampling_config(slug: str, model_name: str) -> "SamplingConfig | None":
+    from src.eval.benchmark_config import resolve_sampling_config
+
+    return resolve_sampling_config(
+        slug,
+        model_name,
+        stage="cot",
+        fallback_templates="multi_choice_cot_default",
+    )
+
+
 def _task_sampling_config(
     cot_mode: CoTMode,
     *,
@@ -144,6 +156,55 @@ def _task_sampling_config(
     )
 
 
+def _build_cascade_metrics_payload(
+    evaluation,
+    *,
+    pass_k,
+    avg_k,
+    report_pass_k,
+    report_avg_k,
+) -> tuple[dict[str, object], dict[str, object]]:
+    from src.eval.metrics.at_k import compute_avg_score_at_k, compute_pass_at_k
+
+    strategy_metrics: dict[str, dict[str, float]] = {}
+    primary_pass_all: dict[str, float] = {}
+    primary_avg_all: dict[str, float] = {}
+    primary_pass_payload: dict[str, float] = {}
+    primary_avg_payload: dict[str, float] = {}
+    for group in ("strategy_a", "strategy_b"):
+        group_metrics = dict(evaluation.metrics_by_group[group])
+        pass_all = compute_pass_at_k(evaluation.rows_by_group[group], pass_k)
+        avg_all = compute_avg_score_at_k(evaluation.score_rows_by_group[group], avg_k)
+        pass_payload = filter_metrics_by_k(pass_all, report_pass_k, "pass@")
+        avg_payload = filter_metrics_by_k(avg_all, report_avg_k, "avg@")
+        if report_pass_k and not pass_payload:
+            pass_payload = pass_all
+        if report_avg_k and not avg_payload:
+            avg_payload = avg_all
+        group_metrics.update(pass_payload)
+        group_metrics.update(avg_payload)
+        strategy_metrics[group] = group_metrics
+        if group == evaluation.primary_group:
+            primary_pass_all = pass_all
+            primary_avg_all = avg_all
+            primary_pass_payload = pass_payload
+            primary_avg_payload = avg_payload
+
+    metrics_payload: dict[str, object] = dict(strategy_metrics[evaluation.primary_group])
+    metrics_payload["strategy_metrics"] = strategy_metrics
+    metrics_payload["strategy_diagnostics"] = {
+        "rerouted": strategy_metrics["strategy_b"].get("rerouted", 0.0),
+        "rescued": strategy_metrics["strategy_b"].get("rescued", 0.0),
+        "rescue_rate": strategy_metrics["strategy_b"].get("rescue_rate", 0.0),
+    }
+    details: dict[str, object] = {}
+    if primary_pass_all and primary_pass_payload != primary_pass_all:
+        details["pass_curve"] = primary_pass_all
+    if primary_avg_all and primary_avg_payload != primary_avg_all:
+        details["avg_curve"] = primary_avg_all
+    return metrics_payload, details
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -154,13 +215,16 @@ def main(
     args = parse_args(argv)
     validate_inference_backend_args(args)
 
-    from src.eval.benchmark_config import resolve_benchmark_model_config, resolve_sampling_config
+    from src.eval.benchmark_config import resolve_benchmark_model_config
     from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
     from src.eval.evaluating import TaskRunController, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
     from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
-    from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
-    from src.eval.metrics.multi_choice import evaluate_multiple_choice
+    from src.eval.metrics.at_k import compute_avg_at_k, compute_avg_score_at_k, compute_pass_at_k
+    from src.eval.metrics.multi_choice import (
+        evaluate_multiple_choice,
+        evaluate_multiple_choice_cascade,
+    )
     from src.eval.results.payloads import make_score_payload
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
     from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
@@ -201,6 +265,12 @@ def main(
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
     long_doc_config = resolve_long_doc_config(args, root_config)
     prompt_max_chars = args.prompt_max_chars if args.prompt_max_chars is not None else getattr(root_config, "prompt_max_chars", None)
+    knowledge_cot_strategy = getattr(root_config, "knowledge_cot_strategy", None) or "cascade_a_b"
+    if knowledge_cot_strategy not in {"two_stage", "cascade_a_b"}:
+        raise ValueError(f"unsupported knowledge CoT strategy: {knowledge_cot_strategy}")
+    missing_prediction_score = getattr(root_config, "missing_prediction_score", None)
+    if missing_prediction_score is not None and not 0.0 <= missing_prediction_score <= 1.0:
+        raise ValueError("missing_prediction_score must be within [0, 1]")
     if prompt_profile == "naive":
         direct_prompt_template = _naive_direct_prompt_template()
         cot_prompt_template = _naive_cot_prompt_template()
@@ -224,11 +294,7 @@ def main(
 
     cot_sampling = None
     if cot_mode is CoTMode.COT:
-        cot_sampling = resolve_sampling_config(
-            slug,
-            model_name,
-            fallback_templates="multi_choice_cot_default",
-        )
+        cot_sampling = _resolve_cot_sampling_config(slug, model_name)
         if cot_sampling is None:
             raise ValueError(f"缺少采样配置: {slug} ({model_name})")
 
@@ -246,6 +312,7 @@ def main(
                 probe_only=True,
                 long_doc_config=long_doc_config,
                 prompt_max_chars=prompt_max_chars,
+                answer_strategy=knowledge_cot_strategy,
             )
             print(
                 f"🧪 probe-only run completed: {batch_size} sample(s) evaluated with batch {args.batch_size}."
@@ -299,6 +366,7 @@ def main(
                 on_record=writer.enqueue,
                 long_doc_config=long_doc_config,
                 prompt_max_chars=prompt_max_chars,
+                answer_strategy=knowledge_cot_strategy,
             )
         else:
             result = pipeline.run_direct(
@@ -317,32 +385,94 @@ def main(
 
     completions_payloads = runtime.complete_attempt_stage(writer)
     with scoring_stage(runtime):
-        metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
-        pass_metrics_all = compute_pass_at_k(metrics.rows, k_plan.pass_k)
-        avg_metrics_all = compute_avg_at_k(metrics.rows, k_plan.avg_k)
-        has_explicit_k_metrics = bool(k_plan.report_pass_k) or bool(k_plan.report_avg_k)
-        metrics_payload: dict[str, float] = {}
-        if not has_explicit_k_metrics:
-            metrics_payload["accuracy"] = metrics.accuracy
-        pass_payload = filter_metrics_by_k(pass_metrics_all, k_plan.report_pass_k, "pass@")
-        if k_plan.report_pass_k and not pass_payload:
-            pass_payload = pass_metrics_all or {}
-        if pass_payload:
-            metrics_payload.update(pass_payload)
-        avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
-        if k_plan.report_avg_k and not avg_payload:
-            avg_payload = avg_metrics_all or {}
-        if avg_payload:
-            metrics_payload.update(avg_payload)
-        task_details = {
-            "accuracy_by_subject": metrics.accuracy_by_subject,
-            **build_plan_task_details(plan, cot_mode=cot_mode.value, prompt_profile=prompt_profile),
-        }
-        if pass_metrics_all and pass_payload != pass_metrics_all:
-            task_details["pass_curve"] = pass_metrics_all
-        if avg_metrics_all and avg_payload != avg_metrics_all:
-            task_details["avg_curve"] = avg_metrics_all
-        runtime.ingest_eval_payloads(metrics.payloads)
+        if cot_mode is CoTMode.COT and knowledge_cot_strategy == "cascade_a_b":
+            cascade = evaluate_multiple_choice_cascade(
+                completions_payloads,
+                dataset_path=dataset_path,
+                missing_prediction_score=missing_prediction_score or 0.0,
+            )
+            strategy_task_ids = service.ingest_eval_payload_groups(
+                task_id=task_id,
+                completion_payloads=completions_payloads,
+                payloads_by_group=cascade.payloads_by_group,
+                primary_group=cascade.primary_group,
+            )
+            metrics_payload, metric_details = _build_cascade_metrics_payload(
+                cascade,
+                pass_k=k_plan.pass_k,
+                avg_k=k_plan.avg_k,
+                report_pass_k=k_plan.report_pass_k,
+                report_avg_k=k_plan.report_avg_k,
+            )
+            metrics_payload["strategy_task_ids"] = {
+                group: int(strategy_task_id)
+                for group, strategy_task_id in strategy_task_ids.items()
+            }
+            task_details = {
+                "knowledge_cot_strategy": knowledge_cot_strategy,
+                "missing_prediction_score": missing_prediction_score,
+                **metric_details,
+                **build_plan_task_details(plan, cot_mode=cot_mode.value, prompt_profile=prompt_profile),
+            }
+            runtime.state.task_results = {
+                (
+                    int(payload["sample_index"]),
+                    int(payload["repeat_index"]),
+                    int(payload.get("pass_index", 0)),
+                ): bool(payload.get("is_passed", False))
+                for payload in cascade.payloads_by_group[cascade.primary_group]
+            }
+            runtime.state.eval_count = len(runtime.state.task_results)
+            score_samples = cascade.samples
+        else:
+            metrics = evaluate_multiple_choice(completions_payloads, dataset_path=dataset_path)
+            pass_metrics_all = compute_pass_at_k(metrics.rows, k_plan.pass_k)
+            if missing_prediction_score is None or cot_mode is CoTMode.NO_COT:
+                avg_metrics_all = compute_avg_at_k(metrics.rows, k_plan.avg_k)
+            else:
+                score_rows = [
+                    (
+                        sample_index,
+                        repeat_index,
+                        1.0
+                        if passed
+                        else missing_prediction_score
+                        if not eval_payload["answer"]
+                        else 0.0,
+                    )
+                    for (sample_index, repeat_index, passed), eval_payload in zip(
+                        metrics.rows,
+                        metrics.payloads,
+                        strict=True,
+                    )
+                ]
+                avg_metrics_all = compute_avg_score_at_k(score_rows, k_plan.avg_k)
+            has_explicit_k_metrics = bool(k_plan.report_pass_k) or bool(k_plan.report_avg_k)
+            metrics_payload = {}
+            if not has_explicit_k_metrics:
+                metrics_payload["accuracy"] = metrics.accuracy
+            pass_payload = filter_metrics_by_k(pass_metrics_all, k_plan.report_pass_k, "pass@")
+            if k_plan.report_pass_k and not pass_payload:
+                pass_payload = pass_metrics_all or {}
+            if pass_payload:
+                metrics_payload.update(pass_payload)
+            avg_payload = filter_metrics_by_k(avg_metrics_all, k_plan.report_avg_k, "avg@")
+            if k_plan.report_avg_k and not avg_payload:
+                avg_payload = avg_metrics_all or {}
+            if avg_payload:
+                metrics_payload.update(avg_payload)
+            task_details = {
+                "accuracy_by_subject": metrics.accuracy_by_subject,
+                "knowledge_cot_strategy": knowledge_cot_strategy,
+                "missing_prediction_score": missing_prediction_score,
+                **build_plan_task_details(plan, cot_mode=cot_mode.value, prompt_profile=prompt_profile),
+            }
+            if pass_metrics_all and pass_payload != pass_metrics_all:
+                task_details["pass_curve"] = pass_metrics_all
+            if avg_metrics_all and avg_payload != avg_metrics_all:
+                task_details["avg_curve"] = avg_metrics_all
+            runtime.ingest_eval_payloads(metrics.payloads)
+            score_samples = metrics.samples
         if _should_run_checker(args):
             runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
@@ -350,7 +480,7 @@ def main(
             is_cot=cot_mode is not CoTMode.NO_COT,
             model_name=model_name,
             metrics=metrics_payload,
-            samples=metrics.samples,
+            samples=score_samples,
             task=job_name,
             task_details=task_details,
             extra={

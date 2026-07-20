@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 
 from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
-from src.eval.metrics.multi_choice import evaluate_multiple_choice
+from src.eval.metrics.multi_choice import (
+    evaluate_multiple_choice,
+    evaluate_multiple_choice_cascade,
+    extract_answer_after_think,
+)
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput
 from src.infer.sampling import SamplingConfig
@@ -26,9 +30,11 @@ class _FallbackOnlyBackend:
         probe_only=False,
         on_complete=None,
         prompt_seeds=None,
+        text_stop_detectors=None,
         prefill_chunk_size=16,
         show_progress=True,
     ):
+        del text_stop_detectors
         self.generate_calls.append(list(prompts))
         self.generate_batch_sizes.append(int(batch_size))
         outputs = [
@@ -48,6 +54,18 @@ class _FallbackOnlyBackend:
 
     def score_choice_tokens(self, *, prompt: str, choice_token_texts):
         raise AssertionError("multiple-choice generation should not read logits")
+
+
+class _ScriptedBackend(_FallbackOnlyBackend):
+    def __init__(self, texts: list[str]) -> None:
+        super().__init__()
+        self.texts = list(texts)
+
+    def generate(self, prompts, **kwargs):
+        if not self.texts:
+            raise AssertionError("unexpected generation call")
+        self.text = self.texts.pop(0)
+        return super().generate(prompts, **kwargs)
 
 
 def test_multiple_choice_pipeline_generates_choice_by_default(tmp_path) -> None:
@@ -285,3 +303,101 @@ def test_multiple_choice_cot_streams_generated_final_answer(tmp_path) -> None:
     assert result.payloads[0]["completion2"] == " B"
     assert len(backend.generate_calls) == 2
     assert metrics.accuracy == 1.0
+
+
+def test_multiple_choice_cot_can_extract_answer_from_same_completion(tmp_path) -> None:
+    dataset_path = tmp_path / "gpqa_diamond_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "2+2=?",
+                "A": "3",
+                "B": "4",
+                "C": "5",
+                "D": "6",
+                "answer": "B",
+                "subject": "math",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend(text=">reasoning</think>\nFinal answer: B")
+    pipeline = MultipleChoicePipeline(backend)
+
+    result = pipeline.run_chain_of_thought(
+        str(dataset_path),
+        cot_sampling=SamplingConfig(max_generate_tokens=32),
+        batch_size=1,
+        answer_strategy="cascade_a_b",
+    )
+    metrics = evaluate_multiple_choice_cascade(result.payloads, dataset_path=dataset_path)
+
+    assert result.payloads[0]["strategy_a_completion"] == ">reasoning</think>\nFinal answer: B"
+    assert "completion1" not in result.payloads[0]
+    assert len(backend.generate_calls) == 1
+    assert metrics.metrics_by_group["strategy_a"]["exact_accuracy"] == 1.0
+    assert metrics.metrics_by_group["strategy_b"]["exact_accuracy"] == 1.0
+
+
+def test_multiple_choice_cot_extracts_chinese_final_answer(tmp_path) -> None:
+    dataset_path = tmp_path / "ceval_demo_test.jsonl"
+    dataset_path.write_text(
+        json.dumps({"question": "2+2=?", "A": "3", "B": "4", "answer": "B"}) + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend(text=">推理过程</think>\n最终答案是 B。")
+
+    result = MultipleChoicePipeline(backend).run_chain_of_thought(
+        str(dataset_path),
+        cot_sampling=SamplingConfig(max_generate_tokens=32),
+        answer_strategy="cascade_a_b",
+    )
+
+    assert result.payloads[0]["strategy_a_completion"] == ">推理过程</think>\n最终答案是 B。"
+    assert len(backend.generate_calls) == 1
+
+
+def test_answer_after_think_uses_first_formal_answer() -> None:
+    text = ">reasoning</think>\nThe correct answer is **B. 4**\ncontinued text\nFinal answer: C"
+
+    assert extract_answer_after_think(text, 4) == "B"
+    assert extract_answer_after_think("Final answer: B", 4) == ""
+
+
+def test_multiple_choice_cascade_routes_only_strategy_a_failure_to_b(tmp_path) -> None:
+    dataset_path = tmp_path / "gpqa_diamond_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "2+2=?",
+                "A": "3",
+                "B": "4",
+                "C": "5",
+                "D": "6",
+                "answer": "B",
+                "subject": "math",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _ScriptedBackend(
+        [
+            ">first attempt</think>\nFinal answer: A",
+            ">fresh reasoning without a final answer",
+            " B",
+        ]
+    )
+
+    result = MultipleChoicePipeline(backend).run_chain_of_thought(
+        str(dataset_path),
+        cot_sampling=SamplingConfig(max_generate_tokens=32),
+        answer_strategy="cascade_a_b",
+    )
+    metrics = evaluate_multiple_choice_cascade(result.payloads, dataset_path=dataset_path)
+
+    assert len(backend.generate_calls) == 3
+    assert metrics.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
+    assert metrics.metrics_by_group["strategy_b"]["exact_accuracy"] == 1.0
+    assert metrics.metrics_by_group["strategy_b"]["rescued"] == 1.0

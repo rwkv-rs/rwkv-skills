@@ -25,6 +25,16 @@ class MultipleChoiceMetrics:
     payloads: list[dict]
 
 
+@dataclass(slots=True)
+class MultipleChoiceCascadeMetrics:
+    rows_by_group: dict[str, list[tuple[int, int, bool]]]
+    score_rows_by_group: dict[str, list[tuple[int, int, float]]]
+    payloads_by_group: dict[str, list[dict]]
+    metrics_by_group: dict[str, dict[str, float]]
+    samples: int
+    primary_group: str = "strategy_b"
+
+
 def _iter_completions(source: Iterable[dict] | str | Path) -> Iterable[dict]:
     if isinstance(source, (str, Path)):
         yield from iter_jsonl(source)
@@ -43,6 +53,141 @@ def _max_stage_index(payload: dict) -> int:
 def _extract_choice_letter(token_text: str) -> str | None:
     match = _LETTER_RE.search(token_text or "")
     return match.group(0) if match else None
+
+
+def extract_answer_after_think(text: str, num_choices: int) -> str:
+    valid_letters = ALPHABET[:num_choices]
+    _reasoning, separator, answer_text = (text or "").partition("</think>")
+    if not separator:
+        return ""
+    decoration = r"[*_`~]*"
+    patterns = (
+        rf"\\boxed\s*\{{[^}}]*?{decoration}([{re.escape(valid_letters)}])[^}}]*\}}",
+        rf"(?:final\s+answer|correct\s+answer|answer)\s*(?:(?:choice|option)\s*)?"
+        rf"(?:is\s*|[:=]\s*){decoration}\(?\s*([{re.escape(valid_letters)}])",
+        rf"(?:choice|option)?\s*{decoration}\(?\s*([{re.escape(valid_letters)}])\s*\)?"
+        rf"{decoration}\s+is\s+(?:the\s+)?(?:final\s+|correct\s+)?answer",
+        rf"(?:最终答案|正确答案|答案|选择|选项)\s*(?:是|为|[:：=])?\s*"
+        rf"{decoration}[（(]?([{re.escape(valid_letters)}])",
+    )
+    matches: list[tuple[int, str]] = []
+    for pattern in patterns:
+        matches.extend(
+            (match.start(), match.group(1).upper())
+            for match in re.finditer(pattern, answer_text, re.IGNORECASE)
+        )
+    if matches:
+        return min(matches, key=lambda item: item[0])[1]
+    for line in answer_text.splitlines():
+        match = re.fullmatch(
+            rf"\s*(?:final\s+answer\s*[:=]?\s*)?{decoration}[\[(]?"
+            rf"([{re.escape(valid_letters)}])[\])]?{decoration}[.!]?\s*",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def evaluate_multiple_choice_cascade(
+    completions: Iterable[dict] | str | Path,
+    *,
+    dataset_path: str | Path,
+    missing_prediction_score: float = 0.0,
+) -> MultipleChoiceCascadeMetrics:
+    dataset = list(JsonlMultipleChoiceLoader(str(dataset_path)).load())
+    groups = ("strategy_a", "strategy_b")
+    rows_by_group: dict[str, list[tuple[int, int, bool]]] = {group: [] for group in groups}
+    score_rows_by_group: dict[str, list[tuple[int, int, float]]] = {
+        group: [] for group in groups
+    }
+    payloads_by_group: dict[str, list[dict]] = {group: [] for group in groups}
+    valid_by_group = {group: 0 for group in groups}
+    correct_by_group = {group: 0 for group in groups}
+    rescued = 0
+    rerouted = 0
+    total = 0
+
+    for payload in _iter_completions(completions):
+        sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
+        repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
+        record = dataset[sample_index] if 0 <= sample_index < len(dataset) else None
+        answer_letter = ALPHABET[record.answer_index] if record is not None else ""
+        num_choices = len(record.choices) if record is not None else len(ALPHABET)
+        strategy_a_text = str(payload.get("strategy_a_completion", ""))
+        strategy_a_prediction = extract_answer_after_think(strategy_a_text, num_choices)
+        strategy_a_passed = bool(answer_letter) and strategy_a_prediction == answer_letter
+        strategy_a_score = (
+            1.0
+            if strategy_a_passed
+            else float(missing_prediction_score)
+            if not strategy_a_prediction
+            else 0.0
+        )
+
+        last_stage = _max_stage_index(payload)
+        strategy_b_generated = (
+            _extract_choice_letter(str(payload.get(f"completion{last_stage}", ""))) or ""
+            if last_stage > 0
+            else ""
+        )
+        if strategy_a_passed:
+            strategy_b_prediction = strategy_a_prediction
+            strategy_b_passed = True
+        else:
+            rerouted += 1
+            strategy_b_prediction = strategy_b_generated or strategy_a_prediction
+            strategy_b_passed = bool(answer_letter) and strategy_b_generated == answer_letter
+            if strategy_b_passed:
+                rescued += 1
+        strategy_b_score = 1.0 if strategy_b_passed else strategy_a_score
+
+        group_values = {
+            "strategy_a": (strategy_a_prediction, strategy_a_passed, strategy_a_score),
+            "strategy_b": (strategy_b_prediction, strategy_b_passed, strategy_b_score),
+        }
+        strategy_a_context = f"{payload.get('strategy_a_prompt', '')}{strategy_a_text}"
+        for group, (prediction, passed, score) in group_values.items():
+            rows_by_group[group].append((sample_index, repeat_index, passed))
+            score_rows_by_group[group].append((sample_index, repeat_index, score))
+            valid_by_group[group] += int(bool(prediction))
+            correct_by_group[group] += int(passed)
+            eval_payload = make_eval_payload(
+                payload,
+                is_passed=passed,
+                fail_reason="missing_prediction" if not prediction else "incorrect",
+                answer=prediction,
+                ref_answer=answer_letter,
+            )
+            if group == "strategy_a" or not eval_payload["context"]:
+                eval_payload["context"] = strategy_a_context
+            payloads_by_group[group].append(eval_payload)
+        total += 1
+
+    denominator = total or 1
+    metrics_by_group = {
+        group: {
+            "exact_accuracy": correct_by_group[group] / denominator,
+            "score": sum(row[2] for row in score_rows_by_group[group]) / denominator,
+            "valid": valid_by_group[group] / denominator,
+        }
+        for group in groups
+    }
+    metrics_by_group["strategy_b"].update(
+        {
+            "rerouted": float(rerouted),
+            "rescued": float(rescued),
+            "rescue_rate": rescued / rerouted if rerouted else 0.0,
+        }
+    )
+    return MultipleChoiceCascadeMetrics(
+        rows_by_group=rows_by_group,
+        score_rows_by_group=score_rows_by_group,
+        payloads_by_group=payloads_by_group,
+        metrics_by_group=metrics_by_group,
+        samples=total,
+    )
 
 
 def evaluate_multiple_choice(
@@ -109,4 +254,10 @@ def evaluate_multiple_choice(
     )
 
 
-__all__ = ["MultipleChoiceMetrics", "evaluate_multiple_choice"]
+__all__ = [
+    "MultipleChoiceCascadeMetrics",
+    "MultipleChoiceMetrics",
+    "evaluate_multiple_choice",
+    "evaluate_multiple_choice_cascade",
+    "extract_answer_after_think",
+]

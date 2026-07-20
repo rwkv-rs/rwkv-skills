@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.eval.metrics.at_k import compute_avg_at_k, compute_pass_at_k
+from src.eval.metrics.at_k import compute_avg_at_k, compute_avg_score_at_k, compute_pass_at_k
 
 
 def test_compute_pass_at_k_deduplicates_resume_rows_by_sample_and_repeat() -> None:
@@ -33,3 +33,11 @@ def test_compute_avg_at_k_deduplicates_resume_rows_by_sample_and_repeat() -> Non
 
     assert metrics["avg@0.5"] == pytest.approx(0.5)
     assert metrics["avg@1"] == pytest.approx(0.5)
+
+
+def test_compute_avg_score_at_k_preserves_fractional_scores() -> None:
+    rows = [(0, 0, 1.0), (0, 1, 0.25), (1, 0, 0.0), (1, 1, 0.25)]
+
+    metrics = compute_avg_score_at_k(rows, (2,))
+
+    assert metrics["avg@2"] == pytest.approx(0.375)

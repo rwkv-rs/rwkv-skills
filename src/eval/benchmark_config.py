@@ -64,6 +64,8 @@ class BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
+    knowledge_cot_strategy: str | None = None
+    missing_prediction_score: float | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
     agent_plugin_enabled: bool | None = None
     tool_router_mode: str | None = None
@@ -351,6 +353,8 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
     cot_prompt_template: str | None = None
     final_prompt_template: str | None = None
     judge_prompt_template: str | None = None
+    knowledge_cot_strategy: str | None = None
+    missing_prediction_score: float | None = None
     browsecomp_plus_judge: dict[str, Any] | None = None
     agent_plugin_enabled: bool | None = None
     tool_router_mode: str | None = None
@@ -422,6 +426,12 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             continue
         elif key == "judge_prompt_template":
             judge_prompt_template = _coerce_str(raw)
+            continue
+        elif key == "knowledge_cot_strategy":
+            knowledge_cot_strategy = _coerce_str(raw)
+            continue
+        elif key == "missing_prediction_score":
+            missing_prediction_score = _coerce_float(raw)
             continue
         elif key == "browsecomp_plus_judge":
             browsecomp_plus_judge = _coerce_str_mapping(raw)
@@ -530,6 +540,8 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
         cot_prompt_template=cot_prompt_template,
         final_prompt_template=final_prompt_template,
         judge_prompt_template=judge_prompt_template,
+        knowledge_cot_strategy=knowledge_cot_strategy,
+        missing_prediction_score=missing_prediction_score,
         browsecomp_plus_judge=browsecomp_plus_judge,
         agent_plugin_enabled=agent_plugin_enabled,
         tool_router_mode=tool_router_mode,

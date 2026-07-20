@@ -194,6 +194,7 @@ class InferenceBackend(Protocol):
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        text_stop_detectors: Sequence[Callable[[str], bool] | None] | None = None,
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
@@ -285,6 +286,7 @@ class RemoteInferenceBackend:
         on_complete: Callable[[GenerationOutput], None] | None = None,
         on_token: Callable[[int, GeneratedTextDelta], None] | None = None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None = None,
+        text_stop_detectors: Sequence[Callable[[str], bool] | None] | None = None,
         constraints: Sequence[DecodeConstraint | None] | None = None,
         constraint_mode: Literal["off", "soft", "strict"] = "off",
         prompt_seeds: Sequence[int | None] | None = None,
@@ -304,6 +306,8 @@ class RemoteInferenceBackend:
             raise ValueError("prompt_seeds length must match prompts length")
         if prompt_stop_suffixes is not None and len(prompt_stop_suffixes) != len(prompts):
             raise ValueError("prompt_stop_suffixes length must match prompts length")
+        if text_stop_detectors is not None and len(text_stop_detectors) != len(prompts):
+            raise ValueError("text_stop_detectors length must match prompts length")
         effective_sampling = sampling.clamp(1) if probe_only else sampling
         omit_prompt_seeds = (
             self.config.protocol in {"vllm", "completions"}
@@ -321,6 +325,7 @@ class RemoteInferenceBackend:
         if len(prompts) > 1 and self._can_generate_completion_batches(
             prompt_seeds=prompt_seeds,
             prompt_stop_suffixes=prompt_stop_suffixes,
+            text_stop_detectors=text_stop_detectors,
         ):
             return self._generate_completion_batches(
                 prompts,
@@ -347,6 +352,7 @@ class RemoteInferenceBackend:
                         effective_sampling,
                         None if prompt_seeds is None else int(prompt_seeds[prompt_index]),
                         None if prompt_stop_suffixes is None else prompt_stop_suffixes[prompt_index],
+                        None if text_stop_detectors is None else text_stop_detectors[prompt_index],
                         prefill_chunk_size,
                         openai_sampling_compat,
                     ): prompt_index
@@ -369,8 +375,13 @@ class RemoteInferenceBackend:
         *,
         prompt_seeds: Sequence[int | None] | None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
+        text_stop_detectors: Sequence[Callable[[str], bool] | None] | None,
     ) -> bool:
         if self.config.protocol != "completions":
+            return False
+        if text_stop_detectors is not None and any(
+            detector is not None for detector in text_stop_detectors
+        ):
             return False
         if prompt_seeds is not None and any(seed is not None for seed in prompt_seeds):
             return False
@@ -452,7 +463,7 @@ class RemoteInferenceBackend:
     ) -> list[GenerationOutput]:
         if not prompts:
             return []
-        include_private_fields = self.config.protocol == "completions" and not openai_sampling_compat
+        include_private_fields = self.config.protocol in {"vllm", "completions"} and not openai_sampling_compat
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompts[0],
@@ -461,7 +472,7 @@ class RemoteInferenceBackend:
             stop_suffixes=stop_suffixes,
             prefill_chunk_size=prefill_chunk_size,
             include_private_fields=include_private_fields,
-            preserve_zero_penalties=openai_sampling_compat,
+            preserve_zero_penalties=self.config.protocol == "vllm",
         )
         payload["prompt"] = list(prompts)
         response = self._post_json_with_context_retry(self.config.completions_url(), payload)
@@ -573,10 +584,11 @@ class RemoteInferenceBackend:
         sampling: SamplingConfig,
         seed: int | None,
         stop_suffixes: Sequence[str] | None,
+        text_stop_detector: Callable[[str], bool] | None,
         prefill_chunk_size: int,
         openai_sampling_compat: bool,
     ) -> GenerationOutput:
-        include_private_fields = self.config.protocol == "completions" and not openai_sampling_compat
+        include_private_fields = self.config.protocol in {"vllm", "completions"} and not openai_sampling_compat
         payload = _completion_payload_from_sampling(
             model=self.model_name,
             prompt=prompt,
@@ -585,7 +597,7 @@ class RemoteInferenceBackend:
             stop_suffixes=stop_suffixes,
             prefill_chunk_size=prefill_chunk_size,
             include_private_fields=include_private_fields,
-            preserve_zero_penalties=openai_sampling_compat,
+            preserve_zero_penalties=self.config.protocol == "vllm",
         )
         chat_payload = _chat_payload_from_completion_payload(
             payload,
@@ -596,6 +608,19 @@ class RemoteInferenceBackend:
             response = self._post_json_with_context_retry(self.config.chat_completions_url(), chat_payload)
             is_chat_response = True
         elif self.config.protocol == "completions":
+            if text_stop_detector is not None:
+                text, finish_reason = self._stream_completion_with_context_retry(
+                    self.config.completions_url(),
+                    payload,
+                    text_stop_detector,
+                )
+                return GenerationOutput(
+                    prompt_index=prompt_index,
+                    prompt=prompt,
+                    token_ids=[],
+                    text=text,
+                    finish_reason=finish_reason,
+                )
             response = self._post_json_with_context_retry(self.config.completions_url(), payload)
             is_chat_response = False
         elif self.config.prefer_chat_completions:
@@ -631,6 +656,107 @@ class RemoteInferenceBackend:
             finish_reason=_normalize_remote_finish_reason(choice0.get("finish_reason")),
         )
 
+    def _stream_completion_with_context_retry(
+        self,
+        url: str,
+        payload: dict[str, object],
+        text_stop_detector: Callable[[str], bool],
+    ) -> tuple[str, str]:
+        request_payload = dict(payload)
+        request_payload["stream"] = True
+        last_context_error: RemoteHTTPError | None = None
+        for _ in range(4):
+            try:
+                return self._stream_completion(url, request_payload, text_stop_detector)
+            except RemoteHTTPError as exc:
+                next_max_tokens = _context_retry_max_tokens(exc, request_payload.get("max_tokens"))
+                if next_max_tokens is None:
+                    raise
+                last_context_error = exc
+                request_payload["max_tokens"] = next_max_tokens
+        assert last_context_error is not None
+        raise last_context_error
+
+    def _stream_completion(
+        self,
+        url: str,
+        payload: dict[str, object],
+        text_stop_detector: Callable[[str], bool],
+    ) -> tuple[str, str]:
+        started = time.perf_counter()
+        ok = False
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "Authorization": f"Bearer {self.config.api_key or 'rwkv-skills'}",
+        }
+        attempts = max(1, int(self.config.max_retries) + 1)
+        transient_attempts = max(attempts, 12)
+        timeout_s = max(float(self.config.timeout_s), 1.0)
+        delay_s = max(float(self.config.retry_initial_delay_s), 0.0)
+        max_delay_s = max(float(self.config.retry_max_delay_s), delay_s)
+        last_exc: BaseException | None = None
+        try:
+            for attempt in range(1, transient_attempts + 1):
+                try:
+                    text_parts: list[str] = []
+                    finish_reason = "stop_token"
+                    with self._http_client_for_requests().stream(
+                        "POST",
+                        url,
+                        content=body,
+                        headers=headers,
+                        timeout=timeout_s,
+                    ) as response:
+                        if int(response.status_code) >= 400:
+                            response.read()
+                            raise RemoteHTTPError(int(response.status_code), response.text)
+                        for line in response.iter_lines():
+                            stripped = line.strip()
+                            if not stripped or not stripped.startswith("data:"):
+                                continue
+                            data_text = stripped.removeprefix("data:").strip()
+                            if data_text == "[DONE]":
+                                break
+                            event = json.loads(data_text)
+                            choices = event.get("choices") if isinstance(event, dict) else None
+                            if not isinstance(choices, list) or not choices:
+                                continue
+                            choice = choices[0]
+                            if not isinstance(choice, dict):
+                                continue
+                            delta = _extract_completion_choice_text(choice)
+                            if delta:
+                                text_parts.append(delta)
+                                accumulated = "".join(text_parts)
+                                if text_stop_detector(accumulated):
+                                    ok = True
+                                    return accumulated, "answer"
+                            raw_reason = choice.get("finish_reason")
+                            if raw_reason is not None:
+                                finish_reason = _normalize_remote_finish_reason(raw_reason)
+                    ok = True
+                    return "".join(text_parts), finish_reason
+                except RemoteHTTPError as exc:
+                    last_exc = exc
+                    if not _is_retryable_remote_http_error(exc) or attempt >= attempts:
+                        raise
+                except _REMOTE_TRANSIENT_ERRORS as exc:  # pragma: no cover - integration retries
+                    last_exc = exc
+                    if attempt >= transient_attempts:
+                        break
+                if delay_s > 0:
+                    time.sleep(delay_s)
+                    delay_s = min(delay_s * 2, max_delay_s)
+            raise RuntimeError(
+                f"remote infer stream failed after {transient_attempts} attempts: {last_exc}"
+            ) from last_exc
+        finally:
+            callback = self.config.request_latency_callback
+            if callback is not None:
+                callback(str(url), max(0.0, time.perf_counter() - started), ok)
+
     def _generate_tool_call_one(
         self,
         prompt_index: int,
@@ -650,6 +776,20 @@ class RemoteInferenceBackend:
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
         )
+        if self.config.protocol == "vllm":
+            payload.pop("frequency_penalty", None)
+            payload.update(
+                {
+                    "top_k": int(sampling.top_k),
+                    "repetition_penalty": (
+                        1.0
+                        if float(sampling.alpha_frequency) == 0.0
+                        else float(sampling.alpha_frequency)
+                    ),
+                    "penalty_decay": float(sampling.alpha_decay),
+                    "stop_token_ids": [int(token_id) for token_id in sampling.stop_tokens],
+                }
+            )
         response = self._post_json_with_context_retry(self.config.chat_completions_url(), payload)
         choices = response.get("choices")
         if not isinstance(choices, list) or not choices:
@@ -803,7 +943,7 @@ def _completion_payload_from_sampling(
         "top_p": nonzero(sampling.top_p),
     }
     presence_penalty = float(sampling.alpha_presence)
-    if not preserve_zero_penalties or presence_penalty != 0.0:
+    if preserve_zero_penalties or presence_penalty != 0.0:
         payload["presence_penalty"] = presence_penalty if preserve_zero_penalties else nonzero(presence_penalty)
     if seed is not None:
         payload["seed"] = int(seed)
@@ -813,7 +953,11 @@ def _completion_payload_from_sampling(
         payload.update(
             {
                 "top_k": int(sampling.top_k),
-                "repetition_penalty": nonzero(sampling.alpha_frequency),
+                "repetition_penalty": (
+                    1.0
+                    if float(sampling.alpha_frequency) == 0.0
+                    else float(sampling.alpha_frequency)
+                ),
                 "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
                 "stop_token_ids": [int(token_id) for token_id in sampling.stop_tokens],
                 "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
@@ -823,7 +967,7 @@ def _completion_payload_from_sampling(
             }
         )
         if os.environ.get("RWKV_OMIT_PENALTY_DECAY") not in {"1", "true", "TRUE", "yes", "YES"}:
-            payload["penalty_decay"] = nonzero(sampling.alpha_decay)
+            payload["penalty_decay"] = float(sampling.alpha_decay)
     return payload
 
 

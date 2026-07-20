@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 
+import httpx
 import pytest
 
 from src.infer.backend import (
@@ -67,7 +69,15 @@ def test_vllm_generation_uses_chat_completions(monkeypatch) -> None:
 
     outputs = backend.generate(
         ["hello"],
-        sampling=SamplingConfig(max_generate_tokens=3, temperature=0.0, top_p=1.0, top_k=0),
+        sampling=SamplingConfig(
+            max_generate_tokens=3,
+            temperature=0.0,
+            top_p=1.0,
+            top_k=17,
+            alpha_presence=0.0,
+            alpha_frequency=0.0,
+            alpha_decay=0.0,
+        ),
         batch_size=1,
         show_progress=False,
     )
@@ -75,7 +85,10 @@ def test_vllm_generation_uses_chat_completions(monkeypatch) -> None:
     assert outputs[0].text == "ok"
     assert calls[0][0] == "http://127.0.0.1:19082/v1/chat/completions"
     assert calls[0][1]["messages"] == [{"role": "user", "content": "hello"}]
-    assert "top_k" not in calls[0][1]
+    assert calls[0][1]["top_k"] == 17
+    assert calls[0][1]["presence_penalty"] == 0.0
+    assert calls[0][1]["repetition_penalty"] == 1.0
+    assert calls[0][1]["penalty_decay"] == 0.0
 
 
 def test_vllm_tool_call_generation_preserves_native_tool_calls(monkeypatch) -> None:
@@ -134,6 +147,10 @@ def test_vllm_tool_call_generation_preserves_native_tool_calls(monkeypatch) -> N
 
     assert calls[0][0] == "http://127.0.0.1:19082/v1/chat/completions"
     assert calls[0][1]["tool_choice"] == "auto"
+    assert "frequency_penalty" not in calls[0][1]
+    assert calls[0][1]["top_k"] == 0
+    assert calls[0][1]["repetition_penalty"] == 0.5
+    assert calls[0][1]["penalty_decay"] == 0.99
     assert "seed" not in calls[0][1]
     assert outputs[0].content == ""
     assert outputs[0].finish_reason == "tool_calls"
@@ -235,7 +252,7 @@ def test_completions_generation_uses_raw_prompt_with_private_sampling(monkeypatc
     assert calls[0][0] == "http://127.0.0.1:19082/v1/completions"
     assert calls[0][1]["prompt"] == "hello"
     assert calls[0][1]["top_k"] == 17
-    assert calls[0][1]["repetition_penalty"] == 1e-5
+    assert calls[0][1]["repetition_penalty"] == 1.0
     assert calls[0][1]["stop_tokens"] == [0, 10060]
     assert calls[0][1]["stop_token_ids"] == [0, 10060]
 
@@ -311,3 +328,48 @@ def test_completions_generation_can_use_openai_sampling_compat(monkeypatch) -> N
     assert "top_k" not in payload
     assert "repetition_penalty" not in payload
     assert "penalty_decay" not in payload
+
+
+def test_completion_text_detector_streams_individual_requests(monkeypatch) -> None:
+    backend = RemoteInferenceBackend(
+        RemoteInferenceConfig(
+            base_url="http://127.0.0.1:19082/v1",
+            model="demo",
+            protocol="completions",
+            max_workers=1,
+        )
+    )
+    payloads: list[dict[str, object]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        payloads.append(json.loads(request.read()))
+        body = "".join(
+            (
+                'data: {"choices":[{"text":">reason</think>\\n","finish_reason":null}]}\n\n',
+                'data: {"choices":[{"text":"Final answer: B","finish_reason":null}]}\n\n',
+                'data: {"choices":[{"text":"\\nFinal answer: C","finish_reason":null}]}\n\n',
+                "data: [DONE]\n\n",
+            )
+        )
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    client = httpx.Client(transport=httpx.MockTransport(_handler))
+    monkeypatch.setattr(RemoteInferenceBackend, "_http_client_for_requests", lambda self: client)
+
+    def detector(text: str) -> bool:
+        return "Final answer: B" in text
+
+    outputs = backend.generate(
+        ["one", "two"],
+        sampling=SamplingConfig(max_generate_tokens=64, stop_tokens=(0,)),
+        batch_size=1,
+        text_stop_detectors=[detector, detector],
+        show_progress=False,
+    )
+
+    assert [payload["prompt"] for payload in payloads] == ["one", "two"]
+    assert all(payload["stream"] is True for payload in payloads)
+    assert all(output.finish_reason == "answer" for output in outputs)
+    assert all(output.text.endswith("Final answer: B") for output in outputs)
+    assert all("Final answer: C" not in output.text for output in outputs)
+    client.close()

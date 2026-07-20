@@ -16,7 +16,13 @@ from src.eval.prompt_builders import (
 )
 from src.eval.context_budget import build_budgeted_context_prompt, fuse_context_question
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
-from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
+from src.eval.metrics.multi_choice import extract_answer_after_think
+from src.eval.results.schema import (
+    dataset_slug_parts,
+    normalize_sampling_config_by_stage,
+    prompt_delta,
+    sampling_config_to_dict,
+)
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
 from src.infer.backend import InferenceBackend
@@ -81,6 +87,10 @@ class MultipleChoicePipelineResult:
     dataset: str
     sample_count: int
     payloads: list[dict]
+
+
+def _answer_after_think_detector(num_choices: int) -> Callable[[str], bool]:
+    return lambda text: bool(extract_answer_after_think(text, num_choices))
 
 
 class MultipleChoicePipeline:
@@ -180,7 +190,10 @@ class MultipleChoicePipeline:
         on_record: Callable[[dict], None] | None = None,
         long_doc_config: LongDocEvidenceConfig | None = None,
         prompt_max_chars: int | None = None,
+        answer_strategy: str = "two_stage",
     ) -> MultipleChoicePipelineResult:
+        if answer_strategy not in {"two_stage", "cascade_a_b"}:
+            raise ValueError(f"unsupported knowledge CoT answer strategy: {answer_strategy}")
         records, resolved_name = self._load_records(
             dataset_path,
             sample_limit,
@@ -298,34 +311,65 @@ class MultipleChoicePipeline:
                 on_record(cot_payload)
 
         # 阶段一：流式提交所有 CoT，在飞并发上限用本 benchmark 的 batch_size（去屏障、保档位）
-        _ = self.backend.generate(
+        generated_outputs = self.backend.generate(
             cot_prompts,
             sampling=cot_sampling,
             batch_size=batch_size,
             progress_desc="Generating CoT" if not probe_only else "Probing CoT",
             probe_only=probe_only,
-            on_complete=None if probe_only else _on_cot_complete,
+            on_complete=(
+                _on_cot_complete
+                if not probe_only and answer_strategy == "two_stage"
+                else None
+            ),
             prompt_seeds=cot_seeds,
+            text_stop_detectors=(
+                [
+                    _answer_after_think_detector(len(record.choices))
+                    for _key, record in remaining_entries
+                ]
+                if answer_strategy == "cascade_a_b"
+                else None
+            ),
         )
         if probe_only:
             return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
+        for output in generated_outputs:
+            if 0 <= output.prompt_index < len(cot_outputs):
+                cot_outputs[output.prompt_index] = output
+
+        if answer_strategy == "cascade_a_b":
+            return self._run_cascade_answer_strategy(
+                dataset_name=dataset_name,
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                entries=remaining_entries,
+                cot_prompts=cot_prompts,
+                strategy_a_outputs=cot_outputs,
+                cot_sampling=cot_sampling,
+                final_answer_template=final_answer_template,
+                batch_size=batch_size,
+                sampling_config=sampling_config,
+                long_doc_traces=long_doc_traces,
+                on_record=on_record,
+            )
 
         # 阶段二：用全部 CoT 输出构造答案段 prompt，单次并发生成。
         # 贪心采样、无 seed，解析函数（_extract_generated_choice_letter）不变 ⇒ 逐条等价。
+        final_prompt_by_idx: dict[int, str] = {}
+        pred_letter_by_idx: dict[int, str] = {}
         answer_indices: list[int] = []
         answer_prompts: list[str] = []
-        final_prompt_by_idx: dict[int, str] = {}
         for idx, output in enumerate(cot_outputs):
             if output is None:
                 continue
-            final_prompt = (
-                final_answer_template.replace("<Q>", cot_prompts[idx]).replace("<COT>", output.text)
+            final_prompt = final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
+                "<COT>", output.text
             )
             final_prompt_by_idx[idx] = final_prompt
             answer_indices.append(idx)
             answer_prompts.append(final_prompt)
 
-        pred_letter_by_idx: dict[int, str] = {}
         if answer_prompts:
             answer_outputs = self.backend.generate(
                 answer_prompts,
@@ -381,6 +425,169 @@ class MultipleChoicePipeline:
                 on_record(payload)
             payloads.append(payload)
         return MultipleChoicePipelineResult(dataset_name, len(expanded), payloads)
+
+    def _run_cascade_answer_strategy(
+        self,
+        *,
+        dataset_name: str,
+        benchmark_name: str,
+        dataset_split: str,
+        entries: list[tuple[AttemptKey, MultipleChoiceRecord]],
+        cot_prompts: list[str],
+        strategy_a_outputs: list[GenerationOutput | None],
+        cot_sampling: SamplingConfig,
+        final_answer_template: str,
+        batch_size: int,
+        sampling_config: dict[str, object],
+        long_doc_traces: list[dict[str, object] | None],
+        on_record: Callable[[dict], None] | None,
+    ) -> MultipleChoicePipelineResult:
+        final_sampling = _multiple_choice_answer_sampling()
+        cascade_sampling = dict(sampling_config)
+        cascade_sampling["strategy_a"] = sampling_config_to_dict(cot_sampling)
+        cascade_sampling["stage2"] = sampling_config_to_dict(final_sampling)
+
+        failed_indices: list[int] = []
+        payloads: list[dict] = []
+
+        def _base_payload(idx: int, *, stages: list[StageRecord]) -> dict:
+            key, _record = entries[idx]
+            output = strategy_a_outputs[idx]
+            payload = SampleRecord(
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sample_index=key.sample_index,
+                repeat_index=key.repeat_index,
+                pass_index=key.pass_index,
+                sampling_config=cascade_sampling,
+                stages=stages,
+            ).as_payload()
+            payload["strategy_a_prompt"] = cot_prompts[idx]
+            payload["strategy_a_completion"] = output.text if output is not None else ""
+            payload["strategy_a_stop_reason"] = (
+                output.finish_reason if output is not None else "missing_output"
+            )
+            trace = long_doc_traces[idx]
+            if trace is not None:
+                payload["long_doc"] = dict(trace)
+            return payload
+
+        for idx, output in enumerate(strategy_a_outputs):
+            _key, record = entries[idx]
+            prediction = (
+                extract_answer_after_think(output.text, len(record.choices))
+                if output is not None
+                else ""
+            )
+            expected = ALPHABET[record.answer_index]
+            if prediction == expected:
+                payload = _base_payload(idx, stages=[])
+                payload["_stage"] = "answer"
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
+            else:
+                failed_indices.append(idx)
+                if on_record is not None:
+                    partial = _base_payload(idx, stages=[])
+                    partial["_stage"] = "cot"
+                    on_record(partial)
+
+        if not failed_indices:
+            return MultipleChoicePipelineResult(dataset_name, len(entries), payloads)
+
+        strategy_b_prompts = [cot_prompts[idx] for idx in failed_indices]
+        strategy_b_outputs = self.backend.generate(
+            strategy_b_prompts,
+            sampling=cot_sampling,
+            batch_size=min(batch_size, len(strategy_b_prompts)),
+            progress_desc="Generating strategy B CoT",
+            prompt_seeds=[
+                sample_repeat_seed(
+                    entries[idx][0].sample_index,
+                    entries[idx][0].repeat_index,
+                    pass_index=entries[idx][0].pass_index,
+                    stage=2,
+                )
+                for idx in failed_indices
+            ],
+            text_stop_detectors=[
+                _answer_after_think_detector(len(entries[idx][1].choices))
+                for idx in failed_indices
+            ],
+        )
+        strategy_b_by_idx = {
+            failed_indices[int(output.prompt_index)]: output
+            for output in strategy_b_outputs
+            if 0 <= int(output.prompt_index) < len(failed_indices)
+        }
+        if len(strategy_b_by_idx) != len(failed_indices):
+            raise RuntimeError("backend returned incomplete strategy B CoT batch")
+
+        final_prompts: list[str] = []
+        for idx in failed_indices:
+            output = strategy_b_by_idx[idx]
+            final_prompts.append(
+                final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
+                    "<COT>", output.text
+                )
+            )
+        final_outputs = self.backend.generate(
+            final_prompts,
+            sampling=final_sampling,
+            batch_size=min(batch_size, len(final_prompts)),
+            progress_desc="Generating strategy B answers",
+            show_progress=False,
+        )
+        final_by_idx = {
+            failed_indices[int(output.prompt_index)]: output
+            for output in final_outputs
+            if 0 <= int(output.prompt_index) < len(failed_indices)
+        }
+        if len(final_by_idx) != len(failed_indices):
+            raise RuntimeError("backend returned incomplete strategy B answer batch")
+
+        for idx in failed_indices:
+            strategy_b_output = strategy_b_by_idx[idx]
+            final_output = final_by_idx[idx]
+            _key, record = entries[idx]
+            full_final_prompt = final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
+                "<COT>", strategy_b_output.text
+            )
+            prior_context = f"{cot_prompts[idx]}{strategy_b_output.text}"
+            delta_prompt = prompt_delta(full_final_prompt, prior_context)
+            prediction = self._extract_generated_choice_letter(
+                final_output.text,
+                len(record.choices),
+            )
+            payload = _base_payload(
+                idx,
+                stages=[
+                    StageRecord(
+                        prompt=cot_prompts[idx],
+                        completion=strategy_b_output.text,
+                        stop_reason=strategy_b_output.finish_reason,
+                    ),
+                    StageRecord(
+                        prompt=delta_prompt,
+                        completion=self.target_token_format.replace("<LETTER>", prediction),
+                        stop_reason="generated_choice",
+                    ),
+                ],
+            )
+            payload["_stage"] = "answer"
+            if on_record is not None:
+                on_record(payload)
+            payloads.append(payload)
+
+        payloads.sort(
+            key=lambda payload: (
+                int(payload["sample_index"]),
+                int(payload["repeat_index"]),
+                int(payload.get("pass_index", 0)),
+            )
+        )
+        return MultipleChoicePipelineResult(dataset_name, len(entries), payloads)
 
     def _load_records(
         self,
