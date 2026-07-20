@@ -5,7 +5,8 @@ from pathlib import Path
 from src.eval.evaluating import RunMode
 from src.eval.scheduler import cli
 from src.eval.scheduler.db_bootstrap import DbSchemaReport
-from src.eval.scheduler.launch_config import load_launch_profile
+from src.eval.scheduler.launch_config import expand_infer_model_groups, load_launch_profile
+from src.eval.scheduler.remote_slots import parse_remote_model_slots
 
 
 def test_default_scheduler_profile_carries_launch_parameters_from_toml() -> None:
@@ -101,3 +102,25 @@ long_doc_mode = "off"
     assert opts.knowledge.prompt_max_chars == 4096
     assert opts.knowledge.long_doc_mode == "off"
     assert (tmp_path / "logs" / "unit_run" / "resolved_config.json").exists()
+
+
+def test_model_groups_can_pin_each_slot_to_an_endpoint() -> None:
+    specs = expand_infer_model_groups(
+        (),
+        (
+            {
+                "slot_prefix": "demo",
+                "model": "demo-model",
+                "slots": 2,
+                "base_urls": ["http://127.0.0.1:9001/v1", "http://127.0.0.1:9002/v1"],
+            },
+        ),
+        slots_per_model=1,
+    )
+
+    slots = parse_remote_model_slots(specs)
+    assert [slot.model for slot in slots] == ["demo-model", "demo-model"]
+    assert [slot.base_url for slot in slots] == [
+        "http://127.0.0.1:9001/v1",
+        "http://127.0.0.1:9002/v1",
+    ]

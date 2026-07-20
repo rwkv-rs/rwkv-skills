@@ -95,6 +95,7 @@ class SchedulerLaunchRequest:
     skip_missing_dataset: bool = False
     clean_param_swap: bool = False
     batch_cache: str | None = None
+    benchmark_config_root: str = ""
     overwrite: bool = False
     disable_checker: bool = False
     coding_eval_workers: int | None = None
@@ -345,6 +346,11 @@ class SchedulerLaunchRequest:
             clean_param_swap=self.clean_param_swap,
             batch_cache_path=batch_cache_path,
             disable_checker=self.disable_checker,
+            benchmark_config_root=(
+                Path(self.benchmark_config_root).expanduser()
+                if str(self.benchmark_config_root or "").strip()
+                else None
+            ),
         )
 
 
@@ -414,8 +420,20 @@ def expand_infer_model_groups(
         slots = max(1, int(group.get("slots", 1)))
         start = int(group.get("start", 1))
         width = max(1, int(group.get("width", 2)))
-        for index in range(start, start + slots):
-            _add(f"{slot_prefix}_s{index:0{width}d}={model}")
+        raw_base_urls = group.get("base_urls")
+        if raw_base_urls is None:
+            base_urls: tuple[str, ...] = ()
+        elif isinstance(raw_base_urls, Sequence) and not isinstance(raw_base_urls, (str, bytes)):
+            base_urls = tuple(str(url).strip() for url in raw_base_urls)
+        else:
+            raise ValueError("inference.model_groups base_urls must be an array")
+        if base_urls and (len(base_urls) != slots or any(not url for url in base_urls)):
+            raise ValueError("inference.model_groups base_urls must contain one URL per slot")
+        shared_base_url = str(group.get("base_url") or "").strip()
+        for offset, index in enumerate(range(start, start + slots)):
+            spec = f"{slot_prefix}_s{index:0{width}d}={model}"
+            base_url = base_urls[offset] if base_urls else shared_base_url
+            _add(f"{spec}|{base_url}" if base_url else spec)
 
     explicit_slots = max(1, int(slots_per_model))
     for raw in infer_models:
@@ -508,6 +526,7 @@ def _flatten_profile_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
             "skip_missing_dataset": "skip_missing_dataset",
             "clean_param_swap": "clean_param_swap",
             "batch_cache": "batch_cache",
+            "benchmark_config_root": "benchmark_config_root",
             "overwrite": "overwrite",
             "disable_checker": "disable_checker",
             "distributed_claims": "distributed_claims",

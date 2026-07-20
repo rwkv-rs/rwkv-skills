@@ -176,6 +176,7 @@ class DispatchOptions(QueueOptions):
     clean_param_swap: bool = False
     batch_cache_path: Path | None = None
     disable_checker: bool = False
+    benchmark_config_root: Path | None = None
 
 
 @dataclass(slots=True)
@@ -211,6 +212,10 @@ class DispatcherState:
     launch_times: dict[str, float] = field(default_factory=dict)
     job_metadata: dict[str, dict[str, object]] = field(default_factory=dict)
     completed_versions: dict[str, str | None] = field(default_factory=dict)
+    # ``completed_versions`` can legitimately be empty on the first poll.  Keep
+    # that empty snapshot distinct from an uninitialized state so a score that
+    # appears after an empty first poll is treated as a current-session result.
+    completed_versions_initialized: bool = False
     cooldown_until: dict[str, float] = field(default_factory=dict)
     cancel_requested: bool = False
 
@@ -243,7 +248,9 @@ def _completed_for_queue(
     completed: Sequence[CompletedKey] | set[CompletedKey],
     session_completed: Sequence[CompletedKey] | set[CompletedKey] = (),
 ) -> set[CompletedKey]:
-    if run_mode is RunMode.RERUN:
+    # ``fresh`` is also a deliberate replacement run.  Existing score rows
+    # are historical evidence and must not suppress the requested queue.
+    if run_mode in {RunMode.RERUN, RunMode.FRESH}:
         return set(session_completed)
     return set(completed) | set(session_completed)
 
@@ -284,8 +291,9 @@ def _reconcile_completed_versions(
     now: float,
 ) -> set[str]:
     current_versions = {job_id: info.version_id for job_id, info in completed_records.items()}
-    if not state.completed_versions:
+    if not state.completed_versions_initialized:
         state.completed_versions.update(current_versions)
+        state.completed_versions_initialized = True
         return set()
 
     new_completed = {

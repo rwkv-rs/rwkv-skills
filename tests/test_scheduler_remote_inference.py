@@ -338,7 +338,10 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
         job_order=("code_human_eval",),
         inference=InferenceConfig(
             base_url="http://127.0.0.1:19083/v1",
-            models=("slot-a=remote-a", "slot-b=remote-a"),
+            models=(
+                "slot-a=remote-a|http://127.0.0.1:19084/v1",
+                "slot-b=remote-a|http://127.0.0.1:19085/v1",
+            ),
         ),
     )
     items = [_item("human_eval_test"), _item("human_eval_cn_test")]
@@ -359,6 +362,10 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
 
     assert [model for _job_id, model in launched] == ["remote-a", "remote-a"]
     assert [env.get("CUDA_VISIBLE_DEVICES") for env in child_envs] == ["", ""]
+    assert [env.get("RWKV_SKILLS_INFER_BASE_URL") for env in child_envs] == [
+        "http://127.0.0.1:19084/v1",
+        "http://127.0.0.1:19085/v1",
+    ]
     assert sorted(path.read_text(encoding="utf-8").splitlines()[1] for path in opts.pid_dir.glob("*.pid")) == [
         "model:slot_a",
         "model:slot_b",

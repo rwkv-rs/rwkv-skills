@@ -2,9 +2,10 @@ from __future__ import annotations
 
 """Remote inference slot parsing.
 
-The scheduler treats remote model slots as launch resources.  A slot may point
-at the same backend model as another slot, allowing multiple benchmark jobs to
-feed one batching server while the DB identity stays the real model name.
+The scheduler treats remote model slots as launch resources. A slot may point
+at the same backend model as another slot. An optional ``|base_url`` suffix
+pins that slot to one physical inference endpoint while the DB identity stays
+the real model name.
 """
 
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ INFER_WORKER_PROFILE_CHOICES = ("fixed", "param-size")
 class RemoteModelSlot:
     slot: str
     model: str
+    base_url: str | None = None
 
     @property
     def slot_slug(self) -> str:
@@ -35,12 +37,17 @@ def parse_remote_model_slot(raw: str) -> RemoteModelSlot | None:
     text = str(raw or "").strip()
     if not text:
         return None
+    target, separator, raw_base_url = text.partition("|")
+    base_url = raw_base_url.strip() if separator else None
+    if separator and not base_url:
+        raise ValueError(f"invalid infer model slot endpoint: {raw!r}")
+    text = target.strip()
     if "=" not in text:
-        return RemoteModelSlot(slot=text, model=text)
+        return RemoteModelSlot(slot=text, model=text, base_url=base_url)
     slot, model = (part.strip() for part in text.split("=", 1))
     if not slot or not model:
         raise ValueError(f"invalid infer model slot spec: {raw!r}")
-    return RemoteModelSlot(slot=slot, model=model)
+    return RemoteModelSlot(slot=slot, model=model, base_url=base_url)
 
 
 def parse_remote_model_slots(raw_slots: Sequence[str]) -> tuple[RemoteModelSlot, ...]:

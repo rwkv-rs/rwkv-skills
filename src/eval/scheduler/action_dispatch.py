@@ -254,6 +254,10 @@ def _launch_queue_items(
         console_log_path = _allocate_console_log_path(opts.run_log_dir, log_relpath)
         pid_path = opts.pid_dir / f"{item.job_id}.pid"
         item.dataset_path = dataset_path
+        if remote_mode and resource_slot_slug is not None:
+            slot_spec = remote_slots.get(resource_slot_slug)
+            if slot_spec is not None and slot_spec.base_url:
+                item.infer_base_url = slot_spec.base_url
 
         if pid_path.exists():
             lines = pid_path.read_text().splitlines()
@@ -303,6 +307,8 @@ def _launch_queue_items(
             env["RWKV_SKILLS_INFER_SEED_POLICY"] = str(opts.inference.seed_policy or "preserve")
         if opts.disable_checker:
             env["RWKV_SKILLS_DISABLE_CHECKER"] = "1"
+        if opts.benchmark_config_root is not None:
+            env["RWKV_BENCHMARK_CONFIG_ROOT"] = str(opts.benchmark_config_root)
 
         questions = question_counts.get(dataset_slug)
 
