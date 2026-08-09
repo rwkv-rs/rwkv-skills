@@ -41,6 +41,14 @@ tau2_bench/
 /tmp/
 summary-*/
 /.codex
+/.codex-staging/
+/.claude/
+/.pytest_cache/
+/.ruff_cache/
+/.idea/
+**/.nltk_data/
+tmp_*.py
+/NUL
 /.memsearch/
 /weights/
 /references/
