@@ -33,7 +33,6 @@ def test_collect_benchmarks_matches_field_plus_extra_union() -> None:
 def test_resolve_registered_benchmark_name_accepts_dataset_slug() -> None:
     assert resolve_registered_benchmark_name("simpleqa_verified") == "simpleqa"
     assert resolve_registered_benchmark_name("ifeval_test") == "ifeval"
-    assert resolve_registered_benchmark_name("arena_hard_test") == "arena_hard_v2"
 
 
 def test_collect_benchmark_dataset_slugs_uses_default_splits() -> None:
@@ -43,7 +42,7 @@ def test_collect_benchmark_dataset_slugs_uses_default_splits() -> None:
     )
 
     assert canonical_slug("ifeval_test") in slugs
-    assert canonical_slug("flores200_devtest") in slugs
+    assert canonical_slug("ifbench_test") in slugs
     assert canonical_slug("browsecomp_test") in slugs
 
 

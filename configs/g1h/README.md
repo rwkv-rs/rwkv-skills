@@ -1,10 +1,17 @@
 # G1h Benchmark Config Override
 
-Use this directory as an override root:
+The formal 157 evaluation checkout is the authoritative caller for this
+directory. From that checkout, use the relative path below:
 
 ```bash
-RWKV_BENCHMARK_CONFIG_ROOT=/home/rwkv/chase/rwkv-skills/configs/g1h
+cd /home/rwkv/chase/rwkv-skills-g1h-normal-20260719
+PYTHONPATH=/home/rwkv/chase/rwkv-skills-g1h-normal-20260719
+RWKV_BENCHMARK_CONFIG_ROOT=configs/g1h
 ```
+
+Do not point a formal scheduler at the shared main checkout. The shared
+checkout owns symlinked data/results and service code; the formal checkout
+owns the scheduler, runner, benchmark code, and G1h config used for a run.
 
 Policy from prompt probes on 2026-07-17:
 

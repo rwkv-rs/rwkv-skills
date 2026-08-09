@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -362,6 +363,11 @@ def test_remote_launch_uses_alias_slots_for_same_model(monkeypatch, tmp_path: Pa
 
     assert [model for _job_id, model in launched] == ["remote-a", "remote-a"]
     assert [env.get("CUDA_VISIBLE_DEVICES") for env in child_envs] == ["", ""]
+    assert all(
+        env.get("PYTHONPATH", "").split(os.pathsep, 1)[0]
+        == str(actions_base.REPO_ROOT)
+        for env in child_envs
+    )
     assert [env.get("RWKV_SKILLS_INFER_BASE_URL") for env in child_envs] == [
         "http://127.0.0.1:19084/v1",
         "http://127.0.0.1:19085/v1",
@@ -535,8 +541,6 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
             "2",
             "--infer-budget-min-workers",
             "3",
-            "--coding-swebench-max-prompt-chars",
-            "18000",
         ]
     )
 
@@ -548,7 +552,6 @@ def test_scheduler_cli_accepts_remote_inference_flags() -> None:
     assert args.infer_backpressure_timeout_s == 1.5
     assert args.infer_backpressure_pending_high_watermark == 2
     assert args.infer_budget_min_workers == 3
-    assert args.coding_swebench_max_prompt_chars == 18000
 
 
 def test_scheduler_slot_expansion_preserves_explicit_slots() -> None:
@@ -713,7 +716,7 @@ def test_function_calling_extra_args_only_apply_to_function_jobs(tmp_path: Path)
     assert "1" in browsecomp_args
 
 
-def test_maths_extra_args_only_apply_to_llm_judge_jobs(tmp_path: Path) -> None:
+def test_maths_extra_args_apply_the_abc_contract_to_both_prompt_profiles(tmp_path: Path) -> None:
     opts = DispatchOptions(
         log_dir=tmp_path,
         pid_dir=tmp_path,
@@ -723,11 +726,42 @@ def test_maths_extra_args_only_apply_to_llm_judge_jobs(tmp_path: Path) -> None:
     )
 
     assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_judge"]) == (
+        "--strategy-a-single-generation",
         "--judge-max-workers",
         "2",
     )
-    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == ()
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == (
+        "--strategy-a-single-generation",
+    )
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_naive"]) == (
+        "--strategy-a-single-generation",
+    )
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_judge_naive"]) == (
+        "--strategy-a-single-generation",
+        "--judge-max-workers",
+        "2",
+    )
     assert actions._maths_extra_args(opts, JOB_CATALOGUE["function_browsecomp"]) == ()
+
+
+def test_maths_extra_args_can_disable_oracle_cascade(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    opts = DispatchOptions(
+        log_dir=tmp_path,
+        pid_dir=tmp_path,
+        run_log_dir=tmp_path,
+        job_order=("free_response_judge_naive",),
+        math=MathConfig(judge_max_workers=2),
+    )
+    monkeypatch.setenv("RWKV_MATH_DISABLE_ORACLE_CASCADE", "1")
+
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_naive"]) == ()
+    assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response_judge_naive"]) == (
+        "--judge-max-workers",
+        "2",
+    )
 
 
 def test_non_fc_long_doc_extra_args_are_scoped_by_runner_group(tmp_path: Path) -> None:
@@ -741,6 +775,7 @@ def test_non_fc_long_doc_extra_args_are_scoped_by_runner_group(tmp_path: Path) -
     )
 
     assert actions._maths_extra_args(opts, JOB_CATALOGUE["free_response"]) == (
+        "--strategy-a-single-generation",
         "--prompt-max-chars",
         "8192",
         "--long-doc-mode",

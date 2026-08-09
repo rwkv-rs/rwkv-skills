@@ -684,8 +684,6 @@ def _coding_benchmark_kind(job_name: str) -> str:
         return "human_eval"
     if job_name == "code_livecodebench":
         return "livecodebench"
-    if job_name in {"code_swe_bench", "code_swe_bench_naive"}:
-        return "swe_bench"
     return "mbpp"
 
 

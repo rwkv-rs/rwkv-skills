@@ -185,7 +185,13 @@ def load_running(pid_dir: Path) -> dict[str, RunningEntry]:
         return running
     for pid_file in pid_dir.glob("*.pid"):
         job_id = pid_file.stem
-        lines = pid_file.read_text().splitlines()
+        try:
+            lines = pid_file.read_text().splitlines()
+        except FileNotFoundError:
+            # A completed child may remove its PID file between glob() and
+            # read_text().  Treat that entry as already reconciled instead of
+            # terminating the scheduler that launched the remaining runners.
+            continue
         if not lines:
             continue
         try:

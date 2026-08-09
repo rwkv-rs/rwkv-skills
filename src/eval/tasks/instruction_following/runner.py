@@ -13,8 +13,12 @@ from dataclasses import replace
 from src.db.database import init_db
 from src.db.eval_db_service import EvalDbService
 from src.eval.benchmark_registry import CoTMode, resolve_benchmark_metadata
-from src.eval.benchmark_config import resolve_sampling_config
+from src.eval.benchmark_config import (
+    benchmark_config_source_paths,
+    resolve_sampling_config,
+)
 from src.eval.datasets.data_loader.instruction_following import JsonlInstructionFollowingLoader
+from src.eval.datasets.snapshot import build_dataset_snapshot, build_protocol_bundle
 from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
 from src.eval.common.field_runner import (
     add_common_runner_args,
@@ -28,7 +32,6 @@ from src.eval.metrics.instruction_following.metrics import evaluate_instruction_
 from src.eval.results.payloads import make_score_payload
 from src.eval.results.schema import sampling_config_to_dict
 from src.eval.scheduler.config import DEFAULT_DB_CONFIG
-from src.eval.scheduler.job_env import ensure_job_id
 from src.eval.evaluating import prepare_task_execution
 from src.eval.scheduler.dataset_resolver import resolve_or_prepare_dataset
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path, canonical_slug
@@ -110,7 +113,6 @@ def main(
     avg_k_final = k_plan.avg_k
     report_avg_k = k_plan.report_avg_k
     samples_per_prompt = max(plan.repeat_count, 1)
-    records = dataset_records
     expected_count = plan_attempt_count(plan, max_pass_k=1)
 
     sampling = resolve_sampling_config(
@@ -129,6 +131,42 @@ def main(
     service = EvalDbService()
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", "instruction_following")
     prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
+    sampling_payload = {"stage1": sampling_config_to_dict(sampling)}
+    is_ifbench = canonical_slug(str(slug)).startswith("ifbench")
+    dataset_snapshot = build_dataset_snapshot(
+        dataset_path,
+        dataset_slug=slug,
+        loader=JsonlInstructionFollowingLoader,
+        resolver=resolve_or_prepare_dataset,
+        records=dataset_records,
+    )
+    protocol_bundle = build_protocol_bundle(
+        protocol_name="instruction_following",
+        source_files=(
+            Path(__file__),
+            Path(__file__).with_name("pipeline.py"),
+            Path(__file__).parents[2] / "field_common.py",
+            Path(__file__).parents[2] / "benchmark_config.py",
+            Path(__file__).parents[2]
+            / "datasets"
+            / "data_loader"
+            / "instruction_following.py",
+            Path(__file__).parents[2]
+            / "metrics"
+            / "instruction_following"
+            / "metrics.py",
+        ),
+        config_files=benchmark_config_source_paths(slug, model_name),
+        resolved_contract={
+            "cot_mode": CoTMode.NO_COT.value,
+            "prompt_profile": prompt_profile,
+            "enable_think": bool(args.enable_think),
+            "stop_tokens": list(sampling.stop_tokens),
+            "ban_tokens": list(ban_tokens or ()),
+            "scoring_mode": "loose" if is_ifbench else "strict",
+            "sampling": sampling_payload,
+        },
+    )
     task_state = prepare_task_execution(
         service=service,
         dataset=str(slug),
@@ -139,9 +177,11 @@ def main(
         sampling_config=build_task_sampling_config(
             cot_mode=CoTMode.NO_COT,
             avg_k=plan.avg_k,
-            sampling_config={"stage1": sampling_config_to_dict(sampling)},
+            sampling_config=sampling_payload,
             effective_sample_count=plan.effective_sample_count,
             prompt_profile=prompt_profile,
+            dataset_snapshot=dataset_snapshot,
+            protocol_bundle=protocol_bundle,
         ),
     )
     task_run = TaskRunState.from_task_execution(
@@ -171,7 +211,6 @@ def main(
         )
     completions_payloads = runtime.complete_attempt_stage(writer)
     with scoring_stage(runtime):
-        is_ifbench = canonical_slug(str(slug)).startswith("ifbench")
         metrics = evaluate_instruction_following(
             completions_payloads,
             dataset_path=str(dataset_path),

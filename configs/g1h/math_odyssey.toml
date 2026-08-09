@@ -9,3 +9,8 @@ template = "free_response_cot_default"
 
 [final]
 template = "free_response_final_default"
+# Math Odyssey solutions are often long enough that the final answer extraction
+# prompt needs more than the generic 128-token budget.  A 512-token budget
+# avoids truncating the boxed/final answer while staying far below the model's
+# context ceiling.
+max_generate_tokens = 512

@@ -148,6 +148,113 @@ def test_completion_context_roundtrips_strategy_a_payload() -> None:
     assert payloads[0]["strategy_a_stop_reason"] == "max_length"
 
 
+def test_completion_context_roundtrips_structurally_present_empty_final_stage() -> None:
+    """An immediate final-stage EOS must survive DB rehydration as evidence.
+
+    The evaluator distinguishes an absent recovery stage from a recovery stage
+    that the model ended without emitting text.  Losing the empty string during
+    persistence would silently re-enable the old stage-1/prompt fallback.
+    """
+
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+    context = EvalDbService._build_completion_context(
+        {
+            **_completion_payload(),
+            "prompt2": "Return only the final answer: \\(\\boxed{",
+            "completion2": "",
+            "stop_reason2": "stop_token",
+        }
+    )
+    repo.completion_rows = [
+        {
+            "benchmark_name": "math_500",
+            "benchmark_split": "test",
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "context": context,
+        }
+    ]
+
+    payload = service.list_completion_payloads(task_id="123", status="Completed")[0]
+
+    assert len(context["stages"]) == 2
+    assert context["stages"][1]["completion"] == ""
+    assert context["stages"][1]["stop_reason"] == "stop_token"
+    assert "completion2" in payload
+    assert payload["completion2"] == ""
+    assert payload["stop_reason2"] == "stop_token"
+
+
+def test_completion_context_preserves_direct_choice_raw_output() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+    context = EvalDbService._build_completion_context(
+        {
+            **_completion_payload(),
+            "direct_raw_completion": " A",
+            "direct_raw_finish_reason": "stop_token",
+        }
+    )
+
+    assert context["direct_raw_completion"] == " A"
+    assert context["direct_raw_finish_reason"] == "stop_token"
+    repo.completion_rows = [
+        {
+            "benchmark_name": "mmlu",
+            "benchmark_split": "test",
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "context": context,
+        }
+    ]
+    payload = service.list_completion_payloads(task_id="123", status="Completed")[0]
+    assert payload["direct_raw_completion"] == " A"
+    assert payload["direct_raw_finish_reason"] == "stop_token"
+
+
+def test_completion_context_roundtrips_browsecomp_plus_audit_fields() -> None:
+    service = object.__new__(EvalDbService)
+    repo = _FakeRepo()
+    service._repo = repo
+    browsecomp_plus_run = {
+        "query_id": "q1",
+        "status": "completed",
+        "retrieved_docids": ["doc-1"],
+        "document_read_docids": ["doc-1"],
+    }
+    metadata = {"query_id": "q1", "source": "official"}
+    context = EvalDbService._build_completion_context(
+        {
+            **_completion_payload(),
+            "browsecomp_plus_run": browsecomp_plus_run,
+            "metadata": metadata,
+        }
+    )
+    repo.completion_rows = [
+        {
+            "benchmark_name": "browsecomp_plus",
+            "benchmark_split": "test",
+            "sample_index": 0,
+            "repeat_index": 0,
+            "pass_index": 0,
+            "context": context,
+        }
+    ]
+
+    payload = service.list_completion_payloads(task_id="123", status="Completed")[0]
+    rebuilt = EvalDbService._build_completion_context(payload)
+
+    assert payload["browsecomp_plus_run"] == browsecomp_plus_run
+    assert payload["metadata"] == metadata
+    assert rebuilt["browsecomp_plus_run"] == browsecomp_plus_run
+    assert rebuilt["metadata"] == metadata
+
+
 def test_completion_ingest_uses_batch_repo_method() -> None:
     service = object.__new__(EvalDbService)
     repo = _FakeRepo()

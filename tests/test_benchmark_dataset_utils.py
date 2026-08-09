@@ -11,19 +11,19 @@ from src.eval.scheduler.dataset_utils import (
 
 def test_canonicalize_benchmark_list_resolves_aliases_and_base_names() -> None:
     known_slugs = {
-        "hendrycks_math_test",
+        "gsm8k_test",
         "ifeval_test",
         "livecodebench_test",
         "math_500_test",
     }
 
     resolved = canonicalize_benchmark_list(
-        ["math", "math500", "lcb", "ifeval"],
+        ["gsm8k", "math500", "lcb", "ifeval"],
         known_slugs=known_slugs,
     )
 
     assert resolved == (
-        "hendrycks_math_test",
+        "gsm8k_test",
         "ifeval_test",
         "livecodebench_test",
         "math_500_test",

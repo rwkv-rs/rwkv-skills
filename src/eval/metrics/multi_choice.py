@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
@@ -55,14 +55,133 @@ def _extract_choice_letter(token_text: str) -> str | None:
     return match.group(0) if match else None
 
 
-def extract_answer_after_think(text: str, num_choices: int) -> str:
+def _extract_direct_choice(
+    text: str,
+    num_choices: int,
+    choices: Sequence[str] | None = None,
+) -> str:
+    """Extract a direct-fill answer without trusting a stale derived field.
+
+    Persisted completion payloads may contain both the model's raw text and a
+    historical ``completionN`` value produced by the answer adapter that was
+    active at generation time.  Re-evaluation must start from the immutable
+    raw text; otherwise fixing the adapter cannot repair those rows.
+    """
+
     valid_letters = ALPHABET[:num_choices]
-    _reasoning, separator, answer_text = (text or "").partition("</think>")
-    if not separator:
+    leading = re.match(
+        rf"^\s*[\[(ï¼ˆ]?([{re.escape(valid_letters)}])"
+        r"(?:[\])ï¼‰.,:ï¼šã€-]|\s|$)",
+        text or "",
+        re.IGNORECASE,
+    )
+    if leading:
+        return leading.group(1).upper()
+    return extract_answer_after_think(text, num_choices, choices)
+
+
+def _normalize_choice_text(text: str) -> str:
+    text = str(text or "").strip().casefold()
+    text = re.sub(r"^[\s\-–—•]+", "", text)
+    text = re.sub(r"^[\s\W]*[A-Z]\s*[\).:：、-]\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[*_`~\"'“”‘’（）()\[\]{}<>]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t\r\n,.;:：。！？!?")
+
+
+def _candidate_answer_texts(answer_text: str) -> list[str]:
+    candidates: list[str] = []
+    for match in re.finditer(
+        r"<answer>\s*(.*?)\s*</answer>",
+        answer_text or "",
+        re.IGNORECASE | re.DOTALL,
+    ):
+        candidates.append(match.group(1).strip())
+    cue_pattern = re.compile(
+        r"(?:final\s+answer|correct\s+answer|answer)\s*"
+        r"(?:(?:choice|option)\s*)?(?:is\s*|[:=]\s*)\s*(.+)",
+        re.IGNORECASE,
+    )
+    for line in (answer_text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = cue_pattern.search(stripped)
+        if match:
+            candidates.append(match.group(1).strip())
+    nonempty_lines = [line.strip() for line in (answer_text or "").splitlines() if line.strip()]
+    if nonempty_lines:
+        tail = nonempty_lines[-1]
+        if len(tail) <= 120:
+            candidates.append(tail)
+    return candidates
+
+
+def _extract_choice_by_option_text(
+    answer_text: str,
+    choices: Sequence[str] | None,
+) -> str:
+    if not choices:
         return ""
+    normalized_choices = [_normalize_choice_text(choice) for choice in choices]
+    # This is a deliberately narrow, last-resort fallback. If the model
+    # revises its answer, the later explicit answer must win; walking the
+    # candidates backwards keeps this fallback aligned with the formal parser
+    # below instead of resurrecting an early discarded option.
+    for candidate in reversed(_candidate_answer_texts(answer_text)):
+        normalized_candidate = _normalize_choice_text(candidate)
+        if not normalized_candidate:
+            continue
+        matches: list[int] = []
+        for idx, normalized_choice in enumerate(normalized_choices):
+            if not normalized_choice:
+                continue
+            if normalized_candidate == normalized_choice:
+                matches.append(idx)
+            elif (
+                len(normalized_choice) >= 2
+                and re.search(
+                    rf"(?<!\w){re.escape(normalized_choice)}(?!\w)",
+                    normalized_candidate,
+                )
+            ):
+                matches.append(idx)
+            elif (
+                len(normalized_candidate) >= 3
+                and re.search(
+                    rf"(?<!\w){re.escape(normalized_candidate)}(?!\w)",
+                    normalized_choice,
+                )
+            ):
+                matches.append(idx)
+        if len(set(matches)) == 1:
+            return ALPHABET[matches[0]]
+    return ""
+
+
+def extract_answer_after_think(
+    text: str,
+    num_choices: int,
+    choices: Sequence[str] | None = None,
+) -> str:
+    valid_letters = ALPHABET[:num_choices]
+    reasoning, separator, answer_text = (text or "").rpartition("</think>")
+    if not separator:
+        malformed_close = re.search(r"</think\s*[)>]", text or "", re.IGNORECASE)
+        if malformed_close:
+            answer_text = (text or "")[malformed_close.end() :]
+        else:
+            # A truncated CoT may still contain one explicit final answer.
+            # Parse that raw completion directly, but never infer a choice
+            # from arbitrary capital letters or option text in its reasoning.
+            answer_text = text or ""
     decoration = r"[*_`~]*"
     patterns = (
         rf"\\boxed\s*\{{[^}}]*?{decoration}([{re.escape(valid_letters)}])[^}}]*\}}",
+        rf"(?:final\s+answer|correct\s+answer|answer)\s*(?:(?:choice|option)\s*)?"
+        rf"(?:is\s*|[:=]\s*){decoration}\(?\s*(?:option\s*)?"
+        r"([1-9][0-9]?)\b",
+        r"(?:option|choice)\s*([1-9][0-9]?)\b",
         rf"(?:final\s+answer|correct\s+answer|answer)\s*(?:(?:choice|option)\s*)?"
         rf"(?:is\s*|[:=]\s*){decoration}\(?\s*([{re.escape(valid_letters)}])",
         rf"(?:choice|option)?\s*{decoration}\(?\s*([{re.escape(valid_letters)}])\s*\)?"
@@ -72,13 +191,18 @@ def extract_answer_after_think(text: str, num_choices: int) -> str:
     )
     matches: list[tuple[int, str]] = []
     for pattern in patterns:
-        matches.extend(
-            (match.start(), match.group(1).upper())
-            for match in re.finditer(pattern, answer_text, re.IGNORECASE)
-        )
+        for match in re.finditer(pattern, answer_text, re.IGNORECASE):
+            raw = match.group(1)
+            if raw.isdigit():
+                index = int(raw) - 1
+                if not 0 <= index < num_choices:
+                    continue
+                matches.append((match.start(), ALPHABET[index]))
+                continue
+            matches.append((match.start(), raw.upper()))
     if matches:
-        return min(matches, key=lambda item: item[0])[1]
-    for line in answer_text.splitlines():
+        return max(matches, key=lambda item: item[0])[1]
+    for line in reversed(answer_text.splitlines()):
         match = re.fullmatch(
             rf"\s*(?:final\s+answer\s*[:=]?\s*)?{decoration}[\[(]?"
             rf"([{re.escape(valid_letters)}])[\])]?{decoration}[.!]?\s*",
@@ -87,6 +211,25 @@ def extract_answer_after_think(text: str, num_choices: int) -> str:
         )
         if match:
             return match.group(1).upper()
+    # When a normal completion closed its think block but omitted a clean
+    # answer segment, accept only its last explicit answer cue from the
+    # reasoning. This mirrors the reference Albatross extractor and avoids
+    # treating a random uppercase character as an answer.
+    if separator:
+        reasoning_matches = list(
+            re.finditer(
+                rf"(?:final\s+answer|correct\s+answer|answer|最终答案|正确答案|答案)"
+                rf"\s*(?:is\s*|[:=：]\s*|是\s*|为\s*)?{decoration}[（(]?"
+                rf"([{re.escape(valid_letters)}])",
+                reasoning,
+                re.IGNORECASE,
+            )
+        )
+        if reasoning_matches:
+            return reasoning_matches[-1].group(1).upper()
+    option_text_letter = _extract_choice_by_option_text(answer_text, choices)
+    if option_text_letter in valid_letters:
+        return option_text_letter
     return ""
 
 
@@ -116,7 +259,11 @@ def evaluate_multiple_choice_cascade(
         answer_letter = ALPHABET[record.answer_index] if record is not None else ""
         num_choices = len(record.choices) if record is not None else len(ALPHABET)
         strategy_a_text = str(payload.get("strategy_a_completion", ""))
-        strategy_a_prediction = extract_answer_after_think(strategy_a_text, num_choices)
+        strategy_a_prediction = extract_answer_after_think(
+            strategy_a_text,
+            num_choices,
+            record.choices if record is not None else None,
+        )
         strategy_a_passed = bool(answer_letter) and strategy_a_prediction == answer_letter
         strategy_a_score = (
             1.0
@@ -132,6 +279,12 @@ def evaluate_multiple_choice_cascade(
             if last_stage > 0
             else ""
         )
+        if not strategy_b_generated and last_stage > 0:
+            strategy_b_generated = extract_answer_after_think(
+                str(payload.get("completion1", "")),
+                num_choices,
+                record.choices if record is not None else None,
+            )
         if strategy_a_passed:
             strategy_b_prediction = strategy_a_prediction
             strategy_b_passed = True
@@ -207,18 +360,31 @@ def evaluate_multiple_choice(
     for payload in _iter_completions(completions):
         sample_index = strict_nonneg_int(payload.get("sample_index"), "sample_index")
         repeat_index = strict_nonneg_int(payload.get("repeat_index"), "repeat_index")
-        last_stage = _max_stage_index(payload)
-        token_text = str(payload.get(f"completion{last_stage}", ""))
-        predicted = _extract_choice_letter(token_text)
         if sample_index < 0 or sample_index >= len(dataset):
             # Unknown sample index -> mark incorrect, but still emit an eval row.
             passed = False
             subject = None
             answer_letter = None
+            predicted = ""
         else:
             record = dataset[sample_index]
             subject = record.subject
             answer_letter = ALPHABET[record.answer_index]
+            raw_text = str(payload.get("direct_raw_completion", "") or "")
+            if raw_text:
+                predicted = _extract_direct_choice(
+                    raw_text,
+                    len(record.choices),
+                    record.choices,
+                )
+            else:
+                last_stage = _max_stage_index(payload)
+                token_text = str(payload.get(f"completion{last_stage}", ""))
+                predicted = _extract_direct_choice(
+                    token_text,
+                    len(record.choices),
+                    record.choices,
+                )
             passed = bool(predicted) and predicted == answer_letter
 
         total += 1

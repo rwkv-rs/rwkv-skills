@@ -19,10 +19,8 @@ from src.eval.prompt_builders import (
     prompt_for_cot,
     prompt_for_marker,
 )
-from src.eval.tasks.coding.swe_bench import build_swebench_prompt_with_trace
 from src.eval.results.schema import dataset_slug_parts, normalize_sampling_config_by_stage, prompt_delta
 from src.eval.scheduler.dataset_utils import infer_dataset_slug_from_path
-from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.backend import InferenceBackend, resolve_generation_prompt_batch_size
 from src.infer.sampling import GenerationOutput, SamplingConfig
 from src.eval.evaluators.common import SampleRecord, StageRecord, sample_repeat_seed
@@ -107,6 +105,21 @@ def _format_lcb_naive_cot_prompt(question: str, starter_code: str | None) -> str
     if starter_code and starter_code.strip():
         clean = f"{clean}\n```python\n{starter_code.strip()}\n```"
     return f"User: {clean}\n\nAssistant: <think"
+
+
+def _format_lcb_direct_prompt(
+    question: str,
+    starter_code: str | None,
+    *,
+    prompt_profile: str,
+) -> str:
+    if prompt_profile == "naive":
+        clean = (question or "").strip()
+        if starter_code and starter_code.strip():
+            clean = f"{clean}\n```python\n{starter_code.strip()}\n```"
+        return f"User: {clean}\n\nAssistant: <think></think>\n```python\n"
+    body = _format_lcb_body(question, starter_code)
+    return f"User: {_LCB_SYSTEM_MESSAGE}\n{body}Assistant: <think></think>\n```python\n"
 
 
 def _format_lcb_final_prompt(cot_prompt: str, cot_completion: str) -> str:
@@ -645,7 +658,8 @@ class CodingPipeline:
         dataset_path: str,
         *,
         cot_sampling: SamplingConfig,
-        final_sampling: SamplingConfig,
+        final_sampling: SamplingConfig | None,
+        cot_mode: CoTMode = CoTMode.COT,
         batch_size: int = 64,
         sample_limit: int | None = None,
         record_indices: Sequence[int] | None = None,
@@ -672,6 +686,26 @@ class CodingPipeline:
         benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
         if not records:
             return CodingPipelineResult(dataset_name, 0, 0, [])
+
+        if cot_mode is CoTMode.NO_COT:
+            return self._run_livecodebench_direct(
+                records=records,
+                dataset_name=dataset_name,
+                benchmark_name=benchmark_name,
+                dataset_split=dataset_split,
+                sampling=cot_sampling,
+                batch_size=batch_size,
+                samples_per_task=samples_per_task,
+                probe_only=probe_only,
+                attempt_keys=attempt_keys,
+                resume_start_index=resume_start_index,
+                skip_keys=skip_keys,
+                on_record=on_record,
+                prompt_profile=prompt_profile,
+            )
+
+        if final_sampling is None:
+            raise ValueError("final_sampling is required for LiveCodeBench CoT mode")
 
         if probe_only:
             prompts = []
@@ -861,65 +895,46 @@ class CodingPipeline:
             payloads=payloads,
         )
 
-    def run_swe_bench(
+    def _run_livecodebench_direct(
         self,
-        dataset_path: str,
         *,
+        records: Sequence[tuple[int, CodeGenerationRecord]],
+        dataset_name: str,
+        benchmark_name: str,
+        dataset_split: str,
         sampling: SamplingConfig,
-        batch_size: int = 8,
-        sample_limit: int | None = None,
-        record_indices: Sequence[int] | None = None,
-        pass_k: Iterable[int] = DEFAULT_PASS_K,
-        samples_per_task: int | None = None,
-        probe_only: bool = False,
-        attempt_keys: Sequence[AttemptKey] | None = None,
-        resume_start_index: int = 0,
-        skip_keys: set[tuple[int, int, int]] | None = None,
-        on_record: Callable[[dict], None] | None = None,
-        max_context_chars: int | None = None,
-        max_prompt_chars: int | None = None,
-        long_doc_config: LongDocEvidenceConfig | None = None,
-        prompt_profile: str = "normal",
+        batch_size: int,
+        samples_per_task: int,
+        probe_only: bool,
+        attempt_keys: Sequence[AttemptKey] | None,
+        resume_start_index: int,
+        skip_keys: set[tuple[int, int, int]] | None,
+        on_record: Callable[[dict], None] | None,
+        prompt_profile: str,
     ) -> CodingPipelineResult:
-        batch_size = max(1, int(batch_size))
-        if probe_only and (sample_limit is None or sample_limit <= 0 or sample_limit > batch_size):
-            sample_limit = batch_size
-        samples_per_task = 1 if probe_only else int(samples_per_task or max(1, max(pass_k) if pass_k else 1))
-        records, dataset_name = self._load_records(
-            dataset_path,
-            sample_limit,
-            record_indices=record_indices,
-        )
-        benchmark_name, dataset_split = dataset_slug_parts(dataset_name)
-        if not records:
-            return CodingPipelineResult(dataset_name, 0, 0, [])
-
         if probe_only:
-            prompts = []
-            probe_seeds: list[int] = []
-            for idx in range(batch_size):
-                record_idx, record = records[idx % len(records)]
-                repeat_idx = idx // len(records)
-                prompt_seed = sample_repeat_seed(record_idx, repeat_idx, stage=0)
-                prompt_text, _trace = build_swebench_prompt_with_trace(
-                    record,
-                    max_context_chars=max_context_chars,
-                    max_prompt_chars=max_prompt_chars,
-                    long_doc_config=long_doc_config,
-                    engine=self.backend,
-                    sampling=sampling,
-                    prompt_seed=prompt_seed,
+            prompts = [
+                _format_lcb_direct_prompt(
+                    records[idx % len(records)][1].prompt,
+                    records[idx % len(records)][1].starter_code,
                     prompt_profile=prompt_profile,
                 )
-                prompts.append(prompt_text)
-                probe_seeds.append(sample_repeat_seed(record_idx, repeat_idx, stage=1))
-            _ = self.backend.generate(
+                for idx in range(batch_size)
+            ]
+            self.backend.generate(
                 prompts,
                 sampling=sampling,
                 batch_size=batch_size,
-                progress_desc="Probing SWE-bench patches",
+                progress_desc="Probing direct code",
                 probe_only=True,
-                prompt_seeds=probe_seeds,
+                prompt_seeds=[
+                    sample_repeat_seed(
+                        records[idx % len(records)][0],
+                        idx // len(records),
+                        stage=1,
+                    )
+                    for idx in range(batch_size)
+                ],
             )
             return CodingPipelineResult(dataset_name, len(prompts), len(records), [])
 
@@ -929,95 +944,67 @@ class CodingPipeline:
             attempt_keys=attempt_keys,
             skip_keys=skip_keys,
         )
-        total_expected = len(expanded)
-        if resume_start_index < 0:
-            resume_start_index = 0
-        if resume_start_index:
-            if resume_start_index >= len(expanded):
-                return CodingPipelineResult(dataset_name, len(expanded), len(records), [])
+        if resume_start_index > 0:
             expanded = expanded[resume_start_index:]
-            print(
-                f"SWE-bench resume: completed {resume_start_index}/{len(records) * samples_per_task}, "
-                f"remaining {len(expanded)}"
-            )
-        entries = []
-        for key, record in expanded:
-            prompt_text, trace = build_swebench_prompt_with_trace(
-                record,
-                max_context_chars=max_context_chars,
-                max_prompt_chars=max_prompt_chars,
-                long_doc_config=long_doc_config,
-                engine=self.backend,
-                sampling=sampling,
-                prompt_profile=prompt_profile,
-                prompt_seed=sample_repeat_seed(
-                    key.sample_index,
-                    key.repeat_index,
-                    pass_index=key.pass_index,
-                    stage=0,
+        entries = [
+            (
+                _format_lcb_direct_prompt(
+                    record.prompt,
+                    record.starter_code,
+                    prompt_profile=prompt_profile,
                 ),
+                record,
+                key,
             )
-            entries.append((prompt_text, trace, record, key))
-        skipped = total_expected - len(entries)
-        if skipped > 0:
-            print(f"SWE-bench resume: skipped {skipped}/{total_expected} samples")
-
+            for key, record in expanded
+        ]
         sampling_config = normalize_sampling_config_by_stage([(1, sampling)])
         payloads: list[dict] = []
-        if entries:
-            chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
-            for start in range(0, len(entries), chunk_size):
-                chunk = entries[start : start + chunk_size]
-                prompts = [entry[0] for entry in chunk]
+        chunk_size = resolve_generation_prompt_batch_size(self.backend, batch_size)
+        for start in range(0, len(entries), chunk_size):
+            chunk = entries[start : start + chunk_size]
 
-                def _on_complete(output: GenerationOutput) -> None:
-                    local_idx = output.prompt_index
-                    if local_idx < 0 or local_idx >= len(chunk):
-                        return
-                    prompt_text, trace, _record, key = chunk[local_idx]
-                    stage = StageRecord(
-                        prompt=prompt_text,
-                        completion=output.text or "",
-                        stop_reason=output.finish_reason,
-                    )
-                    payload = SampleRecord(
-                        benchmark_name=benchmark_name,
-                        dataset_split=dataset_split,
-                        sample_index=key.sample_index,
-                        repeat_index=key.repeat_index,
-                        pass_index=key.pass_index,
-                        sampling_config=sampling_config,
-                        stages=[stage],
-                    ).as_payload()
-                    payload["_stage"] = "answer"
-                    payload["long_context"] = {"swebench": trace}
-                    if on_record is not None:
-                        on_record(payload)
-                    payloads.append(payload)
-
-                _ = self.backend.generate(
-                    prompts,
-                    sampling=sampling,
-                    batch_size=max(1, min(batch_size, len(prompts))),
-                    progress_desc="Generating SWE-bench patches",
-                    on_complete=_on_complete,
-                    prompt_seeds=[
-                        sample_repeat_seed(
-                            key.sample_index,
-                            key.repeat_index,
-                            pass_index=key.pass_index,
-                            stage=1,
+            def _on_complete(output: GenerationOutput) -> None:
+                if output.prompt_index < 0 or output.prompt_index >= len(chunk):
+                    return
+                prompt_text, _record, key = chunk[output.prompt_index]
+                payload = SampleRecord(
+                    benchmark_name=benchmark_name,
+                    dataset_split=dataset_split,
+                    sample_index=key.sample_index,
+                    repeat_index=key.repeat_index,
+                    pass_index=key.pass_index,
+                    sampling_config=sampling_config,
+                    stages=[
+                        StageRecord(
+                            prompt=prompt_text,
+                            completion=output.text,
+                            stop_reason=output.finish_reason,
                         )
-                            for _prompt_text, _trace, _record, key in chunk
                     ],
-                )
+                ).as_payload()
+                payload["_stage"] = "answer"
+                if on_record is not None:
+                    on_record(payload)
+                payloads.append(payload)
 
-        return CodingPipelineResult(
-            dataset=dataset_name,
-            sample_count=len(entries),
-            problem_count=len(records),
-            payloads=payloads,
-        )
+            self.backend.generate(
+                [entry[0] for entry in chunk],
+                sampling=sampling,
+                batch_size=max(1, min(batch_size, len(chunk))),
+                progress_desc="Generating direct code",
+                on_complete=_on_complete,
+                prompt_seeds=[
+                    sample_repeat_seed(
+                        key.sample_index,
+                        key.repeat_index,
+                        pass_index=key.pass_index,
+                        stage=1,
+                    )
+                    for _prompt, _record, key in chunk
+                ],
+            )
+        return CodingPipelineResult(dataset_name, len(entries), len(records), payloads)
 
     def _load_records(
         self,

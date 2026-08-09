@@ -4,17 +4,24 @@ import contextlib
 import faulthandler
 import io
 import linecache
-import multiprocessing
 import os
 import platform
 import signal
+import sys
 import tempfile
 import traceback
 from typing import Any, Dict, Optional
 
+from ..subprocess_runner import run_isolated
+
 
 def _format_plus_assertions(problem: Dict) -> str | None:
     """Render EvalPlus extra cases into plain asserts if possible."""
+    # Some EvalPlus cases contain integers beyond Python's default conversion
+    # guard.  Keep this at the actual assertion-construction boundary so direct
+    # callers of ``check_correctness`` are as safe as the batch evaluator.
+    if hasattr(sys, "set_int_max_str_digits"):
+        sys.set_int_max_str_digits(0)
     plus_inputs = problem.get("plus_input")
     canonical_solution = problem.get("canonical_solution")
     entry_point = problem.get("entry_point")
@@ -62,14 +69,22 @@ def _format_plus_assertions(problem: Dict) -> str | None:
     return "\n".join(lines) if lines else None
 
 
-def _build_check_program(problem: Dict, completion: str) -> str:
+_NOT_PRECOMPUTED = object()
+
+
+def _build_check_program(
+    problem: Dict,
+    completion: str,
+    plus_block: str | None | object = _NOT_PRECOMPUTED,
+) -> str:
     prompt = problem.get("prompt") or ""
     test = problem.get("test") or ""
     entry_point = problem.get("entry_point")
     if not entry_point:
         raise ValueError("entry_point 缺失，无法构造检查程序")
 
-    plus_block = _format_plus_assertions(problem)
+    if plus_block is _NOT_PRECOMPUTED:
+        plus_block = _format_plus_assertions(problem)
     if plus_block:
         combined_tests = (
             f"{test}\n\n"
@@ -126,26 +141,24 @@ def unsafe_execute(check_program: str, timeout: float, result):
 
 
 def check_correctness(
-    problem: Dict, completion: str, timeout: float, completion_id: Optional[int] = None
+    problem: Dict,
+    completion: str,
+    timeout: float,
+    completion_id: Optional[int] = None,
+    plus_block: str | None | object = _NOT_PRECOMPUTED,
 ) -> Dict:
     """Run provided completion against HumanEval tests."""
-    manager = multiprocessing.Manager()
-    result = manager.list()
-
-    check_program = _build_check_program(problem, completion)
-    proc = multiprocessing.Process(target=unsafe_execute, args=(check_program, timeout, result))
-    proc.start()
-    proc.join(timeout=timeout + 1)
-    if proc.is_alive():
-        proc.kill()
-
-    if not result:
-        result.append("timed out")
+    check_program = _build_check_program(problem, completion, plus_block)
+    result = run_isolated(
+        unsafe_execute,
+        (check_program, timeout),
+        timeout=timeout,
+    )
 
     return dict(
         task_id=problem["task_id"],
-        passed=result[0] == "passed",
-        result=result[0],
+        passed=result == "passed",
+        result=result,
         completion_id=completion_id,
     )
 

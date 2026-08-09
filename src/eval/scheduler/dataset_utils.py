@@ -9,7 +9,6 @@ from typing import Collection, Sequence
 DATASET_SLUG_ALIASES: dict[str, str] = {
     "gsm8k": "gsm8k_test",
     "math500": "math_500_test",
-    "math": "hendrycks_math_test",
     "input_data": "ifeval_test",
     "ceval_exam_test": "ceval_test",
     "mbpp": "mbpp_test",
@@ -19,7 +18,6 @@ DATASET_SLUG_ALIASES: dict[str, str] = {
     "humanevalfix": "human_eval_fix_test",
     "humaneval_cn": "human_eval_cn_test",
     "lcb": "livecodebench_test",
-    "mmmlu": "mmmlu_test",
     "cmmlu": "cmmlu_test",
 }
 

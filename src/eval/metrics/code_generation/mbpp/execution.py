@@ -4,13 +4,14 @@ import contextlib
 import faulthandler
 import io
 import linecache
-import multiprocessing
 import os
 import platform
 import signal
 import tempfile
 import traceback
 from typing import Dict, Optional
+
+from ..subprocess_runner import run_isolated
 
 
 def unsafe_execute(problem: Dict, completion: str, timeout: float, result):
@@ -72,22 +73,16 @@ def unsafe_execute(problem: Dict, completion: str, timeout: float, result):
 
 def check_correctness(problem: Dict, completion: str, timeout: float, completion_id: Optional[int] = None) -> Dict:
     """Execute MBPP tests for a completion."""
-    manager = multiprocessing.Manager()
-    result = manager.list()
-
-    proc = multiprocessing.Process(target=unsafe_execute, args=(problem, completion, timeout, result))
-    proc.start()
-    proc.join(timeout=timeout + 1)
-    if proc.is_alive():
-        proc.kill()
-
-    if not result:
-        result.append("timed out")
+    result = run_isolated(
+        unsafe_execute,
+        (problem, completion, timeout),
+        timeout=timeout,
+    )
 
     return dict(
         task_id=problem.get("task_id"),
-        passed=result[0] == "passed",
-        result=result[0],
+        passed=result == "passed",
+        result=result,
         completion_id=completion_id,
     )
 

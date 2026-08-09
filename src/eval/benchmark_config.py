@@ -2,12 +2,14 @@ from __future__ import annotations
 
 """Benchmark-level overrides loaded from configs/<model_name>/<benchmark>.toml."""
 
+import hashlib
 import os
 import tomllib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from src.eval.datasets.snapshot import read_stable_file_bytes
 from src.eval.k_values import NumericK
 from src.eval.scheduler.config import REPO_ROOT
 from src.eval.scheduler.dataset_utils import (
@@ -21,7 +23,7 @@ CONFIG_ROOT = REPO_ROOT / "configs"
 TEMPLATE_PATH = CONFIG_ROOT / "_templates.toml"
 CONFIG_OVERRIDE_ROOT_ENV = "RWKV_BENCHMARK_CONFIG_ROOT"
 
-_INT_FIELDS = {"max_generate_tokens", "top_k"}
+_INT_FIELDS = {"max_generate_tokens", "top_k", "min_think_tokens"}
 _FLOAT_FIELDS = {
     "temperature",
     "top_p",
@@ -30,6 +32,7 @@ _FLOAT_FIELDS = {
     "alpha_decay",
 }
 _TUPLE_INT_FIELDS = {"stop_tokens", "ban_tokens", "no_penalty_token_ids"}
+_TUPLE_STR_FIELDS = {"bad_words"}
 _BOOL_FIELDS = {"pad_zero"}
 _INT_FIELD_ALIASES = {"max_new_tokens": "max_generate_tokens"}
 _FLOAT_FIELD_ALIASES = {
@@ -47,7 +50,12 @@ _CONFIG_KEY_ALIASES = {
     "long_doc_query_chars": "long_context_query_chars",
 }
 
-_CONFIG_CACHE: dict[Path, tuple[float, dict[str, Any]]] = {}
+_CONFIG_CACHE: dict[Path, tuple[str, dict[str, Any]]] = {}
+_FAMILY_LONG_GENERATION_BUDGETS = {
+    "-g1g-": 6144,
+    "-g1h-": 8192,
+    "-g1i-": 8192,
+}
 
 
 @dataclass(slots=True)
@@ -123,6 +131,26 @@ def config_path_for_benchmark(benchmark_name: str, model_name: str | None = None
     return _config_path_for_root(CONFIG_ROOT, benchmark_name, None)
 
 
+def benchmark_config_source_paths(
+    dataset_slug: str,
+    model_name: str,
+) -> tuple[Path, ...]:
+    """Return every TOML file that can affect the resolved benchmark config.
+
+    The order mirrors the loader, but callers should treat this as a provenance
+    set.  Template files are included because a benchmark TOML can inherit
+    sampling and prompt fields from them.
+    """
+
+    benchmark, _ = split_benchmark_and_split(dataset_slug)
+    paths = list(_benchmark_config_paths(benchmark, model_name))
+    for root in _config_roots():
+        template_path = root / TEMPLATE_PATH.name
+        if template_path.exists() and template_path not in paths:
+            paths.append(template_path)
+    return tuple(paths)
+
+
 def _config_path_for_root(
     root: Path,
     benchmark_name: str,
@@ -187,7 +215,39 @@ def resolve_benchmark_model_config(
     if not merged:
         return None
     merged = _merge_templates(merged)
+    merged = _apply_family_generation_override(merged, model_name)
     return _parse_table(merged)
+
+
+def _apply_family_generation_override(
+    table: Mapping[str, Any],
+    model_name: str,
+) -> dict[str, Any]:
+    """Normalize long-generation budgets for the G1g/G1h/G1i score lanes.
+
+    G1g uses a 6K long-output budget, including benchmarks whose explicit
+    code template still says 8K. G1h and G1i expand legacy 4K templates to
+    8K. Short answer budgets remain untouched for all families.
+    """
+
+    merged = dict(table)
+    raw_limit = merged.get("max_generate_tokens", merged.get("max_new_tokens"))
+    try:
+        current_limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return merged
+    normalized_model = model_name.lower()
+    for marker, replacement in _FAMILY_LONG_GENERATION_BUDGETS.items():
+        if marker not in normalized_model:
+            continue
+        if marker == "-g1g-" and current_limit >= 4096:
+            merged["max_generate_tokens"] = replacement
+            merged.pop("max_new_tokens", None)
+        elif marker in {"-g1h-", "-g1i-"} and current_limit == 4096:
+            merged["max_generate_tokens"] = replacement
+            merged.pop("max_new_tokens", None)
+        break
+    return merged
 
 
 def _load_benchmark_tables(benchmark_name: str, model_name: str) -> dict[str, Mapping[str, Any]]:
@@ -231,19 +291,20 @@ def _merge_mapping(
 
 def _load_toml(path: Path) -> dict[str, Any]:
     try:
-        mtime = path.stat().st_mtime
-    except OSError:
+        raw_bytes = read_stable_file_bytes(path)
+    except FileNotFoundError:
         return {}
+    digest = hashlib.sha256(raw_bytes).hexdigest()
     cached = _CONFIG_CACHE.get(path)
-    if cached and cached[0] == mtime:
+    if cached and cached[0] == digest:
         return cached[1]
     try:
-        payload = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return {}
+        payload = tomllib.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise ValueError(f"invalid benchmark config TOML: {path}: {exc}") from exc
     if not isinstance(payload, dict):
         payload = {}
-    _CONFIG_CACHE[path] = (mtime, payload)
+    _CONFIG_CACHE[path] = (digest, payload)
     return payload
 
 
@@ -395,6 +456,8 @@ def _parse_table(table: Mapping[str, Any]) -> BenchmarkModelConfig:
             value = _coerce_float(raw)
         elif normalized_key in _TUPLE_INT_FIELDS:
             value = _coerce_int_tuple(raw)
+        elif normalized_key in _TUPLE_STR_FIELDS:
+            value = _coerce_str_tuple(raw)
         elif normalized_key in _BOOL_FIELDS:
             value = raw if isinstance(raw, bool) else None
         elif key == "pass_k":
@@ -599,6 +662,15 @@ def _coerce_str(value: Any) -> str | None:
     return None
 
 
+def _coerce_str_tuple(value: Any) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    raw_items = value if isinstance(value, (list, tuple)) else (value,)
+    if not all(isinstance(item, str) for item in raw_items):
+        return None
+    return tuple(str(item) for item in raw_items)
+
+
 def _coerce_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -716,6 +788,7 @@ def _normalize_template_names(value: str | Sequence[str]) -> tuple[str, ...]:
 
 
 __all__ = [
+    "benchmark_config_source_paths",
     "BenchmarkModelConfig",
     "config_path_for_benchmark",
     "resolve_benchmark_model_config",

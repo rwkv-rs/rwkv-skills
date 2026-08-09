@@ -574,8 +574,12 @@ class EvalDbService:
         ctx.completed_task_ids = tuple(completed_ids)
         ctx.resumable_task_ids = self._effective_resumable_task_ids(ctx.matching_tasks)
 
-        if not completed_ids and len(ctx.resumable_task_ids) == 1:
-            ctx.task_id = ctx.resumable_task_ids[0]
+        if not completed_ids and ctx.resumable_task_ids:
+            # In auto mode, repeated scheduler interruptions can leave more than
+            # one matching Running/Failed task for the same identity.  Prefer
+            # resuming the newest resumable task instead of creating yet another
+            # task and discarding usable completions.
+            ctx.task_id = ctx.resumable_task_ids[-1]
             ctx.can_resume = True
             answer_rows = self._repo.fetch_completion_keys(
                 task_id=ctx.task_id,
@@ -985,6 +989,10 @@ class EvalDbService:
         """Distinct (model, dataset) options for the score-history picker."""
         return self._repo.fetch_score_history_pairs()
 
+    def list_eval_answers_for_tasks(self, *, task_ids: list[int]) -> list[dict[str, Any]]:
+        """Evaluated answers used by dashboard-only repetition diagnostics."""
+        return self._repo.fetch_eval_answers_for_tasks(task_ids=task_ids)
+
     def get_score_history_detail(self, *, task_id: str) -> dict[str, Any] | None:
         """Score + task + representative completion context for one task."""
         tid = int(task_id)
@@ -1068,6 +1076,18 @@ class EvalDbService:
                 agent_trace = context.get("agent_trace")
                 if isinstance(agent_trace, list):
                     payload["agent_trace"] = agent_trace
+                browsecomp_plus_run = context.get("browsecomp_plus_run")
+                if isinstance(browsecomp_plus_run, dict):
+                    payload["browsecomp_plus_run"] = browsecomp_plus_run
+                metadata = context.get("metadata")
+                if isinstance(metadata, dict):
+                    payload["metadata"] = metadata
+                direct_raw_completion = context.get("direct_raw_completion")
+                if isinstance(direct_raw_completion, str):
+                    payload["direct_raw_completion"] = direct_raw_completion
+                direct_raw_finish_reason = context.get("direct_raw_finish_reason")
+                if isinstance(direct_raw_finish_reason, str):
+                    payload["direct_raw_finish_reason"] = direct_raw_finish_reason
                 long_doc = context.get("long_doc")
                 if isinstance(long_doc, dict):
                     payload["long_doc"] = long_doc
@@ -1245,6 +1265,8 @@ class EvalDbService:
             "agent_details",
             "events",
             "format_bridges",
+            "direct_raw_completion",
+            "direct_raw_finish_reason",
             "complexfuncbench_official_result",
             "official_score",
             "success",

@@ -51,6 +51,17 @@ def test_knowledge_runner_checker_is_opt_in(monkeypatch) -> None:
     assert knowledge_runner._should_run_checker(args) is False
 
 
+def test_knowledge_cot_strategy_can_be_forced_without_oracle_cascade(monkeypatch) -> None:
+    class Config:
+        knowledge_cot_strategy = "cascade_a_b"
+
+    monkeypatch.delenv("RWKV_KNOWLEDGE_COT_STRATEGY", raising=False)
+    assert knowledge_runner._resolve_knowledge_cot_strategy(Config()) == "cascade_a_b"
+
+    monkeypatch.setenv("RWKV_KNOWLEDGE_COT_STRATEGY", "two_stage")
+    assert knowledge_runner._resolve_knowledge_cot_strategy(Config()) == "two_stage"
+
+
 def test_knowledge_runner_resolves_cot_stage_sampling(monkeypatch) -> None:
     config_root = Path(__file__).resolve().parents[1] / "configs" / "g1h"
     monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", str(config_root))

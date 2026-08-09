@@ -60,7 +60,9 @@ def test_maths_prompt_builder_matches_rwkv_rs_shape() -> None:
 
 
 def test_instruction_following_prompt_builder_matches_rwkv_rs_shape() -> None:
-    assert build_instruction_following_prompt("Hello") == "User: Hello\n\nAssistant:"
+    assert build_instruction_following_prompt("Hello") == (
+        "User: Hello\n\nAssistant: <think></think>\n"
+    )
     assert build_instruction_following_prompt("Hello", enable_think=True) == "User: Hello\n\nAssistant: <think"
 
 

@@ -12,6 +12,10 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
         "multi_choice_cot_naive",
     ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.MATHS]] == [
+        "free_response_plain",
+        "free_response_plain_naive",
+        "free_response_judge_plain",
+        "free_response_judge_plain_naive",
         "free_response",
         "free_response_naive",
         "free_response_judge",
@@ -27,9 +31,9 @@ def test_runner_registry_groups_jobs_by_field_like_rwkv_rs() -> None:
         "code_mbpp",
         "code_mbpp_naive",
         "code_livecodebench",
+        "code_livecodebench_plain",
+        "code_livecodebench_plain_naive",
         "code_livecodebench_naive",
-        "code_swe_bench",
-        "code_swe_bench_naive",
     ]
     assert [runner.name for runner in RUNNERS_BY_GROUP[RunnerGroup.FUNCTION_CALLING]] == [
         "function_agent_tool_call",

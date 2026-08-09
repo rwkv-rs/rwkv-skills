@@ -37,7 +37,11 @@ _CONTEXT_LENGTH_ERROR_RE = re.compile(
     r"prompt contains at least (?P<prompt>\d+) input tokens",
     re.IGNORECASE | re.DOTALL,
 )
-_CONTEXT_LENGTH_RETRY_MARGIN_TOKENS = 16
+# vLLM's context-length error reports the prompt length as "at least N".
+# Keep a conservative retry margin so automatic budget reduction does not
+# re-hit the boundary on prompts whose server-side token count is slightly
+# above the reported lower bound.
+_CONTEXT_LENGTH_RETRY_MARGIN_TOKENS = 1024
 
 RemoteInferenceProtocol = Literal["openai", "vllm", "completions"]
 RemoteInferenceSeedPolicy = Literal["preserve", "omit"]
@@ -113,6 +117,38 @@ def _context_retry_max_tokens(exc: RemoteHTTPError, current_max_tokens: object) 
     return next_max if next_max < current else None
 
 
+def _context_retry_prompt_chars(
+    exc: RemoteHTTPError,
+    *,
+    prompt: str,
+    current_max_tokens: object,
+) -> int | None:
+    """Estimate a smaller prompt while preserving the requested output budget."""
+
+    if int(exc.status_code) != 400:
+        return None
+    match = _CONTEXT_LENGTH_ERROR_RE.search(str(exc.detail))
+    if match is None:
+        return None
+    try:
+        output_tokens = int(current_max_tokens) if current_max_tokens is not None else 0
+        context_limit = int(match.group("context"))
+        prompt_tokens = int(match.group("prompt"))
+    except (TypeError, ValueError):
+        return None
+    if output_tokens <= 0 or prompt_tokens <= 0:
+        return None
+    # Preserve a small boundary margin while keeping the caller's requested
+    # output length. The server reports a lower bound for prompt tokens, so
+    # shrink slightly more than the direct character/token ratio suggests.
+    target_prompt_tokens = context_limit - output_tokens - 64
+    if target_prompt_tokens < 1 or target_prompt_tokens >= prompt_tokens:
+        return None
+    target_chars = int(len(prompt) * target_prompt_tokens / prompt_tokens * 0.9)
+    target_chars = max(256, min(len(prompt) - 1, target_chars))
+    return target_chars if target_chars < len(prompt) else None
+
+
 def add_inference_backend_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--infer-base-url", help="OpenAI-compatible infer service base URL")
     parser.add_argument("--infer-model", help="Model name exposed by the remote infer service")
@@ -182,6 +218,10 @@ def require_completion_style_remote_protocol(
 class InferenceBackend(Protocol):
     model_name: str
 
+    def resolve_single_token_ids(self, token_texts: Sequence[str]) -> dict[str, int]:
+        """Resolve literals that encode to exactly one model token."""
+        ...
+
     def generate(
         self,
         prompts: Sequence[str],
@@ -201,6 +241,8 @@ class InferenceBackend(Protocol):
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         openai_sampling_compat: bool = False,
         show_progress: bool = True,
+        min_tokens: int | None = None,
+        context_retry_prompt_compactor: Callable[[str, int], str] | None = None,
     ) -> list[GenerationOutput]:
         """生成补全。
 
@@ -253,6 +295,9 @@ class RemoteInferenceConfig:
     def chat_completions_url(self) -> str:
         return f"{normalize_api_base_for_version(self.base_url, 'v1')}/chat/completions"
 
+    def tokenize_url(self) -> str:
+        return f"{normalize_api_root(self.base_url)}/tokenize"
+
 
 def resolve_generation_prompt_batch_size(
     backend: object,
@@ -269,10 +314,63 @@ class RemoteInferenceBackend:
     config: RemoteInferenceConfig
     _http_client: httpx.Client | None = field(default=None, init=False, repr=False)
     _http_client_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _token_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _token_prefix_ids: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    _single_token_cache: dict[str, int | None] = field(default_factory=dict, init=False, repr=False)
 
     @property
     def model_name(self) -> str:
         return self.config.model
+
+    def resolve_single_token_ids(self, token_texts: Sequence[str]) -> dict[str, int]:
+        """Resolve model-specific single-token literals through `/tokenize`.
+
+        vLLM's tokenize endpoint may prepend a model-specific BOS token even
+        when `add_special_tokens` is false.  Tokenizing the empty string gives
+        us that exact prefix, which is removed before enforcing the
+        single-token contract.  This keeps constrained decoding independent
+        of a particular tokenizer vocabulary.
+        """
+
+        requested = tuple(dict.fromkeys(str(text) for text in token_texts if str(text)))
+        if not requested:
+            return {}
+
+        def _tokenize(text: str) -> tuple[int, ...]:
+            response = self._post_json(
+                self.config.tokenize_url(),
+                {
+                    "model": self.model_name,
+                    "prompt": text,
+                    "add_special_tokens": False,
+                },
+            )
+            raw_tokens = response.get("tokens")
+            if not isinstance(raw_tokens, list):
+                raise RuntimeError("remote tokenize response is missing token ids")
+            try:
+                return tuple(int(token_id) for token_id in raw_tokens)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("remote tokenize response contains invalid token ids") from exc
+
+        with self._token_cache_lock:
+            if self._token_prefix_ids is None:
+                self._token_prefix_ids = _tokenize("")
+            prefix = self._token_prefix_ids
+            for text in requested:
+                if text in self._single_token_cache:
+                    continue
+                token_ids = _tokenize(text)
+                if prefix and token_ids[: len(prefix)] == prefix:
+                    token_ids = token_ids[len(prefix) :]
+                self._single_token_cache[text] = token_ids[0] if len(token_ids) == 1 else None
+
+            unresolved = [text for text in requested if self._single_token_cache.get(text) is None]
+            if unresolved:
+                raise RuntimeError(
+                    "choice literals are not single model tokens: " + ", ".join(repr(text) for text in unresolved)
+                )
+            return {text: int(self._single_token_cache[text]) for text in requested}  # type: ignore[arg-type]
 
     def generate(
         self,
@@ -293,6 +391,8 @@ class RemoteInferenceBackend:
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
         openai_sampling_compat: bool = False,
         show_progress: bool = True,
+        min_tokens: int | None = None,
+        context_retry_prompt_compactor: Callable[[str, int], str] | None = None,
     ) -> list[GenerationOutput]:
         effective_constraints = _resolve_effective_constraints(
             constraints=constraints,
@@ -326,6 +426,7 @@ class RemoteInferenceBackend:
             prompt_seeds=prompt_seeds,
             prompt_stop_suffixes=prompt_stop_suffixes,
             text_stop_detectors=text_stop_detectors,
+            context_retry_prompt_compactor=context_retry_prompt_compactor,
         ):
             return self._generate_completion_batches(
                 prompts,
@@ -340,6 +441,7 @@ class RemoteInferenceBackend:
                 prefill_chunk_size=prefill_chunk_size,
                 openai_sampling_compat=openai_sampling_compat,
                 show_progress=show_progress,
+                min_tokens=min_tokens,
             )
         progress = tqdm(total=len(prompts), desc=progress_desc, unit=" request", disable=not show_progress)
         try:
@@ -355,6 +457,8 @@ class RemoteInferenceBackend:
                         None if text_stop_detectors is None else text_stop_detectors[prompt_index],
                         prefill_chunk_size,
                         openai_sampling_compat,
+                        min_tokens,
+                        context_retry_prompt_compactor,
                     ): prompt_index
                     for prompt_index, prompt in enumerate(prompts)
                 }
@@ -376,7 +480,10 @@ class RemoteInferenceBackend:
         prompt_seeds: Sequence[int | None] | None,
         prompt_stop_suffixes: Sequence[Sequence[str] | None] | None,
         text_stop_detectors: Sequence[Callable[[str], bool] | None] | None,
+        context_retry_prompt_compactor: Callable[[str, int], str] | None,
     ) -> bool:
+        if context_retry_prompt_compactor is not None:
+            return False
         if self.config.protocol != "completions":
             return False
         if text_stop_detectors is not None and any(
@@ -409,6 +516,7 @@ class RemoteInferenceBackend:
         prefill_chunk_size: int,
         openai_sampling_compat: bool,
         show_progress: bool,
+        min_tokens: int | None,
     ) -> list[GenerationOutput]:
         chunk_size = max(1, int(batch_size))
         chunks = [
@@ -436,6 +544,7 @@ class RemoteInferenceBackend:
                         self._common_completion_batch_stop_suffixes(prompt_stop_suffixes),
                         prefill_chunk_size,
                         openai_sampling_compat,
+                        min_tokens,
                     ): start
                     for start, chunk in chunks
                 }
@@ -460,6 +569,7 @@ class RemoteInferenceBackend:
         stop_suffixes: Sequence[str] | None,
         prefill_chunk_size: int,
         openai_sampling_compat: bool,
+        min_tokens: int | None,
     ) -> list[GenerationOutput]:
         if not prompts:
             return []
@@ -474,6 +584,8 @@ class RemoteInferenceBackend:
             include_private_fields=include_private_fields,
             preserve_zero_penalties=self.config.protocol == "vllm",
         )
+        if min_tokens is not None:
+            payload["min_tokens"] = max(0, int(min_tokens))
         payload["prompt"] = list(prompts)
         response = self._post_json_with_context_retry(self.config.completions_url(), payload)
         choices = response.get("choices")
@@ -587,6 +699,8 @@ class RemoteInferenceBackend:
         text_stop_detector: Callable[[str], bool] | None,
         prefill_chunk_size: int,
         openai_sampling_compat: bool,
+        min_tokens: int | None,
+        context_retry_prompt_compactor: Callable[[str, int], str] | None,
     ) -> GenerationOutput:
         include_private_fields = self.config.protocol in {"vllm", "completions"} and not openai_sampling_compat
         payload = _completion_payload_from_sampling(
@@ -599,15 +713,21 @@ class RemoteInferenceBackend:
             include_private_fields=include_private_fields,
             preserve_zero_penalties=self.config.protocol == "vllm",
         )
+        if min_tokens is not None:
+            payload["min_tokens"] = max(0, int(min_tokens))
         chat_payload = _chat_payload_from_completion_payload(
             payload,
             prompt,
             include_private_fields=include_private_fields,
         )
-        if self.config.protocol == "vllm":
-            response = self._post_json_with_context_retry(self.config.chat_completions_url(), chat_payload)
-            is_chat_response = True
-        elif self.config.protocol == "completions":
+        actual_prompt = prompt
+        # Benchmark pipelines pass fully rendered prompts here.  Sending those
+        # prompts through /v1/chat/completions applies the model chat template a
+        # second time and changes the text being evaluated.  Keep ordinary
+        # generation on the raw completions endpoint for both vLLM-native and
+        # OpenAI-compatible completion protocols.  Tool-call generation has its
+        # own chat-completions path in _generate_tool_call_one.
+        if self.config.protocol in {"vllm", "completions"}:
             if text_stop_detector is not None:
                 text, finish_reason = self._stream_completion_with_context_retry(
                     self.config.completions_url(),
@@ -621,7 +741,15 @@ class RemoteInferenceBackend:
                     text=text,
                     finish_reason=finish_reason,
                 )
-            response = self._post_json_with_context_retry(self.config.completions_url(), payload)
+            if context_retry_prompt_compactor is not None:
+                response, actual_prompt = self._post_json_with_prompt_compaction_retry(
+                    self.config.completions_url(),
+                    payload,
+                    prompt=prompt,
+                    compactor=context_retry_prompt_compactor,
+                )
+            else:
+                response = self._post_json_with_context_retry(self.config.completions_url(), payload)
             is_chat_response = False
         elif self.config.prefer_chat_completions:
             try:
@@ -650,7 +778,7 @@ class RemoteInferenceBackend:
         text = _extract_chat_choice_text(choice0) if is_chat_response else _extract_completion_choice_text(choice0)
         return GenerationOutput(
             prompt_index=prompt_index,
-            prompt=prompt,
+            prompt=actual_prompt,
             token_ids=[],
             text=text,
             finish_reason=_normalize_remote_finish_reason(choice0.get("finish_reason")),
@@ -665,7 +793,10 @@ class RemoteInferenceBackend:
         request_payload = dict(payload)
         request_payload["stream"] = True
         last_context_error: RemoteHTTPError | None = None
-        for _ in range(4):
+        # Some vLLM-compatible servers refine their prompt-token lower bound
+        # across retries. Allow enough reductions to converge instead of
+        # raising the final boundary error without trying the last budget.
+        for _ in range(32):
             try:
                 return self._stream_completion(url, request_payload, text_stop_detector)
             except RemoteHTTPError as exc:
@@ -777,15 +908,15 @@ class RemoteInferenceBackend:
             parallel_tool_calls=parallel_tool_calls,
         )
         if self.config.protocol == "vllm":
-            payload.pop("frequency_penalty", None)
             payload.update(
                 {
                     "top_k": int(sampling.top_k),
-                    "repetition_penalty": (
-                        1.0
-                        if float(sampling.alpha_frequency) == 0.0
-                        else float(sampling.alpha_frequency)
-                    ),
+                    # ``alpha_frequency`` is RWKV's additive frequency
+                    # coefficient.  Sending it as vLLM's multiplicative
+                    # repetition_penalty (for example 0.1) severely distorts
+                    # logits on the rapid sampler.  Keep standard repetition
+                    # neutral and use the API's additive field instead.
+                    "repetition_penalty": 1.0,
                     "penalty_decay": float(sampling.alpha_decay),
                     "stop_token_ids": [int(token_id) for token_id in sampling.stop_tokens],
                 }
@@ -817,7 +948,8 @@ class RemoteInferenceBackend:
     def _post_json_with_context_retry(self, url: str, payload: dict[str, object]) -> dict[str, object]:
         request_payload = dict(payload)
         last_context_error: RemoteHTTPError | None = None
-        for _ in range(4):
+        # A server may refine the reported prompt lower bound across retries.
+        for _ in range(32):
             try:
                 return self._post_json(url, request_payload)
             except RemoteHTTPError as exc:
@@ -826,6 +958,39 @@ class RemoteInferenceBackend:
                     raise
                 last_context_error = exc
                 request_payload["max_tokens"] = next_max_tokens
+        assert last_context_error is not None
+        raise last_context_error
+
+    def _post_json_with_prompt_compaction_retry(
+        self,
+        url: str,
+        payload: dict[str, object],
+        *,
+        prompt: str,
+        compactor: Callable[[str, int], str],
+    ) -> tuple[dict[str, object], str]:
+        """Retry an oversized prompt without reducing its output-token budget."""
+
+        request_payload = dict(payload)
+        current_prompt = str(prompt)
+        last_context_error: RemoteHTTPError | None = None
+        for _ in range(32):
+            try:
+                return self._post_json(url, request_payload), current_prompt
+            except RemoteHTTPError as exc:
+                target_chars = _context_retry_prompt_chars(
+                    exc,
+                    prompt=current_prompt,
+                    current_max_tokens=request_payload.get("max_tokens"),
+                )
+                if target_chars is None:
+                    raise
+                compacted = str(compactor(current_prompt, target_chars) or "")
+                if not compacted or len(compacted) >= len(current_prompt):
+                    raise
+                last_context_error = exc
+                current_prompt = compacted
+                request_payload["prompt"] = current_prompt
         assert last_context_error is not None
         raise last_context_error
 
@@ -945,27 +1110,33 @@ def _completion_payload_from_sampling(
     presence_penalty = float(sampling.alpha_presence)
     if preserve_zero_penalties or presence_penalty != 0.0:
         payload["presence_penalty"] = presence_penalty if preserve_zero_penalties else nonzero(presence_penalty)
+    frequency_penalty = float(sampling.alpha_frequency)
+    if preserve_zero_penalties or frequency_penalty != 0.0:
+        payload["frequency_penalty"] = (
+            frequency_penalty if preserve_zero_penalties else nonzero(frequency_penalty)
+        )
     if seed is not None:
         payload["seed"] = int(seed)
     if stop_suffixes:
         payload["stop"] = list(stop_suffixes)
+    if sampling.bad_words:
+        payload["bad_words"] = [str(value) for value in sampling.bad_words]
     if include_private_fields:
         payload.update(
             {
                 "top_k": int(sampling.top_k),
-                "repetition_penalty": (
-                    1.0
-                    if float(sampling.alpha_frequency) == 0.0
-                    else float(sampling.alpha_frequency)
-                ),
+                "repetition_penalty": 1.0,
                 "stop_tokens": [int(token_id) for token_id in sampling.stop_tokens],
                 "stop_token_ids": [int(token_id) for token_id in sampling.stop_tokens],
                 "ban_tokens": [int(token_id) for token_id in sampling.ban_tokens or ()],
                 "pad_zero": bool(sampling.pad_zero),
                 "no_penalty_token_ids": [int(token_id) for token_id in sampling.no_penalty_token_ids],
                 "prefill_chunk_size": int(prefill_chunk_size),
+                "bad_words_min_tokens": max(0, int(sampling.min_think_tokens)),
             }
         )
+        if sampling.allowed_token_ids:
+            payload["allowed_token_ids"] = [int(token_id) for token_id in sampling.allowed_token_ids]
         if os.environ.get("RWKV_OMIT_PENALTY_DECAY") not in {"1", "true", "TRUE", "yes", "YES"}:
             payload["penalty_decay"] = float(sampling.alpha_decay)
     return payload
@@ -996,6 +1167,10 @@ def _chat_payload_from_completion_payload(
         chat_payload["seed"] = payload["seed"]
     if "stop" in payload:
         chat_payload["stop"] = payload["stop"]
+    if "bad_words" in payload:
+        chat_payload["bad_words"] = payload["bad_words"]
+    if "min_tokens" in payload:
+        chat_payload["min_tokens"] = payload["min_tokens"]
     if include_private_fields:
         if "top_k" in payload:
             chat_payload["top_k"] = payload["top_k"]
@@ -1006,6 +1181,8 @@ def _chat_payload_from_completion_payload(
             "pad_zero",
             "no_penalty_token_ids",
             "prefill_chunk_size",
+            "bad_words_min_tokens",
+            "allowed_token_ids",
         ):
             if key in payload:
                 chat_payload[key] = payload[key]

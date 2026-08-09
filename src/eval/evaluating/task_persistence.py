@@ -1,13 +1,21 @@
-from __future__ import annotations
-
 """Task persistence helpers aligned with rwkv-rs evaluating run modes."""
 
+from __future__ import annotations
+
+import json
 import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping
 
 from src.db.eval_db_service import EvalDbService, ResumeContext
+from src.eval.datasets.snapshot import (
+    bind_resume_identity,
+    validate_runtime_attestation_provenance,
+)
+
+
+STRICT_RUNTIME_PROVENANCE_ENV = "RWKV_STRICT_RUNTIME_PROVENANCE_JSON"
 
 
 class RunMode(str, Enum):
@@ -63,6 +71,20 @@ def prepare_task_execution(
     requested_mode = run_mode if isinstance(run_mode, RunMode) else RunMode.parse(run_mode)
     if run_mode is None:
         requested_mode = current_run_mode()
+    runtime_provenance = _runtime_attestation_provenance_for_model(model)
+    if runtime_provenance is not None:
+        if sampling_config is None:
+            raise ValueError(
+                "strict G1i runtime provenance requires a protocol-bound sampling config"
+            )
+        sampling_config = dict(sampling_config)
+        existing = sampling_config.get("runtime_attestation_provenance")
+        if existing is not None and existing != runtime_provenance:
+            raise ValueError("task config contains conflicting runtime attestation provenance")
+        sampling_config["runtime_attestation_provenance"] = runtime_provenance
+    bound_sampling_config = (
+        bind_resume_identity(sampling_config) if sampling_config is not None else None
+    )
 
     if requested_mode in {RunMode.RERUN, RunMode.FRESH}:
         ctx = service.get_resume_context(
@@ -70,7 +92,7 @@ def prepare_task_execution(
             model=model,
             is_param_search=is_param_search,
             job_name=job_name,
-            sampling_config=sampling_config,
+            sampling_config=bound_sampling_config,
             force_new_task=True,
         )
         task_id = service.create_task_from_context(
@@ -79,7 +101,7 @@ def prepare_task_execution(
             dataset=dataset,
             model=model,
             is_param_search=is_param_search,
-            sampling_config=sampling_config,
+            sampling_config=bound_sampling_config,
         )
         return TaskExecutionState(task_id=task_id, run_mode=requested_mode, resume_context=ctx)
 
@@ -88,7 +110,7 @@ def prepare_task_execution(
         model=model,
         is_param_search=is_param_search,
         job_name=job_name,
-        sampling_config=sampling_config,
+        sampling_config=bound_sampling_config,
         force_new_task=False,
     )
 
@@ -118,7 +140,7 @@ def prepare_task_execution(
         dataset=dataset,
         model=model,
         is_param_search=is_param_search,
-        sampling_config=sampling_config,
+        sampling_config=bound_sampling_config,
     )
     effective_mode = requested_mode
     if requested_mode is RunMode.AUTO:
@@ -132,6 +154,28 @@ def _auto_effective_mode(ctx: ResumeContext) -> RunMode:
     if ctx.can_resume:
         return RunMode.RESUME
     return RunMode.RERUN
+
+
+def _runtime_attestation_provenance_for_model(
+    model: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, object] | None:
+    source = env if env is not None else os.environ
+    raw = source.get(STRICT_RUNTIME_PROVENANCE_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("strict G1i runtime provenance is not valid JSON") from exc
+    validated = validate_runtime_attestation_provenance(payload)
+    if validated["model"] != model:
+        raise ValueError(
+            "strict G1i runtime provenance model does not match task model: "
+            f"attested={validated['model']!r} task={model!r}"
+        )
+    return validated
 
 
 def _render_task_match(ctx: ResumeContext) -> str:
@@ -148,4 +192,5 @@ __all__ = [
     "TaskExecutionState",
     "current_run_mode",
     "prepare_task_execution",
+    "STRICT_RUNTIME_PROVENANCE_ENV",
 ]

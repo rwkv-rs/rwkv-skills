@@ -60,16 +60,30 @@ _MULTI_CHOICE_JOBS = (
     "multi_choice_cot_naive",
 )
 _FREE_RESPONSE_JOBS = ("free_response",)
-_FREE_RESPONSE_NAIVE_JOBS = ("free_response", "free_response_naive")
+_FREE_RESPONSE_NAIVE_JOBS = (
+    "free_response",
+    "free_response_naive",
+    "free_response_plain",
+    "free_response_plain_naive",
+)
 _FREE_RESPONSE_JUDGE_JOBS = ("free_response_judge",)
-_FREE_RESPONSE_JUDGE_NAIVE_JOBS = ("free_response_judge", "free_response_judge_naive")
+_FREE_RESPONSE_JUDGE_NAIVE_JOBS = (
+    "free_response_judge",
+    "free_response_judge_naive",
+    "free_response_judge_plain",
+    "free_response_judge_plain_naive",
+)
 _HUMAN_EVAL_JOBS = ("code_human_eval",)
 _HUMAN_EVAL_NAIVE_JOBS = ("code_human_eval", "code_human_eval_naive")
 _MBPP_JOBS = ("code_mbpp",)
 _MBPP_NAIVE_JOBS = ("code_mbpp", "code_mbpp_naive")
 _LIVECODEBENCH_JOBS = ("code_livecodebench",)
-_LIVECODEBENCH_NAIVE_JOBS = ("code_livecodebench", "code_livecodebench_naive")
-_SWE_BENCH_JOBS = ("code_swe_bench", "code_swe_bench_naive")
+_LIVECODEBENCH_NAIVE_JOBS = (
+    "code_livecodebench",
+    "code_livecodebench_naive",
+    "code_livecodebench_plain",
+    "code_livecodebench_plain_naive",
+)
 _INSTRUCTION_FOLLOWING_JOBS = ("instruction_following", "instruction_following_naive")
 _AGENT_TOOL_CALL_JOBS = ("function_agent_tool_call",)
 _AGENT_LOOP_JOBS = ("function_agent_loop",)
@@ -141,7 +155,7 @@ def _math(
     return _metadata(
         name,
         field=BenchmarkField.MATHS,
-        cot_modes=_COT_ONLY,
+        cot_modes=_TWO_MODE_KNOWLEDGE,
         default_split=default_split,
         dataset_name=dataset_name,
         scheduler_jobs=scheduler_jobs,
@@ -172,19 +186,9 @@ def _coding_livecodebench(name: str, *, dataset_name: str | None = None) -> Benc
     return _metadata(
         name,
         field=BenchmarkField.CODING,
-        cot_modes=_COT_ONLY,
+        cot_modes=_TWO_MODE_KNOWLEDGE,
         dataset_name=dataset_name,
         scheduler_jobs=_LIVECODEBENCH_NAIVE_JOBS,
-    )
-
-
-def _coding_swe_bench(name: str, *, dataset_name: str | None = None) -> BenchmarkMetadata:
-    return _metadata(
-        name,
-        field=BenchmarkField.CODING,
-        cot_modes=_COT_ONLY,
-        dataset_name=dataset_name,
-        scheduler_jobs=_SWE_BENCH_JOBS,
     )
 
 
@@ -224,8 +228,6 @@ def _function_calling(
 
 _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     # Knowledge
-    canonical_slug("mmlu_prox"): _knowledge("mmlu_prox"),
-    canonical_slug("include"): _knowledge("include"),
     canonical_slug("arc_easy"): _knowledge("arc_easy"),
     canonical_slug("mmlu"): _knowledge("mmlu"),
     canonical_slug("openbookqa"): _knowledge("openbookqa"),
@@ -236,47 +238,32 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("mmlu_pro"): _knowledge("mmlu_pro"),
     canonical_slug("hellaswag"): _knowledge("hellaswag", default_split="validation"),
     canonical_slug("mmlu_redux"): _knowledge("mmlu_redux"),
-    canonical_slug("mmlu_cf"): _knowledge("mmlu_cf", default_split="val"),
-    canonical_slug("mmlu_sr_question_only"): _knowledge("mmlu_sr_question_only"),
     canonical_slug("winogrande"): _knowledge("winogrande", default_split="validation"),
-    canonical_slug("mmlu_sr_answer_only"): _knowledge("mmlu_sr_answer_only"),
     canonical_slug("agieval_mcq"): _knowledge("agieval_mcq"),
     canonical_slug("mmlu_sr_question_and_answer"): _knowledge("mmlu_sr_question_and_answer"),
     canonical_slug("bbh_mcq"): _knowledge("bbh_mcq"),
-    canonical_slug("mmmlu"): _knowledge("mmmlu"),
     canonical_slug("kmmlu"): _knowledge("kmmlu"),
     canonical_slug("gpqa_main"): _knowledge("gpqa_main", dataset_name="gpqa", default_split="main"),
-    canonical_slug("arabicmmlu"): _knowledge("arabicmmlu"),
     canonical_slug("gpqa_extended"): _knowledge("gpqa_extended", dataset_name="gpqa", default_split="extended"),
     canonical_slug("medqa"): _knowledge("medqa"),
     canonical_slug("gpqa_diamond"): _knowledge("gpqa_diamond", dataset_name="gpqa", default_split="diamond"),
     canonical_slug("medmcqa"): _knowledge("medmcqa", default_split="validation"),
-    canonical_slug("supergpqa"): _knowledge("supergpqa"),
     canonical_slug("arc_challenge"): _knowledge("arc_challenge"),
     # Maths / free response
     canonical_slug("aime24"): _math("aime24"),
     canonical_slug("aime25"): _math("aime25"),
-    canonical_slug("algebra222"): _math("algebra222"),
     canonical_slug("amc23"): _math("amc23", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
     canonical_slug("answer_judge"): _math("answer_judge"),
-    canonical_slug("asdiv"): _math("asdiv"),
     canonical_slug("beyond_aime"): _math("beyond_aime"),
     canonical_slug("brumo25"): _math("brumo25"),
-    canonical_slug("college_math"): _math("college_math"),
     canonical_slug("comp_math_24_25"): _math("comp_math_24_25", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
     canonical_slug("gaokao2023en"): _math("gaokao2023en", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("gsm_plus"): _math("gsm_plus"),
-    canonical_slug("gsm8k"): _math("gsm8k", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("hendrycks_math"): _math("hendrycks_math"),
-    canonical_slug("hle"): _math("hle", default_split="all"),
+    canonical_slug("gsm8k"): _math("gsm8k"),
     canonical_slug("hmmt_feb25"): _math("hmmt_feb25"),
-    canonical_slug("math_500"): _math("math_500", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
+    canonical_slug("math_500"): _math("math_500"),
     canonical_slug("math_odyssey"): _math("math_odyssey"),
-    canonical_slug("mawps"): _math("mawps"),
     canonical_slug("minerva_math"): _math("minerva_math", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("olympiadbench"): _math("olympiadbench", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("omni_math"): _math("omni_math"),
-    canonical_slug("polymath"): _math("polymath", default_split="all"),
+    canonical_slug("olympiadbench"): _math("olympiadbench"),
     canonical_slug("simpleqa"): _math("simpleqa", default_split="verified"),
     canonical_slug("svamp"): _math("svamp"),
     # Coding
@@ -287,23 +274,9 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
     canonical_slug("mbpp"): _coding_mbpp("mbpp"),
     canonical_slug("mbpp_plus"): _coding_mbpp("mbpp_plus"),
     canonical_slug("livecodebench"): _coding_livecodebench("livecodebench"),
-    canonical_slug("swe_bench"): _coding_swe_bench("swe_bench"),
-    canonical_slug("swe_bench_lite"): _coding_swe_bench("swe_bench_lite"),
-    canonical_slug("swe_bench_multilingual"): _coding_swe_bench("swe_bench_multilingual"),
-    canonical_slug("swe_bench_verified"): _coding_swe_bench("swe_bench_verified"),
-    canonical_slug("swe_bench_pro"): _coding_swe_bench("swe_bench_pro"),
-    canonical_slug("swe_bench_lite_oracle"): _coding_swe_bench("swe_bench_lite_oracle"),
-    canonical_slug("swe_bench_lite_bm25_13k"): _coding_swe_bench("swe_bench_lite_bm25_13k"),
     # Instruction following
     canonical_slug("ifeval"): _instruction_following("ifeval"),
     canonical_slug("ifbench"): _instruction_following("ifbench"),
-    canonical_slug("arena_hard_v2"): _instruction_following(
-        "arena_hard_v2",
-        dataset_name="arena_hard",
-        scheduler_jobs=(),
-    ),
-    canonical_slug("wmt24pp"): _instruction_following("wmt24pp", scheduler_jobs=()),
-    canonical_slug("flores200"): _instruction_following("flores200", default_split="devtest", scheduler_jobs=()),
     # Function calling
     canonical_slug("terminal_bench_2_1"): _function_calling(
         "terminal_bench_2_1",
@@ -344,30 +317,7 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
         "hle_with_tools",
         scheduler_jobs=_AGENT_LOOP_JOBS,
     ),
-    # Free-answer benchmarks (math/science/long-context): official form is a free
-    # response graded by an answer parser (free_response) or an LLM judge
-    # (free_response_judge), matching each benchmark's official grading.
-    canonical_slug("frontierscience_research"): _math(
-        "frontierscience_research",
-        scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS,
-    ),
-    canonical_slug("frontierscience_olympiad"): _math(
-        "frontierscience_olympiad",
-        scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS,
-    ),
-    canonical_slug("usamo_2026"): _math("usamo_2026", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("matharena_apex"): _math("matharena_apex"),
-    canonical_slug("arxivmath"): _math("arxivmath"),
-    canonical_slug("horizonmath"): _math("horizonmath"),
-    canonical_slug("hy_math"): _math("hy_math"),
     canonical_slug("hy_euler_pro"): _function_calling("hy_euler_pro", scheduler_jobs=_AGENT_LOOP_JOBS),
-    canonical_slug("imoanswerbench"): _math("imoanswerbench"),
-    canonical_slug("phybench"): _math("phybench", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("cmt_benchmark"): _math("cmt_benchmark", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("superchem"): _math("superchem", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("cl_bench"): _math("cl_bench", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("cl_bench_life"): _math("cl_bench_life", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
-    canonical_slug("aa_lcr"): _math("aa_lcr", scheduler_jobs=_FREE_RESPONSE_JUDGE_NAIVE_JOBS),
     canonical_slug("browsecomp_plus"): _function_calling(
         "browsecomp_plus",
         scheduler_jobs=_BROWSECOMP_PLUS_JOBS,
@@ -474,23 +424,14 @@ _EXPLICIT_METADATA: dict[str, BenchmarkMetadata] = {
 }
 
 BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
-    canonical_slug("swe_bench_all"): (
-        canonical_slug("swe_bench"),
-        canonical_slug("swe_bench_multilingual"),
-        canonical_slug("swe_bench_verified"),
-        canonical_slug("swe_bench_pro"),
-    ),
     canonical_slug("gpqa"): (
         canonical_slug("gpqa_main"),
         canonical_slug("gpqa_extended"),
         canonical_slug("gpqa_diamond"),
     ),
     canonical_slug("mmlu_sr"): (
-        canonical_slug("mmlu_sr_question_only"),
-        canonical_slug("mmlu_sr_answer_only"),
         canonical_slug("mmlu_sr_question_and_answer"),
     ),
-    canonical_slug("arena_hard"): (canonical_slug("arena_hard_v2"),),
     canonical_slug("longcodebench"): (canonical_slug("longcodeqa"),),
     canonical_slug("terminal_bench"): (canonical_slug("terminal_bench_2_1"),),
     canonical_slug("terminal_bench_2.1"): (canonical_slug("terminal_bench_2_1"),),
@@ -502,17 +443,6 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
     canonical_slug("hle_tools"): (canonical_slug("hle_with_tools"),),
     canonical_slug("claw_eval"): (canonical_slug("claweval"),),
     canonical_slug("wide_search"): (canonical_slug("widesearch"),),
-    canonical_slug("frontierscience"): (
-        canonical_slug("frontierscience_research"),
-        canonical_slug("frontierscience_olympiad"),
-    ),
-    canonical_slug("matharena"): (
-        canonical_slug("usamo_2026"),
-        canonical_slug("matharena_apex"),
-        canonical_slug("arxivmath"),
-    ),
-    canonical_slug("cl-bench"): (canonical_slug("cl_bench"),),
-    canonical_slug("cl-bench_life"): (canonical_slug("cl_bench_life"),),
     canonical_slug("apibank"): (
         canonical_slug("apibank_l1"),
         canonical_slug("apibank_l2"),
@@ -541,7 +471,7 @@ BENCHMARK_ALIASES: dict[str, tuple[str, ...]] = {
 
 _PREFIX_FALLBACKS: tuple[tuple[tuple[str, ...], BenchmarkMetadata], ...] = (
     (
-        ("mmlu", "cmmlu", "mmmlu", "ceval", "supergpqa"),
+        ("mmlu", "cmmlu", "ceval"),
         _knowledge("knowledge"),
     ),
     (
@@ -557,7 +487,6 @@ _PREFIX_FALLBACKS: tuple[tuple[tuple[str, ...], BenchmarkMetadata], ...] = (
         _coding_livecodebench("livecodebench"),
     ),
     (("ifeval", "ifbench"), _instruction_following("instruction_following")),
-    (("wmt24pp", "flores200"), _instruction_following("instruction_following", scheduler_jobs=())),
     (
         ("browsecomp",),
         _function_calling("browsecomp", scheduler_jobs=_BROWSECOMP_JOBS),

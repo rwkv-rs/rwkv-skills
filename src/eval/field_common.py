@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from src.eval.benchmark_registry import CoTMode
+from src.eval.datasets.snapshot import bind_resume_identity
 from src.eval.execution_plan import AvgKExecutionPlan, avg_k_metric_key, build_avg_k_execution_plan
 from src.eval.k_values import NumericK, max_generation_k
 from src.eval.metrics.at_k import compute_avg_at_k
@@ -157,6 +158,8 @@ def build_task_sampling_config(
     judger_model_name: str | None = None,
     checker_model_name: str | None = None,
     prompt_profile: str = "normal",
+    dataset_snapshot: Mapping[str, Any] | None = None,
+    protocol_bundle: Mapping[str, Any] | None = None,
 ) -> dict[str, object]:
     normalized_pass_ks = sorted(
         {
@@ -178,7 +181,11 @@ def build_task_sampling_config(
     }
     if prompt_profile != "normal":
         payload["prompt_profile"] = str(prompt_profile or "normal")
-    return payload
+    if dataset_snapshot is not None:
+        payload["dataset_snapshot"] = dict(dataset_snapshot)
+    if protocol_bundle is not None:
+        payload["protocol_bundle"] = dict(protocol_bundle)
+    return bind_resume_identity(payload)
 
 
 __all__ = [

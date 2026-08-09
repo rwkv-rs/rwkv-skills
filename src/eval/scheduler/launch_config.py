@@ -100,7 +100,6 @@ class SchedulerLaunchRequest:
     disable_checker: bool = False
     coding_eval_workers: int | None = None
     max_active_coding_runners: int | None = None
-    coding_swebench_max_prompt_chars: int | None = None
     math_judge_max_workers: int | None = None
     math_prompt_max_chars: int | None = None
     math_long_doc_mode: str | None = None
@@ -308,11 +307,6 @@ class SchedulerLaunchRequest:
                 max_active_runners=(
                     int(self.max_active_coding_runners)
                     if self.max_active_coding_runners is not None
-                    else None
-                ),
-                swebench_max_prompt_chars=(
-                    int(self.coding_swebench_max_prompt_chars)
-                    if self.coding_swebench_max_prompt_chars is not None
                     else None
                 ),
             ),
@@ -536,7 +530,6 @@ def _flatten_profile_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
         "coding": {
             "eval_workers": "coding_eval_workers",
             "max_active_runners": "max_active_coding_runners",
-            "swebench_max_prompt_chars": "coding_swebench_max_prompt_chars",
         },
         "math": {
             "judge_max_workers": "math_judge_max_workers",

@@ -25,7 +25,7 @@ def test_truthfulqa_mc1_registry_and_scheduler_use_validation_split() -> None:
     assert all(slug in JOB_CATALOGUE[name].dataset_slugs for name in metadata.scheduler_jobs)
 
 
-def test_truthfulqa_mc1_parser_uses_single_positive_label() -> None:
+def test_truthfulqa_mc1_parser_deterministically_shuffles_single_positive_label() -> None:
     record = _parse_row(
         {
             "question": "Which option is truthful?",
@@ -38,8 +38,21 @@ def test_truthfulqa_mc1_parser_uses_single_positive_label() -> None:
         "https://example.test/source",
     )
 
-    assert record["answer"] == "C"
-    assert [record[label] for label in "ABC"] == ["False", "Also false", "Truthful"]
+    repeated = _parse_row(
+        {
+            "question": "Which option is truthful?",
+            "mc1_targets": {
+                "choices": ["False", "Also false", "Truthful"],
+                "labels": [0, 0, 1],
+            },
+        },
+        "Misconceptions and urban legends",
+        "https://example.test/source",
+    )
+
+    assert record == repeated
+    assert sorted(record[label] for label in "ABC") == ["Also false", "False", "Truthful"]
+    assert record[record["answer"]] == "Truthful"
     assert record["subject"] == "misconceptions_and_urban_legends"
     assert record["source_category"] == "Misconceptions and urban legends"
 

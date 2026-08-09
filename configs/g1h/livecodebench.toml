@@ -6,6 +6,8 @@ report_avg_k = [4]
 
 [cot]
 template = "full_code_cot_default"
+max_generate_tokens = 4096
 
 [final]
 template = "full_code_final_default"
+max_generate_tokens = 3072

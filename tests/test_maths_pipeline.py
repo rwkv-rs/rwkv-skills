@@ -3,15 +3,57 @@ from __future__ import annotations
 import json
 
 from src.eval.tasks.maths.pipeline import (
+    FINAL_BOXED_STOP_SUFFIXES,
     FREE_RESPONSE_STOP_TOKENS,
     G1H_GENERATION_STOP_SUFFIXES,
     G1H_REMOTE_STOP_SUFFIXES,
     LEGACY_GENERATION_STOP_SUFFIXES,
     FreeResponsePipeline,
+    _output_stats,
+    _prompt_stop_suffixes,
 )
 from src.eval.metrics import free_response as fr
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.infer.sampling import GenerationOutput, SamplingConfig
+
+
+def test_output_stats_does_not_claim_remote_empty_token_ids_are_zero() -> None:
+    stats = _output_stats(
+        GenerationOutput(
+            prompt_index=0,
+            prompt="User✿Q✿\nBot✿<think>",
+            token_ids=[],
+            text="a long remote completion",
+            finish_reason="max_tokens",
+        )
+    )
+
+    assert stats["truncated"] is True
+    assert stats["stop_reason_class"] == 2
+    assert stats["generated_token_count"] is None
+
+
+def test_final_boxed_prompt_uses_text_stops_that_survive_token_merges() -> None:
+    legacy_final = "work\nTherefore, the answer is \\(\\boxed{"
+    # Build the prompt from the production marker constants so this test also
+    # remains stable in checkouts containing the historical mojibake marker.
+    production_g1h_final = (
+        f"{G1H_REMOTE_STOP_SUFFIXES[2]}Q\n{G1H_REMOTE_STOP_SUFFIXES[4]}"
+        "<think>work</think>\nTherefore, the answer is \\(\\boxed{"
+    )
+    g1h_final = "Userâœ¿Qâœ¿\nBotâœ¿<think>work</think>\nTherefore, the answer is \\(\\boxed{"
+
+    assert _prompt_stop_suffixes([legacy_final]) == [
+        (*LEGACY_GENERATION_STOP_SUFFIXES, *FINAL_BOXED_STOP_SUFFIXES)
+    ]
+    assert _prompt_stop_suffixes([g1h_final]) == [
+        (*LEGACY_GENERATION_STOP_SUFFIXES, *FINAL_BOXED_STOP_SUFFIXES)
+    ]
+    assert _prompt_stop_suffixes([production_g1h_final]) == [
+        (*G1H_REMOTE_STOP_SUFFIXES, *FINAL_BOXED_STOP_SUFFIXES)
+    ]
+    assert "}\\)" in FINAL_BOXED_STOP_SUFFIXES
+    assert "}" not in FINAL_BOXED_STOP_SUFFIXES
 
 
 def _patch_math_verify(monkeypatch) -> None:
@@ -79,6 +121,8 @@ def test_free_response_pipeline_generates_single_full_response_stage(tmp_path) -
             "stats": {
                 "truncated": False,
                 "stop_detail": "stop_token",
+                "stop_reason_class": 1,
+                "termination_reason": "stop",
                 "generated_token_count": 1,
             },
             "_stage": "answer",
@@ -205,6 +249,9 @@ def test_free_response_pipeline_generates_cot_then_final_answer(tmp_path) -> Non
     assert len(backend.calls) == 2
     assert backend.calls[0]["sampling"].stop_tokens == FREE_RESPONSE_STOP_TOKENS
     assert backend.calls[1]["sampling"].stop_tokens == (0, 2402)
+    assert backend.calls[1]["prompt_stop_suffixes"] == [
+        (*LEGACY_GENERATION_STOP_SUFFIXES, *FINAL_BOXED_STOP_SUFFIXES)
+    ]
     assert backend.calls[1]["prompts"] == [
         "User: solve\n2+5?\n\nAssistant: <think</think>\nwork\nTherefore, the answer is \\(\\boxed{"
     ]

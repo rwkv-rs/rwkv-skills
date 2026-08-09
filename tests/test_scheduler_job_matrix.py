@@ -18,11 +18,8 @@ from src.eval.scheduler.jobs import (
     locate_dataset,
 )
 from src.eval.scheduler.actions import (
-    CodingConfig,
-    FunctionCallingConfig,
     QueueOptions,
-    _coding_extra_args,
-    _function_calling_extra_args,
+    _NO_GENERATION_SLOT_RELEASE_JOBS,
     _running_remote_slot_slugs,
 )
 from src.eval.scheduler.state import RunningEntry
@@ -32,16 +29,10 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert "multi_choice_fake_cot" not in JOB_CATALOGUE
     assert "code_mbpp_fake_cot" not in JOB_CATALOGUE
     assert "code_mbpp_cot" not in JOB_CATALOGUE
-    assert "code_swe_bench" in JOB_CATALOGUE
-    assert "code_swe_bench_naive" in JOB_CATALOGUE
 
     assert JOB_CATALOGUE["multi_choice_plain"].runner_group is RunnerGroup.KNOWLEDGE
     assert JOB_CATALOGUE["free_response"].runner_group is RunnerGroup.MATHS
     assert JOB_CATALOGUE["code_mbpp"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench"].domain == "code"
-    assert JOB_CATALOGUE["code_swe_bench_naive"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench_naive"].domain == "code"
     assert JOB_CATALOGUE["function_agent_tool_call"].runner_group is RunnerGroup.FUNCTION_CALLING
     assert JOB_CATALOGUE["function_mcp_bench"].runner_group is RunnerGroup.FUNCTION_CALLING
     assert JOB_CATALOGUE["multi_choice_plain"].module == "src.eval.tasks.knowledge.runner"
@@ -51,8 +42,6 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["code_human_eval"].module == "src.eval.tasks.coding.runner"
     assert JOB_CATALOGUE["code_mbpp"].module == "src.eval.tasks.coding.runner"
     assert JOB_CATALOGUE["code_livecodebench"].module == "src.eval.tasks.coding.runner"
-    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.tasks.coding.runner"
-    assert JOB_CATALOGUE["code_swe_bench_naive"].module == "src.eval.tasks.coding.runner"
     assert JOB_CATALOGUE["instruction_following"].module == "src.eval.tasks.instruction_following.runner"
     assert JOB_CATALOGUE["instruction_following_naive"].module == "src.eval.tasks.instruction_following.runner"
     assert JOB_CATALOGUE["function_agent_tool_call"].module == "src.eval.tasks.function_calling.runner"
@@ -75,66 +64,37 @@ def test_job_catalogue_exposes_legacy_aligned_coding_jobs() -> None:
     assert JOB_CATALOGUE["free_response_judge"].extra_args == ("--judge-mode", "llm")
     assert JOB_CATALOGUE["code_mbpp"].extra_args == ("--cot-mode", "no_cot")
     assert JOB_CATALOGUE["function_agent_tool_call"].extra_args == ("--candidate-router-mode", "auto")
-    assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
-    assert canonical_slug("swe_bench_multilingual_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
-    assert canonical_slug("swe_bench_pro_test") in JOB_CATALOGUE["code_swe_bench"].dataset_slugs
-    assert canonical_slug("swe_bench_lite_test") in JOB_CATALOGUE["code_swe_bench_naive"].dataset_slugs
     assert canonical_slug("widesearch_test") in JOB_CATALOGUE["function_agent_loop"].dataset_slugs
     assert JOB_CATALOGUE["function_agent_loop"].extra_args == ()
-    assert detect_job_from_dataset(canonical_slug("swe_bench_lite_test"), is_cot=True) == "code_swe_bench"
     assert detect_job_from_dataset(canonical_slug("widesearch_test"), is_cot=True) == "function_agent_loop"
     assert JOB_CATALOGUE["instruction_following"].extra_args == ()
     assert JOB_CATALOGUE["instruction_following_naive"].extra_args == ("--prompt-profile", "naive")
 
 
-def test_swe_bench_coding_jobs_do_not_receive_function_prompt_flags(tmp_path: Path) -> None:
-    opts = QueueOptions(
-        log_dir=tmp_path / "logs",
-        pid_dir=tmp_path / "pids",
-        job_order=tuple(JOB_CATALOGUE.keys()),
-        functions=FunctionCallingConfig(
-            prompt_style="rwkv-official-json",
-            tool_catalog_format="json",
-        ),
-    )
-
-    assert JOB_CATALOGUE["code_swe_bench"].runner_group is RunnerGroup.CODING
-    assert JOB_CATALOGUE["code_swe_bench"].module == "src.eval.tasks.coding.runner"
-    assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench"]) == ()
-    assert _function_calling_extra_args(opts, JOB_CATALOGUE["code_swe_bench_naive"]) == ()
-    assert "--prompt-style" in _function_calling_extra_args(opts, JOB_CATALOGUE["function_bfcl_v3"])
-
-
-def test_swe_bench_coding_jobs_receive_prompt_budget(tmp_path: Path) -> None:
-    opts = QueueOptions(
-        log_dir=tmp_path / "logs",
-        pid_dir=tmp_path / "pids",
-        job_order=tuple(JOB_CATALOGUE.keys()),
-        coding=CodingConfig(eval_workers=2, swebench_max_prompt_chars=18000),
-    )
-
-    assert _coding_extra_args(opts, JOB_CATALOGUE["code_swe_bench"]) == (
-        "--eval-workers",
-        "2",
-        "--swebench-max-prompt-chars",
-        "18000",
-    )
-    assert "--swebench-max-prompt-chars" not in _coding_extra_args(opts, JOB_CATALOGUE["code_human_eval"])
-
-
 def test_generated_remote_jobs_do_not_occupy_model_slots() -> None:
     running = {
-        "code_swe_bench__swe_bench_lite_test_cot_rwkv7_g1": RunningEntry(pid=1, gpu=None),
+        "code_human_eval__human_eval_test_nocot_rwkv7_g1": RunningEntry(pid=1, gpu=None),
         "function_bfcl_v3__bfcl_v3_test_cot_rwkv7_g2": RunningEntry(pid=2, gpu=None),
     }
 
     occupied = _running_remote_slot_slugs(
         running,
         ("g1=rwkv7-g1", "g2=rwkv7-g2"),
-        generated_job_ids={"code_swe_bench__swe_bench_lite_test_cot_rwkv7_g1"},
+        generated_job_ids={"code_human_eval__human_eval_test_nocot_rwkv7_g1"},
     )
 
     assert occupied == {"g2"}
+
+
+def test_maths_jobs_never_release_a_remote_slot_before_the_runner_exits() -> None:
+    # Strategy A can reach effective_sample_count while the same runner still
+    # performs B/C requests. Releasing here would mix runners on one endpoint.
+    assert {
+        "free_response",
+        "free_response_naive",
+        "free_response_judge",
+        "free_response_judge_naive",
+    } <= _NO_GENERATION_SLOT_RELEASE_JOBS
 
 
 def test_instruction_following_matrix_includes_rule_scored_datasets_only() -> None:
@@ -146,27 +106,24 @@ def test_instruction_following_matrix_includes_rule_scored_datasets_only() -> No
 
 
 def test_scheduler_matrix_uses_metadata_default_splits() -> None:
-    assert canonical_slug("include_test") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
-    for variant in ("question_only", "answer_only", "question_and_answer"):
-        slug = canonical_slug(f"mmlu_sr_{variant}_test")
-        assert slug in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
-        assert slug in JOB_CATALOGUE["multi_choice_cot"].dataset_slugs
-        assert slug in JOB_CATALOGUE["multi_choice_plain_naive"].dataset_slugs
-        assert slug in JOB_CATALOGUE["multi_choice_cot_naive"].dataset_slugs
-        assert DATASET_PREP_SPECS[slug].dataset == f"mmlu_sr_{variant}"
-        assert DATASET_PREP_SPECS[slug].split == "test"
+    slug = canonical_slug("mmlu_sr_question_and_answer_test")
+    assert slug in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
+    assert slug in JOB_CATALOGUE["multi_choice_cot"].dataset_slugs
+    assert slug in JOB_CATALOGUE["multi_choice_plain_naive"].dataset_slugs
+    assert slug in JOB_CATALOGUE["multi_choice_cot_naive"].dataset_slugs
+    assert DATASET_PREP_SPECS[slug].dataset == "mmlu_sr_question_and_answer"
+    assert DATASET_PREP_SPECS[slug].split == "test"
     assert canonical_slug("gpqa_main") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("gpqa_extended") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("gpqa_diamond") in JOB_CATALOGUE["multi_choice_plain"].dataset_slugs
     assert canonical_slug("simpleqa_verified") in JOB_CATALOGUE["free_response"].dataset_slugs
-    assert canonical_slug("polymath_all") in JOB_CATALOGUE["free_response"].dataset_slugs
-    assert canonical_slug("gsm8k_test") in JOB_CATALOGUE["free_response_judge"].dataset_slugs
+    for slug in ("gsm8k_test", "math_500_test", "olympiadbench_test"):
+        assert canonical_slug(slug) in JOB_CATALOGUE["free_response"].dataset_slugs
+        assert canonical_slug(slug) not in JOB_CATALOGUE["free_response_judge"].dataset_slugs
 
 
 def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     gpqa_spec = DATASET_PREP_SPECS[canonical_slug("gpqa_diamond")]
-    include_spec = DATASET_PREP_SPECS[canonical_slug("include_test")]
-    polymath_spec = DATASET_PREP_SPECS[canonical_slug("polymath_all")]
     tau2_spec = DATASET_PREP_SPECS[canonical_slug("tau2_bench_airline_base")]
     tau3_spec = DATASET_PREP_SPECS[canonical_slug("tau3_bench_banking_knowledge_base")]
     complex_spec = DATASET_PREP_SPECS[canonical_slug("complexfuncbench_official_test")]
@@ -174,10 +131,6 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
 
     assert gpqa_spec.dataset == "gpqa"
     assert gpqa_spec.split == "diamond"
-    assert include_spec.dataset == "include"
-    assert include_spec.split == "test"
-    assert polymath_spec.dataset == "polymath"
-    assert polymath_spec.split == "all"
     assert tau2_spec.dataset == "tau2_bench_airline"
     assert tau2_spec.split == "base"
     assert tau3_spec.dataset == "tau3_bench_banking_knowledge"
@@ -186,8 +139,6 @@ def test_dataset_prep_specs_follow_benchmark_metadata_splits() -> None:
     assert complex_spec.split == "test"
     assert complex_subset_spec.dataset == "complexfuncbench_subset"
     assert complex_subset_spec.split == "test"
-    assert DATASET_PREP_SPECS[canonical_slug("swe_bench_multilingual_test")].dataset == "swe_bench_multilingual"
-    assert DATASET_PREP_SPECS[canonical_slug("swe_bench_pro_test")].dataset == "swe_bench_pro"
     assert DATASET_PREP_SPECS[canonical_slug("terminal_bench_2_1_test")].dataset == "terminal_bench_2_1"
     assert DATASET_PREP_SPECS[canonical_slug("hle_with_tools_test")].dataset == "hle_with_tools"
     assert canonical_slug("tau2_bench_airline_base") in CODE_DATASET_SLUGS
@@ -340,8 +291,6 @@ def test_function_calling_jobs_cover_browsecomp_and_mcp_bench() -> None:
     assert canonical_slug("widesearch_test") in agent_loop_slugs
     assert canonical_slug("mcp_atlas_test") in agent_loop_slugs
     assert canonical_slug("terminal_bench_2_1_test") in agent_loop_slugs
-    assert canonical_slug("matharena_apex_test") in JOB_CATALOGUE["free_response"].dataset_slugs
-    assert canonical_slug("aa_lcr_test") in JOB_CATALOGUE["free_response_judge"].dataset_slugs
     assert canonical_slug("browsecomp_test") in browsecomp_slugs
     assert canonical_slug("browsecomp_zh_test") in browsecomp_slugs
     assert canonical_slug("longbench_test") in longbench_slugs

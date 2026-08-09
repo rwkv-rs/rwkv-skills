@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Prepare the three MMLU-SR symbol-replacement variants from raw CSV files.
+"""Prepare the selected MMLU-SR Question+Answer representative set.
 
 The upstream CSV files intentionally have no header.  Reading the generated
 Hugging Face parquet configs would drop the first example from every subject,
@@ -20,7 +20,7 @@ from .mmlu import _SUBCATEGORIES as _MMLU_SUBCATEGORIES
 
 _DATASET_ID = "NiniCat/MMLU-SR"
 _DATASET_REVISION = "2c0b9096737078969a0af2b548e0f7682271fff1"
-_VARIANTS = ("question_only", "answer_only", "question_and_answer")
+_VARIANTS = ("question_and_answer",)
 _CHOICE_LETTERS = ("A", "B", "C", "D")
 _REQUIRED_FIELDS = ("question", "answer", *_CHOICE_LETTERS)
 
@@ -122,22 +122,6 @@ def _prepare_variant_spec(
     )
 
 
-@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_sr_question_only")
-def prepare_mmlu_sr_question_only_spec(
-    output_root: Path,
-    split: str = "test",
-) -> HfRepoJsonlDatasetSpec:
-    return _prepare_variant_spec("question_only", output_root, split)
-
-
-@MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_sr_answer_only")
-def prepare_mmlu_sr_answer_only_spec(
-    output_root: Path,
-    split: str = "test",
-) -> HfRepoJsonlDatasetSpec:
-    return _prepare_variant_spec("answer_only", output_root, split)
-
-
 @MULTIPLE_CHOICE_REGISTRY.register_spec("mmlu_sr_question_and_answer")
 def prepare_mmlu_sr_question_and_answer_spec(
     output_root: Path,
@@ -147,7 +131,5 @@ def prepare_mmlu_sr_question_and_answer_spec(
 
 
 __all__ = [
-    "prepare_mmlu_sr_answer_only_spec",
     "prepare_mmlu_sr_question_and_answer_spec",
-    "prepare_mmlu_sr_question_only_spec",
 ]

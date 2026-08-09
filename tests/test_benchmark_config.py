@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from src.eval.benchmark_config import (
     config_path_for_benchmark,
     resolve_benchmark_model_config,
@@ -8,6 +11,25 @@ from src.eval.benchmark_config import (
 from src.eval.results.schema import sampling_config_to_dict
 from src.infer.sampling import SamplingConfig
 from src.eval import benchmark_config
+
+
+def test_config_cache_is_content_addressed_not_mtime_addressed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "demo.toml"
+    path.write_text("[default]\ntarget_samples = 10\n")
+    benchmark_config._CONFIG_CACHE.clear()  # type: ignore[attr-defined]
+    first = benchmark_config._load_toml(path)  # type: ignore[attr-defined]
+    original = path.stat()
+
+    # Keep the exact old mtime while changing the semantics. An mtime cache
+    # would silently reuse the first table and bind the wrong protocol.
+    path.write_text("[default]\ntarget_samples = 20\n")
+    os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    second = benchmark_config._load_toml(path)  # type: ignore[attr-defined]
+
+    assert first["default"]["target_samples"] == 10
+    assert second["default"]["target_samples"] == 20
 
 
 def test_config_path_for_benchmark_strips_split_suffix() -> None:
@@ -27,6 +49,123 @@ def test_resolve_math_500_cot_config_merges_default_and_template() -> None:
     assert config.sampling_overrides["top_k"] == 40
     assert config.sampling_overrides["temperature"] == 0.8
     assert config.sampling_overrides["stop_tokens"] == (0,)
+
+
+def test_g1g_g1h_and_g1i_expand_legacy_4k_generation_budget() -> None:
+    g1g = resolve_benchmark_model_config(
+        "math_500_test",
+        "rwkv7-g1g-7.2b-20260523-ctx8192",
+        stage="cot",
+    )
+    g1h = resolve_benchmark_model_config(
+        "math_500_test",
+        "rwkv7-g1h-7.2b-20260710-ctx10240",
+        stage="cot",
+    )
+    g1i = resolve_benchmark_model_config(
+        "math_500_test",
+        "rwkv7-g1i-7.2b-20260805-ctx16384",
+        stage="cot",
+    )
+
+    assert g1g is not None
+    assert g1h is not None
+    assert g1i is not None
+    assert g1g.sampling_overrides["max_generate_tokens"] == 6144
+    assert g1h.sampling_overrides["max_generate_tokens"] == 8192
+    assert g1i.sampling_overrides["max_generate_tokens"] == 8192
+
+
+def test_g1g_and_g1h_mbpp_use_same_frontend_avg8_metric(monkeypatch) -> None:
+    monkeypatch.delenv("RWKV_BENCHMARK_CONFIG_ROOT", raising=False)
+    g1g = resolve_benchmark_model_config(
+        "mbpp_test",
+        "rwkv7-g1g-2.9b-20260526-ctx8192",
+        stage="no_cot",
+    )
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", "configs/g1h")
+    g1h = resolve_benchmark_model_config(
+        "mbpp_test",
+        "rwkv7-g1h-2.9b-20260710-ctx10240",
+        stage="no_cot",
+    )
+
+    assert g1g is not None
+    assert g1h is not None
+    assert g1g.avg_k == g1h.avg_k == (8,)
+    assert g1g.report_avg_k == g1h.report_avg_k == (8,)
+
+
+def test_g1h_olympiadbench_uses_larger_final_answer_budget(monkeypatch) -> None:
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", "configs/g1h")
+    config = resolve_sampling_config(
+        "olympiadbench_test",
+        "rwkv7-g1h-13.3b-20260710-ctx10240",
+        stage="final",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 512
+
+
+def test_g1h_answer_judge_cot_keeps_minimum_think_guard(monkeypatch) -> None:
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", "configs/g1h")
+    config = resolve_sampling_config(
+        "answer_judge_test",
+        "rwkv7-g1h-1.5b-20260710-ctx10240",
+        stage="cot",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 8192
+    assert config.min_think_tokens == 16
+    assert config.bad_words == ("</think>",)
+    assert config.stop_tokens == (0,)
+
+
+def test_generation_budget_override_leaves_other_limits_unchanged() -> None:
+    config = resolve_sampling_config(
+        "livecodebench_test",
+        "rwkv7-g1h-7.2b-20260710-ctx10240",
+        stage="final",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 8192
+
+
+def test_g1g_caps_explicit_8k_long_generation_budget_at_6k() -> None:
+    config = resolve_sampling_config(
+        "livecodebench_test",
+        "rwkv7-g1g-7.2b-20260523-ctx8192",
+        stage="final",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 6144
+
+
+def test_g1g_keeps_short_generation_budget_unchanged() -> None:
+    config = resolve_sampling_config(
+        "human_eval_test",
+        "rwkv7-g1g-7.2b-20260523-ctx8192",
+        stage="code",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 1024
+
+
+def test_g1h_math_odyssey_final_answer_budget_is_512(monkeypatch) -> None:
+    monkeypatch.setenv("RWKV_BENCHMARK_CONFIG_ROOT", "configs/g1h")
+    config = resolve_sampling_config(
+        "math_odyssey_test",
+        "rwkv7-g1h-1.5b-20260710-ctx10240",
+        stage="final",
+    )
+
+    assert config is not None
+    assert config.max_generate_tokens == 512
 
 
 def test_resolve_livecodebench_final_sampling_config_uses_code_template() -> None:
@@ -113,6 +252,7 @@ def test_sampling_config_to_dict_uses_rwkv_rs_field_names() -> None:
             alpha_presence=1.0,
             alpha_frequency=0.1,
             alpha_decay=0.99,
+            allowed_token_ids=(300, 301),
         )
     )
 
@@ -120,5 +260,6 @@ def test_sampling_config_to_dict_uses_rwkv_rs_field_names() -> None:
     assert payload["presence_penalty"] == 1.0
     assert payload["repetition_penalty"] == 0.1
     assert payload["penalty_decay"] == 0.99
+    assert payload["allowed_token_ids"] == [300, 301]
     assert "max_generate_tokens" not in payload
     assert "alpha_presence" not in payload

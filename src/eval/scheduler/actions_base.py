@@ -58,11 +58,16 @@ from src.eval.runner_registry import RunnerGroup
 _SAMPLE_WORKER_JOB_NAMES = frozenset({"function_bfcl_v3", "function_browsecomp_plus"})
 _NO_GENERATION_SLOT_RELEASE_JOBS = frozenset(
     {
+        # Math A/B/C uses the same remote endpoint after strategy A reaches
+        # ``effective_sample_count``. Releasing the slot at that intermediate
+        # point launches a second runner into the same endpoint.
+        "free_response",
+        "free_response_naive",
+        "free_response_judge",
+        "free_response_judge_naive",
         "code_human_eval_naive",
         "code_mbpp_naive",
         "code_livecodebench_naive",
-        "code_swe_bench",
-        "code_swe_bench_naive",
     }
 )
 
@@ -126,7 +131,6 @@ class FunctionCallingConfig:
 class CodingConfig:
     eval_workers: int | None = None
     max_active_runners: int | None = None
-    swebench_max_prompt_chars: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

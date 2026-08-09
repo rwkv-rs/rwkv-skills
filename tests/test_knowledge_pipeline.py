@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
 from src.eval.metrics.multi_choice import (
     evaluate_multiple_choice,
@@ -19,6 +21,15 @@ class _FallbackOnlyBackend:
         self.text = text
         self.generate_calls: list[list[str]] = []
         self.generate_batch_sizes: list[int] = []
+        self.text_stop_detectors: list[object] = []
+        self.min_tokens: list[int | None] = []
+        self.samplings: list[SamplingConfig] = []
+        self.resolved_token_texts: list[tuple[str, ...]] = []
+
+    def resolve_single_token_ids(self, token_texts):
+        texts = tuple(str(text) for text in token_texts)
+        self.resolved_token_texts.append(texts)
+        return {text: 300 + ord(text[-1]) - ord("A") for text in texts}
 
     def generate(
         self,
@@ -33,10 +44,13 @@ class _FallbackOnlyBackend:
         text_stop_detectors=None,
         prefill_chunk_size=16,
         show_progress=True,
+        min_tokens=None,
     ):
-        del text_stop_detectors
         self.generate_calls.append(list(prompts))
         self.generate_batch_sizes.append(int(batch_size))
+        self.text_stop_detectors.append(text_stop_detectors)
+        self.min_tokens.append(min_tokens)
+        self.samplings.append(sampling)
         outputs = [
             GenerationOutput(
                 prompt_index=index,
@@ -51,10 +65,6 @@ class _FallbackOnlyBackend:
             for output in outputs:
                 on_complete(output)
         return outputs
-
-    def score_choice_tokens(self, *, prompt: str, choice_token_texts):
-        raise AssertionError("multiple-choice generation should not read logits")
-
 
 class _ScriptedBackend(_FallbackOnlyBackend):
     def __init__(self, texts: list[str]) -> None:
@@ -95,6 +105,9 @@ def test_multiple_choice_pipeline_generates_choice_by_default(tmp_path) -> None:
     assert result.payloads[0]["completion1"] == " B"
     assert result.payloads[0]["stop_reason1"] == "generated_choice"
     assert len(backend.generate_calls) == 1
+    assert backend.min_tokens == [1]
+    assert backend.samplings[0].max_generate_tokens == 1
+    assert backend.samplings[0].allowed_token_ids == (300, 301, 302, 303)
 
 
 def test_multiple_choice_pipeline_batches_generation(tmp_path) -> None:
@@ -232,6 +245,67 @@ def test_multiple_choice_pipeline_marks_invalid_generation_wrong(tmp_path) -> No
     assert metrics.accuracy == 0.0
 
 
+def test_multiple_choice_replay_prefers_raw_completion_over_stale_extraction(tmp_path) -> None:
+    dataset_path = tmp_path / "arc_easy_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "Which choice is correct?",
+                "A": "first",
+                "B": "second",
+                "C": "third",
+                "D": "fourth",
+                "answer": "C",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "sample_index": 0,
+        "repeat_index": 0,
+        "pass_index": 0,
+        # This is the historical adapter bug we are repairing.
+        "completion1": " A",
+        "direct_raw_completion": " (C).\nThe third option is correct.",
+    }
+
+    metrics = evaluate_multiple_choice([payload], dataset_path=dataset_path)
+
+    assert metrics.accuracy == 1.0
+    assert metrics.payloads[0]["answer"] == "C"
+
+
+def test_multiple_choice_replay_accepts_leading_label_with_explanation(tmp_path) -> None:
+    dataset_path = tmp_path / "mmlu_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "question": "Pick four.",
+                "A": "0",
+                "B": "4",
+                "C": "2",
+                "D": "6",
+                "answer": "B",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "sample_index": 0,
+        "repeat_index": 0,
+        "pass_index": 0,
+        "completion1": " A",
+        "direct_raw_completion": " B. 4.",
+    }
+
+    metrics = evaluate_multiple_choice([payload], dataset_path=dataset_path)
+
+    assert metrics.accuracy == 1.0
+    assert metrics.payloads[0]["answer"] == "B"
+
+
 def test_multiple_choice_cot_generates_final_answer_by_default(tmp_path) -> None:
     dataset_path = tmp_path / "mmlu_pro_demo_test.jsonl"
     dataset_path.write_text(
@@ -358,11 +432,32 @@ def test_multiple_choice_cot_extracts_chinese_final_answer(tmp_path) -> None:
     assert len(backend.generate_calls) == 1
 
 
-def test_answer_after_think_uses_first_formal_answer() -> None:
+def test_answer_after_think_uses_last_explicit_answer_and_handles_truncation() -> None:
     text = ">reasoning</think>\nThe correct answer is **B. 4**\ncontinued text\nFinal answer: C"
 
-    assert extract_answer_after_think(text, 4) == "B"
-    assert extract_answer_after_think("Final answer: B", 4) == ""
+    assert extract_answer_after_think(text, 4) == "C"
+    assert extract_answer_after_think("Final answer: B", 4) == "B"
+    assert extract_answer_after_think("reasoning mentions A, then concludes: final answer is D", 4) == "D"
+
+
+def test_cascade_cot_does_not_stop_at_an_early_answer_marker(tmp_path) -> None:
+    dataset_path = tmp_path / "gpqa_diamond_test.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {"question": "2+2=?", "A": "3", "B": "4", "C": "5", "D": "6", "answer": "B"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend(text=">reasoning</think>\nFinal answer: B")
+
+    MultipleChoicePipeline(backend).run_chain_of_thought(
+        str(dataset_path),
+        cot_sampling=SamplingConfig(max_generate_tokens=32),
+        answer_strategy="cascade_a_b",
+    )
+
+    assert backend.text_stop_detectors == [None]
 
 
 def test_multiple_choice_cascade_routes_only_strategy_a_failure_to_b(tmp_path) -> None:
@@ -398,6 +493,137 @@ def test_multiple_choice_cascade_routes_only_strategy_a_failure_to_b(tmp_path) -
     metrics = evaluate_multiple_choice_cascade(result.payloads, dataset_path=dataset_path)
 
     assert len(backend.generate_calls) == 3
+    assert (
+        ">fresh reasoning without a final answer\n</think>\nTherefore, the answer is"
+        in backend.generate_calls[2][0]
+    )
     assert metrics.metrics_by_group["strategy_a"]["exact_accuracy"] == 0.0
     assert metrics.metrics_by_group["strategy_b"]["exact_accuracy"] == 1.0
     assert metrics.metrics_by_group["strategy_b"]["rescued"] == 1.0
+    assert result.payloads[0]["format_bridges"] == {
+        "strategy_b_final_raw_completion": " B",
+        "strategy_b_final_raw_stop_reason": "stop_token",
+        "strategy_b_final_extracted_letter": "B",
+    }
+
+
+def test_generated_choice_accepts_exact_option_text() -> None:
+    pipeline = MultipleChoicePipeline(_ScriptedBackend([]))
+
+    assert pipeline._extract_generated_choice_letter(
+        " Spironolactone",
+        ["Furosemide", "Spironolactone", "Digoxin", "Aspirin"],
+    ) == "B"
+
+
+def test_generated_choice_accepts_unique_option_text_in_answer_sentence() -> None:
+    pipeline = MultipleChoicePipeline(_ScriptedBackend([]))
+
+    assert pipeline._extract_generated_choice_letter(
+        "The correct answer is the Pre-Botzinger complex.",
+        ["Pons", "Pre-Botzinger complex", "Medulla", "Cerebellum"],
+    ) == "B"
+
+
+def test_generated_choice_accepts_compact_chinese_answer_markers() -> None:
+    pipeline = MultipleChoicePipeline(_ScriptedBackend([]))
+    choices = ["甲", "乙", "丙", "丁"]
+
+    assert pipeline._extract_generated_choice_letter("选项C。", choices) == "C"
+    assert pipeline._extract_generated_choice_letter("答案为D", choices) == "D"
+
+
+def test_generated_choice_keeps_letter_and_rejects_ambiguous_option_text() -> None:
+    pipeline = MultipleChoicePipeline(_ScriptedBackend([]))
+    choices = ["alpha", "alpha beta", "gamma", "delta"]
+
+    assert pipeline._extract_generated_choice_letter(" D", choices) == "D"
+    assert pipeline._extract_generated_choice_letter("The answer is alpha beta.", choices) == ""
+    assert pipeline._extract_generated_choice_letter("unrelated prose", choices) == ""
+
+
+def test_generated_choice_does_not_take_last_letter_from_prose() -> None:
+    pipeline = MultipleChoicePipeline(_ScriptedBackend([]))
+    choices = ["alpha", "beta", "gamma", "delta"]
+
+    assert pipeline._extract_generated_choice_letter("(C) explanation, then Option A appears", choices) == ""
+
+
+def test_direct_generation_groups_mixed_choice_counts_for_constraints(tmp_path) -> None:
+    dataset_path = tmp_path / "mixed_choices_test.jsonl"
+    dataset_path.write_text(
+        "\n".join(
+            (
+                json.dumps({"question": "q1", "A": "a", "B": "b", "answer": "A"}),
+                json.dumps(
+                    {
+                        "question": "q2",
+                        "A": "a",
+                        "B": "b",
+                        "C": "c",
+                        "D": "d",
+                        "answer": "B",
+                    }
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    backend = _FallbackOnlyBackend(text=" A")
+
+    result = MultipleChoicePipeline(backend).run_direct(str(dataset_path), batch_size=8)
+
+    assert result.sample_count == 2
+    assert [sampling.allowed_token_ids for sampling in backend.samplings] == [
+        (300, 301),
+        (300, 301, 302, 303),
+    ]
+
+
+def test_choice_sampling_protocol_persists_exact_tokenizer_mapping() -> None:
+    backend = _FallbackOnlyBackend()
+    protocol = MultipleChoicePipeline(backend).resolve_choice_sampling_protocol(
+        [4, 2, 4]
+    )
+
+    assert backend.resolved_token_texts == [(" A", " B"), (" A", " B", " C", " D")]
+    assert protocol["schema_version"] == "rwkv.knowledge-direct-sampling.v1"
+    assert protocol["tokenizer_identity"]["model"] == "remote-openai"
+    assert protocol["tokenizer_identity"]["token_text_to_id"] == {
+        " A": 300,
+        " B": 301,
+        " C": 302,
+        " D": 303,
+    }
+    four_choice = protocol["by_choice_count"]["4"]
+    assert four_choice["letter_to_token_id"] == {
+        "A": 300,
+        "B": 301,
+        "C": 302,
+        "D": 303,
+    }
+    assert four_choice["allowed_token_ids"] == [300, 301, 302, 303]
+    assert four_choice["sampling"]["max_new_tokens"] == 1
+    assert four_choice["sampling"]["temperature"] == 1.0
+    assert four_choice["sampling"]["top_k"] == 1
+
+
+def test_choice_sampling_protocol_rejects_duplicate_or_drifting_token_ids() -> None:
+    class DuplicateBackend(_FallbackOnlyBackend):
+        def resolve_single_token_ids(self, token_texts):
+            return {str(text): 300 for text in token_texts}
+
+    with pytest.raises(RuntimeError, match="distinct tokens"):
+        MultipleChoicePipeline(DuplicateBackend()).resolve_choice_sampling_protocol([4])
+
+    class DriftingBackend(_FallbackOnlyBackend):
+        def resolve_single_token_ids(self, token_texts):
+            texts = tuple(str(text) for text in token_texts)
+            offset = 100 if len(texts) > 2 else 0
+            return {
+                text: 300 + offset + ord(text[-1]) - ord("A") for text in texts
+            }
+
+    with pytest.raises(RuntimeError, match="changed across choice counts"):
+        MultipleChoicePipeline(DriftingBackend()).resolve_choice_sampling_protocol([2, 4])

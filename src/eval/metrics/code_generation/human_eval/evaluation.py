@@ -10,7 +10,7 @@ import numpy as np
 import tqdm
 
 from .data import read_problems, stream_jsonl, write_jsonl
-from .execution import check_correctness
+from .execution import _format_plus_assertions, check_correctness
 
 
 def estimate_pass_at_k(
@@ -50,6 +50,14 @@ def evaluate_functional_correctness(
         sys.set_int_max_str_digits(0)  # 0 -> disable limit
 
     problems = read_problems(problem_file)
+    # HumanEval+ has many candidates per problem.  Building its additional
+    # assertions executes the canonical solution across every plus_input, so
+    # doing that once per candidate creates a severe, entirely redundant CPU
+    # tail.  The assertions depend only on the problem, never on the candidate.
+    plus_assertions = {
+        task_id: _format_plus_assertions(problem)
+        for task_id, problem in problems.items()
+    }
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = []
@@ -60,7 +68,13 @@ def evaluate_functional_correctness(
         for sample in tqdm.tqdm(stream_jsonl(sample_file), desc="Reading samples"):
             task_id = sample["task_id"]
             completion = sample["completion"]
-            args = (problems[task_id], completion, timeout, completion_id[task_id])
+            args = (
+                problems[task_id],
+                completion,
+                timeout,
+                completion_id[task_id],
+                plus_assertions[task_id],
+            )
             futures.append(executor.submit(check_correctness, *args))
             completion_id[task_id] += 1
             n_samples += 1

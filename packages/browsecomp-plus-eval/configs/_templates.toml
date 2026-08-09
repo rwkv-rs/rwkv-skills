@@ -1,0 +1,129 @@
+[math_cot_default]
+cot_prompt_template = """User: Solve the problem using one clean solution path. Keep each step concise. Put the complete final answer inside \\(\\boxed{...}\\), preserving every required component such as ordered pairs, fractions, degree symbols, units,names, or expressions. Do not return only the first component. Do not use a choice letter unless the problem asks for a letter. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)
+<Q>
+
+Assistant: <think"""
+max_generate_tokens = 4096
+temperature = 0.8
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
+alpha_decay = 0.99
+stop_tokens = [0]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[code_default]
+max_generate_tokens = 1024
+temperature = 0.8
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [0, 261, 6884, 21214, 24281]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[full_code_cot_default]
+max_generate_tokens = 8192
+temperature = 0.8
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [0]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[full_code_final_default]
+max_generate_tokens = 8192
+temperature = 0.8
+top_k = 50
+top_p = 0.6
+alpha_presence = 0.25
+alpha_frequency = 0.25
+alpha_decay = 0.996
+stop_tokens = [6884, 21214]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[free_response_cot_default]
+cot_prompt_template = """User: Solve the problem using one clean solution path. Keep each step concise. Put the complete final answer inside \\(\\boxed{...}\\), preserving every required component such as ordered pairs, fractions, degree symbols, units,names, or expressions. Do not return only the first component. Do not use a choice letter unless the problem asks for a letter. Do not restart, repeat, enumerate alternative methods, or re-check solved cases. If the reasoning starts to loop, stop and give the best final answer. (think)
+<Q>
+
+Assistant: <think"""
+max_generate_tokens = 4096
+temperature = 0.8
+top_k = 40
+top_p = 0.35
+alpha_presence = 0.65
+alpha_frequency = 0.25
+alpha_decay = 0.99
+stop_tokens = [0]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[free_response_final_default]
+final_prompt_template = """<Q><COT>
+Therefore, the answer is \\(\\boxed{"""
+max_generate_tokens = 128
+temperature = 0.8
+top_k = 8
+top_p = 0.30
+alpha_presence = 1e-5
+alpha_frequency = 1e-5
+alpha_decay = 0.99
+stop_tokens = [0, 2402, 4910]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[function_call_cot_default]
+max_generate_tokens = 2048
+temperature = 0.8
+top_k = 200
+top_p = 1e-5
+alpha_presence = 1e-5
+alpha_frequency = 1e-5
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[function_call_default]
+template = "function_call_cot_default"
+
+[instruction_following_default]
+max_generate_tokens = 4096
+temperature = 0.8
+top_k = 50
+top_p = 0.3
+alpha_presence = 0.5
+alpha_frequency = 0.5
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]
+
+[multi_choice_cot_default]
+max_generate_tokens = 4096
+temperature = 0.8
+top_k = 50
+top_p = 0.3
+alpha_presence = 1.0
+alpha_frequency = 0.1
+alpha_decay = 0.99
+stop_tokens = [0, 261, 24281]
+pad_zero = true
+ban_tokens = []
+no_penalty_token_ids = [33, 10, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58]

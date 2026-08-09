@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
 from src.eval.benchmark_registry import (
     ALL_BENCHMARKS,
     AUTO_TARGET_ATTEMPTS,
-    BENCHMARK_ALIASES,
     BENCHMARKS_BY_FIELD,
     BenchmarkField,
     CoTMode,
@@ -33,43 +34,10 @@ def test_mmlu_metadata_is_two_mode_knowledge_zeroshot() -> None:
     assert metadata.target_eval_attempts == AUTO_TARGET_ATTEMPTS
 
 
-def test_mmlu_sr_metadata_and_group_alias_are_explicit() -> None:
-    expected_names = (
-        "mmlu_sr_question_only",
-        "mmlu_sr_answer_only",
-        "mmlu_sr_question_and_answer",
-    )
+def test_mmlu_sr_uses_only_question_and_answer_representative_set() -> None:
+    metadata = resolve_benchmark_metadata("mmlu_sr_question_and_answer_test")
 
-    for name in expected_names:
-        metadata = resolve_benchmark_metadata(f"{name}_test")
-        assert metadata.name == name
-        assert metadata.field is BenchmarkField.KNOWLEDGE
-        assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
-        assert metadata.default_split == "test"
-        assert metadata.scheduler_jobs == (
-            "multi_choice_plain",
-            "multi_choice_cot",
-            "multi_choice_plain_naive",
-            "multi_choice_cot_naive",
-        )
-
-    assert expand_benchmark_alias("mmlu_sr") == expected_names
-
-    from src.dashboard.core.domains import DOMAIN_MMLU, domain_for_benchmark_field
-
-    assert (
-        domain_for_benchmark_field(
-            BenchmarkField.KNOWLEDGE,
-            dataset_slug="mmlu_sr_question_and_answer_test",
-        )
-        == DOMAIN_MMLU
-    )
-
-
-def test_include_defaults_to_knowledge_test_split() -> None:
-    metadata = resolve_benchmark_metadata("include_test")
-
-    assert metadata.name == "include"
+    assert metadata.name == "mmlu_sr_question_and_answer"
     assert metadata.field is BenchmarkField.KNOWLEDGE
     assert metadata.default_split == "test"
     assert metadata.scheduler_jobs == (
@@ -78,6 +46,7 @@ def test_include_defaults_to_knowledge_test_split() -> None:
         "multi_choice_plain_naive",
         "multi_choice_cot_naive",
     )
+    assert expand_benchmark_alias("mmlu_sr") == ("mmlu_sr_question_and_answer",)
 
 
 def test_gpqa_variants_use_explicit_catalog_entries_with_shared_dataset_source() -> None:
@@ -117,28 +86,9 @@ def test_mbpp_family_is_legacy_no_cot_only() -> None:
     assert not supports_cot_mode("mbpp_plus_test", CoTMode.COT)
 
 
-def test_swe_bench_family_is_coding_cot_only_with_naive_variant() -> None:
-    metadata = resolve_benchmark_metadata("swe_bench_lite_test")
-    multilingual = resolve_benchmark_metadata("swe_bench_multilingual_test")
-    pro = resolve_benchmark_metadata("swe_bench_pro_test")
-
-    assert metadata.field is BenchmarkField.CODING
-    assert metadata.cot_modes == (CoTMode.COT,)
-    assert metadata.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
-    assert multilingual.field is BenchmarkField.CODING
-    assert multilingual.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
-    assert pro.field is BenchmarkField.CODING
-    assert pro.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
-    assert supports_cot_mode("swe_bench_lite_test", CoTMode.COT)
-    assert not supports_cot_mode("swe_bench_lite_test", CoTMode.NO_COT)
-    assert multilingual.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
-    assert pro.scheduler_jobs == ("code_swe_bench", "code_swe_bench_naive")
-
-
 def test_function_calling_benchmarks_are_cot_only() -> None:
     agent_tool_call = resolve_benchmark_metadata("widesearch_test")
     terminal_bench = resolve_benchmark_metadata("terminal_bench_2_1_test")
-    matharena_apex = resolve_benchmark_metadata("matharena_apex_test")
     browsecomp = resolve_benchmark_metadata("browsecomp_zh_test")
     complexfuncbench = resolve_benchmark_metadata("complexfuncbench_official_test")
     complexfuncbench_subset = resolve_benchmark_metadata("complexfuncbench_subset_test")
@@ -166,8 +116,6 @@ def test_function_calling_benchmarks_are_cot_only() -> None:
     assert agent_tool_call.cot_modes == (CoTMode.COT,)
     assert agent_tool_call.scheduler_jobs == ("function_agent_loop",)
     assert terminal_bench.scheduler_jobs == ("function_agent_loop",)
-    assert matharena_apex.field is BenchmarkField.MATHS
-    assert matharena_apex.scheduler_jobs == ("free_response", "free_response_naive")
     assert browsecomp.field is BenchmarkField.FUNCTION_CALLING
     assert browsecomp.cot_modes == (CoTMode.COT,)
     assert browsecomp.scheduler_jobs == ("function_browsecomp",)
@@ -230,33 +178,12 @@ def test_instruction_following_benchmarks_are_no_cot_only() -> None:
     assert metadata.scheduler_jobs == ("instruction_following", "instruction_following_naive")
 
 
-def test_instruction_following_data_only_benchmarks_do_not_use_ifeval_scorer() -> None:
-    flores = resolve_benchmark_metadata("flores200_devtest")
-    arena = resolve_benchmark_metadata("arena_hard_test")
-    wmt = resolve_benchmark_metadata("wmt24pp_test")
-
-    assert flores.field is BenchmarkField.INSTRUCTION_FOLLOWING
-    assert flores.default_split == "devtest"
-    assert flores.scheduler_jobs == ()
-    assert arena.field is BenchmarkField.INSTRUCTION_FOLLOWING
-    assert arena.scheduler_jobs == ()
-    assert wmt.field is BenchmarkField.INSTRUCTION_FOLLOWING
-    assert wmt.scheduler_jobs == ()
-
-
 def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
-    assert expand_benchmark_alias("swe_bench_all") == (
-        "swe_bench",
-        "swe_bench_multilingual",
-        "swe_bench_verified",
-        "swe_bench_pro",
-    )
     assert expand_benchmark_alias("gpqa") == (
         "gpqa_main",
         "gpqa_extended",
         "gpqa_diamond",
     )
-    assert BENCHMARK_ALIASES["arena_hard"] == ("arena_hard_v2",)
     assert expand_benchmark_alias("tau_bench") == (
         "tau_bench_retail",
         "tau_bench_airline",
@@ -277,44 +204,48 @@ def test_benchmark_aliases_expand_rwkv_rs_style_group_names() -> None:
         "apibank_level2",
     )
     assert expand_benchmark_alias("terminal_bench") == ("terminal_bench_2_1",)
-    assert expand_benchmark_alias("frontierscience") == (
-        "frontierscience_research",
-        "frontierscience_olympiad",
-    )
-    assert expand_benchmark_alias("matharena") == ("usamo_2026", "matharena_apex", "arxivmath")
 
 
-def test_simpleqa_defaults_to_cot_only_maths() -> None:
+def test_simpleqa_supports_direct_and_cot_maths() -> None:
     metadata = resolve_benchmark_metadata("simpleqa_verified")
 
     assert metadata.field is BenchmarkField.MATHS
-    assert metadata.cot_modes == (CoTMode.COT,)
+    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
     assert metadata.default_split == "verified"
-    assert metadata.scheduler_jobs == ("free_response", "free_response_naive")
+    assert metadata.scheduler_jobs == (
+        "free_response",
+        "free_response_naive",
+        "free_response_plain",
+        "free_response_plain_naive",
+    )
     assert metadata.n_shots == (0,)
     assert metadata.pass_ks == ()
 
 
-def test_polymath_defaults_to_all_split_maths() -> None:
-    metadata = resolve_benchmark_metadata("polymath_all")
-
-    assert metadata.name == "polymath"
-    assert metadata.field is BenchmarkField.MATHS
-    assert metadata.default_split == "all"
-    assert metadata.scheduler_jobs == ("free_response", "free_response_naive")
-
-
-def test_judge_only_math_benchmarks_route_to_judge_runner() -> None:
-    metadata = resolve_benchmark_metadata("gsm8k_test")
+@pytest.mark.parametrize("dataset", ["gsm8k_test", "math_500_test", "olympiadbench_test"])
+def test_parser_grade_math_benchmarks_route_to_exact_runner(dataset: str) -> None:
+    metadata = resolve_benchmark_metadata(dataset)
 
     assert metadata.field is BenchmarkField.MATHS
-    assert metadata.scheduler_jobs == ("free_response_judge", "free_response_judge_naive")
+    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
+    assert metadata.scheduler_jobs == (
+        "free_response",
+        "free_response_naive",
+        "free_response_plain",
+        "free_response_plain_naive",
+    )
+
+
+def test_livecodebench_supports_direct_and_cot_modes() -> None:
+    metadata = resolve_benchmark_metadata("livecodebench_test")
+
+    assert metadata.cot_modes == (CoTMode.NO_COT, CoTMode.COT)
+    assert "code_livecodebench_plain_naive" in metadata.scheduler_jobs
 
 
 def test_catalog_names_are_not_polluted_by_dataset_slug_aliases() -> None:
     assert resolve_benchmark_metadata("mbpp_test").name == "mbpp"
     assert resolve_benchmark_metadata("cmmlu_test").name == "cmmlu"
-    assert resolve_benchmark_metadata("mmmlu_test").name == "mmmlu"
 
 
 def test_benchmarks_are_grouped_by_field_like_rwkv_rs() -> None:
@@ -329,3 +260,11 @@ def test_benchmarks_are_grouped_by_field_like_rwkv_rs() -> None:
     assert any(item.name == "gsm8k" for item in maths)
     assert any(item.name == "human_eval" for item in coding)
     assert all(item.field is BenchmarkField.KNOWLEDGE for item in knowledge)
+
+
+def test_non_fc_catalog_is_exactly_the_strict46_set() -> None:
+    assert len(BENCHMARKS_BY_FIELD[BenchmarkField.KNOWLEDGE]) == 21
+    assert len(BENCHMARKS_BY_FIELD[BenchmarkField.MATHS]) == 16
+    assert len(BENCHMARKS_BY_FIELD[BenchmarkField.CODING]) == 7
+    assert len(BENCHMARKS_BY_FIELD[BenchmarkField.INSTRUCTION_FOLLOWING]) == 2
+    assert len(BENCHMARKS_BY_FIELD[BenchmarkField.FUNCTION_CALLING]) == 62

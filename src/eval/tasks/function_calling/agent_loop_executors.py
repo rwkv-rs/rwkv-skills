@@ -350,25 +350,66 @@ class ShellSandboxExecutor:
             else:
                 if self._dockerfile_context:
                     self._ensure_docker_image()
-                subprocess.run(
-                    [
-                        "docker",
-                        "run",
-                        "-d",
-                        "--rm",
-                        "--name",
-                        name,
-                        *_docker_proxy_env_args(),
-                        self._image,
-                        "sleep",
-                        "infinity",
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                elif str(
+                    os.environ.get(
+                        "RWKV_AGENT_LOOP_DOCKER_PULL_BEFORE_RUN", ""
+                    )
+                ).strip().lower() in {"1", "true", "yes", "on"}:
+                    self._ensure_registry_image()
+                docker_run = [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--rm",
+                    "--name",
+                    name,
+                    *(
+                        ["--network", "none"]
+                        if str(
+                            os.environ.get(
+                                "RWKV_AGENT_LOOP_DOCKER_NETWORK_NONE", ""
+                            )
+                        ).strip().lower()
+                        in {"1", "true", "yes", "on"}
+                        else []
+                    ),
+                    *_docker_proxy_env_args(),
+                    self._image,
+                    "sleep",
+                    "infinity",
+                ]
+                attempts = _positive_env_int(
+                    "RWKV_AGENT_LOOP_DOCKER_RUN_RETRIES",
+                    3,
                 )
+                last_output = ""
+                for attempt in range(1, attempts + 1):
+                    proc = subprocess.run(
+                        docker_run,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if proc.returncode == 0:
+                        break
+                    last_output = (proc.stdout + "\n" + proc.stderr).strip()
+                    subprocess.run(
+                        ["docker", "rm", "-f", name],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if attempt < attempts:
+                        time.sleep(min(30.0, 5.0 * attempt))
+                else:
+                    raise RuntimeError(
+                        "docker run failed after "
+                        f"{attempts} attempt(s): {last_output[-4000:]}"
+                    )
                 self._container_id = name
             self._container_id = name
             for item in self._docker_copy_paths:
@@ -386,17 +427,54 @@ class ShellSandboxExecutor:
         if not source.exists():
             raise ValueError(f"docker_copy_paths source does not exist: {source}")
         assert self._container_id is not None
-        proc = subprocess.run(
-            ["docker", "cp", str(source), f"{self._container_id}:{dst}"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
+        lock_path = self._docker_lock_path("container-copy-global")
+        with lock_path.open("w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            attempts = _positive_env_int(
+                "RWKV_AGENT_LOOP_DOCKER_CP_RETRIES",
+                5,
+            )
+            last_output = ""
+            for attempt in range(1, attempts + 1):
+                proc = subprocess.run(
+                    [
+                        "docker",
+                        "cp",
+                        str(source),
+                        f"{self._container_id}:{dst}",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    return
+                last_output = (proc.stdout + "\n" + proc.stderr).strip()
+                subprocess.run(
+                    [
+                        "docker",
+                        "exec",
+                        self._container_id,
+                        "rm",
+                        "-rf",
+                        "--",
+                        dst,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                if attempt < attempts:
+                    time.sleep(min(30.0, 5.0 * attempt))
+        raise RuntimeError(
+            "docker cp failed after "
+            f"{attempts} attempt(s) for {source} -> {dst}: "
+            f"{last_output[-2000:]}"
         )
-        if proc.returncode != 0:
-            output = (proc.stdout + "\n" + proc.stderr).strip()
-            raise RuntimeError(f"docker cp failed for {source} -> {dst}: {output[-2000:]}")
 
     def _ensure_docker_image(self) -> None:
         assert self._image is not None
@@ -426,6 +504,151 @@ class ShellSandboxExecutor:
             timeout=max(300.0, self._timeout_s),
             action=f"docker build for {self._image} from {context}",
         )
+
+    def _ensure_registry_image(self) -> None:
+        assert self._image is not None
+        if self._docker_image_exists(self._image):
+            return
+        lock_path = self._docker_lock_path("registry-pull-global")
+        with lock_path.open("w", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            if self._docker_image_exists(self._image):
+                return
+            attempts = _positive_env_int(
+                "RWKV_AGENT_LOOP_DOCKER_PULL_RETRIES",
+                8,
+            )
+            pull_timeout_s = float(
+                _positive_env_int(
+                    "RWKV_AGENT_LOOP_DOCKER_PULL_TIMEOUT_S",
+                    1800,
+                )
+            )
+            load_timeout_s = float(
+                _positive_env_int(
+                    "RWKV_AGENT_LOOP_DOCKER_LOAD_TIMEOUT_S",
+                    1800,
+                )
+            )
+            mirror_prefix = str(
+                os.environ.get("RWKV_AGENT_LOOP_DOCKER_MIRROR_PREFIX", "")
+            ).strip().rstrip("/")
+            source_image = (
+                f"{mirror_prefix}/{self._image}"
+                if mirror_prefix
+                else self._image
+            )
+            crane_path = str(
+                os.environ.get("RWKV_AGENT_LOOP_CRANE_PATH", "")
+            ).strip()
+            last_output = ""
+            for attempt in range(1, attempts + 1):
+                if crane_path:
+                    tar_path = (
+                        Path(tempfile.gettempdir())
+                        / f"rwkv-agent-image-{uuid.uuid4().hex}.tar"
+                    )
+                    crane_env = dict(os.environ)
+                    for proxy_name in _PROXY_ENV_NAMES:
+                        crane_env.pop(proxy_name, None)
+                    crane_proxy = str(
+                        os.environ.get(
+                            "RWKV_AGENT_LOOP_CRANE_PROXY", ""
+                        )
+                    ).strip()
+                    if crane_proxy:
+                        crane_env["HTTP_PROXY"] = crane_proxy
+                        crane_env["HTTPS_PROXY"] = crane_proxy
+                    try:
+                        proc = subprocess.run(
+                            [
+                                crane_path,
+                                "pull",
+                                "--platform",
+                                "linux/amd64",
+                                source_image,
+                                str(tar_path),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=pull_timeout_s,
+                            check=False,
+                            env=crane_env,
+                        )
+                        if proc.returncode == 0:
+                            proc = subprocess.run(
+                                ["docker", "load", "--input", str(tar_path)],
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=load_timeout_s,
+                                check=False,
+                            )
+                    except subprocess.TimeoutExpired as exc:
+                        last_output = (
+                            f"attempt {attempt} timed out after "
+                            f"{float(exc.timeout):.0f}s for {source_image}"
+                        )
+                        if attempt < attempts:
+                            time.sleep(min(60.0, 10.0 * attempt))
+                        continue
+                    finally:
+                        tar_path.unlink(missing_ok=True)
+                else:
+                    try:
+                        proc = subprocess.run(
+                            ["docker", "pull", source_image],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=pull_timeout_s,
+                            check=False,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        last_output = (
+                            f"attempt {attempt} timed out after "
+                            f"{float(exc.timeout):.0f}s for {source_image}"
+                        )
+                        if attempt < attempts:
+                            time.sleep(min(60.0, 10.0 * attempt))
+                        continue
+                if proc.returncode == 0:
+                    if source_image != self._image:
+                        tag_proc = subprocess.run(
+                            ["docker", "tag", source_image, self._image],
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            check=False,
+                        )
+                        if tag_proc.returncode != 0:
+                            last_output = (
+                                tag_proc.stdout + "\n" + tag_proc.stderr
+                            ).strip()
+                        else:
+                            subprocess.run(
+                                ["docker", "image", "rm", source_image],
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                check=False,
+                            )
+                            return
+                    else:
+                        return
+                last_output = (proc.stdout + "\n" + proc.stderr).strip()
+                if attempt < attempts:
+                    time.sleep(min(60.0, 10.0 * attempt))
+            raise RuntimeError(
+                "docker pull failed after "
+                f"{attempts} attempt(s) for {source_image}: {last_output[-4000:]}"
+            )
 
     def _start_docker_compose(self, container_name: str) -> None:
         assert self._image is not None

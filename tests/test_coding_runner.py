@@ -4,6 +4,7 @@ import pytest
 
 from src.eval.benchmark_registry import CoTMode
 from src.eval.tasks.coding import runner as coding_runner
+from src.infer.sampling import SamplingConfig
 
 
 def test_coding_runner_parser_accepts_benchmark_kind_and_cot_mode() -> None:
@@ -48,6 +49,36 @@ def test_coding_runner_rejects_non_legacy_mbpp_cot_modes() -> None:
         coding_runner._resolve_cot_mode(coding_runner.CodingBenchmarkKind.MBPP, CoTMode.COT.value)
 
 
+def test_livecodebench_accepts_direct_nocot_mode() -> None:
+    assert (
+        coding_runner._resolve_cot_mode(
+            coding_runner.CodingBenchmarkKind.LIVECODEBENCH,
+            CoTMode.NO_COT.value,
+        )
+        is CoTMode.NO_COT
+    )
+
+    sampling = SamplingConfig(max_generate_tokens=32)
+    payload = coding_runner._sampling_payload(
+        coding_runner.CodingBenchmarkKind.LIVECODEBENCH,
+        CoTMode.NO_COT,
+        cot_sampling=sampling,
+    )
+    assert set(payload) == {"stage1"}
+
+
+@pytest.mark.parametrize(
+    "kind, expected",
+    [
+        (coding_runner.CodingBenchmarkKind.HUMAN_EVAL, True),
+        (coding_runner.CodingBenchmarkKind.MBPP, True),
+        (coding_runner.CodingBenchmarkKind.LIVECODEBENCH, True),
+    ],
+)
+def test_coding_runner_uses_raw_completions_for_literal_prefill(kind, expected) -> None:
+    assert coding_runner._requires_completion_style_remote(kind) is expected
+
+
 @pytest.mark.parametrize(
     "dataset_slug",
     [
@@ -66,38 +97,3 @@ def test_coding_runner_treats_human_eval_variants_as_human_eval(dataset_slug: st
         coding_runner._resolve_benchmark_kind(dataset_slug, coding_runner.CodingBenchmarkKind.HUMAN_EVAL)
         is coding_runner.CodingBenchmarkKind.HUMAN_EVAL
     )
-
-
-def test_coding_runner_parser_accepts_swebench_options() -> None:
-    args = coding_runner.parse_args(
-        [
-            "--dataset",
-            "dataset.jsonl",
-            "--benchmark-kind",
-            "swe_bench",
-            "--cot-mode",
-            "cot",
-            "--swebench-run-harness",
-            "--swebench-dataset-name",
-            "princeton-nlp/SWE-bench_Lite",
-            "--swebench-max-context-chars",
-            "12000",
-            "--swebench-max-prompt-chars",
-            "18000",
-            "--swebench-harness-timeout-s",
-            "3600",
-            "--long-doc-mode",
-            "lexical",
-            "--long-doc-max-evidence-chars",
-            "3000",
-        ]
-    )
-    assert args.benchmark_kind == "swe_bench"
-    assert args.cot_mode == "cot"
-    assert args.swebench_run_harness is True
-    assert args.swebench_dataset_name == "princeton-nlp/SWE-bench_Lite"
-    assert args.swebench_max_context_chars == 12000
-    assert args.swebench_max_prompt_chars == 18000
-    assert args.swebench_harness_timeout_s == 3600
-    assert args.long_doc_mode == "lexical"
-    assert args.long_doc_max_evidence_chars == 3000

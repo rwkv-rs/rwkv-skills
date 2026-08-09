@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 from __future__ import annotations
 
 """Argparse-based CLI that exposes the scheduler actions."""
@@ -38,6 +39,7 @@ from .actions import (
     action_status,
     action_stop,
 )
+from .action_dispatch import require_strict_g1i_runtime_attestation
 from .admin import SchedulerAdminController, serve_scheduler_admin
 from .config import (
     DEFAULT_ADMIN_API_KEY,
@@ -285,11 +287,6 @@ def _add_dispatch_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--sample-workers", type=int, help="runner 侧 episode 并发数；当前透传给 function-calling runner")
     parser.add_argument("--coding-eval-workers", type=int, help="coding runner 本地评测并发数；透传为 --eval-workers")
-    parser.add_argument(
-        "--coding-swebench-max-prompt-chars",
-        type=int,
-        help="SWE-Bench coding runner 的完整 prompt 字符预算；透传为 --swebench-max-prompt-chars",
-    )
     parser.add_argument("--max-active-coding-runners", type=int, help="最多同时运行的 coding runner 数；空出的远端槽可调度非 coding 任务")
     parser.add_argument("--math-judge-max-workers", type=int, help="maths free_response_judge 的 --judge-max-workers")
     parser.add_argument("--math-prompt-max-chars", type=int, help="maths runner 的 --prompt-max-chars")
@@ -596,11 +593,6 @@ def _dispatch_options_from_args(
                 if getattr(args, "max_active_coding_runners", None) is not None
                 else None
             ),
-            swebench_max_prompt_chars=(
-                int(getattr(args, "coding_swebench_max_prompt_chars"))
-                if getattr(args, "coding_swebench_max_prompt_chars", None) is not None
-                else None
-            ),
         ),
         math=MathConfig(
             judge_max_workers=(
@@ -886,6 +878,11 @@ def _run_profile_dispatch(parser: argparse.ArgumentParser, args: argparse.Namesp
         opts = request.to_dispatch_options()
     except Exception as exc:  # noqa: BLE001
         parser.error(str(exc))
+
+    # Profile-based launches may bootstrap the DB before reaching
+    # action_dispatch.  Strict G1i therefore needs the same innermost runtime
+    # proof here, before that first possible write.
+    require_strict_g1i_runtime_attestation(opts)
 
     if getattr(args, "print_config", False):
         print(launch_request_to_json(request))

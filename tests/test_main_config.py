@@ -167,41 +167,6 @@ def test_resolve_run_config_passes_avg_k_to_function_calling_runner(monkeypatch,
     assert "--judge-base-url" in resolved.argv
 
 
-def test_resolve_run_config_passes_long_doc_options_to_swebench_runner(monkeypatch, tmp_path: Path) -> None:
-    config = main_module.RunConfig.from_mapping(
-        {
-            "dataset": {"name": "swe_bench_lite_bm25_13k", "split": "test"},
-            "model": {"infer_base_url": "http://127.0.0.1:8181", "infer_model": "demo"},
-            "runner": {
-                "benchmark_kind": "swe_bench",
-                "cot_mode": "cot",
-                "long_doc_mode": "lexical",
-                "long_doc_max_evidence_chars": 3000,
-                "swebench_max_prompt_chars": 18000,
-            },
-        }
-    )
-
-    dataset_path = tmp_path / "swe_bench_lite_bm25_13k" / "test.jsonl"
-    dataset_path.parent.mkdir(parents=True)
-    dataset_path.write_text(
-        json.dumps({"task_id": "a__b-1", "prompt": "Fix it.", "instance_id": "a__b-1"}) + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(main_module, "resolve_or_prepare_dataset", lambda *_args, **_kwargs: dataset_path)
-
-    resolved = main_module.resolve_run_config(config)
-
-    assert resolved.runner.name == "code_swe_bench"
-    assert resolved.module == "src.eval.tasks.coding.runner"
-    assert "--long-doc-mode" in resolved.argv
-    assert "lexical" in resolved.argv
-    assert "--long-doc-max-evidence-chars" in resolved.argv
-    assert "3000" in resolved.argv
-    assert "--swebench-max-prompt-chars" in resolved.argv
-    assert "18000" in resolved.argv
-
-
 def test_resolve_run_config_passes_longcodebench_kind_and_answer_tokens(monkeypatch, tmp_path: Path) -> None:
     config = main_module.RunConfig.from_mapping(
         {
@@ -489,8 +454,8 @@ def test_resolve_run_config_supports_param_search_mode(monkeypatch, tmp_path: Pa
 
     resolved = main_module.resolve_run_config(config)
 
-    assert resolved.runner.name == "param_search_free_response_judge"
-    assert resolved.module == "src.bin.param_search_free_response_judge"
+    assert resolved.runner.name == "param_search_free_response"
+    assert resolved.module == "src.bin.param_search_free_response"
     assert "--db-write-queue" in resolved.argv
     assert "--cot-max-tokens" in resolved.argv
     assert "256" in resolved.argv

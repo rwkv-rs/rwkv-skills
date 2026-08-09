@@ -617,6 +617,55 @@ def test_shell_sandbox_docker_compose_skips_build_for_cached_image(
     assert any("up" in argv for argv in compose_calls)
 
 
+def test_shell_sandbox_registry_pull_retries_crane_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.eval.tasks.function_calling import agent_loop_executors
+
+    calls: list[list[str]] = []
+    crane_timeouts: list[float] = []
+    crane_attempts = 0
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001, ARG001
+        nonlocal crane_attempts
+        call = list(argv)
+        calls.append(call)
+        if call[:3] == ["docker", "image", "inspect"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="missing")
+        if call and call[0] == "/fake/crane":
+            crane_attempts += 1
+            crane_timeouts.append(float(kwargs["timeout"]))
+            if crane_attempts == 1:
+                raise agent_loop_executors.subprocess.TimeoutExpired(
+                    cmd=call,
+                    timeout=kwargs["timeout"],
+                )
+            return SimpleNamespace(returncode=0, stdout="pulled", stderr="")
+        if call[:2] == ["docker", "run"]:
+            return SimpleNamespace(returncode=0, stdout="container-id\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setenv("RWKV_AGENT_LOOP_DOCKER_PULL_BEFORE_RUN", "1")
+    monkeypatch.setenv("RWKV_AGENT_LOOP_DOCKER_PULL_RETRIES", "2")
+    monkeypatch.setenv("RWKV_AGENT_LOOP_DOCKER_PULL_TIMEOUT_S", "7200")
+    monkeypatch.setenv("RWKV_AGENT_LOOP_DOCKER_LOAD_TIMEOUT_S", "3600")
+    monkeypatch.setenv("RWKV_AGENT_LOOP_CRANE_PATH", "/fake/crane")
+    monkeypatch.setattr(agent_loop_executors.subprocess, "run", fake_run)
+    monkeypatch.setattr(agent_loop_executors.time, "sleep", lambda _seconds: None)
+
+    executor = ShellSandboxExecutor(
+        backend="docker",
+        image="swebench/example:latest",
+    )
+    executor.open()
+    executor.close()
+
+    assert crane_attempts == 2
+    assert crane_timeouts == [7200.0, 7200.0]
+    assert any(call[:3] == ["docker", "load", "--input"] for call in calls)
+    assert any(call[:2] == ["docker", "run"] for call in calls)
+
+
 def test_preflight_fails_for_unsupported_official_and_missing_assets(monkeypatch) -> None:
     monkeypatch.delenv("RWKV_TERMINAL_BENCH_ROOT", raising=False)
     records = [

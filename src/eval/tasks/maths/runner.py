@@ -24,6 +24,7 @@ from src.eval.field_common import (
     set_task_env,
 )
 from src.eval.context_budget import add_long_doc_cli_args, long_doc_config_payload, resolve_long_doc_config
+from src.eval.datasets.snapshot import canonical_json_sha256
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
 from src.eval.tasks.maths.common import (
     JudgeMode,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 from src.infer.backend import (
     add_inference_backend_arguments,
     build_inference_backend_from_args,
+    require_completion_style_remote_protocol,
     resolve_backend_model_name,
     validate_inference_backend_args,
 )
@@ -54,6 +56,24 @@ class MathStageConfig:
     final_sampling: Any | None
     prompt_max_chars: int | None = None
     long_doc_config: LongDocEvidenceConfig | None = None
+
+
+def _judge_transport_contract(config: Any) -> dict[str, object]:
+    """Bind non-secret Judge routing/retry semantics into task identity.
+
+    The public Judge score protocol intentionally omits connection details.
+    For resume safety we still need endpoint changes to create a new task, so
+    only a one-way digest of the effective base URL is persisted; API keys are
+    never included.
+    """
+
+    normalized_base_url = str(getattr(config, "base_url", None) or "").strip().rstrip("/")
+    return {
+        "schema_version": "rwkv.llm-judge-transport.v1",
+        "base_url_sha256": canonical_json_sha256(normalized_base_url),
+        "timeout_s": float(getattr(config, "timeout_s")),
+        "backoff_base": float(getattr(config, "backoff_base")),
+    }
 
 
 def _safe_int(value: object) -> int:
@@ -78,11 +98,32 @@ def _judge_error_summaries(judge_stats_by_group: Mapping[str, Mapping[str, objec
     return summaries
 
 
+def _require_clean_judge_results(
+    judge_mode: JudgeMode,
+    judge_stats_by_group: Mapping[str, Mapping[str, object]],
+) -> None:
+    summaries = _judge_error_summaries(judge_stats_by_group)
+    for summary in summaries:
+        print(f"⚠️ LLM judge 存在异常样本：{summary}")
+    if judge_mode is JudgeMode.LLM and summaries:
+        raise RuntimeError(
+            "LLM judge returned request/format errors; refusing to "
+            "convert them into false answers or write a score: "
+            + "; ".join(summaries)
+        )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RWKV maths benchmark runner")
     add_common_runner_args(parser, batch_size_default=64, db_write_queue_default=None)
     add_inference_backend_arguments(parser)
     parser.add_argument("--max-tokens", type=int, help="Clamp full-response generation length")
+    parser.add_argument(
+        "--cot-mode",
+        choices=[mode.value for mode in CoTMode],
+        default=CoTMode.COT.value,
+        help="Use cot for the established reasoning pipeline or no_cot for one-stage direct answers.",
+    )
     parser.add_argument("--cot-max-tokens", type=int, help="Compatibility alias for --max-tokens")
     parser.add_argument("--final-max-tokens", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--prompt-max-chars", type=int, help="Clamp rendered prompt length")
@@ -205,6 +246,42 @@ def _apply_generation_sampling_overrides(
     return replace(stage_config, cot_sampling=replace(stage_config.cot_sampling, **overrides))
 
 
+def _allow_full_response_think_close(stage_config: MathStageConfig) -> MathStageConfig:
+    """Make Strategy A capable of emitting a complete ``<think>`` response.
+
+    The staged B/C reasoning pass intentionally suppresses ``</think>`` until
+    the separately prompted final-answer stage.  Strategy A is different: it
+    is the full-response fast path and therefore must be allowed to close the
+    reasoning block itself.  Reusing the staged sampling config verbatim makes
+    standard vLLM treat ``</think>`` as a permanent bad word (the private
+    ``bad_words_min_tokens`` extension is not part of vLLM), so virtually every
+    hard-math Strategy-A generation runs to the token limit before falling
+    back to B/C.
+
+    Remove only the structural close marker.  Other configured bad words are
+    preserved.  ``min_think_tokens`` is paired with that marker and cannot be
+    enforced by standard vLLM once the marker is allowed, so clear it for this
+    full-response branch rather than persisting a misleading configuration.
+    """
+
+    from dataclasses import replace
+
+    sampling = stage_config.cot_sampling
+    filtered_bad_words = tuple(
+        word for word in sampling.bad_words if word.strip() != "</think>"
+    )
+    if filtered_bad_words == sampling.bad_words:
+        return stage_config
+    return replace(
+        stage_config,
+        cot_sampling=replace(
+            sampling,
+            bad_words=filtered_bad_words,
+            min_think_tokens=0,
+        ),
+    )
+
+
 def _math_sampling_payload(
     stage_config: MathStageConfig,
     *,
@@ -215,9 +292,8 @@ def _math_sampling_payload(
     payload: dict[str, object] = {
         "stage1": sampling_config_to_dict(stage_config.cot_sampling),
     }
-    if stage_config.final_sampling is None:
-        raise ValueError("final_sampling is required for two-stage math generation")
-    payload["stage2"] = sampling_config_to_dict(stage_config.final_sampling)
+    if stage_config.final_sampling is not None:
+        payload["stage2"] = sampling_config_to_dict(stage_config.final_sampling)
     if stage_config.long_doc_config is not None and stage_config.long_doc_config.enabled:
         payload["long_doc"] = long_doc_config_payload(stage_config.long_doc_config)
     if strategy_a_config is not None:
@@ -252,15 +328,23 @@ def main(
     args = parse_args(argv)
     validate_inference_backend_args(args)
 
-    from src.eval.benchmark_config import resolve_benchmark_model_config
+    from src.eval.benchmark_config import (
+        benchmark_config_source_paths,
+        resolve_benchmark_model_config,
+    )
+    from src.eval.datasets.data_loader.free_answer import JsonlFreeAnswerLoader
+    from src.eval.datasets.snapshot import build_dataset_snapshot, build_protocol_bundle
     from src.eval.env_config import load_env_file
     from src.eval.evaluating import TaskRunController, TaskRunSignalGuard, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
     from src.eval.tasks.maths.pipeline import FreeResponsePipeline
     from src.eval.metrics.free_response import (
+        STRATEGY_C,
         attach_strategy_task_ids,
         build_grouped_metrics_payload,
         evaluate_free_response,
+        llm_judge_protocol,
+        llm_judge_protocol_fingerprint,
     )
     from src.eval.results.payloads import make_score_payload
     from src.eval.scheduler.config import DEFAULT_DB_CONFIG
@@ -271,10 +355,16 @@ def main(
 
     load_env_file(Path(".env"))
     judge_mode = JudgeMode(args.judge_mode)
+    cot_mode = CoTMode(args.cot_mode)
     job_name = run_context.job_name if run_context is not None else os.environ.get("RWKV_SKILLS_JOB_NAME", default_job_name(judge_mode))
     prompt_profile = resolve_prompt_profile(args.prompt_profile, job_name)
     dataset_path = resolve_or_prepare_dataset(args.dataset, verbose=False)
     slug = infer_dataset_slug_from_path(str(dataset_path))
+    # Math prompts use assistant-prefix prefill (G1h Bot✿/<think> and the
+    # final boxed-answer continuation).  Chat templating wraps that string as
+    # user content and makes vLLM restart generation instead of honoring the
+    # prefill, so remote math must use the raw v1 completions endpoint.
+    require_completion_style_remote_protocol(args, benchmark_name=f"maths/{slug}")
     model_name = resolve_backend_model_name(args)
     total_records = count_free_answer_records(dataset_path, None)
     k_plan = resolve_configured_k_plan(
@@ -288,15 +378,23 @@ def main(
     backend = build_inference_backend_from_args(args)
     pipeline = FreeResponsePipeline(backend)
 
-    stage_config = _resolve_math_stage_config(
-        args,
-        slug,
-        model_name,
-        cot_max_tokens=args.max_tokens or args.cot_max_tokens,
-        final_max_tokens=args.final_max_tokens,
-        prompt_profile=prompt_profile,
-    )
-    strategy_a_single_generation = bool(
+    if cot_mode is CoTMode.NO_COT:
+        stage_config = _resolve_direct_stage_config(
+            args,
+            slug,
+            model_name,
+            max_tokens=args.max_tokens or args.cot_max_tokens,
+        )
+    else:
+        stage_config = _resolve_math_stage_config(
+            args,
+            slug,
+            model_name,
+            cot_max_tokens=args.max_tokens or args.cot_max_tokens,
+            final_max_tokens=args.final_max_tokens,
+            prompt_profile=prompt_profile,
+        )
+    strategy_a_single_generation = cot_mode is CoTMode.COT and bool(
         args.strategy_a_single_generation or args.single_generation
     )
     strategy_a_config = None
@@ -308,6 +406,7 @@ def main(
             max_tokens=args.max_tokens or args.cot_max_tokens,
             prompt_profile=prompt_profile,
         )
+        strategy_a_config = _allow_full_response_think_close(strategy_a_config)
         strategy_a_config = _apply_generation_sampling_overrides(strategy_a_config, args)
     else:
         stage_config = _apply_generation_sampling_overrides(stage_config, args)
@@ -326,6 +425,60 @@ def main(
     if judge is not None and root_config is not None and root_config.judge_prompt_template:
         judge.config.prompt_template = root_config.judge_prompt_template
 
+    judge_protocol_payload: dict[str, object] | None = None
+    judge_transport_payload: dict[str, object] | None = None
+    if judge is not None:
+        judge_protocol_payload = {
+            **llm_judge_protocol(judge.config),
+            "protocol_fingerprint_sha256": llm_judge_protocol_fingerprint(
+                judge.config
+            ),
+        }
+        judge_transport_payload = _judge_transport_contract(judge.config)
+    math_sampling_payload = _math_sampling_payload(
+        stage_config,
+        strategy_a_config=strategy_a_config,
+    )
+    if judge_protocol_payload is not None:
+        math_sampling_payload["judge_protocol"] = judge_protocol_payload
+    if judge_transport_payload is not None:
+        math_sampling_payload["judge_transport"] = judge_transport_payload
+    dataset_snapshot = build_dataset_snapshot(
+        dataset_path,
+        dataset_slug=slug,
+        loader=JsonlFreeAnswerLoader,
+        resolver=resolve_or_prepare_dataset,
+    )
+    protocol_bundle = build_protocol_bundle(
+        protocol_name="maths",
+        source_files=(
+            Path(__file__),
+            Path(__file__).with_name("pipeline.py"),
+            Path(__file__).with_name("common.py"),
+            Path(__file__).parents[2] / "field_common.py",
+            Path(__file__).parents[2] / "benchmark_config.py",
+            Path(__file__).parents[2] / "metrics" / "free_response.py",
+            Path(__file__).parents[2]
+            / "datasets"
+            / "data_loader"
+            / "free_answer.py",
+        ),
+        config_files=benchmark_config_source_paths(slug, model_name),
+        resolved_contract={
+            "cot_mode": cot_mode.value,
+            "prompt_profile": prompt_profile,
+            "judge_mode": judge_mode.value,
+            "judge_protocol": judge_protocol_payload,
+            "judge_transport": judge_transport_payload,
+            "strategy_a_single_generation": strategy_a_single_generation,
+            "primary_only": _should_score_primary_only(args),
+            "cot_prompt_template": stage_config.cot_prompt_template,
+            "final_answer_template": stage_config.final_answer_template,
+            "prompt_max_chars": stage_config.prompt_max_chars,
+            "sampling": math_sampling_payload,
+        },
+    )
+
     init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
     task_state = prepare_task_execution(
@@ -336,16 +489,15 @@ def main(
         job_name=job_name,
         run_mode=(run_context.run_mode if run_context is not None else None),
         sampling_config=build_task_sampling_config(
-            cot_mode=CoTMode.COT,
+            cot_mode=cot_mode,
             avg_k=plan.avg_k,
-            sampling_config=_math_sampling_payload(
-                stage_config,
-                strategy_a_config=strategy_a_config,
-            ),
+            sampling_config=math_sampling_payload,
             effective_sample_count=plan.effective_sample_count,
             pass_ks=k_plan.pass_k,
             judger_model_name=(judge.config.model if judge is not None else None),
             prompt_profile=prompt_profile,
+            dataset_snapshot=dataset_snapshot,
+            protocol_bundle=protocol_bundle,
         ),
     )
     expected_count = plan_attempt_count(plan, max_pass_k=1)
@@ -439,18 +591,16 @@ def main(
             dataset_path=str(dataset_path),
             judge=judge,
             primary_only=_should_score_primary_only(args),
+            # The user-approved Math contract is A first, then B/C only for
+            # A failures while inheriting A passes.  C is consequently the
+            # formal combined result; A remains in strategy_metrics as the
+            # raw, unpatched diagnostic baseline.
+            primary_group=STRATEGY_C if strategy_a_single_generation else None,
         )
         if judge_mode is JudgeMode.LLM and evaluation.judge_accuracy is None:
             raise RuntimeError("LLM judge 未返回有效 judge_accuracy，无法写入 judge-only 分数。")
         if judge is not None:
-            judge_errors = _judge_error_summaries(evaluation.judge_stats_by_group)
-            for summary in judge_errors:
-                print(f"⚠️ LLM judge 存在异常样本：{summary}")
-            if judge_mode is JudgeMode.LLM and judge_errors:
-                print(
-                    "⚠️ LLM judge 异常样本已按 judge_false 计入，并写入 judge_stats: "
-                    + "; ".join(judge_errors)
-                )
+            _require_clean_judge_results(judge_mode, evaluation.judge_stats_by_group)
 
         strategy_task_ids = service.ingest_eval_payload_groups(
             task_id=task_id,
@@ -469,7 +619,7 @@ def main(
 
         task_details: dict[str, object] = build_plan_task_details(
             plan,
-            cot_mode=CoTMode.COT.value,
+            cot_mode=cot_mode.value,
             prompt_profile=prompt_profile,
         )
         task_details.update(metric_details)
@@ -484,7 +634,7 @@ def main(
             runtime.run_checker(model_name=model_name)
         score_payload = make_score_payload(
             slug,
-            is_cot=True,
+            is_cot=cot_mode.is_cot,
             model_name=model_name,
             metrics=metrics_payload,
             samples=evaluation.samples,
@@ -492,16 +642,16 @@ def main(
             task=job_name,
             task_details=task_details,
             extra={
-                "cot_mode": CoTMode.COT.value,
+                "cot_mode": cot_mode.value,
                 "prompt_profile": prompt_profile,
                 "strategy_a_single_generation": strategy_a_single_generation,
             },
         )
         runtime.record_score(score_payload)
     if judge_mode is JudgeMode.LLM:
-        print(f"✅ judge CoT done: {result.sample_count} samples")
+        print(f"✅ judge {cot_mode.value} done: {result.sample_count} samples")
     else:
-        print(f"✅ CoT free-form done: {result.sample_count} samples")
+        print(f"✅ {cot_mode.value} free-form done: {result.sample_count} samples")
     return 0
 
 
@@ -562,6 +712,35 @@ def _resolve_single_generation_stage_config(
         final_sampling=None,
         prompt_max_chars=prompt_max_chars,
         long_doc_config=long_doc_config,
+    )
+
+
+def _resolve_direct_stage_config(
+    args: argparse.Namespace,
+    slug: str,
+    model_name: str,
+    *,
+    max_tokens: int | None = None,
+) -> MathStageConfig:
+    """Build the genuine one-stage NoCoT contract."""
+
+    from src.eval.benchmark_config import resolve_benchmark_model_config
+    from src.eval.tasks.maths.pipeline import DEFAULT_DIRECT_PROMPT
+
+    sampling = resolve_generation_sampling(slug, model_name, max_tokens=max_tokens)
+    root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
+    prompt_max_chars = (
+        args.prompt_max_chars
+        if args.prompt_max_chars is not None
+        else getattr(root_config, "prompt_max_chars", None)
+    )
+    return MathStageConfig(
+        cot_prompt_template=DEFAULT_DIRECT_PROMPT,
+        final_answer_template=None,
+        cot_sampling=sampling,
+        final_sampling=None,
+        prompt_max_chars=prompt_max_chars,
+        long_doc_config=resolve_long_doc_config(args, root_config),
     )
 
 

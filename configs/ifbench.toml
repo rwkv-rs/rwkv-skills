@@ -1,0 +1,3 @@
+[default]
+avg_k = [16]
+report_avg_k = [16]

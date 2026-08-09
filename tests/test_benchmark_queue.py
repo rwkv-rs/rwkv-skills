@@ -18,11 +18,9 @@ def _prepare_single_latest_model(monkeypatch, tmp_path: Path) -> Path:
 
 
 def test_detect_job_from_dataset_prioritizes_judge_and_agent_benchmarks() -> None:
-    assert jobs.detect_job_from_dataset("math_500_test", True) == "free_response_judge"
-    assert jobs.detect_job_from_dataset("hendrycks_math_test", True) == "free_response"
+    assert jobs.detect_job_from_dataset("math_500_test", True) == "free_response"
     assert jobs.detect_job_from_dataset("widesearch_test", True) == "function_agent_loop"
-    assert jobs.detect_job_from_dataset("matharena_apex_test", True) == "free_response"
-    assert jobs.detect_job_from_dataset("phybench_test", True) == "free_response_judge"
+    assert jobs.detect_job_from_dataset("comp_math_24_25_test", True) == "free_response_judge"
     assert jobs.detect_job_from_dataset("bfcl_v3_test", True) == "function_bfcl_v3"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_ast_test", True) == "function_bfcl_ast"
     assert jobs.detect_job_from_dataset("bfcl_exec_simple_test", True) == "function_bfcl_exec"

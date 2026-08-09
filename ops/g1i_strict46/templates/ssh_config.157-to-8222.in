@@ -1,0 +1,28 @@
+# TEMPLATE ONLY. provision_root_runtime.sh rejects every __STRICT46_* token.
+# Fill from an administrator-controlled console, hash the completed file, and
+# submit only the completed public metadata to install-ssh-metadata.
+Host strict46-8222
+    HostName __STRICT46_8222_HOST_OR_IP__
+    Port __STRICT46_8222_SSH_PORT__
+    User __STRICT46_8222_SERVICE_LOGIN__
+    IdentityFile /etc/rwkv-strict46/id_ed25519_8222
+    UserKnownHostsFile /etc/rwkv-strict46/known_hosts_8222
+    GlobalKnownHostsFile /dev/null
+    BatchMode yes
+    IdentitiesOnly yes
+    IdentityAgent none
+    StrictHostKeyChecking yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PubkeyAuthentication yes
+    ForwardAgent no
+    AddKeysToAgent no
+    ControlMaster no
+    ControlPath none
+    ControlPersist no
+    ClearAllForwardings no
+    PermitLocalCommand no
+    RequestTTY no
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    TCPKeepAlive yes

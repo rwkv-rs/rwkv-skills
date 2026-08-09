@@ -5,8 +5,6 @@ from pathlib import Path
 import zipfile
 
 from src.eval.datasets.data_prepper.data_manager import (
-    available_code_generation_datasets,
-    available_free_answer_datasets,
     available_function_calling_datasets,
     prepare_dataset,
 )
@@ -84,19 +82,6 @@ def test_available_function_calling_datasets_lists_registered_specs() -> None:
     assert "prodbench" in names
     assert "hy_skillsworld" in names
     assert "hy_euler_pro" in names
-
-
-def test_available_free_answer_datasets_lists_hy_math() -> None:
-    names = set(available_free_answer_datasets())
-
-    assert "hy_math" in names
-
-
-def test_available_code_generation_datasets_lists_swe_bench_expansions() -> None:
-    names = set(available_code_generation_datasets())
-
-    assert "swe_bench_multilingual" in names
-    assert "swe_bench_pro" in names
 
 
 def test_prepare_dataset_materializes_source_required_agent_slot(tmp_path: Path, monkeypatch) -> None:

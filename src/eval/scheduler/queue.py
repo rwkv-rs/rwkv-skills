@@ -251,7 +251,7 @@ def build_queue(
                     if not any(pattern.search(local_name) or pattern.search(model_name) for pattern in compiled_patterns):
                         continue
 
-                # Latest 2.9b: replace gsm8k + hendrycks_math eval runs with a param-search workflow.
+                # Latest 2.9b: replace eligible strict46 maths runs with the parameter-search workflow.
                 param_search_on = (
                     enable_param_search
                     and model_name in latest_2_9b_models

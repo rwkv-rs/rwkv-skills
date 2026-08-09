@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+"""Select the best shared param-search grid point and promote scores in DB.
+
+This script reads per-trial scores from the database (is_param_search=1),
+selects a single best shared grid point across benchmarks, and promotes the
+corresponding scores into non-param-search records for the original datasets.
+"""
+
+import argparse
+import json
+import os
+from typing import TYPE_CHECKING
+from typing import Any, Sequence
+
+from src.db.database import init_db
+from src.eval.results.payloads import make_score_payload
+from src.eval.scheduler.config import DEFAULT_DB_CONFIG
+from src.eval.scheduler.dataset_utils import canonical_slug
+from src.eval.scheduler.job_env import ensure_job_id
+from src.db.eval_db_service import EvalDbService
+from src.infer.backend import add_inference_backend_arguments, resolve_backend_model_name, validate_inference_backend_args
+
+if TYPE_CHECKING:
+    from src.eval.evaluating.contracts import RunContext, TaskSpec
+
+
+DEFAULT_BENCHMARKS = ("gsm8k_test", "math_500_test")
+
+
+def _objective_from_metrics(metrics: dict[str, Any]) -> float:
+    judge = metrics.get("judge_accuracy")
+    if isinstance(judge, (int, float)):
+        return float(judge)
+    exact = metrics.get("exact_accuracy")
+    if isinstance(exact, (int, float)):
+        return float(exact)
+    return 0.0
+
+
+def _param_key_from_payload(payload: dict[str, Any]) -> str | None:
+    task_details = payload.get("task_details")
+    if isinstance(task_details, dict):
+        trial_info = task_details.get("param_search_trial")
+        if isinstance(trial_info, dict):
+            params = trial_info.get("params")
+            if isinstance(params, dict):
+                return json.dumps(params, sort_keys=True, ensure_ascii=False)
+    return None
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="RWKV param-search selector/promoter")
+    add_inference_backend_arguments(parser)
+    parser.add_argument("--dataset", help="Ignored (scheduler compatibility)")
+    parser.add_argument(
+        "--benchmarks",
+        nargs="+",
+        default=list(DEFAULT_BENCHMARKS),
+        help="Benchmarks to aggregate (default: gsm8k_test math_500_test)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite promoted records in DB.",
+    )
+    return parser.parse_args(argv)
+
+
+def _should_skip_promotion(
+    service: EvalDbService,
+    *,
+    dataset: str,
+    model_name: str,
+    overwrite: bool,
+) -> bool:
+    if overwrite:
+        return False
+    existing = service.list_scores_by_dataset(dataset=dataset, model=model_name, is_param_search=False)
+    return bool(existing)
+
+
+def _promote_score(
+    service: EvalDbService,
+    *,
+    source_payload: dict[str, Any],
+    dest_dataset: str,
+    model_name: str,
+    overwrite: bool,
+    job_name: str,
+) -> None:
+    if _should_skip_promotion(service, dataset=dest_dataset, model_name=model_name, overwrite=overwrite):
+        return
+    task_details = source_payload.get("task_details") if isinstance(source_payload.get("task_details"), dict) else {}
+    task_details = dict(task_details)
+    task_details["param_search_selected_from"] = {
+        "task_id": source_payload.get("task_id"),
+        "param_key": _param_key_from_payload(source_payload),
+    }
+    score_payload = make_score_payload(
+        dest_dataset,
+        is_cot=bool(source_payload.get("cot", True)),
+        model_name=model_name,
+        metrics=source_payload.get("metrics") if isinstance(source_payload.get("metrics"), dict) else {},
+        samples=int(source_payload.get("samples", 0) or 0),
+        problems=source_payload.get("problems"),
+        task=str(source_payload.get("task") or "param_search_select"),
+        task_details=task_details,
+    )
+    task_id = service.get_or_create_task(
+        job_name=job_name,
+        job_id=ensure_job_id(job_name),
+        dataset=str(dest_dataset),
+        model=model_name,
+        is_param_search=False,
+        allow_resume=False,
+    )
+    os.environ["RWKV_SKILLS_TASK_ID"] = task_id
+    os.environ["RWKV_SKILLS_VERSION_ID"] = task_id
+    service.record_score_payload(
+        payload=score_payload,
+        task_id=task_id,
+    )
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    run_context: "RunContext | None" = None,
+    task_spec: "TaskSpec | None" = None,
+) -> int:
+    del task_spec
+    args = parse_args(argv)
+    validate_inference_backend_args(args)
+    init_db(DEFAULT_DB_CONFIG)
+
+    service = EvalDbService()
+    job_name = run_context.job_name if run_context is not None else "param_search_select"
+    model_name = resolve_backend_model_name(args)
+    benchmarks = tuple(canonical_slug(b) for b in args.benchmarks if b)
+    if len(benchmarks) < 2:
+        print("❌ 需要至少 2 个 benchmark 才能进行综合选参。")
+        return 2
+
+    by_benchmark: dict[str, dict[str, tuple[float, dict[str, Any]]]] = {}
+    for bench in benchmarks:
+        rows = service.list_scores_by_dataset(dataset=bench, model=model_name, is_param_search=True)
+        if not rows:
+            print(f"❌ 缺少 param-search trial scores: {bench}")
+            return 1
+        mapping: dict[str, tuple[float, dict[str, Any]]] = {}
+        for payload in rows:
+            metrics = payload.get("metrics")
+            if not isinstance(metrics, dict):
+                continue
+            key = _param_key_from_payload(payload)
+            if key is None:
+                continue
+            objective = _objective_from_metrics(metrics)
+            existing = mapping.get(key)
+            if existing is None or objective > existing[0]:
+                mapping[key] = (objective, payload)
+        if not mapping:
+            print(f"❌ 未能从 {bench} 解析出任何有效 trial score")
+            return 1
+        by_benchmark[bench] = mapping
+
+    common_keys = set.intersection(*(set(m.keys()) for m in by_benchmark.values()))
+    if not common_keys:
+        print("❌ 各 benchmark 的 grid 点没有交集（params key 不一致）")
+        return 1
+
+    best_key: str | None = None
+    best_sum: float | None = None
+    best_detail: dict[str, float] = {}
+    best_payloads: dict[str, dict[str, Any]] = {}
+
+    for key in sorted(common_keys):
+        total = 0.0
+        detail: dict[str, float] = {}
+        payloads: dict[str, dict[str, Any]] = {}
+        for bench, mapping in by_benchmark.items():
+            score, payload = mapping[key]
+            total += float(score)
+            detail[bench] = float(score)
+            payloads[bench] = payload
+        if best_sum is None or total > best_sum:
+            best_sum = total
+            best_key = key
+            best_detail = detail
+            best_payloads = payloads
+
+    if best_key is None or best_sum is None:
+        print("❌ 未找到可用的最佳 grid 点")
+        return 1
+
+    detail_text = ", ".join(f"{bench}={best_detail.get(bench, 0.0):.6f}" for bench in benchmarks)
+    print("✅ best param-search selection:")
+    print(f"    model: {model_name}")
+    print(f"    total={best_sum:.6f} ({detail_text})")
+
+    for bench, payload in best_payloads.items():
+        _promote_score(
+            service,
+            source_payload=payload,
+            dest_dataset=bench,
+            model_name=model_name,
+            overwrite=bool(args.overwrite),
+            job_name=job_name,
+        )
+
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

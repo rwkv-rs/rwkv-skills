@@ -38,6 +38,12 @@ def sampling_config_to_dict(config: SamplingConfig) -> dict[str, object]:
     raw = asdict(config)
     normalized: dict[str, object] = {}
     for key, value in raw.items():
+        if key == "allowed_token_ids" and not value:
+            continue
+        if key == "bad_words" and not value:
+            continue
+        if key == "min_think_tokens" and int(value) == 0:
+            continue
         if key == "max_generate_tokens":
             key = "max_new_tokens"
         elif key == "alpha_presence":

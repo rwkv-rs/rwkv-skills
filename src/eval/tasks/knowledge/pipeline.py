@@ -9,14 +9,22 @@ from typing import Callable, Sequence
 from src.eval.benchmark_registry import CoTMode
 from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
 from src.eval.datasets.data_struct.multiple_choice import MultipleChoiceRecord
+from src.eval.datasets.snapshot import canonical_json_sha256
 from src.eval.execution_plan import AttemptKey
 from src.eval.prompt_builders import (
     ALPHABET,
     concat_choices,
 )
-from src.eval.context_budget import build_budgeted_context_prompt, fuse_context_question
+from src.eval.context_budget import (
+    build_budgeted_context_prompt,
+    fuse_context_question,
+    middle_truncate_text,
+)
 from src.eval.long_doc_evidence import LongDocEvidenceConfig
-from src.eval.metrics.multi_choice import extract_answer_after_think
+from src.eval.metrics.multi_choice import (
+    _extract_choice_by_option_text,
+    extract_answer_after_think,
+)
 from src.eval.results.schema import (
     dataset_slug_parts,
     normalize_sampling_config_by_stage,
@@ -57,6 +65,18 @@ Assistant: <think"""
 
 ZH_FINAL_ANSWER_TEMPLATE = """<Q><COT>
 综上所述，答案是"""
+
+
+def _render_final_answer_prompt(
+    cot_prompt: str,
+    cot_completion: str,
+    final_answer_template: str,
+) -> str:
+    """Close an unfinished think block before requesting the final choice."""
+    completion = str(cot_completion or "")
+    if "</think>" not in completion.lower():
+        completion = f"{completion.rstrip()}\n</think>"
+    return final_answer_template.replace("<Q>", cot_prompt).replace("<COT>", completion)
 
 
 @dataclass(frozen=True)
@@ -103,9 +123,150 @@ class MultipleChoicePipeline:
         *,
         allow_generation_fallback: bool = False,
     ) -> None:
-        del allow_generation_fallback
         self.backend = backend
         self.target_token_format = target_token_format
+        self.allow_generation_fallback = bool(allow_generation_fallback)
+        self._choice_sampling_cache: dict[
+            int,
+            tuple[SamplingConfig, dict[str, int], dict[str, str]],
+        ] = {}
+
+    def resolve_choice_sampling_protocol(
+        self,
+        choice_counts: Sequence[int],
+    ) -> dict[str, object]:
+        """Resolve and persist the exact tokenizer-bound choice contract."""
+
+        by_choice_count: dict[str, object] = {}
+        tokenizer_mapping: dict[str, int] = {}
+        for choice_count in sorted({int(item) for item in choice_counts if int(item) > 0}):
+            sampling, letter_to_token_id, token_text_by_letter = self._resolve_choice_sampling(
+                choice_count
+            )
+            for letter, token_id in letter_to_token_id.items():
+                token_text = token_text_by_letter[letter]
+                existing = tokenizer_mapping.get(token_text)
+                if existing is not None and existing != token_id:
+                    raise RuntimeError(
+                        "tokenizer answer-token mapping changed across choice counts: "
+                        f"{token_text!r} resolved as both {existing} and {token_id}"
+                    )
+                tokenizer_mapping[token_text] = token_id
+            by_choice_count[str(choice_count)] = {
+                "letter_to_token_id": letter_to_token_id,
+                "token_text_by_letter": token_text_by_letter,
+                "allowed_token_ids": list(sampling.allowed_token_ids or ()),
+                "sampling": sampling_config_to_dict(sampling),
+            }
+        if not by_choice_count:
+            raise ValueError("knowledge dataset contains no answer choices")
+        backend_type = f"{type(self.backend).__module__}.{type(self.backend).__qualname__}"
+        backend_model = str(getattr(self.backend, "model_name", "") or "")
+        tokenizer_evidence = {
+            "identity_kind": "answer-token-mapping-v1",
+            "backend_type": backend_type,
+            "model": backend_model,
+            "target_token_format": self.target_token_format,
+            "token_text_to_id": tokenizer_mapping,
+        }
+        return {
+            "schema_version": "rwkv.knowledge-direct-sampling.v1",
+            "target_token_format": self.target_token_format,
+            "tokenizer_identity": {
+                **tokenizer_evidence,
+                "sha256": canonical_json_sha256(tokenizer_evidence),
+            },
+            "by_choice_count": by_choice_count,
+        }
+
+    def _resolve_choice_sampling(
+        self,
+        num_choices: int,
+    ) -> tuple[SamplingConfig, dict[str, int], dict[str, str]]:
+        cached = self._choice_sampling_cache.get(int(num_choices))
+        if cached is not None:
+            return cached
+        valid_letters = ALPHABET[: max(0, int(num_choices))]
+        if not valid_letters:
+            raise ValueError("multiple-choice record has no answer choices")
+        token_text_by_letter = {
+            letter: self.target_token_format.replace("<LETTER>", letter)
+            for letter in valid_letters
+        }
+        resolver = getattr(self.backend, "resolve_single_token_ids", None)
+        if not callable(resolver):
+            if self.allow_generation_fallback:
+                sampling = _multiple_choice_answer_sampling()
+                resolved = (sampling, {}, token_text_by_letter)
+                self._choice_sampling_cache[int(num_choices)] = resolved
+                return resolved
+            raise RuntimeError(
+                "knowledge multiple-choice evaluation requires a backend that can "
+                "resolve single-token answer literals"
+            )
+        token_ids = resolver(tuple(token_text_by_letter.values()))
+        missing = [
+            text for text in token_text_by_letter.values() if text not in token_ids
+        ]
+        if missing:
+            raise RuntimeError(
+                "knowledge multiple-choice answer literals could not be constrained: "
+                + ", ".join(repr(text) for text in missing)
+            )
+        letter_to_token_id = {
+            letter: int(token_ids[text])
+            for letter, text in token_text_by_letter.items()
+        }
+        if len(set(letter_to_token_id.values())) != len(letter_to_token_id):
+            raise RuntimeError(
+                "knowledge multiple-choice answer literals do not map to distinct tokens"
+            )
+        sampling = _multiple_choice_answer_sampling(tuple(letter_to_token_id.values()))
+        resolved = (sampling, letter_to_token_id, token_text_by_letter)
+        self._choice_sampling_cache[int(num_choices)] = resolved
+        return resolved
+
+    def _choice_sampling(self, num_choices: int) -> SamplingConfig:
+        sampling, _letter_to_token_id, _token_text_by_letter = (
+            self._resolve_choice_sampling(num_choices)
+        )
+        return sampling
+
+    def _generate_constrained_choice_outputs(
+        self,
+        prompts: Sequence[str],
+        records: Sequence[MultipleChoiceRecord],
+        *,
+        batch_size: int,
+        progress_desc: str,
+        show_progress: bool,
+    ) -> dict[int, GenerationOutput]:
+        """Generate one legal option token per prompt, grouped by choice count."""
+
+        if len(prompts) != len(records):
+            raise ValueError("choice prompt and record counts do not match")
+        grouped_indices: dict[int, list[int]] = {}
+        for index, record in enumerate(records):
+            grouped_indices.setdefault(len(record.choices), []).append(index)
+
+        resolved: dict[int, GenerationOutput] = {}
+        for num_choices, indices in grouped_indices.items():
+            sampling = self._choice_sampling(num_choices)
+            outputs = self.backend.generate(
+                [prompts[index] for index in indices],
+                sampling=sampling,
+                batch_size=min(max(1, int(batch_size)), len(indices)),
+                min_tokens=1,
+                progress_desc=progress_desc,
+                show_progress=show_progress,
+            )
+            by_local_index = {int(output.prompt_index): output for output in outputs}
+            for local_index, original_index in enumerate(indices):
+                output = by_local_index.get(local_index)
+                if output is None:
+                    raise RuntimeError("backend returned incomplete constrained-choice batch")
+                resolved[original_index] = output
+        return resolved
 
     def run_direct(
         self,
@@ -323,14 +484,10 @@ class MultipleChoicePipeline:
                 else None
             ),
             prompt_seeds=cot_seeds,
-            text_stop_detectors=(
-                [
-                    _answer_after_think_detector(len(record.choices))
-                    for _key, record in remaining_entries
-                ]
-                if answer_strategy == "cascade_a_b"
-                else None
-            ),
+            # Keep each CoT running until its real backend stop condition or
+            # generation budget. An answer-like phrase in an unfinished think
+            # block is not a valid generation stop.
+            text_stop_detectors=None,
         )
         if probe_only:
             return MultipleChoicePipelineResult(dataset_name, len(expanded), [])
@@ -358,35 +515,36 @@ class MultipleChoicePipeline:
         # 贪心采样、无 seed，解析函数（_extract_generated_choice_letter）不变 ⇒ 逐条等价。
         final_prompt_by_idx: dict[int, str] = {}
         pred_letter_by_idx: dict[int, str] = {}
+        answer_output_by_idx: dict[int, GenerationOutput] = {}
         answer_indices: list[int] = []
         answer_prompts: list[str] = []
         for idx, output in enumerate(cot_outputs):
             if output is None:
                 continue
-            final_prompt = final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
-                "<COT>", output.text
+            final_prompt = _render_final_answer_prompt(
+                cot_prompts[idx],
+                output.text,
+                final_answer_template,
             )
             final_prompt_by_idx[idx] = final_prompt
             answer_indices.append(idx)
             answer_prompts.append(final_prompt)
 
         if answer_prompts:
-            answer_outputs = self.backend.generate(
+            answer_output_by_local_idx = self._generate_constrained_choice_outputs(
                 answer_prompts,
-                sampling=_multiple_choice_answer_sampling(),
+                [remaining_entries[idx][1] for idx in answer_indices],
                 batch_size=batch_size,
                 progress_desc="Generating MC answer",
                 show_progress=False,
             )
-            by_index = {int(o.prompt_index): o for o in answer_outputs}
             for local_index, idx in enumerate(answer_indices):
-                ans_output = by_index.get(local_index)
-                if ans_output is None:
-                    raise RuntimeError("backend returned incomplete multiple-choice answer batch")
+                ans_output = answer_output_by_local_idx[local_index]
                 _key, record = remaining_entries[idx]
                 pred_letter_by_idx[idx] = self._extract_generated_choice_letter(
-                    ans_output.text, len(record.choices)
+                    ans_output.text, record.choices
                 )
+                answer_output_by_idx[idx] = ans_output
 
         for idx, output in enumerate(cot_outputs):
             if output is None:
@@ -400,7 +558,11 @@ class MultipleChoicePipeline:
             )
             final_prompt = final_prompt_by_idx[idx]
             pred_letter = pred_letter_by_idx.get(idx, "")
-            prior_context = f"{cot_prompt}{output.text}"
+            prior_context = _render_final_answer_prompt(
+                cot_prompt,
+                output.text,
+                "<Q><COT>",
+            )
             delta_prompt = prompt_delta(final_prompt, prior_context)
             token_text = self.target_token_format.replace("<LETTER>", pred_letter)
             final_stage = StageRecord(
@@ -417,6 +579,11 @@ class MultipleChoicePipeline:
                 sampling_config=sampling_config,
                 stages=[cot_stage, final_stage],
             ).as_payload()
+            payload["format_bridges"] = {
+                "answer_stage_raw_completion": answer_output_by_idx[idx].text,
+                "answer_stage_raw_stop_reason": answer_output_by_idx[idx].finish_reason,
+                "answer_stage_extracted_letter": pred_letter,
+            }
             payload["_stage"] = "answer"
             trace = long_doc_traces[idx]
             if trace is not None:
@@ -442,7 +609,9 @@ class MultipleChoicePipeline:
         long_doc_traces: list[dict[str, object] | None],
         on_record: Callable[[dict], None] | None,
     ) -> MultipleChoicePipelineResult:
-        final_sampling = _multiple_choice_answer_sampling()
+        final_sampling = self._choice_sampling(
+            max(len(record.choices) for _key, record in entries)
+        )
         cascade_sampling = dict(sampling_config)
         cascade_sampling["strategy_a"] = sampling_config_to_dict(cot_sampling)
         cascade_sampling["stage2"] = sampling_config_to_dict(final_sampling)
@@ -511,10 +680,7 @@ class MultipleChoicePipeline:
                 )
                 for idx in failed_indices
             ],
-            text_stop_detectors=[
-                _answer_after_think_detector(len(entries[idx][1].choices))
-                for idx in failed_indices
-            ],
+            text_stop_detectors=None,
         )
         strategy_b_by_idx = {
             failed_indices[int(output.prompt_index)]: output
@@ -528,21 +694,23 @@ class MultipleChoicePipeline:
         for idx in failed_indices:
             output = strategy_b_by_idx[idx]
             final_prompts.append(
-                final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
-                    "<COT>", output.text
+                _render_final_answer_prompt(
+                    cot_prompts[idx],
+                    output.text,
+                    final_answer_template,
                 )
             )
-        final_outputs = self.backend.generate(
+        final_outputs = self._generate_constrained_choice_outputs(
             final_prompts,
-            sampling=final_sampling,
+            [entries[idx][1] for idx in failed_indices],
             batch_size=min(batch_size, len(final_prompts)),
             progress_desc="Generating strategy B answers",
-            show_progress=False,
+            show_progress=True,
         )
         final_by_idx = {
-            failed_indices[int(output.prompt_index)]: output
-            for output in final_outputs
-            if 0 <= int(output.prompt_index) < len(failed_indices)
+            failed_indices[local_index]: output
+            for local_index, output in final_outputs.items()
+            if 0 <= int(local_index) < len(failed_indices)
         }
         if len(final_by_idx) != len(failed_indices):
             raise RuntimeError("backend returned incomplete strategy B answer batch")
@@ -551,14 +719,20 @@ class MultipleChoicePipeline:
             strategy_b_output = strategy_b_by_idx[idx]
             final_output = final_by_idx[idx]
             _key, record = entries[idx]
-            full_final_prompt = final_answer_template.replace("<Q>", cot_prompts[idx]).replace(
-                "<COT>", strategy_b_output.text
+            full_final_prompt = _render_final_answer_prompt(
+                cot_prompts[idx],
+                strategy_b_output.text,
+                final_answer_template,
             )
-            prior_context = f"{cot_prompts[idx]}{strategy_b_output.text}"
+            prior_context = _render_final_answer_prompt(
+                cot_prompts[idx],
+                strategy_b_output.text,
+                "<Q><COT>",
+            )
             delta_prompt = prompt_delta(full_final_prompt, prior_context)
             prediction = self._extract_generated_choice_letter(
                 final_output.text,
-                len(record.choices),
+                record.choices,
             )
             payload = _base_payload(
                 idx,
@@ -575,6 +749,11 @@ class MultipleChoicePipeline:
                     ),
                 ],
             )
+            payload["format_bridges"] = {
+                "strategy_b_final_raw_completion": final_output.text,
+                "strategy_b_final_raw_stop_reason": final_output.finish_reason,
+                "strategy_b_final_extracted_letter": prediction,
+            }
             payload["_stage"] = "answer"
             if on_record is not None:
                 on_record(payload)
@@ -629,7 +808,28 @@ class MultipleChoicePipeline:
             ).rstrip(" ")
 
         if not (record.context or "").strip():
-            return _render(question), None
+            prompt = _render(question)
+            max_chars = int(prompt_max_chars or 0)
+            if max_chars <= 0 or len(prompt) <= max_chars:
+                return prompt, None
+            question_budget = max(0, max_chars - len(_render("")) - 16)
+            fitted_question = middle_truncate_text(question, question_budget)
+            prompt = _render(fitted_question)
+            if len(prompt) > max_chars:
+                fitted_question = middle_truncate_text(
+                    fitted_question,
+                    max(0, len(fitted_question) - (len(prompt) - max_chars) - 32),
+                )
+                prompt = _render(fitted_question)
+            return prompt, {
+                "mode": "question_only",
+                "enabled": True,
+                "original_question_chars": len(question),
+                "rendered_question_chars": len(fitted_question),
+                "trimmed_question_chars": max(0, len(question) - len(fitted_question)),
+                "prompt_chars": len(prompt),
+                "prompt_max_chars": max_chars,
+            }
 
         prompt, trace = build_budgeted_context_prompt(
             context=record.context,
@@ -651,6 +851,8 @@ class MultipleChoicePipeline:
         key: AttemptKey,
         prompt: str,
         pred_letter: str,
+        raw_completion: str = "",
+        raw_finish_reason: str = "",
         long_doc_trace: dict[str, object] | None = None,
     ) -> dict:
         token_text = self.target_token_format.replace("<LETTER>", pred_letter)
@@ -672,6 +874,8 @@ class MultipleChoicePipeline:
         ).as_payload()
         if long_doc_trace is not None:
             payload["long_doc"] = long_doc_trace
+        payload["direct_raw_completion"] = raw_completion
+        payload["direct_raw_finish_reason"] = raw_finish_reason
         return payload
 
     def _run_direct_generation_batches(
@@ -687,7 +891,6 @@ class MultipleChoicePipeline:
         prompt_max_chars: int | None,
     ) -> list[dict]:
         payloads: list[dict] = []
-        sampling = _multiple_choice_answer_sampling()
         entries = list(entries)
         if not entries:
             return payloads
@@ -706,25 +909,24 @@ class MultipleChoicePipeline:
         ]
         prompts = [prompt for prompt, _trace in formatted]
         long_doc_traces = [trace for _prompt, trace in formatted]
-        outputs = self.backend.generate(
+        output_by_index = self._generate_constrained_choice_outputs(
             prompts,
-            sampling=sampling,
+            [record for _key, record in entries],
             batch_size=batch_size,
             progress_desc="Generating MC answer",
             show_progress=False,
         )
-        by_index = {int(output.prompt_index): output for output in outputs}
         for index, ((key, record), prompt) in enumerate(zip(entries, prompts, strict=True)):
-            output = by_index.get(index)
-            if output is None:
-                raise RuntimeError("backend returned incomplete multiple-choice generation batch")
-            pred_letter = self._extract_generated_choice_letter(output.text, len(record.choices))
+            output = output_by_index[index]
+            pred_letter = self._extract_generated_choice_letter(output.text, record.choices)
             payload = self._build_direct_payload(
                 benchmark_name=benchmark_name,
                 dataset_split=dataset_split,
                 key=key,
                 prompt=prompt,
                 pred_letter=pred_letter,
+                raw_completion=output.text,
+                raw_finish_reason=output.finish_reason,
                 long_doc_trace=long_doc_traces[index],
             )
             if on_record is not None:
@@ -732,21 +934,46 @@ class MultipleChoicePipeline:
             payloads.append(payload)
         return payloads
 
-    def _extract_generated_choice_letter(self, text: str, num_choices: int) -> str:
+    def _extract_generated_choice_letter(self, text: str, choices: Sequence[str]) -> str:
+        num_choices = len(choices)
         valid_letters = ALPHABET[:num_choices]
         normalized = (text or "").strip().upper()
-        boundary_match = re.search(rf"\b([{re.escape(valid_letters)}])\b", normalized)
-        if boundary_match is not None:
-            return boundary_match.group(1)
-        for char in normalized:
-            if char in valid_letters:
-                return char
+        # Chinese answer forms such as ``选项C`` and ``答案为C`` do not have a
+        # Unicode word boundary before the ASCII letter, so the standalone
+        # matcher below cannot see them.  Prefer the last explicit answer
+        # marker before falling back to a standalone option token.
+        marked_matches = list(
+            re.finditer(
+                rf"(?:选项|答案(?:是|为)?)[\s:：]*[（(\[]?([{re.escape(valid_letters)}])",
+                normalized,
+            )
+        )
+        if marked_matches:
+            return marked_matches[-1].group(1)
+        # Constrained answer stages emit exactly one legal option token. Keep
+        # the fallback parser equally strict so historical prose cannot be
+        # mis-scored by taking an unrelated later letter.
+        exact_match = re.fullmatch(
+            rf"\s*[\[(]?([{re.escape(valid_letters)}])[\])]?\s*[.:,;ï¼šã€‚]?\s*",
+            normalized,
+        )
+        if exact_match:
+            return exact_match.group(1)
+        # The answer-only pass occasionally returns the option text instead
+        # of its letter (for example, "Spironolactone").  Treat a unique,
+        # deterministic option-text match as that choice; ambiguous prose
+        # remains missing rather than being guessed.
+        option_text_letter = _extract_choice_by_option_text(text, choices)
+        if option_text_letter in valid_letters:
+            return option_text_letter
         return ""
 
 
-def _multiple_choice_answer_sampling() -> SamplingConfig:
+def _multiple_choice_answer_sampling(
+    allowed_token_ids: tuple[int, ...] | None = None,
+) -> SamplingConfig:
     return SamplingConfig(
-        max_generate_tokens=8,
+        max_generate_tokens=1 if allowed_token_ids else 8,
         # Keep top_k=1 deterministic while avoiding vLLM rapid-sampler greedy crashes.
         temperature=1.0,
         top_k=1,
@@ -756,6 +983,7 @@ def _multiple_choice_answer_sampling() -> SamplingConfig:
         alpha_decay=1.0,
         stop_tokens=(),
         no_penalty_token_ids=(),
+        allowed_token_ids=allowed_token_ids,
     )
 
 

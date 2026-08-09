@@ -1,0 +1,281 @@
+\set ON_ERROR_STOP on
+
+-- TEMPLATE ONLY. No role is created and no password is accepted here. The DBA
+-- must first create the LOGIN role interactively (prefer local peer auth), then
+-- invoke psql with all three -v values documented in ROOT_PROVISIONING.md.
+\if :{?strict46_apply}
+\else
+  \echo 'REFUSED: pass -v strict46_apply=true explicitly'
+  \quit 42
+\endif
+\if :strict46_apply
+\else
+  \echo 'REFUSED: strict46_apply must be a psql true value'
+  \quit 42
+\endif
+\if :{?strict46_db}
+\else
+  \echo 'REFUSED: pass -v strict46_db=DATABASE'
+  \quit 42
+\endif
+\if :{?strict46_login_role}
+\else
+  \echo 'REFUSED: pass -v strict46_login_role=ROLE'
+  \quit 42
+\endif
+
+\connect :"strict46_db"
+BEGIN;
+SET LOCAL search_path = pg_catalog, public;
+
+-- Fail if the manually-created login is absent or privileged. No CREATE ROLE,
+-- ALTER ROLE, password, token, or connection string belongs in this file.
+SELECT 1 / (
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_roles
+        WHERE rolname = :'strict46_login_role'
+          AND rolcanlogin
+          AND NOT rolsuper
+          AND NOT rolcreatedb
+          AND NOT rolcreaterole
+          AND NOT rolreplication
+          AND NOT rolbypassrls
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pg_catalog.pg_auth_members membership
+              WHERE membership.member = pg_roles.oid
+          )
+    )::integer
+) AS strict46_unprivileged_login_assertion;
+
+-- The scheduler calls CREATE ... IF NOT EXISTS on this coordination table.
+-- Pre-creating it as DBA lets the runtime role operate without schema CREATE.
+CREATE TABLE IF NOT EXISTS public.scheduler_lease (
+    job_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL,
+    heartbeat_at TIMESTAMPTZ NOT NULL,
+    lease_until TIMESTAMPTZ NOT NULL,
+    lease_meta JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_scheduler_lease_owner
+    ON public.scheduler_lease(owner_id);
+CREATE INDEX IF NOT EXISTS idx_scheduler_lease_until
+    ON public.scheduler_lease(lease_until);
+CREATE INDEX IF NOT EXISTS idx_scheduler_lease_node
+    ON public.scheduler_lease(node_id);
+
+-- Refuse a pre-existing object with a different column contract rather than
+-- granting the runtime role access to an attacker-selected table shape.
+WITH expected(column_name, data_type, is_nullable) AS (
+    VALUES
+        ('job_id', 'text', 'NO'),
+        ('owner_id', 'text', 'NO'),
+        ('node_id', 'text', 'NO'),
+        ('claimed_at', 'timestamp with time zone', 'NO'),
+        ('heartbeat_at', 'timestamp with time zone', 'NO'),
+        ('lease_until', 'timestamp with time zone', 'NO'),
+        ('lease_meta', 'jsonb', 'YES')
+), actual AS (
+    SELECT column_name, data_type, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'scheduler_lease'
+), contract_ok AS (
+    SELECT
+        NOT EXISTS (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+        AND NOT EXISTS (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+        AND EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_constraint constraint_row
+            JOIN pg_catalog.pg_class table_row
+              ON table_row.oid = constraint_row.conrelid
+            JOIN pg_catalog.pg_namespace namespace_row
+              ON namespace_row.oid = table_row.relnamespace
+            WHERE namespace_row.nspname = 'public'
+              AND table_row.relname = 'scheduler_lease'
+              AND constraint_row.contype = 'p'
+              AND pg_get_constraintdef(constraint_row.oid) = 'PRIMARY KEY (job_id)'
+        ) AS ok
+)
+SELECT 1 / (ok::integer) AS scheduler_lease_contract_assertion
+FROM contract_ok;
+
+-- Ownership grants implicit privileges that REVOKE cannot remove. Refuse an
+-- existing role that owns the database, public schema, or any public relation.
+SELECT 1 / ((
+    NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_database database_row
+        JOIN pg_catalog.pg_roles role_row ON role_row.oid = database_row.datdba
+        WHERE database_row.datname = current_database()
+          AND role_row.rolname = :'strict46_login_role'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace namespace_row
+        JOIN pg_catalog.pg_roles role_row ON role_row.oid = namespace_row.nspowner
+        WHERE namespace_row.nspname = 'public'
+          AND role_row.rolname = :'strict46_login_role'
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class relation_row
+        JOIN pg_catalog.pg_namespace namespace_row
+          ON namespace_row.oid = relation_row.relnamespace
+        JOIN pg_catalog.pg_roles role_row ON role_row.oid = relation_row.relowner
+        WHERE namespace_row.nspname = 'public'
+          AND role_row.rolname = :'strict46_login_role'
+    )
+)::integer) AS strict46_no_implicit_ownership_assertion;
+
+-- Remove stale direct grants before installing the reviewed allow-list. Any
+-- privilege inherited through PUBLIC is checked again below and causes the
+-- transaction to roll back when it exceeds this boundary.
+REVOKE ALL PRIVILEGES ON DATABASE :"strict46_db" FROM :"strict46_login_role";
+REVOKE ALL PRIVILEGES ON DATABASE postgres FROM :"strict46_login_role";
+REVOKE ALL PRIVILEGES ON SCHEMA public FROM :"strict46_login_role";
+REVOKE ALL PRIVILEGES ON TABLE
+    public.benchmark,
+    public.model,
+    public.task,
+    public.completions,
+    public.eval,
+    public.checker,
+    public.scores,
+    public.scheduler_lease
+FROM :"strict46_login_role";
+
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON SEQUENCE %s FROM %I',
+    pg_get_serial_sequence(format('public.%I', table_name), id_column)::regclass,
+    :'strict46_login_role'
+)
+FROM (VALUES
+    ('benchmark', 'benchmark_id'),
+    ('model', 'model_id'),
+    ('task', 'task_id'),
+    ('completions', 'completions_id'),
+    ('eval', 'eval_id'),
+    ('checker', 'checker_id'),
+    ('scores', 'score_id')
+) AS identity_columns(table_name, id_column)
+WHERE pg_get_serial_sequence(format('public.%I', table_name), id_column) IS NOT NULL
+\gexec
+
+GRANT CONNECT ON DATABASE :"strict46_db" TO :"strict46_login_role";
+-- src/db/pool.py checks target existence through postgres before opening the
+-- target pool. CONNECT is required; CREATE DATABASE is intentionally absent.
+GRANT CONNECT ON DATABASE postgres TO :"strict46_login_role";
+GRANT USAGE ON SCHEMA public TO :"strict46_login_role";
+
+GRANT SELECT ON TABLE
+    public.benchmark,
+    public.model,
+    public.task,
+    public.completions,
+    public.eval,
+    public.checker,
+    public.scores,
+    public.scheduler_lease
+TO :"strict46_login_role";
+
+GRANT INSERT ON TABLE
+    public.benchmark,
+    public.model,
+    public.task,
+    public.completions,
+    public.eval,
+    public.checker,
+    public.scores,
+    public.scheduler_lease
+TO :"strict46_login_role";
+
+GRANT UPDATE (benchmark_name, num_samples)
+    ON public.benchmark TO :"strict46_login_role";
+GRANT UPDATE (model_name)
+    ON public.model TO :"strict46_login_role";
+GRANT UPDATE (status)
+    ON public.task TO :"strict46_login_role";
+GRANT UPDATE (context, created_at, status)
+    ON public.completions TO :"strict46_login_role";
+GRANT UPDATE (answer, ref_answer, is_passed, fail_reason, created_at)
+    ON public.eval TO :"strict46_login_role";
+GRANT UPDATE (
+    answer_correct,
+    instruction_following_error,
+    world_knowledge_error,
+    math_error,
+    reasoning_logic_error,
+    thought_contains_correct_answer,
+    needs_human_review,
+    reason,
+    created_at
+) ON public.checker TO :"strict46_login_role";
+GRANT UPDATE (cot_mode, metrics, created_at)
+    ON public.scores TO :"strict46_login_role";
+GRANT UPDATE (owner_id, node_id, claimed_at, heartbeat_at, lease_until, lease_meta)
+    ON public.scheduler_lease TO :"strict46_login_role";
+GRANT DELETE ON public.scheduler_lease TO :"strict46_login_role";
+
+-- Identity sequences are discovered from the six fixed result tables. This
+-- does not grant access to unrelated or future sequences.
+SELECT format(
+    'GRANT USAGE, SELECT ON SEQUENCE %s TO %I',
+    pg_get_serial_sequence(format('public.%I', table_name), id_column)::regclass,
+    :'strict46_login_role'
+)
+FROM (VALUES
+    ('benchmark', 'benchmark_id'),
+    ('model', 'model_id'),
+    ('task', 'task_id'),
+    ('completions', 'completions_id'),
+    ('eval', 'eval_id'),
+    ('checker', 'checker_id'),
+    ('scores', 'score_id')
+) AS identity_columns(table_name, id_column)
+WHERE pg_get_serial_sequence(format('public.%I', table_name), id_column) IS NOT NULL
+\gexec
+
+-- Make the intended negative boundary explicit. Fresh strict-46 execution
+-- must not delete or truncate persisted evidence.
+REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE
+    public.benchmark,
+    public.model,
+    public.task,
+    public.completions,
+    public.eval,
+    public.checker,
+    public.scores
+FROM :"strict46_login_role";
+
+SELECT 1 / ((
+    NOT has_table_privilege(:'strict46_login_role', 'public.benchmark', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.model', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.task', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.completions', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.eval', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.checker', 'DELETE,TRUNCATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.scores', 'DELETE,TRUNCATE')
+    AND NOT has_schema_privilege(:'strict46_login_role', 'public', 'CREATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.benchmark', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.model', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.task', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.completions', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.eval', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.checker', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.scores', 'UPDATE')
+    AND NOT has_table_privilege(:'strict46_login_role', 'public.scheduler_lease', 'UPDATE')
+)::integer) AS persisted_evidence_no_delete_assertion;
+
+-- Review output; this template never changes default privileges or PUBLIC.
+SELECT
+    :'strict46_login_role' AS role_name,
+    has_database_privilege(:'strict46_login_role', :'strict46_db', 'CONNECT') AS target_connect,
+    has_schema_privilege(:'strict46_login_role', 'public', 'USAGE') AS schema_usage,
+    has_table_privilege(:'strict46_login_role', 'public.task', 'SELECT,INSERT') AS task_read_insert,
+    has_column_privilege(:'strict46_login_role', 'public.task', 'status', 'UPDATE') AS task_status_update,
+    has_table_privilege(:'strict46_login_role', 'public.scores', 'DELETE') AS forbidden_scores_delete;
+
+COMMIT;

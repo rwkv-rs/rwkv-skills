@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Sequence
 
@@ -96,8 +97,19 @@ def _default_job_name(cot_mode: CoTMode) -> str:
     return "multi_choice_cot"
 
 
+def _resolve_knowledge_cot_strategy(root_config: object | None) -> str:
+    override = os.environ.get("RWKV_KNOWLEDGE_COT_STRATEGY", "").strip()
+    strategy = override or getattr(root_config, "knowledge_cot_strategy", None) or "cascade_a_b"
+    if strategy not in {"two_stage", "cascade_a_b"}:
+        raise ValueError(f"unsupported knowledge CoT strategy: {strategy}")
+    return strategy
+
+
 def _naive_direct_prompt_template() -> str:
-    return "User: <Q>\n<CHOICES>\n\nAssistant:"
+    # NoCoT must close the model's think block in the prompt.  Merely asking
+    # for an answer does not prevent RWKV reasoning checkpoints from opening
+    # a new <think> block and exhausting the short option-generation window.
+    return "User: <Q>\n<CHOICES>\n\nAssistant: <think></think>\nThe answer is"
 
 
 def _naive_cot_prompt_template() -> str:
@@ -105,7 +117,7 @@ def _naive_cot_prompt_template() -> str:
 
 
 def _naive_final_answer_template() -> str:
-    return "<Q><COT>\nTherefore, the answer is"
+    return "<Q><COT>\nFinal answer (option letter only):"
 
 
 def _print_done_message(cot_mode: CoTMode, sample_count: int) -> None:
@@ -136,6 +148,9 @@ def _task_sampling_config(
     prompt_profile: str = "normal",
     long_doc_config: object | None = None,
     prompt_max_chars: int | None = None,
+    choice_sampling_protocol: dict[str, object] | None = None,
+    dataset_snapshot: dict[str, object] | None = None,
+    protocol_bundle: dict[str, object] | None = None,
 ) -> dict[str, object]:
     from src.eval.results.schema import sampling_config_to_dict
 
@@ -146,6 +161,8 @@ def _task_sampling_config(
         sampling_payload["long_doc"] = long_doc_config_payload(long_doc_config)  # type: ignore[arg-type]
     if prompt_max_chars is not None:
         sampling_payload["prompt_max_chars"] = int(prompt_max_chars)
+    if choice_sampling_protocol is not None:
+        sampling_payload["choice_answer"] = choice_sampling_protocol
     return build_task_sampling_config(
         cot_mode=cot_mode,
         avg_k=avg_k,
@@ -153,6 +170,8 @@ def _task_sampling_config(
         pass_ks=pass_ks,
         effective_sample_count=effective_sample_count,
         prompt_profile=prompt_profile,
+        dataset_snapshot=dataset_snapshot,
+        protocol_bundle=protocol_bundle,
     )
 
 
@@ -215,8 +234,12 @@ def main(
     args = parse_args(argv)
     validate_inference_backend_args(args)
 
-    from src.eval.benchmark_config import resolve_benchmark_model_config
+    from src.eval.benchmark_config import (
+        benchmark_config_source_paths,
+        resolve_benchmark_model_config,
+    )
     from src.eval.datasets.data_loader.multiple_choice import JsonlMultipleChoiceLoader
+    from src.eval.datasets.snapshot import build_dataset_snapshot, build_protocol_bundle
     from src.eval.evaluating import TaskRunController, TaskRunState, prepare_task_execution
     from src.eval.execution_plan import build_attempt_keys, plan_attempt_count
     from src.eval.tasks.knowledge.pipeline import MultipleChoicePipeline
@@ -259,15 +282,16 @@ def main(
         backend,
         target_token_format=args.target_token_format,
     )
+    choice_sampling_protocol = pipeline.resolve_choice_sampling_protocol(
+        [len(record.choices) for record in dataset_records]
+    )
     direct_config = resolve_benchmark_model_config(slug, model_name, stage="direct")
     cot_config = resolve_benchmark_model_config(slug, model_name, stage="cot")
     final_config = resolve_benchmark_model_config(slug, model_name, stage="final")
     root_config = resolve_benchmark_model_config(slug, model_name, stage=None)
     long_doc_config = resolve_long_doc_config(args, root_config)
     prompt_max_chars = args.prompt_max_chars if args.prompt_max_chars is not None else getattr(root_config, "prompt_max_chars", None)
-    knowledge_cot_strategy = getattr(root_config, "knowledge_cot_strategy", None) or "cascade_a_b"
-    if knowledge_cot_strategy not in {"two_stage", "cascade_a_b"}:
-        raise ValueError(f"unsupported knowledge CoT strategy: {knowledge_cot_strategy}")
+    knowledge_cot_strategy = _resolve_knowledge_cot_strategy(root_config)
     missing_prediction_score = getattr(root_config, "missing_prediction_score", None)
     if missing_prediction_score is not None and not 0.0 <= missing_prediction_score <= 1.0:
         raise ValueError("missing_prediction_score must be within [0, 1]")
@@ -319,6 +343,41 @@ def main(
             )
             return 0
 
+    dataset_snapshot = build_dataset_snapshot(
+        dataset_path,
+        dataset_slug=slug,
+        loader=JsonlMultipleChoiceLoader,
+        resolver=resolve_or_prepare_dataset,
+        records=dataset_records,
+    )
+    protocol_bundle = build_protocol_bundle(
+        protocol_name="knowledge",
+        source_files=(
+            Path(__file__),
+            Path(__file__).with_name("pipeline.py"),
+            Path(__file__).parents[2] / "field_common.py",
+            Path(__file__).parents[2] / "benchmark_config.py",
+            Path(__file__).parents[2] / "prompt_builders.py",
+            Path(__file__).parents[2] / "metrics" / "multi_choice.py",
+            Path(__file__).parents[2]
+            / "datasets"
+            / "data_loader"
+            / "multiple_choice.py",
+        ),
+        config_files=benchmark_config_source_paths(slug, model_name),
+        resolved_contract={
+            "cot_mode": cot_mode.value,
+            "prompt_profile": prompt_profile,
+            "direct_prompt_template": direct_prompt_template,
+            "cot_prompt_template": cot_prompt_template,
+            "final_answer_template": final_answer_template,
+            "knowledge_cot_strategy": knowledge_cot_strategy,
+            "missing_prediction_score": missing_prediction_score,
+            "prompt_max_chars": prompt_max_chars,
+            "choice_sampling_protocol": choice_sampling_protocol,
+        },
+    )
+
     init_db(DEFAULT_DB_CONFIG)
     service = EvalDbService()
     expected_count = plan_attempt_count(plan, max_pass_k=1)
@@ -338,6 +397,9 @@ def main(
             prompt_profile=prompt_profile,
             long_doc_config=long_doc_config,
             prompt_max_chars=prompt_max_chars,
+            choice_sampling_protocol=choice_sampling_protocol,
+            dataset_snapshot=dataset_snapshot,
+            protocol_bundle=protocol_bundle,
         ),
     )
     task_run = TaskRunState.from_task_execution(

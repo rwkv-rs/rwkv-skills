@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Shared rwkv-rs-style prompt builders for benchmark fields."""
+
+from __future__ import annotations
 
 from collections.abc import Sequence
 
@@ -96,10 +96,8 @@ def build_maths_expected_context(*, subject: str, question: str, cot_mode: CoTMo
 
 def build_instruction_following_prompt(prompt: str, *, enable_think: bool = False) -> str:
     clean_prompt = prompt.lstrip().rstrip(" ")
-    suffix = "<think" if enable_think else ""
-    if suffix:
-        return f"User: {clean_prompt}\n\nAssistant: {suffix}"
-    return f"User: {clean_prompt}\n\nAssistant:"
+    suffix = "<think" if enable_think else "<think></think>\n"
+    return f"User: {clean_prompt}\n\nAssistant: {suffix}"
 
 
 def build_human_eval_expected_context(

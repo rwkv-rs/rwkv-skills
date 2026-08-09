@@ -9,5 +9,11 @@ template = "free_response_cot_default"
 
 [final]
 template = "free_response_final_default"
-final_prompt_template = """<Q><COT>
+final_prompt_template = """<Q><COT></think>
 Therefore, the answer is \\(\\boxed{"""
+# G1h CoT generation bans a model-emitted </think>, so the final stage must
+# close the reasoning block explicitly before asking for the boxed answer.
+# A small subset of long Olympiad solutions still needs more than the generic
+# 128-token finalization budget.  Keep the larger continuation window scoped to
+# this benchmark; the main reasoning budget remains unchanged.
+max_generate_tokens = 512

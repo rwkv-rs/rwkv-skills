@@ -5,19 +5,17 @@
 面向 RWKV7 的评测脚手架，推理侧接入外部 vLLM-RWKV OpenAI 兼容服务，包含常见评测数据集准备器以及一个 GPU 调度器骨架。
 
 ## 项目结构
-前端（`client/`）与后端（`src/`）严格分离；第三方基准数据与评测产物不入源码包。
+第三方基准数据与评测产物不入源码包；公开分数前端由 Helicopter 仓库独立维护。
 
-- `client/`：评测看板前端（Next.js + React）；`/api/*` 通过 Next rewrites 代理到 FastAPI 后端。
 - `src/`：后端 Python 包
   - `src/eval/tasks/`：按域组织的评测 runner/pipeline —— `knowledge`、`maths`、`coding`、`instruction_following`、`function_calling`、`agent_bench`。
   - `src/eval/scheduler`：评测任务排队、GPU/远端 worker 侦测与调度的 CLI。
   - `src/eval/datasets`：数据结构、JSONL 加载器与各数据集准备器。
   - `src/eval/{evaluating,evaluators,metrics,results,checkers}`：评测引擎与指标/结果处理。
   - `src/infer`：远端 OpenAI/vLLM 推理客户端、采样配置与约束。
-  - `src/dashboard/{web,core}`：看板后端（FastAPI web 层 + 框架无关 core 逻辑）。
   - `src/db`：PostgreSQL 数据层。
   - `src/plugins/lexical_chunk_router`：词法分块 / 工具路由插件。
-  - `src/bin`：pyproject 注册的 console-script 入口（infer server/fleet/router、dashboard、perf、download-weights）。
+  - `src/bin`：pyproject 注册的 console-script 入口（infer server/fleet/router、perf、download-weights）。
 - `assets/agent_bench/`：agent-bench（tau_v1 / tau_v2）第三方基准数据（经 sys.path 加载，不在 `src` 包内，构建时经 force-include 打包）。
 - `configs/`：各 benchmark 的 `.toml` 采样 / 评测配置。
 - `scripts/oneoff/`：一次性 / 运维脚本。
@@ -36,41 +34,6 @@ uv sync --extra torch-cu129
 uv pip install -e .
 ```
 如需其他 CUDA/CPU 发行版，请改用 `--extra torch-cu126` / `--extra torch-cpu` 等。
-
-## 评测看板（FastAPI + Next.js）
-看板由一个自包含的 FastAPI 后端（复用本项目的 Python 数据层 `src/dashboard`、`EvalDbService`）
-与 Next.js + React 19 + TypeScript 前端组成，不再依赖任何外部 Rust 服务：API 直接从
-`results/space/score_index.jsonl` 读取排行榜分数索引，并从 `PG_*` 指定的 Postgres 数据库拉取
-评测记录与补全上下文。
-
-```bash
-# 1. 后端 - 在 :7860 提供 JSON API
-cp .env.example .env            # 填写 PG_* 连接信息
-rwkv-skills-dashboard           # 或：python -m src.bin.run_dashboard --reload
-
-# 2. 前端（开发模式）- Next.js 服务在 :3000，将 /api 代理到 :7860
-cd client
-pnpm install
-pnpm dev
-```
-
-开发模式下访问 `http://localhost:3000`。如果 FastAPI 后端不在 `http://127.0.0.1:7860`，
-用 `SCOREBOARD_API_BASE_URL` 指定 API 地址；如果部署到 `/new-eval`，同时设置
-`NEXT_PUBLIC_BASE_PATH=/new-eval`：
-
-```bash
-cd client
-NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
-NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
-```
-
-看板还内置**管理面板**（"管理面板"页签）用于驱动评测调度器：启动 / 暂停 / 恢复 / 取消任务，
-查看实时任务队列与进度，以及 GPU / 远端 worker 遥测。它在 `/api/admin/*` 下封装了
-`SchedulerAdminController`。
-
-可选环境变量覆盖：`RWKV_SPACE_SCORE_INDEX`（分数索引路径）、
-`RWKV_SPACE_RESULTS_DIR`（结果目录），以及 `RWKV_ADMIN_API_KEY`——设置后，所有
-`/api/admin/*` 请求都需要 `Authorization: Bearer <key>` 头（在管理面板的 Token 输入框填写）。
 
 ## 下载模型权重
 `rwkv-download-weights` 会从 Hugging Face 镜像枚举并并发下载 `.pth` 权重：

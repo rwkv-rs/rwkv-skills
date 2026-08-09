@@ -28,6 +28,16 @@ class SamplingConfig:
     # 命中即停止生成，对应 RWKV 对话模板的回合结束标记。
     stop_tokens: tuple[int, ...] = (0, 261, 24281)
     ban_tokens: tuple[int, ...] | None = None
+    # Optional hard vocabulary constraint supported by vLLM-compatible
+    # backends.  This is intentionally token-id based so callers can resolve
+    # model-specific literals (for example multiple-choice answer tokens)
+    # through the serving tokenizer instead of hard-coding a vocabulary.
+    allowed_token_ids: tuple[int, ...] | None = None
+    # Optional string sequences to suppress in the generated text.  G1h CoT
+    # uses this together with min_think_tokens so an immediately generated
+    # </think> cannot collapse the reasoning block to an empty think.
+    bad_words: tuple[str, ...] = ()
+    min_think_tokens: int = 0
     pad_zero: bool = True
     no_penalty_token_ids: tuple[int, ...] = DEFAULT_NO_PENALTY_TOKEN_IDS
 
@@ -78,6 +88,18 @@ class SamplingConfig:
             top_k=top_k,
             top_p=top_p,
             max_generate_tokens=max(1, int(self.max_generate_tokens)),
+            min_think_tokens=max(0, min(int(self.min_think_tokens), int(self.max_generate_tokens))),
+            allowed_token_ids=(
+                None
+                if self.allowed_token_ids is None
+                else tuple(
+                    dict.fromkeys(
+                        int(token_id)
+                        for token_id in self.allowed_token_ids
+                        if 0 <= int(token_id) < int(vocab_size)
+                    )
+                )
+            ),
         )
 
 

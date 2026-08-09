@@ -5,7 +5,6 @@ import contextlib
 import faulthandler
 import io
 import json
-import multiprocessing
 import os
 import platform
 import signal
@@ -14,6 +13,8 @@ import traceback
 from decimal import Decimal
 from types import ModuleType
 from typing import Optional
+
+from ..subprocess_runner import run_isolated
 
 
 _IMPORT_STRING = (
@@ -392,26 +393,17 @@ def check_correctness(
     completion: str,
     timeout: float,
 ) -> dict:
-    manager = multiprocessing.Manager()
-    result = manager.list()
-
-    proc = multiprocessing.Process(
-        target=unsafe_execute,
-        args=(sample, completion, timeout, result),
+    result = run_isolated(
+        unsafe_execute,
+        (sample, completion, timeout),
+        timeout=timeout,
     )
-    proc.start()
-    proc.join(timeout=timeout + 1)
-    if proc.is_alive():
-        proc.kill()
-
-    if not result:
-        result.append("timed out")
 
     return dict(
         sample_index=sample_index,
         repeat_index=repeat_index,
-        passed=result[0] == "passed",
-        result=result[0],
+        passed=result == "passed",
+        result=result,
     )
 
 

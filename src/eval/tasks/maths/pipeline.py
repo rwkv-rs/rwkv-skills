@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Maths benchmark pipeline for full free-response generation."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Sequence
@@ -37,6 +37,13 @@ G1H_REMOTE_STOP_SUFFIXES = tuple(
     suffix for suffix in G1H_GENERATION_STOP_SUFFIXES if suffix != "✿"
 )
 FREE_RESPONSE_STOP_TOKENS = (0,)
+# The final-stage prompt pre-fills ``\boxed{``.  Stop on the closing box plus
+# math-delimiter text rather than relying only on tokenizer-specific token IDs.
+# A literal text stop remains correct when BPE merges ``}}\`` (common for
+# answers such as ``\sqrt{2}``) into a token not present in ``stop_tokens``.
+# Stopping on ``}`` alone would be unsafe because braces also occur inside the
+# answer (fractions, roots, tuples, aligned expressions, ...).
+FINAL_BOXED_STOP_SUFFIXES = ("}\\)", "} \\)", "}\\]")
 
 DEFAULT_COT_PROMPT = """User: <Q>
 
@@ -88,7 +95,13 @@ def _remote_stop_suffixes_for_prompt(prompt: str) -> tuple[str, ...]:
 
 
 def _prompt_stop_suffixes(prompts: Sequence[str]) -> list[tuple[str, ...]]:
-    return [_remote_stop_suffixes_for_prompt(prompt) for prompt in prompts]
+    result: list[tuple[str, ...]] = []
+    for prompt in prompts:
+        suffixes = _remote_stop_suffixes_for_prompt(prompt)
+        if prompt.rstrip().endswith("\\boxed{"):
+            suffixes = (*suffixes, *FINAL_BOXED_STOP_SUFFIXES)
+        result.append(suffixes)
+    return result
 
 
 def _clip_user_sentinel(text: str, *, prompt: str = "") -> str:
@@ -106,11 +119,32 @@ def _is_truncated(output: GenerationOutput) -> bool:
 
 
 def _output_stats(output: GenerationOutput) -> dict[str, object]:
+    truncated = _is_truncated(output)
+    # Contract: class 1 means a normal/explicit stop (token 0 or a role/text
+    # stop); class 2 means the configured generation budget was exhausted.
+    # Remote backends may use different detail strings, so max_tokens and
+    # max_length are the only class-2 signals.
+    # The remote OpenAI/vLLM adapters preserve text and finish_reason but do
+    # not receive token ids in the response.  Do not serialize that unknown
+    # value as a false zero; local backends with token ids still report the
+    # exact count.
+    token_count: int | None = len(output.token_ids) if output.token_ids else None
+    if token_count is None and output.tokens:
+        token_count = len(output.tokens)
     return {
-        "truncated": _is_truncated(output),
+        "truncated": truncated,
         "stop_detail": output.finish_reason or "",
-        "generated_token_count": len(output.token_ids),
+        "stop_reason_class": 2 if truncated else 1,
+        "termination_reason": "max_tokens" if truncated else "stop",
+        "generated_token_count": token_count,
     }
+
+
+def _sum_known_token_counts(*stats: dict[str, object]) -> int | None:
+    counts = [item.get("generated_token_count") for item in stats]
+    if not all(isinstance(value, int) for value in counts):
+        return None
+    return sum(value for value in counts if isinstance(value, int))
 
 
 @dataclass(slots=True)
@@ -208,7 +242,7 @@ class FreeResponsePipeline:
             if cached is not None:
                 return cached
             value = compose_context_question(
-                record.context,
+                getattr(record, "context", None),
                 record.question,
                 long_doc_config=long_doc_cfg,
                 label=f"{dataset_name}:{key.sample_index}",
@@ -522,8 +556,7 @@ class FreeResponsePipeline:
                     payload["stats"] = {
                         "truncated": bool(final_stats["truncated"]),
                         "stop_detail": final_stats["stop_detail"],
-                        "generated_token_count": int(cot_stats["generated_token_count"])
-                        + int(final_stats["generated_token_count"]),
+                        "generated_token_count": _sum_known_token_counts(cot_stats, final_stats),
                         "stage1": cot_stats,
                         "stage2": final_stats,
                     }

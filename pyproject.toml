@@ -157,7 +157,6 @@ default = true
 [project.scripts]
 rwkv-skills = "src.main:main"
 rwkv-skills-scheduler = "src.eval.scheduler.cli:main"
-rwkv-skills-dashboard = "src.bin.run_dashboard:main"
 rwkv-skills-infer = "src.bin.run_infer_server:main"
 rwkv-skills-infer-fleet = "src.bin.run_infer_fleet:main"
 rwkv-skills-infer-router = "src.bin.run_infer_router:main"

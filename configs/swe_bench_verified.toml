@@ -1,4 +1,0 @@
-[default]
-template = "code_default"
-avg_k = [1]
-report_avg_k = [1]

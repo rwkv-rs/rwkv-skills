@@ -5,19 +5,17 @@ English | [中文](README.zh-CN.md)
 An evaluation scaffold for RWKV7 that targets an external vLLM-RWKV OpenAI-compatible inference service, with dataset preppers for common benchmarks and a GPU scheduler skeleton.
 
 ## Project structure
-The frontend (`client/`) and backend (`src/`) are strictly separated; third-party benchmark data and evaluation artifacts stay out of the source package.
+Third-party benchmark data and evaluation artifacts stay out of the source package. The public scoreboard is maintained separately in the Helicopter repository.
 
-- `client/`: dashboard frontend (Next.js + React); `/api/*` is proxied to the FastAPI backend by Next rewrites.
 - `src/`: backend Python package
   - `src/eval/tasks/`: per-domain evaluation runners/pipelines — `knowledge`, `maths`, `coding`, `instruction_following`, `function_calling`, `agent_bench`.
   - `src/eval/scheduler`: CLI for queueing eval jobs, GPU/remote-worker detection, and dispatch.
   - `src/eval/datasets`: data structures, JSONL loaders, and per-dataset preppers.
   - `src/eval/{evaluating,evaluators,metrics,results,checkers}`: evaluation engine and metric/result handling.
   - `src/infer`: remote OpenAI/vLLM inference client, sampling configuration, and constraints.
-  - `src/dashboard/{web,core}`: dashboard backend (FastAPI web layer + framework-agnostic core logic).
   - `src/db`: PostgreSQL data layer.
   - `src/plugins/lexical_chunk_router`: lexical chunking / tool-routing plugin.
-  - `src/bin`: console-script entry points registered in pyproject (infer server/fleet/router, dashboard, perf, download-weights).
+  - `src/bin`: console-script entry points registered in pyproject (infer server/fleet/router, perf, download-weights).
 - `assets/agent_bench/`: agent-bench (tau_v1 / tau_v2) third-party benchmark data (loaded via sys.path, kept out of the `src` package, force-included at build time).
 - `configs/`: per-benchmark `.toml` sampling / evaluation configs.
 - `scripts/oneoff/`: one-off / operational scripts.
@@ -36,43 +34,6 @@ uv sync --extra torch-cu129
 uv pip install -e .
 ```
 For other CUDA/CPU builds, use `--extra torch-cu126` / `--extra torch-cpu`, etc.
-
-## Evaluation dashboard (FastAPI + Next.js)
-The dashboard is a self-contained FastAPI backend that reuses this project's Python data layer
-(`src/dashboard`, `EvalDbService`) plus a Next.js + React 19 + TypeScript frontend. There is no
-external Rust service: the API reads the leaderboard score index from
-`results/space/score_index.jsonl` and pulls eval records / completion context directly from the
-`PG_*` Postgres database.
-
-```bash
-# 1. Backend - serves the JSON API on :7860
-cp .env.example .env            # fill in PG_* connection settings
-rwkv-skills-dashboard           # or: python -m src.bin.run_dashboard --reload
-
-# 2. Frontend (development) - Next.js server on :3000, rewrites /api -> :7860
-cd client
-pnpm install
-pnpm dev
-```
-
-Open `http://localhost:3000` in development. Set `SCOREBOARD_API_BASE_URL` when the FastAPI backend
-is not on `http://127.0.0.1:7860`. For deployment behind `/new-eval`, also set
-`NEXT_PUBLIC_BASE_PATH=/new-eval`:
-
-```bash
-cd client
-NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm build
-NEXT_PUBLIC_BASE_PATH=/new-eval SCOREBOARD_API_BASE_URL=http://127.0.0.1:7860 pnpm start
-```
-
-The dashboard also includes an **admin panel** (the "管理面板" tab) that drives the eval scheduler:
-start / pause / resume / cancel runs, watch the live job queue and progress, and view GPU /
-remote-worker telemetry. It wraps `SchedulerAdminController` under `/api/admin/*`.
-
-Optional environment overrides: `RWKV_SPACE_SCORE_INDEX` (score index path),
-`RWKV_SPACE_RESULTS_DIR` (results directory), and `RWKV_ADMIN_API_KEY` — when set, every
-`/api/admin/*` request requires an `Authorization: Bearer <key>` header (enter it in the admin
-panel's token field).
 
 ## Download model weights
 `rwkv-download-weights` enumerates and downloads `.pth` weights concurrently from a Hugging Face mirror:
